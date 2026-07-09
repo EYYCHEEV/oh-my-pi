@@ -11,6 +11,7 @@ import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/inp
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -68,7 +69,17 @@ type TestContext = InteractiveModeContext & {
 };
 
 function createControllerContext() {
-	const editor = { id: "core-editor", pasteText: vi.fn() };
+	let editorText = "";
+	const editor = {
+		id: "core-editor",
+		getText: vi.fn(() => editorText),
+		setText: vi.fn((text: string) => {
+			editorText = text;
+		}),
+		pasteText: vi.fn((text: string) => {
+			editorText += text;
+		}),
+	};
 	const editorContainer = {
 		children: [] as unknown[],
 		clear() {
@@ -79,12 +90,25 @@ function createControllerContext() {
 		},
 	};
 	let focused: unknown;
+	let toolUiContext: ExtensionUIContext | undefined;
 	const ui = {
 		requestRender: vi.fn(),
 		setFocus: vi.fn((component: unknown) => {
 			focused = component;
 		}),
 		getFocused: vi.fn(() => focused),
+		showOverlay: vi.fn((component: unknown) => {
+			const preFocus = focused;
+			ui.setFocus(component);
+			return {
+				hide: vi.fn(() => {
+					ui.setFocus(preFocus ?? null);
+					ui.requestRender();
+				}),
+				setHidden: vi.fn(),
+				isHidden: vi.fn(() => false),
+			};
+		}),
 		start: vi.fn(),
 		stop: vi.fn(),
 		terminal: { columns: 120 },
@@ -92,15 +116,29 @@ function createControllerContext() {
 		setFocus: Mock<any>;
 		getFocused: Mock<any>;
 		requestRender: Mock<any>;
+		showOverlay: Mock<any>;
 	};
 	const ctx = {
 		editor,
 		editorContainer,
 		ui,
 		hookEditor: undefined,
+		session: { extensionRunner: undefined },
+		setToolUIContext(context: ExtensionUIContext): void {
+			toolUiContext = context;
+		},
 	} as unknown as TestContext;
 
-	return { ctx, editor, editorContainer, ui };
+	return {
+		ctx,
+		editor,
+		editorContainer,
+		ui,
+		getToolUiContext() {
+			if (!toolUiContext) throw new Error("expected extension UI context");
+			return toolUiContext;
+		},
+	};
 }
 
 function createPromptAutocompleteProvider(): AutocompleteProvider {
@@ -128,6 +166,7 @@ function createPromptAutocompleteProvider(): AutocompleteProvider {
 function createSkillAutocompleteProvider(): AutocompleteProvider {
 	return new CombinedAutocompleteProvider([{ name: "skill:security-scan", description: "Security scan" }], "/tmp");
 }
+
 
 async function flushAutocomplete(): Promise<void> {
 	await Promise.resolve();
@@ -368,26 +407,6 @@ describe("HookEditorComponent prompt-style mode", () => {
 		expect(renderText(component)).toContain("/goal");
 	});
 
-	it("applies the selected skill autocomplete item before submitting a prompt-style objective", async () => {
-		const onSubmit = vi.fn();
-		const onCancel = vi.fn();
-		const component = new HookEditorComponent(createTui(), "Goal objective", undefined, onSubmit, onCancel, {
-			promptStyle: true,
-			autocompleteProvider: createSkillAutocompleteProvider(),
-		});
-
-		component.handleInput("run a ");
-		component.handleInput("/");
-		await flushAutocomplete();
-
-		expect(component.isShowingAutocomplete()).toBe(true);
-
-		component.handleInput("\r");
-
-		expect(onSubmit).toHaveBeenCalledTimes(1);
-		expect(onSubmit).toHaveBeenCalledWith("run a /skill:security-scan");
-		expect(onCancel).not.toHaveBeenCalled();
-	});
 
 	it("absorbs enhanced-paste payloads delivered via pasteText (kitty OSC 5522 routing)", () => {
 		// Regression: pasting into the ask tool's "Other" editor on OSC 5522
@@ -704,44 +723,104 @@ describe("ExtensionUiController hook editor abort", () => {
 		expect(ui.setFocus).toHaveBeenLastCalledWith(editor);
 	});
 
-	it("keeps the objective editor focused when Escape closes autocomplete before dismissing on a second Escape", async () => {
-		const { ctx, editor, editorContainer, ui } = createControllerContext();
-		const controller = new ExtensionUiController(ctx) as unknown as {
-			showHookEditor: (
-				title: string,
-				prefill?: string,
-				dialogOptions?: { signal?: AbortSignal },
-				editorOptions?: { promptStyle?: boolean; autocompleteProvider?: AutocompleteProvider },
-			) => Promise<string | undefined>;
-		};
-		const promise = controller.showHookEditor("Goal objective", undefined, undefined, {
-			promptStyle: true,
-			autocompleteProvider: createSkillAutocompleteProvider(),
-		});
+	it("routes extension dollar picker selection into the focused objective editor", async () => {
+		const { ctx, editor, ui, getToolUiContext } = createControllerContext();
+		const controller = new ExtensionUiController(ctx);
+		await controller.initHooksAndCustomTools();
+		const extensionUi = getToolUiContext();
+
+		const objectivePromise = controller.showHookEditor("Goal objective", undefined, undefined, { promptStyle: true });
 		const hookEditor = ctx.hookEditor;
 		if (!hookEditor) throw new Error("expected focused objective editor");
-
 		hookEditor.handleInput("run a ");
-		hookEditor.handleInput("/");
-		await flushAutocomplete();
-		expect(hookEditor.isShowingAutocomplete()).toBe(true);
 
-		hookEditor.handleInput("\x1b");
+		let finishPicker: ((result: string | undefined) => void) | undefined;
+		const picker = {
+			render: () => ["Skill"],
+			handleInput: vi.fn((keyData: string) => {
+				if (keyData === "\r" || keyData === "\t") {
+					finishPicker?.("$security-scan ");
+				}
+			}),
+		};
+		const pickerPromise = extensionUi.custom<string | undefined>((_tui, _theme, _keybindings, done) => {
+			finishPicker = done;
+			return picker;
+		}, { overlay: true });
+		await Promise.resolve();
 
-		expect(hookEditor.isShowingAutocomplete()).toBe(false);
+		expect(ui.setFocus).toHaveBeenLastCalledWith(picker);
+		picker.handleInput("\r");
+		const selected = await pickerPromise;
+		expect(selected).toBe("$security-scan ");
+		expect(ui.setFocus).toHaveBeenLastCalledWith(hookEditor);
+
+		extensionUi.pasteToEditor(selected!);
+
+		expect(editor.pasteText).not.toHaveBeenCalled();
+		expect(renderText(hookEditor)).toContain("run a $security-scan ");
+
+		hookEditor.handleInput("\r");
+		expect(await objectivePromise).toBe("run a $security-scan ");
+		expect(ctx.hookEditor).toBeUndefined();
+	});
+
+	it("restores objective focus after extension dollar picker Escape so a second Escape cancels", async () => {
+		const { ctx, editor, editorContainer, ui, getToolUiContext } = createControllerContext();
+		const controller = new ExtensionUiController(ctx);
+		await controller.initHooksAndCustomTools();
+		const extensionUi = getToolUiContext();
+
+		const objectivePromise = controller.showHookEditor("Goal objective", undefined, undefined, { promptStyle: true });
+		const hookEditor = ctx.hookEditor;
+		if (!hookEditor) throw new Error("expected focused objective editor");
+		hookEditor.handleInput("run a ");
+
+		let finishPicker: ((result: string | undefined) => void) | undefined;
+		const picker = {
+			render: () => ["Skill"],
+			handleInput: vi.fn((keyData: string) => {
+				if (keyData === "\x1b") {
+					finishPicker?.(undefined);
+				}
+			}),
+		};
+		const pickerPromise = extensionUi.custom<string | undefined>((_tui, _theme, _keybindings, done) => {
+			finishPicker = done;
+			return picker;
+		}, { overlay: true });
+		await Promise.resolve();
+
+		picker.handleInput("\x1b");
+
+		expect(await pickerPromise).toBeUndefined();
 		expect(ctx.hookEditor).toBe(hookEditor);
 		expect(editorContainer.children).toEqual([hookEditor]);
 		expect(ui.setFocus).toHaveBeenLastCalledWith(hookEditor);
-		let resolvedAfterFirstEscape = false;
-		const observedPromise = promise.then(() => {
-			resolvedAfterFirstEscape = true;
+		let resolvedAfterPickerEscape = false;
+		const observedObjectivePromise = objectivePromise.then(() => {
+			resolvedAfterPickerEscape = true;
 		});
 		await Promise.resolve();
-		expect(resolvedAfterFirstEscape).toBe(false);
+		expect(resolvedAfterPickerEscape).toBe(false);
 
 		hookEditor.handleInput("\x1b");
 
-		expect(await observedPromise).toBeUndefined();
+		expect(await observedObjectivePromise).toBeUndefined();
+		expect(ctx.hookEditor).toBeUndefined();
+		expect(editorContainer.children).toEqual([editor]);
+		expect(ui.setFocus).toHaveBeenLastCalledWith(editor);
+
+		const reopened = controller.showHookEditor("Goal objective", undefined, undefined, { promptStyle: true });
+		const reopenedHookEditor = ctx.hookEditor;
+		if (!reopenedHookEditor) throw new Error("expected reopened objective editor");
+		expect(reopenedHookEditor).not.toBe(hookEditor);
+		expect(editorContainer.children).toEqual([reopenedHookEditor]);
+		expect(ui.setFocus).toHaveBeenLastCalledWith(reopenedHookEditor);
+
+		reopenedHookEditor.handleInput("new goal");
+		reopenedHookEditor.handleInput("\r");
+		expect(await reopened).toBe("new goal");
 		expect(ctx.hookEditor).toBeUndefined();
 		expect(editorContainer.children).toEqual([editor]);
 		expect(ui.setFocus).toHaveBeenLastCalledWith(editor);
