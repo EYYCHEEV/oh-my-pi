@@ -7,7 +7,8 @@
  *   (Ctrl+Q / Ctrl+Enter) submits, bordered popup
  * - Prompt-style (ask): Enter submits, Shift+Enter inserts newline, legacy ask chrome
  */
-import { Container, Editor, matchesKey, Spacer, Text, type TUI } from "@oh-my-pi/pi-tui";
+import { Container, Editor, matchesKey, Spacer, Text } from "@oh-my-pi/pi-tui";
+import type { AutocompleteProvider, TUI } from "@oh-my-pi/pi-tui";
 import { getEditorTheme, theme } from "../../modes/theme/theme";
 import {
 	matchesAppExternalEditor,
@@ -20,6 +21,10 @@ import { DynamicBorder } from "./dynamic-border";
 export interface HookEditorOptions {
 	/** When true, use prompt-style keybindings with the legacy ask prompt chrome. */
 	promptStyle?: boolean;
+	/** Optional autocomplete provider for prompt-like hook editors. */
+	autocompleteProvider?: AutocompleteProvider;
+	/** Optional maximum visible autocomplete rows, mirroring the main editor setting. */
+	autocompleteMaxVisible?: number;
 }
 
 export class HookEditorComponent extends Container {
@@ -58,6 +63,14 @@ export class HookEditorComponent extends Container {
 			this.#editor.setPromptGutter("> ");
 			this.#editor.disableSubmit = true;
 		}
+		if (options?.autocompleteProvider) {
+			this.#editor.setAutocompleteProvider(options.autocompleteProvider);
+			this.#editor.onAutocompleteCancel = () => this.#tui.requestRender(true);
+			this.#editor.onAutocompleteUpdate = () => this.#tui.requestRender();
+		}
+		if (options?.autocompleteMaxVisible !== undefined) {
+			this.#editor.setAutocompleteMaxVisible(options.autocompleteMaxVisible);
+		}
 		if (prefill) {
 			this.#editor.setText(prefill);
 		}
@@ -93,6 +106,10 @@ export class HookEditorComponent extends Container {
 	 *  dialog (#2127 routing contract). */
 	pasteText(text: string): void {
 		this.#editor.pasteText(text);
+	}
+
+	isShowingAutocomplete(): boolean {
+		return this.#editor.isShowingAutocomplete();
 	}
 
 	/**
