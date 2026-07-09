@@ -16,7 +16,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { setKeybindings } from "@oh-my-pi/pi-tui";
-import type { AutocompleteProvider, TUI } from "@oh-my-pi/pi-tui";
+import { CombinedAutocompleteProvider, type AutocompleteProvider, type TUI } from "@oh-my-pi/pi-tui";
 
 beforeAll(async () => {
 	const theme = await getThemeByName("dark");
@@ -117,6 +117,10 @@ function createPromptAutocompleteProvider(): AutocompleteProvider {
 			};
 		}),
 	};
+}
+
+function createSkillAutocompleteProvider(): AutocompleteProvider {
+	return new CombinedAutocompleteProvider([{ name: "skill:security-scan", description: "Security scan" }], "/tmp");
 }
 
 async function flushAutocomplete(): Promise<void> {
@@ -356,6 +360,27 @@ describe("HookEditorComponent prompt-style mode", () => {
 
 		expect(provider.getSuggestions).toHaveBeenCalledWith(["/"], 0, 1);
 		expect(renderText(component)).toContain("/goal");
+	});
+
+	it("applies the selected skill autocomplete item before submitting a prompt-style objective", async () => {
+		const onSubmit = vi.fn();
+		const onCancel = vi.fn();
+		const component = new HookEditorComponent(createTui(), "Goal objective", undefined, onSubmit, onCancel, {
+			promptStyle: true,
+			autocompleteProvider: createSkillAutocompleteProvider(),
+		});
+
+		component.handleInput("run a ");
+		component.handleInput("/");
+		await flushAutocomplete();
+
+		expect(component.isShowingAutocomplete()).toBe(true);
+
+		component.handleInput("\r");
+
+		expect(onSubmit).toHaveBeenCalledTimes(1);
+		expect(onSubmit).toHaveBeenCalledWith("run a /skill:security-scan");
+		expect(onCancel).not.toHaveBeenCalled();
 	});
 
 	it("absorbs enhanced-paste payloads delivered via pasteText (kitty OSC 5522 routing)", () => {
@@ -636,6 +661,49 @@ describe("ExtensionUiController hook editor abort", () => {
 		hookEditor.handleInput("\x1b");
 
 		expect(await promise).toBeUndefined();
+		expect(ctx.hookEditor).toBeUndefined();
+		expect(editorContainer.children).toEqual([editor]);
+		expect(ui.setFocus).toHaveBeenLastCalledWith(editor);
+	});
+
+	it("keeps the objective editor focused when Escape closes autocomplete before dismissing on a second Escape", async () => {
+		const { ctx, editor, editorContainer, ui } = createControllerContext();
+		const controller = new ExtensionUiController(ctx) as unknown as {
+			showHookEditor: (
+				title: string,
+				prefill?: string,
+				dialogOptions?: { signal?: AbortSignal },
+				editorOptions?: { promptStyle?: boolean; autocompleteProvider?: AutocompleteProvider },
+			) => Promise<string | undefined>;
+		};
+		const promise = controller.showHookEditor("Goal objective", undefined, undefined, {
+			promptStyle: true,
+			autocompleteProvider: createSkillAutocompleteProvider(),
+		});
+		const hookEditor = ctx.hookEditor;
+		if (!hookEditor) throw new Error("expected focused objective editor");
+
+		hookEditor.handleInput("run a ");
+		hookEditor.handleInput("/");
+		await flushAutocomplete();
+		expect(hookEditor.isShowingAutocomplete()).toBe(true);
+
+		hookEditor.handleInput("\x1b");
+
+		expect(hookEditor.isShowingAutocomplete()).toBe(false);
+		expect(ctx.hookEditor).toBe(hookEditor);
+		expect(editorContainer.children).toEqual([hookEditor]);
+		expect(ui.setFocus).toHaveBeenLastCalledWith(hookEditor);
+		let resolvedAfterFirstEscape = false;
+		const observedPromise = promise.then(() => {
+			resolvedAfterFirstEscape = true;
+		});
+		await Promise.resolve();
+		expect(resolvedAfterFirstEscape).toBe(false);
+
+		hookEditor.handleInput("\x1b");
+
+		expect(await observedPromise).toBeUndefined();
 		expect(ctx.hookEditor).toBeUndefined();
 		expect(editorContainer.children).toEqual([editor]);
 		expect(ui.setFocus).toHaveBeenLastCalledWith(editor);
