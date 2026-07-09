@@ -16,6 +16,7 @@ import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, ImageContent, Message, Model, Usage, UsageReport } from "@oh-my-pi/pi-ai";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import type {
+	AutocompleteProvider,
 	Component,
 	EditorTheme,
 	LoaderMessageColorFn,
@@ -517,6 +518,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	#pendingSlashCommands: SlashCommand[] = [];
 	#cleanupUnsubscribe?: () => void;
+	#promptAutocompleteProvider: AutocompleteProvider | undefined;
 	#signalTeardown?: SessionTeardown;
 	readonly #version: string;
 	readonly #changelogMarkdown: string | undefined;
@@ -1099,6 +1101,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			basePath,
 		);
 		this.editor.setAutocompleteProvider(autocompleteProvider);
+		this.#promptAutocompleteProvider = autocompleteProvider;
 		this.session.setSlashCommands(fileCommands);
 	}
 
@@ -2904,7 +2907,11 @@ export class InteractiveMode implements InteractiveModeContext {
 				return;
 			}
 			const objective = (
-				await this.showHookEditor("Goal objective", undefined, undefined, { promptStyle: true })
+				await this.showHookEditor("Goal objective", undefined, undefined, {
+					promptStyle: true,
+					autocompleteProvider: this.#promptAutocompleteProvider,
+					autocompleteMaxVisible: this.settings.get("autocompleteMaxVisible"),
+				})
 			)?.trim();
 			if (!objective) return;
 			await this.#startGoalFromObjective(objective);
