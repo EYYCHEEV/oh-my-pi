@@ -133,7 +133,7 @@ import { CustomEditor } from "./components/custom-editor";
 import { DynamicBorder } from "./components/dynamic-border";
 import { ErrorBannerComponent } from "./components/error-banner";
 import type { EvalExecutionComponent } from "./components/eval-execution";
-import type { HookEditorComponent } from "./components/hook-editor";
+import type { HookEditorComponent, HookEditorOptions } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent, HookSelectorSlider } from "./components/hook-selector";
 import { PlanReviewOverlay } from "./components/plan-review-overlay";
@@ -4453,7 +4453,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		title: string,
 		prefill?: string,
 		dialogOptions?: ExtensionUIDialogOptions,
-		editorOptions?: { promptStyle?: boolean },
+		editorOptions?: HookEditorOptions,
 	): Promise<string | undefined> {
 		return this.#extensionUiController.showHookEditor(title, prefill, dialogOptions, editorOptions);
 	}
