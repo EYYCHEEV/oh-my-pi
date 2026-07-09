@@ -525,6 +525,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	/** Extension-registered provider factories, applied in registration order (#4919). */
 	#autocompleteProviderFactories: AutocompleteProviderFactory[] = [];
 	#cleanupUnsubscribe?: () => void;
+	#promptAutocompleteProvider: AutocompleteProvider | undefined;
 	#signalTeardown?: SessionTeardown;
 	readonly #version: string;
 	readonly #changelogMarkdown: string | undefined;
@@ -1141,6 +1142,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			}
 		}
 		this.editor.setAutocompleteProvider(provider);
+		this.#promptAutocompleteProvider = provider;
 	}
 
 	/** Stack extension autocomplete behavior on top of the built-in editor provider (#4919). */
@@ -3064,7 +3066,11 @@ export class InteractiveMode implements InteractiveModeContext {
 				return;
 			}
 			const objective = (
-				await this.showHookEditor("Goal objective", undefined, undefined, { promptStyle: true })
+				await this.showHookEditor("Goal objective", undefined, undefined, {
+					promptStyle: true,
+					autocompleteProvider: this.#promptAutocompleteProvider,
+					autocompleteMaxVisible: this.settings.get("autocompleteMaxVisible"),
+				})
 			)?.trim();
 			if (!objective) return;
 			await this.#startGoalFromObjective(objective);
