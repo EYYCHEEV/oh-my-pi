@@ -36,6 +36,14 @@ const ASK_OTHER_OPTION = "Other (type your own)";
 const ASK_CHAT_OPTION = "Chat about this";
 const ASK_NEXT_OPTION = "Next →";
 
+interface PasteTarget {
+	pasteText(text: string): void;
+}
+
+function hasPasteText(value: unknown): value is PasteTarget {
+	return typeof value === "object" && value !== null && typeof (value as PasteTarget).pasteText === "function";
+}
+
 interface CollabDialogWinner {
 	source: "local" | "remote";
 	value: string | undefined;
@@ -96,8 +104,7 @@ export class ExtensionUiController {
 				this.ctx.ui.requestRender();
 			},
 			pasteToEditor: text => {
-				this.ctx.editor.handleInput(`\x1b[200~${text}\x1b[201~`);
-				this.ctx.ui.requestRender();
+				this.pasteToActiveEditor(text);
 			},
 			getEditorText: () => this.ctx.editor.getText(),
 			editor: (title, prefill, dialogOptions, editorOptions) =>
@@ -1014,8 +1021,8 @@ export class ExtensionUiController {
 				this.ctx.editorContainer.clear();
 				this.ctx.editorContainer.addChild(this.ctx.editor);
 				this.ctx.editor.setText(savedText);
+				this.ctx.ui.setFocus(this.ctx.editor);
 			}
-			this.ctx.ui.setFocus(this.ctx.editor);
 			this.ctx.ui.requestRender();
 			resolve(result);
 		};
@@ -1043,8 +1050,20 @@ export class ExtensionUiController {
 		return promise;
 	}
 
+	pasteToActiveEditor(text: string): void {
+		const focused = this.ctx.ui.getFocused?.();
+		const target =
+			focused && focused !== this.ctx.editor && hasPasteText(focused)
+				? focused
+				: this.ctx.hookEditor && hasPasteText(this.ctx.hookEditor)
+					? this.ctx.hookEditor
+					: this.ctx.editor;
+		target.pasteText(text);
+		this.ctx.ui.requestRender();
+	}
+
 	/**
-	 * Show an extension error in the UI.
+	 * Register a terminal-input listener for extensions.
 	 */
 	addExtensionTerminalInputListener(handler: TerminalInputHandler): () => void {
 		const unsubscribe = this.ctx.ui.addInputListener(handler);
@@ -1054,6 +1073,7 @@ export class ExtensionUiController {
 			this.#extensionTerminalInputUnsubscribers.delete(unsubscribe);
 		};
 	}
+
 
 	clearHookWidgets(): void {
 		for (const widget of this.#hookWidgetsAbove.values()) {
@@ -1074,6 +1094,9 @@ export class ExtensionUiController {
 		this.#extensionTerminalInputUnsubscribers.clear();
 	}
 
+	/**
+	 * Show an extension error in the UI.
+	 */
 	showExtensionError(extensionPath: string, error: string): void {
 		const errorText = new Text(theme.fg("error", `Extension "${extensionPath}" error: ${error}`), 1, 0);
 		this.ctx.present(errorText);
