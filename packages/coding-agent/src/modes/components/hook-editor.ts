@@ -7,7 +7,8 @@
  *   (Ctrl+Q / Ctrl+Enter) submits, bordered popup
  * - Prompt-style (ask): Enter submits, Shift+Enter inserts newline, legacy ask chrome
  */
-import { Container, Editor, type Focusable, matchesKey, Spacer, Text, type TUI } from "@oh-my-pi/pi-tui";
+import { Container, Editor, type Focusable, matchesKey, Spacer, Text } from "@oh-my-pi/pi-tui";
+import type { AutocompleteProvider, TUI } from "@oh-my-pi/pi-tui";
 import { getEditorTheme, theme } from "../../modes/theme/theme";
 import {
 	matchesAppExternalEditor,
@@ -27,6 +28,10 @@ export interface HookEditorOptions {
 	 * hint out of view.
 	 */
 	maxHeight?: number;
+	/** Optional autocomplete provider for prompt-like hook editors. */
+	autocompleteProvider?: AutocompleteProvider;
+	/** Optional maximum visible autocomplete rows, mirroring the main editor setting. */
+	autocompleteMaxVisible?: number;
 }
 
 /** Interactive multiline dialog used by hooks and the ask tool's Other response. */
@@ -76,6 +81,14 @@ export class HookEditorComponent extends Container implements Focusable {
 		const termRows = this.#tui.terminal?.rows ?? process.stdout.rows ?? 40;
 		this.#editor.setMaxHeight(options?.maxHeight ?? Math.max(3, termRows - 12));
 		this.#editor.setScrollbarVisible(true);
+		if (options?.autocompleteProvider) {
+			this.#editor.setAutocompleteProvider(options.autocompleteProvider);
+			this.#editor.onAutocompleteCancel = () => this.#tui.requestRender(true);
+			this.#editor.onAutocompleteUpdate = () => this.#tui.requestRender();
+		}
+		if (options?.autocompleteMaxVisible !== undefined) {
+			this.#editor.setAutocompleteMaxVisible(options.autocompleteMaxVisible);
+		}
 		if (prefill) {
 			this.#editor.setText(prefill);
 		}
@@ -123,6 +136,10 @@ export class HookEditorComponent extends Container implements Focusable {
 	 *  dialog (#2127 routing contract). */
 	pasteText(text: string): void {
 		this.#editor.pasteText(text);
+	}
+
+	isShowingAutocomplete(): boolean {
+		return this.#editor.isShowingAutocomplete();
 	}
 
 	/**
