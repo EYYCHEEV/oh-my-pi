@@ -201,6 +201,7 @@ const noOpUIContext: ExtensionUIContext = {
 	setWidget: () => {},
 	setFooter: () => {},
 	setHeader: () => {},
+	requestStatusLineRender: () => {},
 	setTitle: () => {},
 	custom: async () => undefined as never,
 	setEditorText: () => {},
@@ -302,6 +303,19 @@ export class ExtensionRunner {
 		}
 
 		this.#uiContext = uiContext ?? noOpUIContext;
+		this.runtime.requestStatusLineRender = () => this.#uiContext.requestStatusLineRender?.();
+		this.runtime.hostStatusSegment = (key, definition) =>
+			this.#uiContext.registerStatusSegment?.(key, definition);
+		for (const extension of this.extensions) {
+			for (const registration of extension.statusSegments?.values() ?? []) {
+				const disposeUI = this.#uiContext.registerStatusSegment?.(registration.key, {
+					...registration.definition,
+					render: () =>
+						extension.statusSegments?.has(registration.key) ? registration.definition.render() : undefined,
+				});
+				if (disposeUI) registration.disposeUI = disposeUI;
+			}
+		}
 		this.#initialized = true;
 
 		// Drain events buffered by emitCredentialDisabled() before initialize ran. The
