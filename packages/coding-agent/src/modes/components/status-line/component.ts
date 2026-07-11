@@ -1191,7 +1191,10 @@ export class StatusLineComponent implements Component {
 			}
 		}
 
-		const extensionEntries: Array<{ content: string; side: "left" | "right"; index: number }> = [];
+		type ExtensionEntry = { side: "left" | "right" };
+		const extensionEntries: ExtensionEntry[] = [];
+		const leftPartOwners: Array<ExtensionEntry | undefined> = leftParts.map(() => undefined);
+		const rightPartOwners: Array<ExtensionEntry | undefined> = rightParts.map(() => undefined);
 		for (const definition of this.#extensionSegments.values()) {
 			let content: string | undefined;
 			try {
@@ -1207,32 +1210,41 @@ export class StatusLineComponent implements Component {
 			if (leftAnchor >= 0) {
 				let index = leftSegIds.lastIndexOf(anchor) + 1;
 				if (index === 0) index = leftParts.length;
+				const entry: ExtensionEntry = { side: "left" };
 				leftParts.splice(index, 0, content);
 				leftSegIds.splice(index, 0, anchor);
-				extensionEntries.push({ content, side: "left", index });
+				leftPartOwners.splice(index, 0, entry);
+				extensionEntries.push(entry);
 			} else if (rightAnchor >= 0) {
 				let index = rightSegIds.lastIndexOf(anchor) + 1;
 				if (index === 0) index = rightParts.length;
+				const entry: ExtensionEntry = { side: "right" };
 				rightParts.splice(index, 0, content);
 				rightSegIds.splice(index, 0, anchor);
-				extensionEntries.push({ content, side: "right", index });
+				rightPartOwners.splice(index, 0, entry);
+				extensionEntries.push(entry);
 			} else {
-				const index = rightParts.length;
+				const entry: ExtensionEntry = { side: "right" };
 				rightParts.push(content);
-				extensionEntries.push({ content, side: "right", index });
+				rightPartOwners.push(entry);
+				extensionEntries.push(entry);
 			}
 		}
 
 		const runningBackgroundJobs = this.session.getAsyncJobSnapshot()?.running.length ?? 0;
 		if (runningBackgroundJobs > 0) {
 			rightParts.unshift(theme.fg("statusLineSubagents", `${theme.icon.job} ${runningBackgroundJobs}`));
+			rightPartOwners.unshift(undefined);
 		}
 		if (subagentBadge) {
 			rightParts.unshift(subagentBadge);
+			rightPartOwners.unshift(undefined);
 		}
 		const topFillWidth = Math.max(0, width);
 		const left = [...leftParts];
 		const right = [...rightParts];
+		const leftOwners = [...leftPartOwners];
+		const rightOwners = [...rightPartOwners];
 
 		const leftSepWidth = visibleWidth(separatorDef.left);
 		const rightSepWidth = visibleWidth(separatorDef.right);
@@ -1256,9 +1268,11 @@ export class StatusLineComponent implements Component {
 			for (let i = extensionEntries.length - 1; i >= 0 && totalWidth() > topFillWidth; i--) {
 				const extension = extensionEntries[i];
 				const parts = extension.side === "left" ? left : right;
-				const index = parts.indexOf(extension.content);
+				const owners = extension.side === "left" ? leftOwners : rightOwners;
+				const index = owners.indexOf(extension);
 				if (index < 0) continue;
 				parts.splice(index, 1);
+				owners.splice(index, 1);
 				if (extension.side === "left") {
 					leftSegIds.splice(index, 1);
 					leftWidth = groupWidth(left, leftCapWidth, leftSepWidth);
