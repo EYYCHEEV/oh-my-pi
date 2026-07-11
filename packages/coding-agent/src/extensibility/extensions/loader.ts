@@ -18,6 +18,7 @@ import type { ExecOptions } from "../../exec/exec";
 import { execCommand } from "../../exec/exec";
 // Runtime self-reference: dereference this namespace only inside loader functions to keep the index.ts cycle safe.
 import * as PiCodingAgent from "../../index";
+import { ALL_SEGMENT_IDS } from "../../modes/components/status-line/segments";
 import type { CustomMessagePayload } from "../../session/messages";
 import { EventBus } from "../../utils/event-bus";
 import { installLegacyPiSpecifierShim, loadLegacyPiModule } from "../plugins/legacy-pi-compat";
@@ -32,10 +33,12 @@ import type {
 	ExtensionContext,
 	ExtensionFactory,
 	ExtensionRuntime as IExtensionRuntime,
+	ExtensionStatusSegmentDefinition,
 	LoadExtensionsResult,
 	MessageRenderer,
 	ProviderConfig,
 	RegisteredCommand,
+	RegisteredStatusSegment,
 	ToolDefinition,
 } from "./types";
 
@@ -43,6 +46,7 @@ installLegacyPiSpecifierShim();
 
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 type LoadedExtensionModule = ExtensionFactory | { default?: ExtensionFactory };
+const statusSegmentIdsByRuntime = new WeakMap<IExtensionRuntime, Set<string>>();
 
 function getExtensionFactory(module: LoadedExtensionModule): ExtensionFactory | null {
 	const candidate = typeof module === "function" ? module : module.default;
@@ -62,6 +66,8 @@ export class ExtensionRuntimeNotInitializedError extends Error {
 export class ExtensionRuntime implements IExtensionRuntime {
 	flagValues = new Map<string, boolean | string>();
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; sourceId: string }> = [];
+	requestStatusLineRender = (): void => {};
+	hostStatusSegment = (): undefined => undefined;
 
 	sendMessage(): void {
 		throw new ExtensionRuntimeNotInitializedError();
@@ -121,7 +127,7 @@ export class ExtensionRuntime implements IExtensionRuntime {
  * Registration methods write to the extension object.
  * Action methods delegate to the shared runtime.
  */
-class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
+class ConcreteExtensionAPI implements ExtensionAPI {
 	readonly logger = logger;
 	readonly typebox = TypeBox;
 	readonly arktype = Type;
@@ -145,6 +151,50 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		const list = this.extension.handlers.get(event) ?? [];
 		list.push(handler);
 		this.extension.handlers.set(event, list);
+	}
+
+	registerStatusSegment(definition: ExtensionStatusSegmentDefinition): () => void {
+		if (ALL_SEGMENT_IDS.includes(definition.id as never)) {
+			throw new Error(`Status segment id "${definition.id}" is reserved by a built-in segment`);
+		}
+		let registeredIds = statusSegmentIdsByRuntime.get(this.runtime);
+		if (!registeredIds) {
+			registeredIds = new Set();
+			statusSegmentIdsByRuntime.set(this.runtime, registeredIds);
+		}
+		if (registeredIds.has(definition.id)) {
+			throw new Error(`Duplicate status segment: ${definition.id}`);
+		}
+		const key = `${this.extension.path}:${definition.id}`;
+		const registration: RegisteredStatusSegment = { key, definition };
+		registeredIds.add(definition.id);
+		this.extension.statusSegments?.set(key, registration);
+		registration.disposeUI = this.runtime.hostStatusSegment(key, {
+			...definition,
+			render: () => (this.extension.statusSegments?.has(key) ? definition.render() : undefined),
+		});
+		let active = true;
+		return () => {
+			if (!active) return;
+			active = false;
+			registeredIds.delete(definition.id);
+			if (!this.extension.statusSegments?.delete(key)) return;
+			if (registration.disposeUI) registration.disposeUI();
+			else this.runtime.requestStatusLineRender();
+		};
+	}
+
+	rollbackStatusSegments(): void {
+		const registeredIds = statusSegmentIdsByRuntime.get(this.runtime);
+		for (const registration of this.extension.statusSegments?.values() ?? []) {
+			registeredIds?.delete(registration.definition.id);
+			registration.disposeUI?.();
+		}
+		this.extension.statusSegments?.clear();
+	}
+
+	requestStatusLineRender(): void {
+		this.runtime.requestStatusLineRender();
 	}
 
 	registerTool<TParams extends TSchema = TSchema, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void {
@@ -279,6 +329,7 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 		commands: new Map(),
 		flags: new Map(),
 		shortcuts: new Map(),
+		statusSegments: new Map(),
 	};
 }
 
@@ -289,6 +340,8 @@ async function loadExtension(
 	runtime: IExtensionRuntime,
 ): Promise<{ extension: Extension | null; error: string | null }> {
 	const resolvedPath = resolvePath(extensionPath, cwd);
+	const extension = createExtension(extensionPath, resolvedPath);
+	const api = new ConcreteExtensionAPI(PiCodingAgent, extension, runtime, cwd, eventBus);
 	try {
 		const module = (await withExitGuard(() => loadLegacyPiModule(resolvedPath))) as LoadedExtensionModule;
 		const factory = getExtensionFactory(module);
@@ -300,14 +353,13 @@ async function loadExtension(
 			};
 		}
 
-		const extension = createExtension(extensionPath, resolvedPath);
-		const api = new ConcreteExtensionAPI(PiCodingAgent, extension, runtime, cwd, eventBus);
 		await withExitGuard(async () => {
 			await factory(api);
 		});
 
 		return { extension, error: null };
 	} catch (err) {
+		api.rollbackStatusSegments();
 		const message = err instanceof Error ? err.message : String(err);
 		return { extension: null, error: `Failed to load extension: ${message}` };
 	}
@@ -325,8 +377,13 @@ export async function loadExtensionFromFactory(
 ): Promise<Extension> {
 	const extension = createExtension(name, name);
 	const api = new ConcreteExtensionAPI(PiCodingAgent, extension, runtime, cwd, eventBus);
-	await factory(api);
-	return extension;
+	try {
+		await factory(api);
+		return extension;
+	} catch (error) {
+		api.rollbackStatusSegments();
+		throw error;
+	}
 }
 
 /**
