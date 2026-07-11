@@ -18,7 +18,7 @@ import { ADVISOR_TRANSCRIPT_STEM } from "../advisor/transcript-recorder";
  *
  * The first allocation of a given name keeps the name as-is; subsequent
  * allocations of the same name get a `-2`, `-3`, … suffix. On resume, scans
- * existing output files so previously written outputs are never overwritten.
+ * existing output and transcript artifacts so interrupted runs are never reused.
  */
 export class AgentOutputManager {
 	#initialized = false;
@@ -37,8 +37,8 @@ export class AgentOutputManager {
 	}
 
 	/**
-	 * Seed the taken-id set from output files already on disk so a resumed
-	 * session never reuses a name that would clobber a prior subagent's output.
+	 * Seed the taken-id set from artifacts already on disk so a resumed session
+	 * never reuses a name that belongs to a completed or interrupted subagent.
 	 */
 	async #ensureInitialized(): Promise<void> {
 		if (this.#initialized) return;
@@ -56,8 +56,15 @@ export class AgentOutputManager {
 
 		const prefix = this.#parentPrefix ? `${this.#parentPrefix}.` : "";
 		for (const file of files) {
-			if (!file.endsWith(".md")) continue;
-			let rest = file.slice(0, -3); // drop ".md"
+			let extensionLength: number;
+			if (file.endsWith(".jsonl")) {
+				extensionLength = 6;
+			} else if (file.endsWith(".md")) {
+				extensionLength = 3;
+			} else {
+				continue;
+			}
+			let rest = file.slice(0, -extensionLength);
 			if (prefix) {
 				if (!rest.startsWith(prefix)) continue;
 				rest = rest.slice(prefix.length);
