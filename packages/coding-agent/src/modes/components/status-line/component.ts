@@ -5,6 +5,7 @@ import type { AssistantMessage, UsageLimit, UsageReport } from "@oh-my-pi/pi-ai"
 import { type Component, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
 import { getProjectDir } from "@oh-my-pi/pi-utils";
 import { settings } from "../../../config/settings";
+import type { ExtensionStatusSegmentDefinition } from "../../../extensibility/extensions/types";
 import type { AgentSession } from "../../../session/agent-session";
 import type { OAuthAccountIdentity } from "../../../session/auth-storage";
 import { limitMatchesActiveAccount } from "../../../slash-commands/helpers/active-oauth-account";
@@ -311,6 +312,20 @@ export class StatusLineComponent implements Component {
 	// count (matching the provider and the `/context` panel), so a stable
 	// message list + model window yields a stable result we can return verbatim.
 	#contextUsageCache: ContextUsageMemo | undefined;
+
+	#extensionSegments = new Map<string, ExtensionStatusSegmentDefinition>();
+
+	registerExtensionSegment(key: string, definition: ExtensionStatusSegmentDefinition): () => void {
+		if (this.#extensionSegments.has(key)) throw new Error(`Duplicate status segment: ${definition.id}`);
+		this.#extensionSegments.set(key, definition);
+		this.invalidate();
+		let active = true;
+		return () => {
+			if (!active) return;
+			active = false;
+			if (this.#extensionSegments.delete(key)) this.invalidate();
+		};
+	}
 
 	constructor(private session: AgentSession) {
 		this.#settings = {
@@ -1179,11 +1194,45 @@ export class StatusLineComponent implements Component {
 		}
 
 		const rightParts: string[] = [];
+		const rightSegIds: StatusLineSegmentId[] = [];
 		for (const segId of effectiveSettings.rightSegments) {
 			if (subagentBadge && segId === "subagents") continue;
 			const rendered = renderSegment(segId, ctx);
 			if (rendered.visible && rendered.content) {
 				rightParts.push(rendered.content);
+				rightSegIds.push(segId);
+			}
+		}
+
+		const extensionEntries: Array<{ content: string; side: "left" | "right"; index: number }> = [];
+		for (const definition of this.#extensionSegments.values()) {
+			let content: string | undefined;
+			try {
+				content = definition.render();
+			} catch {
+				continue;
+			}
+			if (!content) continue;
+			if (definition.color) content = theme.fg(definition.color, content);
+			const anchor = definition.placement.afterBuiltin as StatusLineSegmentId;
+			const leftAnchor = effectiveSettings.leftSegments.indexOf(anchor);
+			const rightAnchor = effectiveSettings.rightSegments.indexOf(anchor);
+			if (leftAnchor >= 0) {
+				let index = leftSegIds.lastIndexOf(anchor) + 1;
+				if (index === 0) index = leftParts.length;
+				leftParts.splice(index, 0, content);
+				leftSegIds.splice(index, 0, anchor);
+				extensionEntries.push({ content, side: "left", index });
+			} else if (rightAnchor >= 0) {
+				let index = rightSegIds.lastIndexOf(anchor) + 1;
+				if (index === 0) index = rightParts.length;
+				rightParts.splice(index, 0, content);
+				rightSegIds.splice(index, 0, anchor);
+				extensionEntries.push({ content, side: "right", index });
+			} else {
+				const index = rightParts.length;
+				rightParts.push(content);
+				extensionEntries.push({ content, side: "right", index });
 			}
 		}
 
@@ -1217,6 +1266,19 @@ export class StatusLineComponent implements Component {
 		const totalWidth = () => leftWidth + rightWidth + (left.length > 0 && right.length > 0 ? 1 : 0);
 
 		if (topFillWidth > 0) {
+			for (let i = extensionEntries.length - 1; i >= 0 && totalWidth() > topFillWidth; i--) {
+				const extension = extensionEntries[i];
+				const parts = extension.side === "left" ? left : right;
+				const index = parts.indexOf(extension.content);
+				if (index < 0) continue;
+				parts.splice(index, 1);
+				if (extension.side === "left") {
+					leftSegIds.splice(index, 1);
+					leftWidth = groupWidth(left, leftCapWidth, leftSepWidth);
+				} else {
+					rightWidth = groupWidth(right, rightCapWidth, rightSepWidth);
+				}
+			}
 			while (totalWidth() > topFillWidth && right.length > 0) {
 				right.pop();
 				rightWidth = groupWidth(right, rightCapWidth, rightSepWidth);
