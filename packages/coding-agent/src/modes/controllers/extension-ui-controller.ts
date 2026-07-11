@@ -80,6 +80,7 @@ export class ExtensionUiController {
 	// the rest queue. See `#presentDialog`.
 	#dialogActive = false;
 	#dialogQueue: Array<() => void> = [];
+	#dialogActivityPaused = false;
 	constructor(private ctx: InteractiveModeContext) {}
 
 	/**
@@ -125,6 +126,12 @@ export class ExtensionUiController {
 			},
 			setFooter: () => {},
 			setHeader: () => {},
+			requestStatusLineRender: () => {
+				this.ctx.statusLine.invalidate();
+				this.ctx.ui.requestRender();
+			},
+			registerStatusSegment: (key, definition) =>
+				this.ctx.statusLine.registerExtensionSegment(key, definition),
 			setEditorComponent: factory => this.ctx.setEditorComponent(factory),
 			getToolsExpanded: () => this.ctx.toolOutputExpanded,
 			setToolsExpanded: expanded => this.ctx.setToolsExpanded(expanded),
@@ -1198,6 +1205,10 @@ export class ExtensionUiController {
 			}
 			started = true;
 			this.#dialogActive = true;
+			if (!this.#dialogActivityPaused) {
+				this.#dialogActivityPaused = true;
+				this.ctx.session.setActivityWaiting?.(true);
+			}
 			try {
 				hide = present(settle);
 			} catch (error) {
@@ -1224,6 +1235,14 @@ export class ExtensionUiController {
 	}
 
 	#advanceDialogQueue(): void {
-		this.#dialogQueue.shift()?.();
+		const next = this.#dialogQueue.shift();
+		if (next) {
+			next();
+			return;
+		}
+		if (this.#dialogActivityPaused) {
+			this.#dialogActivityPaused = false;
+			this.ctx.session.setActivityWaiting?.(false);
+		}
 	}
 }
