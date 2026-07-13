@@ -1380,6 +1380,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			);
 			const promptTemplates = this.session.promptTemplates;
 			const parentEvalSessionId = this.session.getEvalSessionId?.() ?? undefined;
+			const parentPythonRuntimeProfile = this.session.getPythonRuntimeProfile?.();
+			const parentPythonRuntimeActive = this.session.hasPythonRuntimeSession?.() ?? false;
+			const parentPythonRuntimeCwd = this.session.getPythonRuntimeCwd?.() ?? this.session.cwd;
+			const parentPythonInterpreter = this.session.getPythonInterpreter?.();
 			const mcpManager = this.session.mcpManager ?? MCPManager.instance();
 
 			// Progress tracking for the single agent
@@ -1464,6 +1468,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				parentMnemopiSessionState: this.session.getMnemopiSessionState?.(),
 				parentTelemetry: this.session.getTelemetry?.(),
 				parentEvalSessionId,
+				parentPythonRuntimeProfile,
+				parentPythonRuntimeActive,
+				parentPythonRuntimeCwd,
+				parentPythonInterpreter,
 				parentAgentId: this.session.getAgentId?.() ?? MAIN_AGENT_ID,
 				// Live source of truth for `tier.subagent: inherit`. When the session
 				// exposes a tier accessor, pass the per-family map or null (null =
