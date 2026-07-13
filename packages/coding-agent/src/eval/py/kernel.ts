@@ -7,6 +7,7 @@
  * code. Shutdown writes `{"type":"exit"}` and escalates to SIGTERM/SIGKILL on
  * timeout.
  */
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -20,6 +21,7 @@ import {
 	enumeratePythonRuntimes,
 	filterEnv,
 	type PythonRuntime,
+	type PythonRuntimeProfile,
 	resolveExplicitPythonRuntime,
 	resolvePythonRuntime,
 } from "./runtime";
@@ -38,21 +40,96 @@ export { renderKernelDisplay } from "./display";
 
 const TRACE_IPC = $flag("PI_PYTHON_IPC_TRACE");
 
-// Cache the runner script on disk so the subprocess loads it normally. Cached
-// per script hash so installs don't race across versions.
-const RUNNER_CACHE_DIR = path.join(os.tmpdir(), "omp-python-runner");
-let RUNNER_SCRIPT_PATH: string | null = null;
+// Cache the runner script in a process-private temporary directory so the
+// subprocess loads it normally. The stable inner directory name is part of the
+// guarded-runner identity contract; the unpredictable parent prevents
+// cross-user pre-seeding and cross-process publication races.
+const RUNNER_SCRIPT_BYTES = Buffer.from(RUNNER_SCRIPT, "utf8");
+let runnerCacheDirectory: string | undefined;
+let preparedRunnerPath: string | undefined;
+let runnerScriptPreparation: Promise<string> | undefined;
 
-async function ensureRunnerScript(): Promise<string> {
-	if (RUNNER_SCRIPT_PATH) return RUNNER_SCRIPT_PATH;
-	await fs.promises.mkdir(RUNNER_CACHE_DIR, { recursive: true });
-	const hash = Bun.hash(RUNNER_SCRIPT).toString(36);
-	const target = path.join(RUNNER_CACHE_DIR, `runner-${hash}.py`);
-	if (!fs.existsSync(target)) {
-		await Bun.write(target, RUNNER_SCRIPT);
+function isExactPreparedRunner(target: string): boolean {
+	let descriptor: number | undefined;
+	try {
+		descriptor = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+		const metadata = fs.fstatSync(descriptor);
+		if (
+			!metadata.isFile() ||
+			metadata.nlink !== 1 ||
+			(typeof process.getuid === "function" && metadata.uid !== process.getuid()) ||
+			(process.platform !== "win32" && (metadata.mode & 0o222) !== 0) ||
+			metadata.size !== RUNNER_SCRIPT_BYTES.byteLength
+		) {
+			return false;
+		}
+		return fs.readFileSync(descriptor).equals(RUNNER_SCRIPT_BYTES);
+	} catch {
+		return false;
+	} finally {
+		if (descriptor !== undefined) fs.closeSync(descriptor);
 	}
-	RUNNER_SCRIPT_PATH = target;
-	return target;
+}
+
+async function createRunnerCacheDirectory(): Promise<string> {
+	if (runnerCacheDirectory) return runnerCacheDirectory;
+	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-python-"));
+	const directory = path.join(root, "omp-python-runner");
+	await fs.promises.mkdir(directory, { mode: 0o700 });
+	for (const candidate of [root, directory]) {
+		if (process.platform !== "win32") await fs.promises.chmod(candidate, 0o700);
+		const metadata = await fs.promises.lstat(candidate);
+		if (
+			!metadata.isDirectory() ||
+			metadata.isSymbolicLink() ||
+			(typeof process.getuid === "function" && metadata.uid !== process.getuid()) ||
+			(process.platform !== "win32" && (metadata.mode & 0o077) !== 0)
+		) {
+			throw new Error("Unsafe Python runner cache directory");
+		}
+	}
+	runnerCacheDirectory = directory;
+	return directory;
+}
+
+async function materializePythonRunnerScript(): Promise<string> {
+	const cacheDirectory = await createRunnerCacheDirectory();
+	const hash = Bun.hash(RUNNER_SCRIPT).toString(36);
+	const target = path.join(cacheDirectory, `runner-${hash}.py`);
+	if (isExactPreparedRunner(target)) return target;
+
+	const temporary = path.join(cacheDirectory, `.${path.basename(target)}.${process.pid}.${randomUUID()}`);
+	try {
+		await fs.promises.writeFile(temporary, RUNNER_SCRIPT_BYTES, { flag: "wx", mode: 0o600 });
+		if (process.platform !== "win32") await fs.promises.chmod(temporary, 0o400);
+		if (process.platform === "win32") await fs.promises.rm(target, { force: true });
+		await fs.promises.rename(temporary, target);
+		if (!isExactPreparedRunner(target)) throw new Error("Python runner cache verification failed");
+		return target;
+	} finally {
+		await fs.promises.rm(temporary, { force: true });
+	}
+}
+
+export function preparePythonRunnerScript(): Promise<string> {
+	if (preparedRunnerPath && isExactPreparedRunner(preparedRunnerPath)) {
+		return Promise.resolve(preparedRunnerPath);
+	}
+	preparedRunnerPath = undefined;
+	if (!runnerScriptPreparation) {
+		runnerScriptPreparation = materializePythonRunnerScript().then(
+			target => {
+				preparedRunnerPath = target;
+				runnerScriptPreparation = undefined;
+				return target;
+			},
+			error => {
+				runnerScriptPreparation = undefined;
+				throw error;
+			},
+		);
+	}
+	return runnerScriptPreparation;
 }
 
 const SHUTDOWN_GRACE_MS = 1_000;
@@ -73,25 +150,42 @@ export interface PythonKernelAvailability {
 	runtime?: PythonRuntime;
 }
 
-// Cache successful probes per resolved cwd + explicit interpreter: every cell
-// otherwise pays one (or two — backend.isAvailable + ensureKernelAvailable)
-// interpreter spawns even when the kernel is already hot. Failures are not
-// cached so installing a Python mid-session is picked up on the next attempt.
+export interface PythonKernelStartOptions extends KernelStartOptions {
+	runtimeProfile?: PythonRuntimeProfile;
+}
+
+// Cache successful probes per resolved cwd + explicit interpreter + runtime
+// profile: every cell otherwise pays one (or two — backend.isAvailable +
+// ensureKernelAvailable) interpreter spawns even when the kernel is already
+// hot. Failures are not cached so installing Python mid-session is picked up
+// on the next attempt. The LRU bound prevents unique session profiles from
+// retaining their spawn environments for the lifetime of an embedding process.
+const AVAILABILITY_CACHE_LIMIT = 64;
 const availabilityCache = new Map<string, Promise<PythonKernelAvailability>>();
 
 export async function checkPythonKernelAvailability(
 	cwd: string,
 	interpreter?: string,
+	runtimeProfile?: PythonRuntimeProfile,
 ): Promise<PythonKernelAvailability> {
 	if (isBunTestRuntime() || $flag("PI_PYTHON_SKIP_CHECK")) {
 		return { ok: true };
 	}
 	const resolvedCwd = path.resolve(cwd);
-	const key = `${resolvedCwd}\0${interpreter ?? ""}`;
+	const key = `${resolvedCwd}\0${interpreter ?? ""}\0${runtimeProfile?.key ?? ""}`;
 	const cached = availabilityCache.get(key);
-	if (cached) return await cached;
-	const probe = probePythonKernelAvailability(resolvedCwd, interpreter);
+	if (cached) {
+		availabilityCache.delete(key);
+		availabilityCache.set(key, cached);
+		return await cached;
+	}
+	const probe = probePythonKernelAvailability(resolvedCwd, interpreter, runtimeProfile);
 	availabilityCache.set(key, probe);
+	while (availabilityCache.size > AVAILABILITY_CACHE_LIMIT) {
+		const oldest = availabilityCache.keys().next().value;
+		if (oldest === undefined) break;
+		availabilityCache.delete(oldest);
+	}
 	const result = await probe;
 	if (!result.ok && availabilityCache.get(key) === probe) {
 		availabilityCache.delete(key);
@@ -99,11 +193,15 @@ export async function checkPythonKernelAvailability(
 	return result;
 }
 
-async function probePythonKernelAvailability(cwd: string, interpreter?: string): Promise<PythonKernelAvailability> {
+async function probePythonKernelAvailability(
+	cwd: string,
+	interpreter?: string,
+	runtimeProfile?: PythonRuntimeProfile,
+): Promise<PythonKernelAvailability> {
 	try {
 		const settings = await Settings.init();
 		const { env } = settings.getShellConfig();
-		const baseEnv = filterEnv(env);
+		const baseEnv = { ...filterEnv(env), ...runtimeProfile?.env };
 		const runtimes = interpreter
 			? [resolveExplicitPythonRuntime(interpreter, cwd, baseEnv)]
 			: enumeratePythonRuntimes(cwd, baseEnv);
@@ -116,12 +214,15 @@ async function probePythonKernelAvailability(cwd: string, interpreter?: string):
 		// working system Python take over instead of failing the whole session.
 		const failures: string[] = [];
 		for (const runtime of runtimes) {
+			const probeEnv = Object.fromEntries(Object.entries(runtime.env).filter(([name]) => !name.startsWith("PYTHON")));
 			try {
-				const probe = await $`${runtime.pythonPath} -c "import sys;sys.exit(0)"`
+				// Availability must not execute inherited startup hooks before
+				// extensions have finished their own runtime preflight.
+				const probe = await $`${runtime.pythonPath} -E -S -B -c "import sys;sys.exit(0)"`
 					.quiet()
 					.nothrow()
 					.cwd(cwd)
-					.env(runtime.env);
+					.env(probeEnv);
 				if (probe.exitCode === 0) {
 					return { ok: true, pythonPath: runtime.pythonPath, runtime };
 				}
@@ -160,12 +261,13 @@ export class PythonKernel extends BaseKernel {
 		});
 	}
 
-	static async start(options: KernelStartOptions): Promise<PythonKernel> {
+	static async start(options: PythonKernelStartOptions): Promise<PythonKernel> {
 		const availability = await logger.time(
 			"PythonKernel.start:availabilityCheck",
 			checkPythonKernelAvailability,
 			options.cwd,
 			options.interpreter,
+			options.runtimeProfile,
 		);
 		if (!availability.ok) {
 			throw new Error(availability.reason ?? "Python kernel unavailable");
@@ -174,9 +276,10 @@ export class PythonKernel extends BaseKernel {
 		let runtime = availability.runtime;
 		if (!runtime) {
 			const { env: shellEnv } = (await Settings.init()).getShellConfig();
+			const baseEnv = { ...filterEnv(shellEnv), ...options.runtimeProfile?.env };
 			runtime = options.interpreter
-				? resolveExplicitPythonRuntime(options.interpreter, options.cwd, filterEnv(shellEnv))
-				: resolvePythonRuntime(options.cwd, filterEnv(shellEnv));
+				? resolveExplicitPythonRuntime(options.interpreter, options.cwd, baseEnv)
+				: resolvePythonRuntime(options.cwd, baseEnv);
 		}
 		const spawnEnv: Record<string, string> = {};
 		for (const [key, value] of Object.entries(runtime.env)) {
@@ -188,7 +291,7 @@ export class PythonKernel extends BaseKernel {
 		spawnEnv.PYTHONUNBUFFERED = "1";
 		spawnEnv.PYTHONIOENCODING = "utf-8";
 
-		const scriptPath = await ensureRunnerScript();
+		const scriptPath = await preparePythonRunnerScript();
 		const kernel = new PythonKernel(Snowflake.next());
 
 		const proc = Bun.spawn([runtime.pythonPath, "-u", scriptPath], {
