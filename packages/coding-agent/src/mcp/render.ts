@@ -5,6 +5,7 @@
  * showing args and output in JSON tree format similar to task tool.
  */
 import type { Component } from "@oh-my-pi/pi-tui";
+import { sanitizeText } from "@oh-my-pi/pi-utils";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import {
@@ -18,7 +19,7 @@ import {
 	renderJsonTreeLines,
 } from "../tools/json-tree";
 import { formatStyledTruncationWarning, stripOutputNotice } from "../tools/output-meta";
-import { formatExpandHint, truncateToWidth } from "../tools/render-utils";
+import { formatExpandHint, replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "../tools/render-utils";
 import { renderStatusLine, WidthAwareText } from "../tui";
 import type { MCPToolDetails } from "./tool-bridge";
 
@@ -52,7 +53,13 @@ export function renderMCPCall(args: Record<string, unknown>, theme: Theme, label
  * Render MCP tool result.
  */
 export function renderMCPResult(
-	result: { content: Array<{ type: string; text?: string }>; details?: MCPToolDetails; isError?: boolean },
+	result: {
+		content: Array<
+			{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string } | { type: string }
+		>;
+		details?: MCPToolDetails;
+		isError?: boolean;
+	},
 	options: RenderResultOptions,
 	theme: Theme,
 	args?: Record<string, unknown>,
@@ -86,13 +93,25 @@ export function renderMCPResult(
 				lines.push(""); // Blank line before output
 			}
 
-			// Output section
-			const textContent = result.content?.find(c => c.type === "text")?.text ?? "";
-			// Strip the LLM-facing spill notice before parsing/rendering: a spilled
-			// result appends `[Showing… artifact://N]` to the body, which would break
-			// JSON detection and bury the recovery link. Surface it as a styled warning
-			// instead, mirroring the built-in read/bash/ssh/browser renderers.
-			const trimmedOutput = stripOutputNotice(textContent, result.details?.meta).trimEnd();
+			// Output section. Render only normalized OMP content; raw MCP
+			// diagnostics may contain payloads that must never reach the TUI.
+			const displayBlocks = result.content.flatMap(block => {
+				if (block.type === "image" && "mimeType" in block) {
+					const mimeType = truncateToWidth(
+						replaceTabs(sanitizeText(block.mimeType)).replace(/\s+/g, " ").trim(),
+						TRUNCATE_LENGTHS.CONTENT,
+					);
+					return [`[Image: ${mimeType || "unknown"}]`];
+				}
+				if (block.type === "text" && "text" in block) {
+					const text = stripOutputNotice(block.text, result.details?.meta).trimEnd();
+					return text ? [text] : [];
+				}
+				return [];
+			});
+			const trimmedOutput = displayBlocks.join("\n");
+			const singleTextOutput =
+				result.content.length === 1 && result.content[0]?.type === "text" ? trimmedOutput : undefined;
 			const truncationWarning = result.details?.meta?.truncation
 				? formatStyledTruncationWarning(result.details.meta, theme)
 				: null;
@@ -102,8 +121,8 @@ export function renderMCPResult(
 				return lines.join("\n");
 			}
 
-			// Try to parse as JSON for structured display
-			if (trimmedOutput.startsWith("{") || trimmedOutput.startsWith("[")) {
+			// Preserve structured rendering for the existing single-text result.
+			if (singleTextOutput?.startsWith("{") || singleTextOutput?.startsWith("[")) {
 				try {
 					const parsed = JSON.parse(trimmedOutput);
 					const maxDepth = expanded ? JSON_TREE_MAX_DEPTH_EXPANDED : JSON_TREE_MAX_DEPTH_COLLAPSED;
