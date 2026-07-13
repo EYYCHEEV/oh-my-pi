@@ -212,6 +212,7 @@ import {
 	executePython as executePythonCommand,
 	type PythonResult,
 } from "../eval/py/executor";
+import type { PythonRuntimeProfile } from "../eval/py/runtime";
 import { disposeRubyKernelSessionsByOwner } from "../eval/rb/executor";
 import { defaultEvalSessionId } from "../eval/session-id";
 import { type BashResult, executeBash as executeBashCommand } from "../exec/bash-executor";
@@ -985,6 +986,8 @@ export interface AgentSessionConfig {
 	parentEvalSessionId?: string;
 	/** Logical owner for retained eval kernels created by this session. */
 	evalKernelOwnerId?: string;
+	/** Immutable extension-registered environment for this session's Python kernels. */
+	pythonRuntimeProfile?: PythonRuntimeProfile;
 	/**
 	 * AsyncJobManager that this session installed as the process-global instance.
 	 * Only set for top-level sessions; subagents inherit the parent's manager and
@@ -2002,6 +2005,7 @@ export class AgentSession {
 	#evalAbortControllers = new Set<AbortController>();
 	#evalKernelOwnerId: string;
 	#parentEvalSessionId: string | undefined;
+	#pythonRuntimeProfile: PythonRuntimeProfile | undefined;
 	/**
 	 * AsyncJobManager owned by this session (top-level only). Subagents leave
 	 * this undefined and **MUST NOT** dispose the global instance on teardown.
@@ -2741,6 +2745,7 @@ export class AgentSession {
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
 		this.#evalKernelOwnerId = config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`;
 		this.#parentEvalSessionId = config.parentEvalSessionId;
+		this.#pythonRuntimeProfile = config.pythonRuntimeProfile;
 		this.#ownedAsyncJobManager = config.ownedAsyncJobManager;
 		this.#asyncJobManager = config.asyncJobManager ?? config.ownedAsyncJobManager;
 		this.#scopedModels = config.scopedModels ?? [];
@@ -4524,7 +4529,6 @@ export class AgentSession {
 			timestamp: interruptedAt,
 		};
 	}
-
 
 	async #persistTurnMessagesForMidRunCompaction(context: AgentTurnEndContext | undefined): Promise<boolean> {
 		if (!context) return true;
@@ -8187,10 +8191,16 @@ export class AgentSession {
 	}
 	getEvalSessionId(): string | null {
 		if (this.#parentEvalSessionId !== undefined) return this.#parentEvalSessionId;
+		const sessionFile = this.sessionManager.getSessionFile();
+		if (!sessionFile) return this.#evalKernelOwnerId;
 		return defaultEvalSessionId({
 			cwd: this.sessionManager.getCwd(),
-			getSessionFile: () => this.sessionManager.getSessionFile() ?? null,
+			getSessionFile: () => sessionFile,
 		});
+	}
+
+	getPythonRuntimeProfile(): PythonRuntimeProfile | undefined {
+		return this.#pythonRuntimeProfile;
 	}
 
 	/** Current session display name, if set */
@@ -16146,6 +16156,7 @@ export class AgentSession {
 				kernelOwnerId: this.#evalKernelOwnerId,
 				kernelMode: this.settings.get("python.kernelMode"),
 				interpreter: this.settings.get("python.interpreter")?.trim() || undefined,
+				runtimeProfile: this.#pythonRuntimeProfile,
 				onChunk,
 				signal: abortController.signal,
 			});

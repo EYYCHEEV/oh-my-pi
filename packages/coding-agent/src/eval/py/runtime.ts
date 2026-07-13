@@ -4,6 +4,7 @@
  * Centralizes environment filtering, venv detection, and Python executable resolution
  * for both the shared gateway and local kernel spawning.
  */
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -35,6 +36,9 @@ const DEFAULT_ENV_ALLOWLIST = new Set([
 	"CONDA_DEFAULT_ENV",
 	"VIRTUAL_ENV",
 	"PYTHONPATH",
+	"PYTHONDONTWRITEBYTECODE",
+	"PYTHONNOUSERSITE",
+	"PYTHONSAFEPATH",
 	"LD_LIBRARY_PATH",
 ]);
 
@@ -123,6 +127,26 @@ export interface PythonRuntime {
 	env: Record<string, string | undefined>;
 	/** Path to virtual environment, if detected */
 	venvPath?: string;
+}
+
+export interface PythonRuntimeProfile {
+	/** Stable identity used to isolate availability and retained-kernel caches. */
+	readonly key: string;
+	/** Immutable environment applied before the Python process starts. */
+	readonly env: Readonly<Record<string, string>>;
+}
+
+export function createPythonRuntimeProfile(
+	environment: ReadonlyMap<string, string> | undefined,
+): PythonRuntimeProfile | undefined {
+	if (!environment || environment.size === 0) return undefined;
+	const entries = Array.from(environment).sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+	const serialized = JSON.stringify(entries);
+	const env = Object.freeze(Object.fromEntries(entries));
+	return Object.freeze({
+		key: `sha256:${createHash("sha256").update(serialized).digest("hex")}`,
+		env,
+	});
 }
 
 /**
