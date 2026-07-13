@@ -22,7 +22,6 @@ import type { PromptTemplate } from "../config/prompt-templates";
 import { buildServiceTierByFamily, resolveSubagentServiceTier } from "../config/service-tier";
 import { Settings } from "../config/settings";
 import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
-import type { PythonRuntimeProfile } from "../eval/py/runtime";
 import type { ToolPathWithSource } from "../extensibility/custom-tools";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
@@ -366,14 +365,6 @@ export interface ExecutorOptions {
 	parentMnemopiSessionState?: MnemopiSessionState;
 	/** Parent agent's eval executor session id. Subagents reuse it so eval state is shared. */
 	parentEvalSessionId?: string;
-	/** Parent session's immutable Python spawn profile for retained-kernel reuse. */
-	parentPythonRuntimeProfile?: PythonRuntimeProfile;
-	/** Whether the parent profile already has a live retained Python kernel. */
-	parentPythonRuntimeActive?: boolean;
-	/** Parent working directory participating in the retained-kernel identity. */
-	parentPythonRuntimeCwd?: string;
-	/** Parent configured interpreter participating in the retained-kernel identity. */
-	parentPythonInterpreter?: string;
 	/**
 	 * Parent agent's OpenTelemetry configuration. When defined, the subagent's
 	 * loop is started with the same tracer/hooks but its own agent identity
@@ -2463,10 +2454,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				localProtocolOptions: options.localProtocolOptions,
 				telemetry: subagentTelemetry,
 				parentEvalSessionId: options.parentEvalSessionId,
-				parentPythonRuntimeProfile: options.parentPythonRuntimeProfile,
-				parentPythonRuntimeActive: options.parentPythonRuntimeActive,
-				parentPythonRuntimeCwd: options.parentPythonRuntimeCwd,
-				parentPythonInterpreter: options.parentPythonInterpreter,
 				onFirstChatDispatch: () => {
 					firstChatDispatchAt ??= performance.now();
 				},
