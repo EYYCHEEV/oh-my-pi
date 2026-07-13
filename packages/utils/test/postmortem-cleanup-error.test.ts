@@ -44,6 +44,51 @@ function wrapCause(reason: Error, wrapperCount: number): Error {
 	return current;
 }
 
+describe("postmortem transient read interruptions", () => {
+	it("recognizes only EINTR from read syscalls", () => {
+		const interruptedRead = Object.assign(new Error("Interrupted system call"), {
+			code: "EINTR",
+			syscall: "read",
+			fd: 25,
+			errno: -4,
+		});
+		const interruptedWrite = Object.assign(new Error("Interrupted system call"), {
+			code: "EINTR",
+			syscall: "write",
+		});
+		const retryableRead = Object.assign(new Error("Resource temporarily unavailable"), {
+			code: "EAGAIN",
+			syscall: "read",
+		});
+
+		expect(postmortem.isTransientReadEintr(interruptedRead)).toBe(true);
+		expect(postmortem.isTransientReadEintr(interruptedWrite)).toBe(false);
+		expect(postmortem.isTransientReadEintr(retryableRead)).toBe(false);
+	});
+
+	it("lets the process survive an uncaught transient read EINTR", async () => {
+		const result = await runPostmortemProbe(`
+			import "${postmortemModuleUrl}";
+
+			const interruptedRead = Object.assign(new Error("Interrupted system call"), {
+				code: "EINTR",
+				syscall: "read",
+				fd: 25,
+				errno: -4,
+			});
+			queueMicrotask(() => {
+				throw interruptedRead;
+			});
+			await Promise.resolve();
+			console.log("survived transient read EINTR");
+		`);
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout).toContain("survived transient read EINTR");
+		expect(result.stderr).not.toContain("[Uncaught Exception]");
+	});
+});
+
 describe("postmortem expected cleanup errors", () => {
 	it("marks errors with the well-known cleanup symbol and recognizes them", () => {
 		const reason = new Error("browser run ended");
