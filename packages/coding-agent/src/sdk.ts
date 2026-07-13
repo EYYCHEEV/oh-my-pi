@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import {
 	Agent,
 	type AgentEvent,
@@ -51,7 +52,9 @@ import { CursorExecHandlers } from "./cursor";
 import "./discovery";
 import { initializeWithSettings } from "./discovery";
 import { disposeAllJuliaKernelSessions, disposeJuliaKernelSessionsByOwner } from "./eval/jl/executor";
-import { disposeAllKernelSessions, disposeKernelSessionsByOwner } from "./eval/py/executor";
+import { disposeAllKernelSessions, disposeKernelSessionsByOwner, hasPythonKernelSession } from "./eval/py/executor";
+import { checkPythonKernelAvailability } from "./eval/py/kernel";
+import { createPythonRuntimeProfile, type PythonRuntimeProfile } from "./eval/py/runtime";
 import { disposeAllRubyKernelSessions, disposeRubyKernelSessionsByOwner } from "./eval/rb/executor";
 import { defaultEvalSessionId } from "./eval/session-id";
 import {
@@ -69,6 +72,7 @@ import {
 	ExtensionRunner,
 	ExtensionToolWrapper,
 	type ExtensionUIContext,
+	finalizePythonSpawnEnvResolvers,
 	type LoadExtensionsResult,
 	loadExtensionFromFactory,
 	loadExtensions,
@@ -536,6 +540,14 @@ export interface CreateAgentSessionOptions {
 	parentAgentId?: string;
 	/** Inherited eval executor session id for subagents sharing parent eval state. */
 	parentEvalSessionId?: string;
+	/** Immutable Python spawn profile inherited with the parent's retained eval state. */
+	parentPythonRuntimeProfile?: PythonRuntimeProfile;
+	/** Whether the parent already owns a live retained Python kernel. */
+	parentPythonRuntimeActive?: boolean;
+	/** Parent working directory that participates in the retained-kernel identity. */
+	parentPythonRuntimeCwd?: string;
+	/** Parent configured interpreter that participates in the retained-kernel identity. */
+	parentPythonInterpreter?: string;
 
 	/** Session manager. Default: session stored under the configured agentDir sessions root */
 	sessionManager?: SessionManager;
@@ -1538,6 +1550,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		agentRegistry.unregister(resolvedAgentId);
 	};
 	const evalKernelOwnerId = `agent-session:${Snowflake.next()}`;
+	const pythonInterpreter = settings.get("python.interpreter")?.trim() || undefined;
+	const parentRuntimeLocationMatches =
+		options.parentPythonRuntimeCwd !== undefined &&
+		path.resolve(options.parentPythonRuntimeCwd) === path.resolve(cwd) &&
+		options.parentPythonInterpreter === pythonInterpreter;
+	const effectiveParentEvalSessionId = parentRuntimeLocationMatches ? options.parentEvalSessionId : undefined;
+	const inheritedParentPythonRuntimeProfile =
+		effectiveParentEvalSessionId !== undefined ? options.parentPythonRuntimeProfile : undefined;
 
 	try {
 		const getActiveModelString = (): string | undefined => {
@@ -1557,6 +1577,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				activeToolNames.add(name);
 			}
 		};
+		let pythonRuntimeProfile: PythonRuntimeProfile | undefined;
 		const toolSession: ToolSession = {
 			get cwd() {
 				return sessionManager.getCwd();
@@ -1570,8 +1591,21 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return !requestedToolNames || requestedToolNames.includes("edit");
 			},
 			skipPythonPreflight: options.skipPythonPreflight,
+			getPythonRuntimeProfile: () => pythonRuntimeProfile,
+			getPythonRuntimeCwd: () => sessionManager.getCwd(),
+			getPythonInterpreter: () => pythonInterpreter,
 			contextFiles,
 			workspaceTree: resolvedWorkspaceTree,
+			hasPythonRuntimeSession: () => {
+				const sessionId = session?.getEvalSessionId();
+				if (!sessionId) return false;
+				return hasPythonKernelSession(
+					sessionId,
+					sessionManager.getCwd(),
+					pythonInterpreter,
+					pythonRuntimeProfile,
+				);
+			},
 			skills,
 			rules: allRules,
 			eventBus,
@@ -1581,7 +1615,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
 			getEvalKernelOwnerId: () => evalKernelOwnerId,
 			getEvalSessionId: () =>
-				session?.getEvalSessionId() ?? options.parentEvalSessionId ?? defaultEvalSessionId(toolSession),
+				session?.getEvalSessionId() ??
+				effectiveParentEvalSessionId ??
+				pythonRuntimeProfile?.env.PI_RUNTIME_GUARD_SESSION_ID ??
+				defaultEvalSessionId(toolSession),
 			assertEvalExecutionAllowed: () => session?.assertEvalExecutionAllowed(),
 			trackEvalExecution: (execution, abortController) =>
 				session ? session.trackEvalExecution(execution, abortController) : execution,
@@ -1697,6 +1734,87 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			options.parentTaskPrefix ? { parentPrefix: options.parentTaskPrefix } : undefined,
 		);
 
+		// Load source and caller-provided extensions before built-in tool
+		// construction. Python availability checks must see the complete immutable
+		// spawn profile; otherwise a valid extension-provided runtime can be
+		// rejected by an earlier unprofiled probe.
+		let extensionPaths: string[];
+		let extensionsResult: LoadExtensionsResult;
+		if (options.preloadedExtensions) {
+			extensionsResult = {
+				...options.preloadedExtensions,
+				extensions: [...options.preloadedExtensions.extensions],
+			};
+			extensionPaths = extensionsResult.extensions
+				.map(ext => ext.resolvedPath)
+				.filter(p => !p.startsWith("<inline"));
+		} else {
+			extensionPaths =
+				options.preloadedExtensionPaths ??
+				(await logger.time("discoverSessionExtensionPaths", () =>
+					discoverSessionExtensionPaths(options, cwd, settings),
+				));
+			extensionsResult = await logger.time("loadExtensions", loadExtensions, extensionPaths, cwd, eventBus, {
+				pythonRuntimeSessionId: effectiveParentEvalSessionId,
+				pythonRuntimeSessionActive:
+					effectiveParentEvalSessionId !== undefined && options.parentPythonRuntimeActive,
+			});
+			for (const { path, error } of extensionsResult.errors) {
+				logger.error("Failed to load extension", { path, error });
+			}
+		}
+		if (inheritedParentPythonRuntimeProfile) {
+			for (const [key, value] of Object.entries(inheritedParentPythonRuntimeProfile.env)) {
+				const registered = extensionsResult.runtime.pythonSpawnEnv.get(key);
+				if (registered !== undefined && registered !== value) {
+					throw new Error(`Inherited Python runtime profile conflicts with extension registration: ${key}`);
+				}
+				extensionsResult.runtime.pythonSpawnEnv.set(key, value);
+			}
+		}
+		toolSession.extensionPaths = extensionPaths;
+		pythonRuntimeProfile = createPythonRuntimeProfile(extensionsResult.runtime.pythonSpawnEnv);
+
+		let nextInlineExtensionIndex = 0;
+		for (const factory of options.extensions ?? []) {
+			const loaded = await loadExtensionFromFactory(
+				factory,
+				cwd,
+				eventBus,
+				extensionsResult.runtime,
+				`<inline-${nextInlineExtensionIndex++}>`,
+				{
+					pythonRuntimeSessionId:
+						effectiveParentEvalSessionId ?? pythonRuntimeProfile?.env.PI_RUNTIME_GUARD_SESSION_ID,
+					pythonRuntimeSessionActive:
+						effectiveParentEvalSessionId !== undefined && options.parentPythonRuntimeActive,
+				},
+			);
+			extensionsResult.extensions.push(loaded);
+			pythonRuntimeProfile = createPythonRuntimeProfile(extensionsResult.runtime.pythonSpawnEnv);
+		}
+		if (extensionsResult.runtime.pythonSpawnEnvResolvers.length > 0) {
+			const unresolvedProfile = createPythonRuntimeProfile(extensionsResult.runtime.pythonSpawnEnv);
+			const unresolvedAvailability = await checkPythonKernelAvailability(cwd, pythonInterpreter, unresolvedProfile);
+			await finalizePythonSpawnEnvResolvers(extensionsResult.runtime, {
+				pythonPath: unresolvedAvailability.ok ? unresolvedAvailability.pythonPath : undefined,
+			});
+			pythonRuntimeProfile = createPythonRuntimeProfile(extensionsResult.runtime.pythonSpawnEnv);
+			const resolvedAvailability = await checkPythonKernelAvailability(cwd, pythonInterpreter, pythonRuntimeProfile);
+			const unresolvedPythonPath = unresolvedAvailability.ok ? unresolvedAvailability.pythonPath : undefined;
+			const resolvedPythonPath = resolvedAvailability.ok ? resolvedAvailability.pythonPath : undefined;
+			if (resolvedPythonPath !== unresolvedPythonPath) {
+				throw new Error("Resolved Python spawn environment changed the selected interpreter");
+			}
+		} else {
+			await finalizePythonSpawnEnvResolvers(extensionsResult.runtime, {});
+		}
+		if (
+			effectiveParentEvalSessionId !== undefined &&
+			(pythonRuntimeProfile?.key ?? "") !== (inheritedParentPythonRuntimeProfile?.key ?? "")
+		) {
+			throw new Error("Inherited Python runtime profile changed during extension finalization");
+		}
 		// Create built-in tools (already wrapped with meta notice formatting)
 		const builtinTools = await logger.time("createAllTools", createTools, toolSession, options.toolNames);
 
@@ -1853,68 +1971,30 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// re-bind under their own `CustomToolAPI` while skipping the FS scan.
 		toolSession.customToolPaths = customToolPaths;
 
-		const inlineExtensions: ExtensionFactory[] = options.extensions ? [...options.extensions] : [];
+		const inlineExtensions: ExtensionFactory[] = [];
 		inlineExtensions.push((await import("./autoresearch")).createAutoresearchExtension);
 		if (customTools.length > 0) {
 			inlineExtensions.push(createCustomToolsExtension(customTools));
 		}
 
-		// Load extensions. Three paths:
-		//   1. `preloadedExtensions` (CLI): caller already loaded — reuse the
-		//      Extension instances. Shallow-clone `extensions` so the inline
-		//      push below cannot mutate the caller's array. `runtime` is shared
-		//      so flag values set pre-creation flow into the live session.
-		//   2. `preloadedExtensionPaths` (subagent): caller resolved paths;
-		//      skip the FS scan but always re-call `loadExtensions` here so
-		//      each `Extension` binds to THIS session's `ExtensionAPI`
-		//      (cwd, eventBus, runtime).
-		//   3. No preload: run the full session discovery.
-		// `disableExtensionDiscovery` is honored implicitly: a caller that set
-		// the flag and pre-resolved the result already reflects that choice.
-		let extensionPaths: string[];
-		let extensionsResult: LoadExtensionsResult;
-		if (options.preloadedExtensions) {
-			extensionsResult = {
-				...options.preloadedExtensions,
-				extensions: [...options.preloadedExtensions.extensions],
-			};
-			// Capture paths for downstream forwarding; filter inline-factory
-			// entries (`<inline-N>`) — those are per-session, not source paths.
-			extensionPaths = extensionsResult.extensions
-				.map(ext => ext.resolvedPath)
-				.filter(p => !p.startsWith("<inline"));
-		} else if (options.preloadedExtensionPaths) {
-			extensionPaths = options.preloadedExtensionPaths;
-			extensionsResult = await logger.time("loadExtensions", loadExtensions, extensionPaths, cwd, eventBus);
-			for (const { path, error } of extensionsResult.errors) {
-				logger.error("Failed to load extension", { path, error });
-			}
-		} else {
-			extensionPaths = await logger.time("discoverSessionExtensionPaths", () =>
-				discoverSessionExtensionPaths(options, cwd, settings),
+		// Load internal inline extensions after their dependent custom tools are
+		// discovered. They share the already-finalized source-extension runtime.
+		for (const factory of inlineExtensions) {
+			const loaded = await loadExtensionFromFactory(
+				factory,
+				cwd,
+				eventBus,
+				extensionsResult.runtime,
+				`<inline-${nextInlineExtensionIndex++}>`,
+				{
+					pythonRuntimeSessionId:
+						effectiveParentEvalSessionId ?? pythonRuntimeProfile?.env.PI_RUNTIME_GUARD_SESSION_ID,
+					pythonRuntimeSessionActive:
+						effectiveParentEvalSessionId !== undefined && options.parentPythonRuntimeActive,
+				},
 			);
-			extensionsResult = await logger.time("loadExtensions", loadExtensions, extensionPaths, cwd, eventBus);
-			for (const { path, error } of extensionsResult.errors) {
-				logger.error("Failed to load extension", { path, error });
-			}
-		}
-		// Forward the source-path list (NOT the loaded instances) so subagents
-		// rebuild their own session-scoped extensions.
-		toolSession.extensionPaths = extensionPaths;
-
-		// Load inline extensions from factories
-		if (inlineExtensions.length > 0) {
-			for (let i = 0; i < inlineExtensions.length; i++) {
-				const factory = inlineExtensions[i];
-				const loaded = await loadExtensionFromFactory(
-					factory,
-					cwd,
-					eventBus,
-					extensionsResult.runtime,
-					`<inline-${i}>`,
-				);
-				extensionsResult.extensions.push(loaded);
-			}
+			extensionsResult.extensions.push(loaded);
+			pythonRuntimeProfile = createPythonRuntimeProfile(extensionsResult.runtime.pythonSpawnEnv);
 		}
 
 		// Process provider registrations queued during extension loading.
@@ -2857,6 +2937,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Owned only when this session created the manager; subagents receive a
 		// parent's manager via `options.mcpManager` and MUST NOT disconnect it.
 		const ownedMcpManager = options.mcpManager ? undefined : mcpManager;
+		const effectiveEvalSessionId =
+			effectiveParentEvalSessionId ?? pythonRuntimeProfile?.env.PI_RUNTIME_GUARD_SESSION_ID;
 		session = new AgentSession({
 			advisorWatchdogPrompt,
 			advisorContextPrompt,
@@ -2871,6 +2953,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			settings,
 			autoApprove: options.autoApprove,
 			evalKernelOwnerId,
+			pythonRuntimeProfile,
 			// Defined only for top-level sessions (creation is gated above).
 			// AgentSession uses this to decide whether it may dispose the global
 			// AsyncJobManager on teardown; subagents inherit the parent's and
@@ -2930,7 +3013,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			agentKind,
 			providerSessionId: options.providerSessionId,
 			providerPromptCacheKeySource,
-			parentEvalSessionId: options.parentEvalSessionId,
+			parentEvalSessionId: effectiveEvalSessionId,
 			advisorTools,
 			titleSystemPrompt: options.titleSystemPrompt,
 		});
