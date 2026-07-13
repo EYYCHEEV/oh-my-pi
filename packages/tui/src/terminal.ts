@@ -1,5 +1,6 @@
 import { dlopen, FFIType, ptr } from "bun:ffi";
 import * as fs from "node:fs";
+4: import { ReadStream as TtyReadStream } from "node:tty";
 import {
 	$env,
 	isBunTestRuntime,
@@ -9,6 +10,11 @@ import {
 	restoreTerminalStderr,
 	suppressTerminalStderr,
 } from "@oh-my-pi/pi-utils";
+5: 			// fd 2 may be redirected to the log while a TUI owns the terminal
+			// (stderr-guard); re-point it at the real terminal so the fatal
+			// report is visible. Terminal modes are restored moments later by
+			// the terminal-restore cleanup callback inside runCleanup().
+			restoreTerminalStderr();
 import { setKittyProtocolActive } from "./keys";
 import { StdinBuffer } from "./stdin-buffer";
 import {
@@ -205,6 +211,12 @@ function registerStdoutErrorHandler(handler: (err: Error) => void): () => void {
 	return () => {
 		stdoutErrorHandlers.delete(handler);
 	};
+}
+
+function isTransientReadEintr(err: unknown): boolean {
+	if (err === null || typeof err !== "object") return false;
+	if (!("code" in err) || !("syscall" in err)) return false;
+	return err.code === "EINTR" && err.syscall === "read";
 }
 
 const STD_INPUT_HANDLE = -10;
@@ -483,6 +495,12 @@ export class ProcessTerminal implements Terminal {
 	#modifyOtherKeysTimeout?: Timer;
 	#stdinBuffer?: StdinBuffer;
 	#stdinDataHandler?: (data: string) => void;
+	#stdinDrainHandlers = new Set<(data: string) => void>();
+	#stdin: NodeJS.ReadStream;
+	#reopenStdin: () => NodeJS.ReadStream;
+	#stdinErrorHandler = (err: Error): void => {
+		this.#recoverStdin(err);
+	};
 	#dead = false;
 	// Captured at construction and re-read at start(): when true, every real
 	// terminal side effect (writes, probes, raw mode, SIGWINCH, timers) is
@@ -518,6 +536,16 @@ export class ProcessTerminal implements Terminal {
 	#mode2031DebounceTimer?: Timer;
 	#windowsTerminalAppearancePollTimer?: Timer;
 	#progressTimer?: Timer;
+
+	constructor(
+		options: {
+			stdin?: NodeJS.ReadStream;
+			reopenStdin?: () => NodeJS.ReadStream;
+		} = {},
+	) {
+		this.#stdin = options.stdin ?? process.stdin;
+		this.#reopenStdin = options.reopenStdin ?? (() => new TtyReadStream(process.stdin.fd));
+	}
 
 	get kittyProtocolActive(): boolean {
 		return this.#kittyProtocolActive;
@@ -599,12 +627,8 @@ export class ProcessTerminal implements Terminal {
 		suppressTerminalStderr();
 
 		// Save previous state and enable raw mode
-		this.#wasRaw = process.stdin.isRaw || false;
-		if (process.stdin.setRawMode) {
-			process.stdin.setRawMode(true);
-		}
-		process.stdin.setEncoding("utf8");
-		process.stdin.resume();
+		this.#wasRaw = this.#stdin.isRaw || false;
+		this.#activateStdin(this.#stdin);
 
 		// Enable bracketed paste mode - terminal will wrap pastes in \x1b[200~ ... \x1b[201~
 		this.#safeWrite("\x1b[?2004h");
@@ -1157,7 +1181,7 @@ export class ProcessTerminal implements Terminal {
 	 */
 	#queryAndEnableKittyProtocol(): void {
 		this.#setupStdinBuffer();
-		process.stdin.on("data", this.#stdinDataHandler!);
+		this.#stdin.on("data", this.#stdinDataHandler!);
 		// Progressive enhancement query: CSI ?u asks the terminal for its current
 		// kitty keyboard flags (no side effect on the stack); the DA1 sentinel
 		// guarantees a reply even from terminals that ignore CSI ?u.
@@ -1317,7 +1341,8 @@ export class ProcessTerminal implements Terminal {
 			lastDataTime = Date.now();
 		};
 
-		process.stdin.on("data", onData);
+		this.#stdinDrainHandlers.add(onData);
+		this.#stdin.on("data", onData);
 		const endTime = Date.now() + maxMs;
 
 		try {
@@ -1329,7 +1354,8 @@ export class ProcessTerminal implements Terminal {
 				await new Promise(resolve => setTimeout(resolve, Math.min(idleMs, timeLeft)));
 			}
 		} finally {
-			process.stdin.removeListener("data", onData);
+			this.#stdin.removeListener("data", onData);
+			this.#stdinDrainHandlers.delete(onData);
 			this.#inputHandler = previousHandler;
 		}
 	}
@@ -1422,9 +1448,11 @@ export class ProcessTerminal implements Terminal {
 
 		// Remove event handlers
 		if (this.#stdinDataHandler) {
-			process.stdin.removeListener("data", this.#stdinDataHandler);
+			this.#stdin.removeListener("data", this.#stdinDataHandler);
 			this.#stdinDataHandler = undefined;
 		}
+		for (const handler of this.#stdinDrainHandlers) this.#stdin.removeListener("data", handler);
+		this.#stdinDrainHandlers.clear();
 		this.#inputHandler = undefined;
 		this.#appearance = undefined;
 		if (this.#stdoutResizeListener) {
@@ -1436,14 +1464,46 @@ export class ProcessTerminal implements Terminal {
 		// Pause stdin to prevent any buffered input (e.g., Ctrl+D) from being
 		// re-interpreted after raw mode is disabled. This fixes a race condition
 		// where Ctrl+D could close the parent shell over SSH.
-		process.stdin.pause();
+		this.#stdin.pause();
 
 		// Restore raw mode state
-		if (process.stdin.setRawMode) {
-			process.stdin.setRawMode(this.#wasRaw);
+		if (this.#stdin.setRawMode) {
+			this.#stdin.setRawMode(this.#wasRaw);
 		}
+		this.#stdin.removeListener("error", this.#stdinErrorHandler);
 		this.#stdoutErrorCleanup?.();
 		this.#stdoutErrorCleanup = undefined;
+	}
+
+	#activateStdin(stdin: NodeJS.ReadStream): void {
+		stdin.on("error", this.#stdinErrorHandler);
+		if (stdin.setRawMode) stdin.setRawMode(true);
+		stdin.setEncoding("utf8");
+		if (this.#stdinDataHandler) stdin.on("data", this.#stdinDataHandler);
+		for (const handler of this.#stdinDrainHandlers) stdin.on("data", handler);
+		stdin.resume();
+	}
+
+	#recoverStdin(err: Error): void {
+		if (!isTransientReadEintr(err)) throw err;
+
+		const failed = this.#stdin;
+		failed.removeListener("error", this.#stdinErrorHandler);
+		if (this.#stdinDataHandler) failed.removeListener("data", this.#stdinDataHandler);
+		for (const handler of this.#stdinDrainHandlers) failed.removeListener("data", handler);
+
+		let replacement: NodeJS.ReadStream;
+		try {
+			replacement = this.#reopenStdin();
+			if (replacement === failed || replacement.destroyed) {
+				throw new Error("stdin reopen returned an unusable stream");
+			}
+			this.#stdin = replacement;
+			this.#activateStdin(replacement);
+		} catch (reopenError) {
+			throw new AggregateError([err, reopenError], "Failed to reopen terminal input after interrupted read");
+		}
+		logger.warn("terminal input read interrupted; reopened stdin", { err });
 	}
 
 	#ensureStdoutErrorHandler(): void {
