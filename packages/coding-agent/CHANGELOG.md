@@ -45,6 +45,7 @@
 - Removed the `--prewalk-boomerang` feature and its associated configuration setting.
 - Removed the unreliable Bing and Yahoo HTML-scraping web search providers.
 - Prevented parked subagents and secondary in-process sessions from terminating process-global Tiny and Mnemopi IPC workers; only the primary process owner shuts those shared clients down.
+- Fixed MCP image results being flattened into text markers; ordered image blocks now survive tool execution and artifact truncation, with safe terminal summaries.
 
 - Fixed inconsistent history rendering when toggling the display setting for compacted items
 - Fixed configured `retry.fallbackChains` never engaging on non-retryable provider errors (e.g. "Cloud Code Assist API returned an empty response"): a hard error on a model covered by a fallback chain now switches to the next candidate instead of failing the turn, while still never backoff-retrying the failing model itself
