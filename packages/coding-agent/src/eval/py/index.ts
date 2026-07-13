@@ -29,11 +29,7 @@ export default {
 	highlightLang: "python",
 
 	async isAvailable(session: ToolSession): Promise<boolean> {
-		const availability = await checkPythonKernelAvailability(
-			session.cwd,
-			readInterpreterSetting(session),
-			session.getPythonRuntimeProfile?.(),
-		);
+		const availability = await checkPythonKernelAvailability(session.cwd, readInterpreterSetting(session));
 		return availability.ok;
 	},
 
@@ -46,7 +42,6 @@ export default {
 			sessionId: namespaceSessionId(opts.sessionId),
 			kernelMode,
 			interpreter: readInterpreterSetting(opts.session),
-			runtimeProfile: opts.session.getPythonRuntimeProfile?.(),
 			sessionFile: opts.sessionFile,
 			artifactsDir: opts.session.getArtifactsDir?.() ?? undefined,
 			localRoots: resolveEvalUrlRoots(opts.session),
