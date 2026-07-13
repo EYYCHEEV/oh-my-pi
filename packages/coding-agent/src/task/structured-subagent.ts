@@ -369,6 +369,7 @@ function buildExecutorOptions(
 		getSessionId: session.getSessionId ?? (() => null),
 	};
 	const enableMCP = !policy.planMode && (session.enableMCP ?? true);
+	const shareEvalSession = request.shareEvalSession !== false;
 	return {
 		cwd: session.cwd,
 		agent: policy.effectiveAgent,
@@ -424,7 +425,13 @@ function buildExecutorOptions(
 		parentHindsightSessionState: session.getHindsightSessionState?.(),
 		parentMnemopiSessionState: session.getMnemopiSessionState?.(),
 		parentTelemetry: session.getTelemetry?.(),
-		parentEvalSessionId: request.shareEvalSession === false ? undefined : (session.getEvalSessionId?.() ?? undefined),
+		parentEvalSessionId: shareEvalSession ? (session.getEvalSessionId?.() ?? undefined) : undefined,
+		parentPythonRuntimeProfile: shareEvalSession ? session.getPythonRuntimeProfile?.() : undefined,
+		parentPythonRuntimeActive: shareEvalSession ? (session.hasPythonRuntimeSession?.() ?? false) : undefined,
+		parentPythonRuntimeCwd: shareEvalSession
+			? (session.getPythonRuntimeCwd?.() ?? session.cwd)
+			: undefined,
+		parentPythonInterpreter: shareEvalSession ? session.getPythonInterpreter?.() : undefined,
 		parentAgentId: session.getAgentId?.() ?? MAIN_AGENT_ID,
 		parentServiceTier: session.getServiceTierByFamily ? (session.getServiceTierByFamily() ?? null) : undefined,
 	};

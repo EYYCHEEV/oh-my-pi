@@ -32,11 +32,14 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 	ExtensionFactory,
-	ExtensionRuntime as IExtensionRuntime,
+	ExtensionLoadContext,
 	ExtensionStatusSegmentDefinition,
+	ExtensionRuntime as IExtensionRuntime,
 	LoadExtensionsResult,
 	MessageRenderer,
 	ProviderConfig,
+	PythonRuntimeResolution,
+	PythonSpawnEnvResolver,
 	RegisteredCommand,
 	RegisteredStatusSegment,
 	ToolDefinition,
@@ -53,6 +56,29 @@ function getExtensionFactory(module: LoadedExtensionModule): ExtensionFactory | 
 	return typeof candidate === "function" ? candidate : null;
 }
 
+function registerPythonSpawnEnvironment(
+	runtime: IExtensionRuntime,
+	environment: Readonly<Record<string, string>>,
+): void {
+	const entries = Object.entries(environment);
+	for (const [key, value] of entries) {
+		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+			throw new Error(`Invalid Python environment variable name: ${JSON.stringify(key)}`);
+		}
+		if (typeof value !== "string" || value.includes("\0")) {
+			throw new Error(`Invalid Python environment variable value: ${key}`);
+		}
+		const normalizedKey = process.platform === "win32" ? key.toUpperCase() : key;
+		const registered = runtime.pythonSpawnEnv.get(normalizedKey);
+		if (registered !== undefined && registered !== value) {
+			throw new Error(`Conflicting Python environment variable registration: ${key}`);
+		}
+	}
+	for (const [key, value] of entries) {
+		runtime.pythonSpawnEnv.set(process.platform === "win32" ? key.toUpperCase() : key, value);
+	}
+}
+
 export class ExtensionRuntimeNotInitializedError extends Error {
 	constructor() {
 		super("Extension runtime not initialized. Action methods cannot be called during extension loading.");
@@ -65,6 +91,9 @@ export class ExtensionRuntimeNotInitializedError extends Error {
  */
 export class ExtensionRuntime implements IExtensionRuntime {
 	flagValues = new Map<string, boolean | string>();
+	pythonSpawnEnv = new Map<string, string>();
+	pythonSpawnEnvResolvers: PythonSpawnEnvResolver[] = [];
+	pythonSpawnEnvFinalized = false;
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; sourceId: string }> = [];
 	requestStatusLineRender = (): void => {};
 	hostStatusSegment = (): undefined => undefined;
@@ -122,6 +151,27 @@ export class ExtensionRuntime implements IExtensionRuntime {
 	}
 }
 
+export async function finalizePythonSpawnEnvResolvers(
+	runtime: IExtensionRuntime,
+	resolution: Readonly<PythonRuntimeResolution>,
+): Promise<void> {
+	if (runtime.pythonSpawnEnvFinalization) {
+		await runtime.pythonSpawnEnvFinalization;
+		return;
+	}
+	if (runtime.pythonSpawnEnvFinalized) return;
+	runtime.pythonSpawnEnvFinalized = true;
+	const resolved = Object.freeze({ ...resolution });
+	const resolvers = runtime.pythonSpawnEnvResolvers;
+	runtime.pythonSpawnEnvResolvers = [];
+	runtime.pythonSpawnEnvFinalization = (async () => {
+		for (const resolver of resolvers) {
+			registerPythonSpawnEnvironment(runtime, await resolver(resolved));
+		}
+	})();
+	await runtime.pythonSpawnEnvFinalization;
+}
+
 /**
  * ExtensionAPI implementation for an extension.
  * Registration methods write to the extension object.
@@ -139,13 +189,22 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 		sourceId: string;
 	}> = [];
 
+	private readonly initialPythonSpawnEnv: Map<string, string>;
+	private readonly initialPythonSpawnEnvResolverCount: number;
+	private pythonSpawnEnvRegistrationOpen = true;
+
 	constructor(
 		public readonly pi: typeof PiCodingAgent,
 		private readonly extension: Extension,
 		private readonly runtime: IExtensionRuntime,
 		private readonly cwd: string,
 		public readonly events: EventBus,
-	) {}
+		public readonly pythonRuntimeSessionId?: string,
+		public readonly pythonRuntimeSessionActive?: boolean,
+	) {
+		this.initialPythonSpawnEnv = new Map(runtime.pythonSpawnEnv);
+		this.initialPythonSpawnEnvResolverCount = runtime.pythonSpawnEnvResolvers.length;
+	}
 
 	on<F extends HandlerFn>(event: string, handler: F): void {
 		const list = this.extension.handlers.get(event) ?? [];
@@ -195,6 +254,30 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 
 	requestStatusLineRender(): void {
 		this.runtime.requestStatusLineRender();
+	}
+
+	registerPythonSpawnEnv(environment: Readonly<Record<string, string>>): void {
+		if (!this.pythonSpawnEnvRegistrationOpen || this.runtime.pythonSpawnEnvFinalized) {
+			throw new Error("Python spawn environment registration is closed");
+		}
+		registerPythonSpawnEnvironment(this.runtime, environment);
+	}
+
+	registerPythonSpawnEnvResolver(resolver: PythonSpawnEnvResolver): void {
+		if (!this.pythonSpawnEnvRegistrationOpen || this.runtime.pythonSpawnEnvFinalized) {
+			throw new Error("Python spawn environment registration is closed");
+		}
+		this.runtime.pythonSpawnEnvResolvers.push(resolver);
+	}
+
+	sealPythonSpawnEnvRegistration(): void {
+		this.pythonSpawnEnvRegistrationOpen = false;
+	}
+
+	rollbackPythonSpawnEnv(): void {
+		this.runtime.pythonSpawnEnv.clear();
+		for (const [key, value] of this.initialPythonSpawnEnv) this.runtime.pythonSpawnEnv.set(key, value);
+		this.runtime.pythonSpawnEnvResolvers.length = this.initialPythonSpawnEnvResolverCount;
 	}
 
 	registerTool<TParams extends TSchema = TSchema, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void {
@@ -338,15 +421,25 @@ async function loadExtension(
 	cwd: string,
 	eventBus: EventBus,
 	runtime: IExtensionRuntime,
+	context?: ExtensionLoadContext,
 ): Promise<{ extension: Extension | null; error: string | null }> {
 	const resolvedPath = resolvePath(extensionPath, cwd);
 	const extension = createExtension(extensionPath, resolvedPath);
-	const api = new ConcreteExtensionAPI(PiCodingAgent, extension, runtime, cwd, eventBus);
+	const api = new ConcreteExtensionAPI(
+		PiCodingAgent,
+		extension,
+		runtime,
+		cwd,
+		eventBus,
+		context?.pythonRuntimeSessionId,
+		context?.pythonRuntimeSessionActive,
+	);
 	try {
 		const module = (await withHostGuard(() => loadLegacyPiModule(resolvedPath))) as LoadedExtensionModule;
 		const factory = getExtensionFactory(module);
 
 		if (typeof factory !== "function") {
+			api.sealPythonSpawnEnvRegistration();
 			return {
 				extension: null,
 				error: `Extension does not export a valid factory function: ${extensionPath}`,
@@ -356,10 +449,13 @@ async function loadExtension(
 		await withHostGuard(async () => {
 			await factory(api);
 		});
+		api.sealPythonSpawnEnvRegistration();
 
 		return { extension, error: null };
 	} catch (err) {
+		api.sealPythonSpawnEnvRegistration();
 		api.rollbackStatusSegments();
+		api.rollbackPythonSpawnEnv();
 		const message = err instanceof Error ? err.message : String(err);
 		return { extension: null, error: `Failed to load extension: ${message}` };
 	}
@@ -374,14 +470,26 @@ export async function loadExtensionFromFactory(
 	eventBus: EventBus,
 	runtime: IExtensionRuntime,
 	name = "<inline>",
+	context?: ExtensionLoadContext,
 ): Promise<Extension> {
 	const extension = createExtension(name, name);
-	const api = new ConcreteExtensionAPI(PiCodingAgent, extension, runtime, cwd, eventBus);
+	const api = new ConcreteExtensionAPI(
+		PiCodingAgent,
+		extension,
+		runtime,
+		cwd,
+		eventBus,
+		context?.pythonRuntimeSessionId,
+		context?.pythonRuntimeSessionActive,
+	);
 	try {
 		await factory(api);
+		api.sealPythonSpawnEnvRegistration();
 		return extension;
 	} catch (error) {
+		api.sealPythonSpawnEnvRegistration();
 		api.rollbackStatusSegments();
+		api.rollbackPythonSpawnEnv();
 		throw error;
 	}
 }
@@ -389,14 +497,19 @@ export async function loadExtensionFromFactory(
 /**
  * Load extensions from paths.
  */
-export async function loadExtensions(paths: string[], cwd: string, eventBus?: EventBus): Promise<LoadExtensionsResult> {
+export async function loadExtensions(
+	paths: string[],
+	cwd: string,
+	eventBus?: EventBus,
+	context?: ExtensionLoadContext,
+): Promise<LoadExtensionsResult> {
 	const extensions: Extension[] = [];
 	const errors: Array<{ path: string; error: string }> = [];
 	const resolvedEventBus = eventBus ?? new EventBus();
 	const runtime = new ExtensionRuntime();
 
 	for (const extPath of paths) {
-		const { extension, error } = await loadExtension(extPath, cwd, resolvedEventBus, runtime);
+		const { extension, error } = await loadExtension(extPath, cwd, resolvedEventBus, runtime, context);
 
 		if (error) {
 			errors.push({ path: extPath, error });
