@@ -2,9 +2,6 @@
 
 ## [Unreleased]
 
-### Fixed
-
-- Prevented the global postmortem handler from terminating OMP sessions when Bun surfaces a transient POSIX `read` interruption (`EINTR`) as an uncaught exception.
 
 ## [16.4.6] - 2026-07-12
 

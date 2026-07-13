@@ -25,6 +25,8 @@
 
 ### Fixed
 
+- Prevented parked subagents and secondary in-process sessions from terminating process-global Tiny and Mnemopi IPC workers; only the primary process owner shuts those shared clients down.
+
 - Fixed inconsistent history rendering when toggling the display setting for compacted items
 - Fixed configured `retry.fallbackChains` never engaging on non-retryable provider errors (e.g. "Cloud Code Assist API returned an empty response"): a hard error on a model covered by a fallback chain now switches to the next candidate instead of failing the turn, while still never backoff-retrying the failing model itself
 - Fixed transcript rebuilds (compaction, `/compact`, and toggling history display) repainting content below stale scrollback when collapsing history; rebuilds now correctly clear the scrollback buffer when history is collapsed
