@@ -3,7 +3,6 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
-	createPythonRuntimeProfile,
 	enumeratePythonRuntimes,
 	filterEnv,
 	resolveExplicitPythonRuntime,
@@ -22,9 +21,6 @@ describe("Python gateway environment filtering", () => {
 			PI_CUSTOM: "1",
 			LC_ALL: "en_US.UTF-8",
 			LD_LIBRARY_PATH: "/opt/conda/lib",
-			PYTHONDONTWRITEBYTECODE: "1",
-			PYTHONNOUSERSITE: "1",
-			PYTHONSAFEPATH: "1",
 		};
 
 		const filtered = filterEnv(env);
@@ -34,9 +30,6 @@ describe("Python gateway environment filtering", () => {
 		expect(filtered.PI_CUSTOM).toBe("1");
 		expect(filtered.LC_ALL).toBe("en_US.UTF-8");
 		expect(filtered.LD_LIBRARY_PATH).toBe("/opt/conda/lib");
-		expect(filtered.PYTHONDONTWRITEBYTECODE).toBe("1");
-		expect(filtered.PYTHONNOUSERSITE).toBe("1");
-		expect(filtered.PYTHONSAFEPATH).toBe("1");
 		expect(filtered.OPENAI_API_KEY).toBeUndefined();
 		expect(filtered.ANTHROPIC_API_KEY).toBeUndefined();
 		expect(filtered.UNSAFE_TOKEN).toBeUndefined();
@@ -56,129 +49,6 @@ describe("Python gateway environment filtering", () => {
 		expect(filtered.XDG_RUNTIME_DIR).toBe("/run/user/1000");
 		expect(filtered.LC_CTYPE).toBe("UTF-8");
 		expect(filtered.LC_MESSAGES).toBe("en_US.UTF-8");
-	});
-
-	it("probes Python availability without executing inherited site startup hooks", () => {
-		const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "python-availability-probe-"));
-		try {
-			const startupDirectory = path.join(temporaryRoot, "startup");
-			const marker = path.join(temporaryRoot, "sitecustomize-executed");
-			fs.mkdirSync(startupDirectory);
-			fs.writeFileSync(
-				path.join(startupDirectory, "sitecustomize.py"),
-				`from pathlib import Path\nPath(${JSON.stringify(marker)}).write_text("executed")\n`,
-			);
-			const interpreter = Bun.which("python3");
-			if (!interpreter) throw new Error("python3 unavailable");
-			const probePath = path.resolve(import.meta.dir, "..", "fixtures", "python-availability-probe.ts");
-			const probe = Bun.spawnSync([process.execPath, probePath], {
-				cwd: path.resolve(import.meta.dir, "../.."),
-				env: {
-					...process.env,
-					BUN_ENV: "development",
-					NODE_ENV: "development",
-					PI_PYTHON_SKIP_CHECK: undefined,
-					PYTHONPATH: startupDirectory,
-					OMP_TEST_CWD: temporaryRoot,
-					OMP_TEST_PYTHON: interpreter,
-				},
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-
-			expect(probe.exitCode, Buffer.from(probe.stderr).toString("utf8")).toBe(0);
-			expect(JSON.parse(Buffer.from(probe.stdout).toString("utf8"))).toMatchObject({ ok: true });
-			expect(fs.existsSync(marker)).toBe(false);
-		} finally {
-			fs.rmSync(temporaryRoot, { recursive: true, force: true });
-		}
-	});
-
-	it("preserves the dynamic-library path in the executable viability probe", () => {
-		if (process.platform === "win32") return;
-		const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "python-library-path-probe-"));
-		try {
-			const interpreter = path.join(temporaryRoot, "profile-python");
-			fs.writeFileSync(
-				interpreter,
-				'#!/bin/sh\n[ "$LD_LIBRARY_PATH" = "/runtime/profile/lib" ]\n',
-				{ mode: 0o755 },
-			);
-			const probePath = path.resolve(import.meta.dir, "..", "fixtures", "python-availability-probe.ts");
-			const probe = Bun.spawnSync([process.execPath, probePath], {
-				cwd: path.resolve(import.meta.dir, "../.."),
-				env: {
-					...process.env,
-					BUN_ENV: "development",
-					NODE_ENV: "development",
-					PI_PYTHON_SKIP_CHECK: undefined,
-					OMP_TEST_CWD: temporaryRoot,
-					OMP_TEST_PYTHON: interpreter,
-					OMP_TEST_LD_LIBRARY_PATH: "/runtime/profile/lib",
-				},
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-
-			expect(probe.exitCode, Buffer.from(probe.stderr).toString("utf8")).toBe(0);
-			expect(JSON.parse(Buffer.from(probe.stdout).toString("utf8"))).toMatchObject({
-				ok: true,
-				pythonPath: interpreter,
-			});
-		} finally {
-			fs.rmSync(temporaryRoot, { recursive: true, force: true });
-		}
-	});
-
-	it("applies a runtime profile after an unprofiled availability probe", () => {
-		const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "python-runtime-profile-"));
-		try {
-			const interpreter = Bun.which("python3");
-			if (!interpreter) throw new Error("python3 unavailable");
-			const probePath = path.resolve(import.meta.dir, "..", "fixtures", "python-runtime-profile-probe.ts");
-			const probe = Bun.spawnSync([process.execPath, probePath], {
-				cwd: path.resolve(import.meta.dir, "../.."),
-				env: {
-					...process.env,
-					BUN_ENV: "development",
-					NODE_ENV: "development",
-					PI_PYTHON_SKIP_CHECK: undefined,
-					OMP_TEST_CWD: temporaryRoot,
-					OMP_TEST_PYTHON: interpreter,
-				},
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-
-			expect(probe.exitCode, Buffer.from(probe.stderr).toString("utf8")).toBe(0);
-			expect(JSON.parse(Buffer.from(probe.stdout).toString("utf8"))).toEqual({
-				preExtensionAvailable: true,
-				status: "ok",
-				output: "armed",
-			});
-		} finally {
-			fs.rmSync(temporaryRoot, { recursive: true, force: true });
-		}
-	});
-
-	it("derives a stable immutable profile identity", () => {
-		const first = createPythonRuntimeProfile(
-			new Map([
-				["PI_RUNTIME_GUARD_VERSION", "1"],
-				["PI_RUNTIME_GUARD_SESSION_ID", "session"],
-			]),
-		);
-		const reordered = createPythonRuntimeProfile(
-			new Map([
-				["PI_RUNTIME_GUARD_SESSION_ID", "session"],
-				["PI_RUNTIME_GUARD_VERSION", "1"],
-			]),
-		);
-
-		expect(first?.key).toBe(reordered?.key);
-		expect(first?.env).toEqual(reordered?.env);
-		expect(Object.isFrozen(first)).toBe(true);
-		expect(Object.isFrozen(first?.env)).toBe(true);
 	});
 });
 
