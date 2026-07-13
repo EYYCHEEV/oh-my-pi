@@ -6,7 +6,9 @@ export type { SlashCommandInfo, SlashCommandLocation, SlashCommandSource } from 
 export {
 	discoverAndLoadExtensions,
 	discoverExtensionPaths,
+	ExtensionRuntime,
 	ExtensionRuntimeNotInitializedError,
+	finalizePythonSpawnEnvResolvers,
 	loadExtensionFromFactory,
 	loadExtensions,
 } from "./loader";

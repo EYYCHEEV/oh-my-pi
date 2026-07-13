@@ -265,10 +265,7 @@ export interface ExtensionUIContext {
 	/** Request a status-line redraw. A safe no-op when no interactive UI is attached. */
 	requestStatusLineRender?(): void;
 	/** @internal Attach a declaratively registered extension status segment. */
-	registerStatusSegment?(
-		key: string,
-		definition: ExtensionStatusSegmentDefinition,
-	): () => void;
+	registerStatusSegment?(key: string, definition: ExtensionStatusSegmentDefinition): () => void;
 
 	/** Set the terminal window/tab title. */
 	setTitle(title: string): void;
@@ -1060,6 +1057,25 @@ export interface ExtensionAPI {
 	/** Injected pi-coding-agent exports for accessing SDK utilities */
 	pi: typeof PiCodingAgent;
 
+	/** Host eval-session identity inherited by extensions that share a retained Python kernel. */
+	readonly pythonRuntimeSessionId?: string;
+	/** Whether the inherited eval-session identity already has a live retained Python kernel. */
+	readonly pythonRuntimeSessionActive?: boolean;
+
+	/**
+	 * Register a late-bound spawn environment derived from the exact Python
+	 * executable selected by OMP. Resolvers run once after all startup
+	 * extensions load and before built-in tool availability is evaluated.
+	 */
+	registerPythonSpawnEnvResolver(resolver: PythonSpawnEnvResolver): void;
+
+	/**
+	 * Register immutable environment variables that must be present before a
+	 * Python kernel starts. Registrations are scoped to this extension runtime;
+	 * conflicting values for the same key fail extension loading.
+	 */
+	registerPythonSpawnEnv(environment: Readonly<Record<string, string>>): void;
+
 	// =========================================================================
 	// Event Subscription
 	// =========================================================================
@@ -1131,7 +1147,6 @@ export interface ExtensionAPI {
 
 	/** Request a status-line redraw. Safe in headless modes. */
 	requestStatusLineRender(): void;
-
 
 	/** Register a tool that the LLM can call. */
 	registerTool<TParams extends TSchema = TSchema, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void;
@@ -1413,15 +1428,37 @@ export type GetThinkingLevelHandler = () => ThinkingLevel | undefined;
 
 export type SetThinkingLevelHandler = (level: ThinkingLevel, persist?: boolean) => void;
 
+/** Session-scoped host context available while loading extensions. */
+export interface PythonRuntimeResolution {
+	/** Canonical executable selected by OMP, or undefined when no runtime is available. */
+	readonly pythonPath?: string;
+}
+
+export type PythonSpawnEnvResolver = (
+	runtime: Readonly<PythonRuntimeResolution>,
+) => Readonly<Record<string, string>> | Promise<Readonly<Record<string, string>>>;
+
+export interface ExtensionLoadContext {
+	/** Existing eval-session identity when this runtime should share its parent's Python kernel. */
+	pythonRuntimeSessionId?: string;
+	/** Whether the inherited identity already owns a live retained Python kernel. */
+	pythonRuntimeSessionActive?: boolean;
+}
+
 /** Shared state created by loader, used during registration and runtime. */
 export interface ExtensionRuntimeState {
 	flagValues: Map<string, boolean | string>;
+	/** Late-bound environment resolvers registered during extension loading. */
+	pythonSpawnEnvResolvers: PythonSpawnEnvResolver[];
+	/** True after late-bound environment resolution; further registration is invalid. */
+	pythonSpawnEnvFinalized: boolean;
+	/** Shared in-flight finalization; concurrent session builders must await the same resolution. */
+	pythonSpawnEnvFinalization?: Promise<void>;
+	/** Python process environment registered by extensions loaded for this session. */
+	pythonSpawnEnv: Map<string, string>;
 	requestStatusLineRender: () => void;
 	/** @internal Host a status segment when an interactive UI is attached. */
-	hostStatusSegment: (
-		key: string,
-		definition: ExtensionStatusSegmentDefinition,
-	) => (() => void) | undefined;
+	hostStatusSegment: (key: string, definition: ExtensionStatusSegmentDefinition) => (() => void) | undefined;
 	/** Provider registrations queued during extension loading, processed during session initialization */
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; sourceId: string }>;
 }
