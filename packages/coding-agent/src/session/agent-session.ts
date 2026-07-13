@@ -4525,7 +4525,6 @@ export class AgentSession {
 		};
 	}
 
-
 	async #persistTurnMessagesForMidRunCompaction(context: AgentTurnEndContext | undefined): Promise<boolean> {
 		if (!context) return true;
 		const turnMessages = [context.message, ...context.toolResults];
@@ -6951,8 +6950,9 @@ export class AgentSession {
 		try {
 			await state?.dispose({ timeoutMs: consolidateTimeoutMs });
 		} finally {
-			// Consolidation may embed final memories, so terminate its worker only afterward.
-			await shutdownMnemopiEmbedClient();
+			// Consolidation may embed final memories, so the primary process owner
+			// terminates its shared worker only afterward.
+			if (this.#ownedAsyncJobManager) await shutdownMnemopiEmbedClient();
 		}
 	}
 
@@ -6990,7 +6990,7 @@ export class AgentSession {
 			this.#disposeOwnedAsyncJobs(),
 			this.#disposeEvalKernels(),
 			this.#releaseOwnedBrowserTabs(this.sessionManager.getSessionId()),
-			shutdownTinyTitleClient(),
+			this.#ownedAsyncJobManager ? shutdownTinyTitleClient() : Promise.resolve(),
 			this.#disconnectOwnedMcp(),
 			advisorRecorderClosed,
 			hindsightState?.flushRetainQueue() ?? Promise.resolve(),
@@ -7003,7 +7003,6 @@ export class AgentSession {
 				});
 			}
 		}
-
 		this.#releasePowerAssertion();
 		await cleanupEmptyMoveSession(this.sessionManager, this.#movedFromEmptySessionFile);
 		this.#movedFromEmptySessionFile = undefined;
