@@ -10,7 +10,6 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { createPythonRuntimeProfile } from "@oh-my-pi/pi-coding-agent/eval/py/runtime";
 import type { ToolPathWithSource } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -107,7 +106,7 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("forwards discovered state and retained Python identity to createAgentSession", async () => {
+	it("forwards rules, preloadedExtensionPaths, and preloadedCustomToolPaths to createAgentSession", async () => {
 		const session = yieldEmittingSession();
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
 
@@ -116,18 +115,12 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		const preloadedCustomToolPaths: ToolPathWithSource[] = [
 			{ path: "tools/x.ts", source: { provider: "config", providerName: "Config", level: "project" } },
 		];
-		const parentPythonRuntimeProfile = createPythonRuntimeProfile(new Map([["PI_INLINE_PROFILE", "1"]]));
 
 		const result = await runSubprocess({
 			...baseOptions,
 			rules,
 			preloadedExtensionPaths,
 			preloadedCustomToolPaths,
-			parentEvalSessionId: "parent-eval-session",
-			parentPythonRuntimeProfile,
-			parentPythonRuntimeActive: true,
-			parentPythonRuntimeCwd: "/tmp",
-			parentPythonInterpreter: "/usr/bin/python3",
 		});
 
 		expect(result.exitCode).toBe(0);
@@ -137,11 +130,6 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(forwarded?.rules).toBe(rules);
 		expect(forwarded?.preloadedExtensionPaths).toBe(preloadedExtensionPaths);
 		expect(forwarded?.preloadedCustomToolPaths).toBe(preloadedCustomToolPaths);
-		expect(forwarded?.parentEvalSessionId).toBe("parent-eval-session");
-		expect(forwarded?.parentPythonRuntimeProfile).toBe(parentPythonRuntimeProfile);
-		expect(forwarded?.parentPythonRuntimeActive).toBe(true);
-		expect(forwarded?.parentPythonRuntimeCwd).toBe("/tmp");
-		expect(forwarded?.parentPythonInterpreter).toBe("/usr/bin/python3");
 	});
 
 	it("forwards undefined when the parent has not pre-discovered state", async () => {

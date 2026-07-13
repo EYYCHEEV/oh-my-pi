@@ -9,7 +9,6 @@ import type { Settings } from "../config/settings";
 import { EditTool } from "../edit";
 import { checkJuliaKernelAvailability } from "../eval/jl/kernel";
 import { checkPythonKernelAvailability } from "../eval/py/kernel";
-import type { PythonRuntimeProfile } from "../eval/py/runtime";
 import { checkRubyKernelAvailability } from "../eval/rb/kernel";
 import type { ToolPathWithSource } from "../extensibility/custom-tools";
 import type { Skill } from "../extensibility/skills";
@@ -173,14 +172,6 @@ export interface ToolSession {
 	fetch?: FetchImpl;
 	/** Skip subprocess-kernel availability checks and warmup */
 	skipPythonPreflight?: boolean;
-	/** Session-scoped environment registered before Python kernel startup. */
-	getPythonRuntimeProfile?: () => PythonRuntimeProfile | undefined;
-	/** Working directory participating in the retained Python kernel identity. */
-	getPythonRuntimeCwd?: () => string;
-	/** Configured interpreter participating in the retained Python kernel identity. */
-	getPythonInterpreter?: () => string | undefined;
-	/** Whether this session already owns a live retained Python kernel. */
-	hasPythonRuntimeSession?: () => boolean;
 	/** Pre-loaded context files (AGENTS.md, etc) */
 	contextFiles?: ContextFileEntry[];
 	/** Pre-loaded workspace tree (forwarded to subagents to skip re-scanning) */
@@ -533,7 +524,6 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 				checkPythonKernelAvailability,
 				session.cwd,
 				session.settings.get("python.interpreter")?.trim() || undefined,
-				session.getPythonRuntimeProfile?.(),
 			);
 			pythonAvailable = availability.ok;
 			if (!availability.ok) {
