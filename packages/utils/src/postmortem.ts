@@ -117,17 +117,6 @@ export function registerStdioDisconnectHandling(): () => void {
 	};
 }
 
-/**
- * Detect a transient POSIX read interruption surfaced by Bun as an uncaught
- * exception. The interrupted runtime read can be retried; terminating the
- * session here turns routine signal delivery into a fatal process exit.
- */
-export function isTransientReadEintr(err: unknown): boolean {
-	if (err === null || typeof err !== "object") return false;
-	if (!("code" in err) || !("syscall" in err)) return false;
-	return err.code === "EINTR" && err.syscall === "read";
-}
-
 // Well-known key marking an error as an *expected* teardown artifact (e.g. a
 // browser run-scope abort at normal run end). `Symbol.for` so the marker
 // survives duplicate module instances across bundles/realms.
@@ -220,10 +209,6 @@ if (isMainThread) {
 		.on("uncaughtException", async err => {
 			if (isExpectedCleanupError(err)) {
 				logger.warn("Ignoring expected cleanup exception", { err });
-				return;
-			}
-			if (isTransientReadEintr(err)) {
-				logger.warn("Ignoring transient EINTR from read", { err });
 				return;
 			}
 			await exitAfterFatal("Uncaught Exception", "Uncaught exception", err, Reason.UNCAUGHT_EXCEPTION);
