@@ -45,9 +45,6 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 			errors: [],
 			runtime: {
 				flagValues: new Map(),
-				pythonSpawnEnv: new Map([["PI_RUNTIME_GUARD_SESSION_ID", "preloaded-python-session"]]),
-				pythonSpawnEnvResolvers: [],
-				pythonSpawnEnvFinalized: false,
 				pendingProviderRegistrations: [],
 				// Cast: only the fields we touch matter; the SDK happily accepts a
 				// minimal runtime when no extension hooks fire.
@@ -56,7 +53,7 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 		const beforeLength = preloaded.extensions.length;
 		const beforeArrayRef = preloaded.extensions;
 
-		const { session } = await createAgentSession({
+		await createAgentSession({
 			cwd: sharedDir,
 			agentDir: sharedDir,
 			sessionManager: SessionManager.inMemory(),
@@ -73,11 +70,6 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 			contextFiles: [],
 			promptTemplates: [],
 		});
-		try {
-			expect(session.getEvalSessionId()).toBe("preloaded-python-session");
-		} finally {
-			await session.dispose();
-		}
 
 		// The session's own `extensionsResult` carries inline wrappers, but the
 		// caller's array (and its identity) must be untouched.

@@ -23,7 +23,6 @@ import {
 	type KernelExecuteResult,
 	PythonKernel,
 } from "./kernel";
-import type { PythonRuntimeProfile } from "./runtime";
 import { resolveExplicitPythonRuntime } from "./runtime";
 import { ensurePyToolBridge } from "./tool-bridge";
 
@@ -57,8 +56,6 @@ export interface PythonExecutorOptions {
 	 * session's settings). Skips automatic runtime discovery when set.
 	 */
 	interpreter?: string;
-	/** Immutable extension-registered environment for this retained kernel. */
-	runtimeProfile?: PythonRuntimeProfile;
 	/** Restart the kernel before executing */
 	reset?: boolean;
 	/** Session file path for accessing task outputs */
@@ -148,16 +145,8 @@ interface PythonSession {
 	hasFallbackOwner: boolean;
 }
 
-interface StartingPythonSession {
-	promise: Promise<PythonSession>;
-	ownerIds: Set<string>;
-	hasFallbackOwner: boolean;
-}
-
 const sessions = new Map<string, PythonSession>();
-const startingSessions = new Map<string, StartingPythonSession>();
-const startingSessionRecords = new Set<StartingPythonSession>();
-const orphanedSessions = new Set<PythonSession>();
+const startingSessions = new Map<string, Promise<PythonSession>>();
 const resettingSessions = new Map<string, Promise<void>>();
 
 function normalizeSessionCwd(cwd: string): string {
@@ -174,23 +163,9 @@ function normalizeExplicitInterpreter(cwd: string, interpreter: string | undefin
 	}
 }
 
-function buildSessionKey(
-	sessionId: string,
-	cwd: string,
-	interpreter: string | undefined,
-	runtimeProfile: PythonRuntimeProfile | undefined,
-): string {
+function buildSessionKey(sessionId: string, cwd: string, interpreter: string | undefined): string {
 	const normalizedCwd = normalizeSessionCwd(cwd);
-	return `${sessionId}\0${normalizedCwd}\0${normalizeExplicitInterpreter(normalizedCwd, interpreter)}\0${runtimeProfile?.key ?? ""}`;
-}
-
-export function hasPythonKernelSession(
-	sessionId: string,
-	cwd: string,
-	interpreter?: string,
-	runtimeProfile?: PythonRuntimeProfile,
-): boolean {
-	return sessions.get(buildSessionKey(sessionId, cwd, interpreter, runtimeProfile))?.kernel.isAlive() === true;
+	return `${sessionId}\0${normalizedCwd}\0${normalizeExplicitInterpreter(normalizedCwd, interpreter)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -252,7 +227,6 @@ async function startKernel(cwd: string, options: PythonExecutorOptions): Promise
 		signal: options.signal,
 		deadlineMs: options.deadlineMs,
 		interpreter: options.interpreter,
-		runtimeProfile: options.runtimeProfile,
 	});
 }
 
@@ -269,63 +243,30 @@ async function acquireSession(
 	}
 	const starting = startingSessions.get(sessionKey);
 	if (starting) {
-		attachSessionOwner(starting, sessionId, options.kernelOwnerId);
-		return await starting.promise;
+		const session = await starting;
+		attachSessionOwner(session, sessionId, options.kernelOwnerId);
+		return session;
 	}
-	const deferred = Promise.withResolvers<PythonSession>();
-	const pending: StartingPythonSession = {
-		promise: deferred.promise,
-		ownerIds: new Set(),
-		hasFallbackOwner: false,
-	};
-	attachSessionOwner(pending, sessionId, options.kernelOwnerId);
-	startingSessions.set(sessionKey, pending);
-	startingSessionRecords.add(pending);
-	void (async () => {
+	const startup = (async () => {
 		const kernel = await startKernel(cwd, options);
-		if (pending.ownerIds.size === 0 && !pending.hasFallbackOwner) {
-			const orphanedSession: PythonSession = {
-				sessionKey,
-				sessionId,
-				cwd,
-				kernel,
-				ownerIds: new Set(),
-				hasFallbackOwner: false,
-			};
-			let shutdownFailure: unknown;
-			try {
-				const result = await kernel.shutdown();
-				if (result.confirmed === false) shutdownFailure = "not confirmed";
-			} catch (error) {
-				shutdownFailure = error;
-			}
-			if (shutdownFailure !== undefined) {
-				orphanedSessions.add(orphanedSession);
-				logger.warn("Ownerless Python kernel shutdown not confirmed", {
-					sessionId,
-					sessionKey,
-					cwd,
-					reason: shutdownFailure,
-				});
-			}
-			throw new PythonExecutionCancelledError(false);
-		}
 		const session: PythonSession = {
 			sessionKey,
 			sessionId,
 			cwd,
 			kernel,
-			ownerIds: new Set(pending.ownerIds),
-			hasFallbackOwner: pending.hasFallbackOwner,
+			ownerIds: new Set(),
+			hasFallbackOwner: false,
 		};
 		sessions.set(sessionKey, session);
 		return session;
-	})().then(deferred.resolve, deferred.reject);
+	})();
+	startingSessions.set(sessionKey, startup);
 	try {
-		return await pending.promise;
+		const session = await startup;
+		attachSessionOwner(session, sessionId, options.kernelOwnerId);
+		return session;
 	} finally {
-		if (startingSessions.get(sessionKey) === pending) startingSessions.delete(sessionKey);
-		startingSessionRecords.delete(pending);
+		if (startingSessions.get(sessionKey) === startup) startingSessions.delete(sessionKey);
 	}
 }
 
@@ -352,8 +293,7 @@ async function replaceSessionKernel(
 }
 
 async function resetSession(sessionKey: string): Promise<void> {
-	const existing =
-		sessions.get(sessionKey) ?? (await startingSessions.get(sessionKey)?.promise.catch(() => undefined));
+	const existing = sessions.get(sessionKey) ?? (await startingSessions.get(sessionKey)?.catch(() => undefined));
 	if (!existing) return;
 	sessions.delete(sessionKey);
 	await existing.kernel.shutdown().catch(() => undefined);
@@ -364,13 +304,9 @@ async function resetSession(sessionKey: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export async function disposeAllKernelSessions(): Promise<void> {
-	const pending = [...startingSessionRecords];
+	const pending = [...startingSessions.values()];
 	startingSessions.clear();
-	for (const starting of pending) {
-		starting.ownerIds.clear();
-		starting.hasFallbackOwner = false;
-	}
-	const started = await Promise.allSettled(pending.map(starting => starting.promise));
+	const started = await Promise.allSettled(pending);
 	const all = [...sessions.entries()];
 	for (const result of started) {
 		if (result.status !== "fulfilled") continue;
@@ -395,33 +331,9 @@ export async function disposeAllKernelSessions(): Promise<void> {
 		});
 		if (!sessions.has(id)) sessions.set(id, session);
 	}
-	const orphans = [...orphanedSessions];
-	orphanedSessions.clear();
-	const orphanResults = await Promise.allSettled(orphans.map(session => session.kernel.shutdown()));
-	for (let i = 0; i < orphans.length; i += 1) {
-		const session = orphans[i];
-		const result = orphanResults[i];
-		if (result.status === "fulfilled" && result.value?.confirmed !== false) continue;
-		const reason = result.status === "rejected" ? result.reason : "not confirmed";
-		logger.warn("Orphaned Python kernel shutdown not confirmed", {
-			sessionId: session.sessionId,
-			sessionKey: session.sessionKey,
-			cwd: session.cwd,
-			reason,
-		});
-		orphanedSessions.add(session);
-	}
 }
 
 export async function disposeKernelSessionsByOwner(ownerId: string): Promise<void> {
-	const pendingShutdowns: Promise<PythonSession>[] = [];
-	for (const [sessionKey, starting] of startingSessions) {
-		if (!starting.ownerIds.delete(ownerId)) continue;
-		if (starting.ownerIds.size === 0 && !starting.hasFallbackOwner) {
-			if (startingSessions.get(sessionKey) === starting) startingSessions.delete(sessionKey);
-			pendingShutdowns.push(starting.promise);
-		}
-	}
 	const toShutdown: PythonSession[] = [];
 	for (const session of [...sessions.values()]) {
 		if (!session.ownerIds.has(ownerId)) continue;
@@ -434,10 +346,7 @@ export async function disposeKernelSessionsByOwner(ownerId: string): Promise<voi
 	for (const session of toShutdown) {
 		if (sessions.get(session.sessionKey) === session) sessions.delete(session.sessionKey);
 	}
-	const [results] = await Promise.all([
-		Promise.allSettled(toShutdown.map(session => session.kernel.shutdown())),
-		Promise.allSettled(pendingShutdowns),
-	]);
+	const results = await Promise.allSettled(toShutdown.map(session => session.kernel.shutdown()));
 	for (let i = 0; i < toShutdown.length; i += 1) {
 		const session = toShutdown[i];
 		const result = results[i];
@@ -480,7 +389,7 @@ async function executeWithKernel(
 
 async function ensureKernelAvailable(cwd: string, options: PythonExecutorOptions): Promise<void> {
 	const availability = await waitForPromiseWithCancellation(
-		checkPythonKernelAvailability(cwd, options.interpreter, options.runtimeProfile),
+		checkPythonKernelAvailability(cwd, options.interpreter),
 		options,
 		PythonExecutionCancelledError,
 	);
@@ -514,7 +423,7 @@ async function executePerCall(code: string, cwd: string, options: PythonExecutor
 
 async function executeOnSession(code: string, cwd: string, options: PythonExecutorOptions): Promise<PythonResult> {
 	const sessionId = options.sessionId ?? `session:${cwd}`;
-	const sessionKey = buildSessionKey(sessionId, cwd, options.interpreter, options.runtimeProfile);
+	const sessionKey = buildSessionKey(sessionId, cwd, options.interpreter);
 	if (options.bridge && !options.bridgeSessionId) {
 		options.bridgeSessionId = sessionId;
 	}
