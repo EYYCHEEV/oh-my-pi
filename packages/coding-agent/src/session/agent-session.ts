@@ -6109,7 +6109,11 @@ export class AgentSession {
 				logger.warn("Failed to release owned browser tabs during dispose", { error: String(error) });
 			}
 		}
-		await shutdownTinyTitleClient();
+		// Tiny and Mnemopi workers are process-global singletons. Their lifetime
+		// follows the primary session that owns the process-global async manager;
+		// parked subagents and secondary in-process sessions must not kill workers
+		// still serving the primary session.
+		if (ownedAsyncManager) await shutdownTinyTitleClient();
 		this.#releasePowerAssertion();
 		// Clean up an empty session created by this session's /move so it doesn't accumulate.
 		await cleanupEmptyMoveSession(this.sessionManager, this.#movedFromEmptySessionFile);
@@ -6153,11 +6157,10 @@ export class AgentSession {
 		hindsightState?.dispose();
 		const mnemopiState = setMnemopiSessionState(this, undefined);
 		await mnemopiState?.dispose({ timeoutMs: options.mnemopiConsolidateTimeoutMs });
-		// Tear down the embeddings subprocess AFTER mnemopi state.dispose:
-		// consolidate-on-dispose may still call `embed()` to store the final
-		// memories, and that round-trips through the worker we are about to
-		// hard-kill (issue #3031).
-		await shutdownMnemopiEmbedClient();
+		// The primary process owner tears down the embeddings subprocess only
+		// AFTER its mnemopi state has finished consolidating; aliased subagent
+		// state disposal intentionally leaves this shared worker alive.
+		if (ownedAsyncManager) await shutdownMnemopiEmbedClient();
 		this.#disconnectFromAgent();
 		if (this.#unsubscribeAppendOnly) {
 			this.#unsubscribeAppendOnly();

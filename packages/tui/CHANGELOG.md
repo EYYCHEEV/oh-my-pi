@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Recovered terminal input after Bun surfaces a macOS `read` interruption (`EINTR`) by reopening the destroyed TTY stream and restoring its raw-mode input pipeline, including active shutdown-drain listeners; unrelated stream errors remain fatal.
+
 ## [16.4.7] - 2026-07-12
 
 ### Fixed
