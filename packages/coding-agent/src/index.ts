@@ -38,6 +38,14 @@ export * from "./modes/components";
 export * from "./modes/theme/theme";
 // SDK for programmatic usage
 export * from "./sdk";
+export type {
+	AgentKind,
+	AgentRef,
+	AgentRegistryListener,
+	AgentStatus,
+	RegistryEvent,
+} from "./registry/agent-registry";
+export { listRegisteredAgents, onAgentRegistryChange } from "./registry/agent-registry";
 export * from "./session/agent-session";
 // Auth and model registry
 export * from "./session/auth-storage";
