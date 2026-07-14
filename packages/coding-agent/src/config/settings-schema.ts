@@ -492,6 +492,9 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	extensions: { type: "array", default: EMPTY_STRING_ARRAY },
+	"requiredExtension.path": { type: "string", default: undefined },
+	"requiredExtension.id": { type: "string", default: undefined },
+	"requiredExtension.sha256": { type: "string", default: undefined },
 
 	enabledModels: { type: "array", default: EMPTY_STRING_ARRAY },
 

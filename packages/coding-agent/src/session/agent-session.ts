@@ -9447,13 +9447,11 @@ export class AgentSession {
 		}
 	}
 
-1: 	async #promptAgentInitiatedMessage(
+	async #promptAgentInitiatedMessage(
 		message: CustomMessage,
 		options?: { acceptTerminalEmptyStop?: boolean },
 	): Promise<void> {
 		const inFlightGeneration = this.#beginInFlight();
-2: 			this.#acceptTerminalEmptyStopForPrompt = false;
-			this.#endInFlight(inFlightGeneration);
 		try {
 			const acceptTerminalEmptyStop = options?.acceptTerminalEmptyStop === true;
 			if (acceptTerminalEmptyStop) {
@@ -9463,12 +9461,7 @@ export class AgentSession {
 			await this.agent.prompt(message);
 			await this.#waitForPostPromptRecovery();
 		} finally {
-1: 	async #promptAgentInitiatedMessage(
-		message: CustomMessage,
-		options?: { acceptTerminalEmptyStop?: boolean },
-	): Promise<void> {
-		const inFlightGeneration = this.#beginInFlight();
-2: 			this.#acceptTerminalEmptyStopForPrompt = false;
+			this.#acceptTerminalEmptyStopForPrompt = false;
 			this.#endInFlight(inFlightGeneration);
 		}
 	}
