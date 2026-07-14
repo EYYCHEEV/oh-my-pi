@@ -12,7 +12,7 @@
  * `enableMCP: false`, regardless of what `baseOptions` carries.
  */
 
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAcpSessionFactory } from "@oh-my-pi/pi-coding-agent/main";
@@ -72,6 +72,39 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 				await Bun.sleep(0);
 				await tempDir.remove();
 			}
+		}
+	});
+
+	it("closes its newly-created session manager when startup rejects", async () => {
+		const tempDir = TempDir.createSync("@pi-acp-gate-failure-");
+		let authStorage: AuthStorage | undefined;
+		try {
+			authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+			const modelRegistry = new ModelRegistry(authStorage);
+			let closeCalls = 0;
+			const factory = createAcpSessionFactory({
+				baseOptions: {},
+				settings: Settings.isolated(),
+				sessionDir: tempDir.join("sessions"),
+				authStorage,
+				modelRegistry,
+				parsedArgs: {},
+				rawArgs: [],
+				createSession: async options => {
+					if (!options.sessionManager) throw new Error("expected factory-owned manager");
+					vi.spyOn(options.sessionManager, "close").mockImplementation(async () => {
+						closeCalls++;
+					});
+					throw new Error("required extension gate rejected");
+				},
+			});
+
+			await expect(factory(tempDir.path())).rejects.toThrow("required extension gate rejected");
+			expect(closeCalls).toBe(1);
+		} finally {
+			authStorage?.close();
+			vi.restoreAllMocks();
+			await tempDir.remove();
 		}
 	});
 });
