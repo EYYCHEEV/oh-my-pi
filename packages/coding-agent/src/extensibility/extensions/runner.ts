@@ -14,6 +14,7 @@ import type { SessionManager } from "../../session/session-manager";
 import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
 import { ManagedTimers } from "./managed-timers";
 import { createExtensionModelQuery } from "./model-api";
+import type { RequiredExtensionHandlerSnapshot } from "./loader";
 import type {
 	AfterProviderResponseEvent,
 	AssistantThinkingRenderer,
@@ -223,6 +224,7 @@ const noOpUIContext: ExtensionUIContext = {
 };
 
 export class ExtensionRunner {
+	private readonly extensions: readonly Extension[];
 	#uiContext: ExtensionUIContext;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
 	#getModel: () => Model | undefined = () => undefined;
@@ -250,6 +252,7 @@ export class ExtensionRunner {
 	 * {@link MAX_PENDING_CREDENTIAL_DISABLED}; oldest entries are dropped under pressure.
 	 */
 	#pendingCredentialDisabled: CredentialDisabledEvent[] = [];
+	#requiredToolCallHandlers?: RequiredExtensionHandlerSnapshot;
 
 	/**
 	 * Timers scheduled by extensions through the sanctioned `ctx.setInterval` /
@@ -264,17 +267,27 @@ export class ExtensionRunner {
 	);
 
 	constructor(
-		private readonly extensions: Extension[],
+		extensions: readonly Extension[],
 		private readonly runtime: ExtensionRuntime,
 		private readonly cwd: string,
 		private readonly sessionManager: SessionManager,
 		private readonly modelRegistry: ModelRegistry,
 		getMemory?: () => MemoryRuntimeContext | undefined,
 		private readonly settings?: Settings,
-		private readonly localProtocolOptions?: LocalProtocolOptions,
+6: 		private readonly localProtocolOptions?: LocalProtocolOptions,
+		requiredHandlerSnapshot?: RequiredExtensionHandlerSnapshot,
+7: 			localProtocolOptions,
+			getRequiredExtensionHandlerSnapshot(extensionsResult),
 	) {
+		this.extensions = Object.freeze([...extensions]);
 		this.#uiContext = noOpUIContext;
 		this.#getMemoryFn = getMemory;
+		this.#requiredToolCallHandlers = requiredHandlerSnapshot
+			? {
+					extension: requiredHandlerSnapshot.extension,
+					handlers: Object.freeze([...requiredHandlerSnapshot.handlers]),
+				}
+			: undefined;
 	}
 
 	initialize(
@@ -491,7 +504,10 @@ export class ExtensionRunner {
 
 	hasHandlers(eventType: string): boolean {
 		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get(eventType);
+			const handlers =
+				eventType === "tool_call" && ext === this.#requiredToolCallHandlers?.extension
+					? this.#requiredToolCallHandlers.handlers
+					: ext.handlers.get(eventType);
 			if (handlers && handlers.length > 0) {
 				return true;
 			}
@@ -781,7 +797,10 @@ export class ExtensionRunner {
 		let result: ToolCallEventResult | undefined;
 
 		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get("tool_call");
+			const handlers =
+				ext === this.#requiredToolCallHandlers?.extension
+					? this.#requiredToolCallHandlers.handlers
+					: ext.handlers.get("tool_call");
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
