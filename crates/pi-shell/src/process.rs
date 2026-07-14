@@ -1,6 +1,6 @@
 //! Cross-platform process tree management.
 
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow};
 use parking_lot::Mutex;
@@ -1308,13 +1308,14 @@ pub struct Process {
 
 /// Strict process-group scope pinned by a live supervisor identity.
 ///
-/// Group signals are refused unless the original supervisor is still alive
-/// and still leads the captured group. This prevents a recycled pgid from
-/// receiving a signal after the owned group has disappeared.
+/// The sentinel is never signalled directly. Group members are pinned and
+/// signalled individually so sentinel validation and delivery cannot be split
+/// by a recycled process-group identifier.
 #[derive(Clone)]
 pub struct SupervisedProcessTree {
 	sentinel: Process,
 	pgid:     i32,
+	tracked:  Arc<Mutex<Vec<Process>>>,
 }
 
 impl SupervisedProcessTree {
@@ -1330,7 +1331,8 @@ impl SupervisedProcessTree {
 		#[cfg(target_os = "macos")]
 		{
 			let sentinel = Process::from_pid(pid)?;
-			(sentinel.group_id() == Some(pid)).then_some(Self { sentinel, pgid: pid })
+			(sentinel.group_id() == Some(pid))
+				.then_some(Self { sentinel, pgid: pid, tracked: Arc::new(Mutex::new(Vec::new())) })
 		}
 		#[cfg(not(target_os = "macos"))]
 		{
@@ -1346,7 +1348,7 @@ impl SupervisedProcessTree {
 		let mut elapsed = Duration::ZERO;
 		loop {
 			self.verify_sentinel()?;
-			if self.members()?.is_empty() {
+			if self.members()?.is_some_and(|members| members.is_empty()) {
 				return Ok(true);
 			}
 			let Some(sleep_for) = timeout.map_or(Some(poll_interval), |limit| {
@@ -1359,9 +1361,47 @@ impl SupervisedProcessTree {
 			elapsed += sleep_for;
 		}
 	}
+	/// Observe the old group after the sentinel performs the final group KILL.
+	///
+	/// This method never signals the numeric pgid. A recycled foreign group can
+	/// therefore only make cleanup fail closed by appearing non-empty.
+	pub async fn wait_for_absence_after_kill(
+		&self,
+		timeout: Duration,
+		ct: CancelToken,
+	) -> Result<bool> {
+		let poll_interval = Duration::from_millis(25);
+		let mut elapsed = Duration::ZERO;
+		loop {
+			ct.heartbeat()?;
+			for process in self.tracked.lock().iter() {
+				if process.status() == ProcessStatus::Running
+					&& process.group_id() != Some(self.pgid)
+				{
+					return Err(anyhow!(
+						"tracked supervised process {} escaped process group {}; cleanup cannot be proven",
+						process.pid(),
+						self.pgid
+					));
+				}
+			}
+			#[cfg(target_os = "macos")]
+			if platform::process_group_pids(self.pgid)?.is_empty() {
+				return Ok(true);
+			}
+			#[cfg(not(target_os = "macos"))]
+			return Ok(true);
+			if elapsed >= timeout {
+				return Ok(false);
+			}
+			let sleep_for = timeout.saturating_sub(elapsed).min(poll_interval);
+			tokio::time::sleep(sleep_for).await;
+			elapsed += sleep_for;
+		}
+	}
 
-	/// Signal the pinned group with TERM, then issue at most one group KILL
-	/// while the held supervisor identity is still valid.
+	/// Signal every identity-pinned member with TERM, then escalate remaining
+	/// members with KILL. The held sentinel is deliberately excluded.
 	pub async fn terminate(
 		&self,
 		graceful_ms: i32,
@@ -1369,7 +1409,7 @@ impl SupervisedProcessTree {
 		ct: CancelToken,
 	) -> Result<bool> {
 		ct.heartbeat()?;
-		self.signal_checked(TERM_SIGNAL)?;
+		self.signal_members(TERM_SIGNAL)?;
 		if graceful_ms >= 0
 			&& self
 				.wait_for_empty(Some(Duration::from_millis(graceful_ms as u64)), ct.clone())
@@ -1378,11 +1418,9 @@ impl SupervisedProcessTree {
 			return Ok(true);
 		}
 
-		// This is the one final group signal. It intentionally includes the
-		// sentinel. Afterward we only enumerate group membership; no identity
-		// check, pgid signal, or other operation can affect a reused group.
-		self.signal_checked(KILL_SIGNAL)?;
-		wait_for_group_absence(self.pgid, Duration::from_millis(u64::from(timeout_ms)), ct).await
+		self.signal_members(KILL_SIGNAL)?;
+		self.wait_for_empty(Some(Duration::from_millis(u64::from(timeout_ms))), ct)
+			.await
 	}
 
 	fn verify_sentinel(&self) -> Result<()> {
@@ -1394,52 +1432,101 @@ impl SupervisedProcessTree {
 		Err(anyhow!("supervised process-group identity {} is no longer held", self.pgid))
 	}
 
-	fn members(&self) -> Result<Vec<i32>> {
+	fn members(&self) -> Result<Option<Vec<Process>>> {
 		#[cfg(target_os = "macos")]
 		{
-			Ok(platform::process_group_pids(self.pgid)?
+			self.verify_sentinel()?;
+			let descendants = self
+				.sentinel
+				.inner
+				.descendants()
 				.into_iter()
-				.filter(|pid| *pid != self.sentinel.pid())
-				.collect())
+				.filter(|process| process.pid() != self.sentinel.pid())
+				.map(|inner| Process { inner })
+				.collect::<Vec<_>>();
+			self.merge_tracked(descendants);
+			self.validate_tracked()?;
+			let snapshot = platform::process_group_pids(self.pgid)?;
+			let mut members = Vec::with_capacity(snapshot.len());
+			for pid in snapshot.into_iter().filter(|pid| *pid != self.sentinel.pid()) {
+				let Some(process) = Process::from_pid(pid) else {
+					return Ok(None);
+				};
+				if process.status() != ProcessStatus::Running {
+					return Ok(None);
+				}
+				if process.group_id() != Some(self.pgid) {
+					self.merge_tracked(std::iter::once(process.clone()));
+					return Err(anyhow!(
+						"pinned supervised process {pid} no longer belongs to process group {}; cleanup cannot be proven",
+						self.pgid
+					));
+				}
+				members.push(process);
+			}
+
+			self.verify_sentinel()?;
+			self.merge_tracked(members.iter().cloned());
+			self.validate_tracked()?;
+			Ok(Some(members))
 		}
 		#[cfg(not(target_os = "macos"))]
 		{
-			Ok(Vec::new())
+			Ok(Some(Vec::new()))
 		}
 	}
 
-	fn signal_checked(&self, signal: i32) -> Result<()> {
-		self.verify_sentinel()?;
-		if kill_process_group(self.pgid, signal) {
+	fn merge_tracked(&self, processes: impl IntoIterator<Item = Process>) {
+		let mut tracked = self.tracked.lock();
+		for process in processes {
+			if tracked
+				.iter()
+				.any(|known| known.pid() == process.pid() && known.status() == ProcessStatus::Running)
+			{
+				continue;
+			}
+			tracked.push(process);
+		}
+	}
+
+	fn validate_tracked(&self) -> Result<()> {
+		for process in self.tracked.lock().iter() {
+			if process.status() == ProcessStatus::Running
+				&& process.group_id() != Some(self.pgid)
+			{
+				return Err(anyhow!(
+					"tracked supervised process {} escaped process group {}; cleanup cannot be proven",
+					process.pid(),
+					self.pgid
+				));
+			}
+		}
+		Ok(())
+	}
+
+	fn signal_members(&self, signal: i32) -> Result<()> {
+		for _ in 0..3 {
+			let Some(members) = self.members()? else {
+				continue;
+			};
+			for member in members {
+				self.verify_sentinel()?;
+				if !member.inner.kill(signal) && member.status() == ProcessStatus::Running {
+					return Err(anyhow!(
+						"failed to signal supervised process {} with signal {signal}",
+						member.pid()
+					));
+				}
+			}
 			return Ok(());
 		}
-		let error = std::io::Error::last_os_error();
 		Err(anyhow!(
-			"failed to signal supervised process group {} with signal {signal}: {error}",
+			"could not pin every member of supervised process group {}; refusing signal {signal}",
 			self.pgid
 		))
 	}
 }
 
-async fn wait_for_group_absence(pgid: i32, timeout: Duration, ct: CancelToken) -> Result<bool> {
-	let poll_interval = Duration::from_millis(25);
-	let mut elapsed = Duration::ZERO;
-	loop {
-		ct.heartbeat()?;
-		#[cfg(target_os = "macos")]
-		if platform::process_group_pids(pgid)?.is_empty() {
-			return Ok(true);
-		}
-		#[cfg(not(target_os = "macos"))]
-		return Ok(true);
-		if elapsed >= timeout {
-			return Ok(false);
-		}
-		let sleep_for = timeout.saturating_sub(elapsed).min(poll_interval);
-		tokio::time::sleep(sleep_for).await;
-		elapsed += sleep_for;
-	}
-}
 
 impl Process {
 	/// Open a stable process reference from a PID.
@@ -1999,10 +2086,14 @@ mod tests {
 			.process_group(0);
 		let mut foreign = foreign.spawn().expect("spawn foreign group");
 		let foreign_pgid = i32::try_from(foreign.id()).expect("foreign pid fits i32");
-		let stale = SupervisedProcessTree { sentinel: pinned, pgid: foreign_pgid };
+		let stale = SupervisedProcessTree {
+			sentinel: pinned,
+			pgid: foreign_pgid,
+			tracked: Arc::new(Mutex::new(Vec::new())),
+		};
 
 		assert!(
-			stale.signal_checked(TERM_SIGNAL).is_err(),
+			stale.members().is_err(),
 			"a dead pinned sentinel must prevent signaling a live foreign group"
 		);
 		assert!(

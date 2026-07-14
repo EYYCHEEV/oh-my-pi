@@ -138,6 +138,8 @@ export declare class SupervisedProcessTree {
   static fromSpawn(pid: number): SupervisedProcessTree | null
   /** Wait until the held group contains only the supervisor. */
   waitForEmpty(options?: ProcessWaitOptions | undefined | null): Promise<boolean>
+  /** Observe group absence after the held sentinel performs a final group KILL. */
+  waitForAbsenceAfterKill(options?: ProcessWaitOptions | undefined | null): Promise<boolean>
   /** TERM the held group and, if needed, issue one final group KILL. */
   terminate(options?: SupervisedProcessTreeTerminateOptions | undefined | null): Promise<boolean>
 }
