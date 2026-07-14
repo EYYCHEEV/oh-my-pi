@@ -274,10 +274,8 @@ export class ExtensionRunner {
 		private readonly modelRegistry: ModelRegistry,
 		getMemory?: () => MemoryRuntimeContext | undefined,
 		private readonly settings?: Settings,
-6: 		private readonly localProtocolOptions?: LocalProtocolOptions,
+		private readonly localProtocolOptions?: LocalProtocolOptions,
 		requiredHandlerSnapshot?: RequiredExtensionHandlerSnapshot,
-7: 			localProtocolOptions,
-			getRequiredExtensionHandlerSnapshot(extensionsResult),
 	) {
 		this.extensions = Object.freeze([...extensions]);
 		this.#uiContext = noOpUIContext;

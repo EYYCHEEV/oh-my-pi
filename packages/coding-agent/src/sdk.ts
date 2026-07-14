@@ -2323,9 +2323,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			modelRegistry,
 			() => (hasSession ? createSessionMemoryRuntimeContext(session, agentDir, cwd) : undefined),
 			settings,
-6: 		private readonly localProtocolOptions?: LocalProtocolOptions,
-		requiredHandlerSnapshot?: RequiredExtensionHandlerSnapshot,
-7: 			localProtocolOptions,
+			localProtocolOptions,
 			getRequiredExtensionHandlerSnapshot(extensionsResult),
 		);
 

@@ -1,6 +1,6 @@
 import { dlopen, FFIType, ptr } from "bun:ffi";
 import * as fs from "node:fs";
-4: import { ReadStream as TtyReadStream } from "node:tty";
+import { ReadStream as TtyReadStream } from "node:tty";
 import {
 	$env,
 	isBunTestRuntime,
@@ -10,11 +10,6 @@ import {
 	restoreTerminalStderr,
 	suppressTerminalStderr,
 } from "@oh-my-pi/pi-utils";
-5: 			// fd 2 may be redirected to the log while a TUI owns the terminal
-			// (stderr-guard); re-point it at the real terminal so the fatal
-			// report is visible. Terminal modes are restored moments later by
-			// the terminal-restore cleanup callback inside runCleanup().
-			restoreTerminalStderr();
 import { setKittyProtocolActive } from "./keys";
 import { StdinBuffer } from "./stdin-buffer";
 import {
