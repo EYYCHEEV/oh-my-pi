@@ -243,6 +243,25 @@ impl SupervisedProcessTree {
 		})
 	}
 
+	/// Observe group absence after the held sentinel performs a final group KILL.
+	#[napi]
+	pub fn wait_for_absence_after_kill<'env>(
+		&self,
+		env: &'env Env,
+		options: Option<ProcessWaitOptions<'env>>,
+	) -> Result<PromiseRaw<'env, bool>> {
+		let options = options.unwrap_or_default();
+		let timeout = Duration::from_millis(u64::from(options.timeout_ms.unwrap_or(5_000)));
+		let ct = task::CancelToken::new(None, options.signal);
+		let tree = self.inner.clone();
+		task::future(env, "supervised_process_tree.wait_for_absence_after_kill", async move {
+			tree
+				.wait_for_absence_after_kill(timeout, ct.into_core())
+				.await
+				.map_err(|err| napi::Error::from_reason(err.to_string()))
+		})
+	}
+
 	/// TERM the held group and, if needed, issue one final group KILL.
 	#[napi]
 	pub fn terminate<'env>(
