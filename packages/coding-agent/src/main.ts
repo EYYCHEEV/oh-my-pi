@@ -66,6 +66,7 @@ import {
 	createAgentSession,
 	discoverAuthStorage,
 	loadSessionExtensions,
+	requiredExtensionFromSettings,
 } from "./sdk";
 import type { AgentSession } from "./session/agent-session";
 import type { AuthStorage } from "./session/auth-storage";
@@ -1361,9 +1362,10 @@ export async function runRootCommand(
 		return result;
 	};
 
+	const hostRequiredExtension = requiredExtensionFromSettings(sessionOptions, settingsInstance);
 	if (mode === "acp") {
 		const createAcpSession = createAcpSessionFactory({
-			baseOptions: sessionOptions,
+			baseOptions: { ...sessionOptions, requiredExtension: hostRequiredExtension },
 			settings: settingsInstance,
 			sessionDir: parsedArgs.sessionDir,
 			authStorage,

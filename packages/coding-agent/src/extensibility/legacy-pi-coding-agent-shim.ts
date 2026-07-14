@@ -25,7 +25,7 @@ import type { CreateAgentSessionOptions, CreateAgentSessionResult, LoadExtension
 import {
 	discoverContextFiles,
 	discoverPromptTemplates,
-	discoverSessionExtensionPaths,
+	loadSessionExtensions,
 	discoverSkills,
 	createAgentSession as ompCreateAgentSession,
 } from "../sdk";
@@ -44,7 +44,7 @@ import { ReadTool } from "../tools/read";
 import { formatBytes } from "../tools/render-utils";
 import { WriteTool } from "../tools/write";
 import { EventBus } from "../utils/event-bus";
-import { loadExtensionFromFactory, loadExtensions } from "./extensions";
+import { getRequiredExtensionAttestation, loadExtensionFromFactory } from "./extensions";
 import { ExtensionRuntime } from "./extensions/loader";
 import type { ExtensionFactory, ToolDefinition } from "./extensions/types";
 import type { Skill } from "./skills";
@@ -933,20 +933,15 @@ export class DefaultResourceLoader implements ResourceLoader {
 	async #loadExtensions(settings: Settings): Promise<LoadExtensionsResult> {
 		const { cwd, noExtensions, additionalExtensionPaths, extensionFactories, eventBus } = this.#state;
 
-		if (noExtensions && additionalExtensionPaths.length === 0 && extensionFactories.length === 0) {
-			return { extensions: [], errors: [], runtime: new ExtensionRuntime() };
-		}
-
-		const paths = await discoverSessionExtensionPaths(
+		const result = await loadSessionExtensions(
 			{
 				disableExtensionDiscovery: noExtensions,
 				additionalExtensionPaths,
 			},
 			cwd,
 			settings,
+			eventBus,
 		);
-
-		const result = await loadExtensions(paths, cwd, eventBus);
 		for (let i = 0; i < extensionFactories.length; i++) {
 			const loaded = await loadExtensionFromFactory(
 				extensionFactories[i],
@@ -1171,6 +1166,10 @@ export async function createAgentSession(
 	// `noExtensions: true`.
 	if (rest.preloadedExtensions === undefined && rest.preloadedExtensionPaths === undefined) {
 		forwarded.preloadedExtensions = state.extensionsResult;
+	}
+	if (rest.requiredExtension === undefined) {
+		const requiredExtension = getRequiredExtensionAttestation(state.extensionsResult);
+		if (requiredExtension) forwarded.requiredExtension = requiredExtension;
 	}
 
 	if (rest.skills === undefined) {
