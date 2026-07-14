@@ -7,8 +7,9 @@
  * - Convenience helpers: captureText / execText, AbortSignal, timeouts.
  */
 
-import { Process } from "@oh-my-pi/pi-natives";
+import { SupervisedProcessTree as NativeSupervisedProcessTree, Process } from "@oh-my-pi/pi-natives";
 import type { Spawn, Subprocess } from "bun";
+import { BOUNDED_PROCESS_SUPERVISOR_SOURCE } from "../private/bounded-process-supervisor";
 
 type InMask = "pipe" | "ignore" | Buffer | Uint8Array | null;
 
@@ -345,6 +346,471 @@ export function spawn<In extends InMask = InMask>(cmd: string[], opts?: ChildSpa
 	if (signal) cp.attachSignal(signal);
 	if (timeout > 0) cp.attachTimeout(timeout);
 	return cp;
+}
+
+/** Strict retained-tree policy for bounded subprocesses. */
+export type BoundedTreePolicy = "required";
+
+/** Options for strict bounded subprocess capture. */
+export type BoundedSpawnOptions<In extends InMask = InMask> = Omit<
+	Spawn.SpawnOptions<In, "pipe", "pipe">,
+	"stdout" | "stderr" | "detached" | "timeout" | "onExit" | "signal" | "ipc"
+> & {
+	tree?: BoundedTreePolicy;
+	stdoutCap: number;
+	stderrCap: number;
+	signal?: AbortSignal;
+	overflowGracefulMs?: number;
+	overflowTimeoutMs?: number;
+};
+
+/** Options for waiting on a retained process tree. */
+export interface BoundedTreeWaitOptions {
+	timeoutMs?: number;
+	signal?: AbortSignal;
+}
+
+/** Options for terminating a retained process tree. */
+export interface BoundedTreeTerminateOptions extends BoundedTreeWaitOptions {
+	gracefulMs?: number;
+}
+
+/** One immutable result from the shared bounded-output capture. */
+export interface BoundedOutput {
+	stdout: Uint8Array;
+	stderr: Uint8Array;
+	stdoutOverflow: boolean;
+	stderrOverflow: boolean;
+	exitCode: number;
+}
+
+interface BoundedStreamResult {
+	bytes: Uint8Array;
+	overflow: boolean;
+}
+
+function validateCap(name: string, cap: number): void {
+	if (!Number.isSafeInteger(cap) || cap < 0) {
+		throw new RangeError(`${name} must be a finite nonnegative safe integer`);
+	}
+}
+
+function validateTimeout(name: string, value: number, minimum: number): void {
+	if (!Number.isSafeInteger(value) || value < minimum || value > 0xffff_ffff) {
+		throw new RangeError(`${name} must be a safe integer from ${minimum} through 4294967295`);
+	}
+}
+
+async function drainBounded(
+	stream: ReadableStream<Uint8Array>,
+	cap: number,
+	onOverflow: () => void,
+): Promise<BoundedStreamResult> {
+	const reader = stream.getReader();
+	const chunks: Uint8Array[] = [];
+	let retained = 0;
+	let overflow = false;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			const available = cap - retained;
+			if (available > 0) {
+				const take = Math.min(available, value.byteLength);
+				const chunk = new Uint8Array(take);
+				chunk.set(value.subarray(0, take));
+				chunks.push(chunk);
+				retained += take;
+			}
+			if (!overflow && value.byteLength > available) {
+				overflow = true;
+				onOverflow();
+			}
+		}
+	} finally {
+		reader.releaseLock();
+	}
+
+	if (chunks.length === 0) return { bytes: new Uint8Array(), overflow };
+	if (chunks.length === 1) return { bytes: chunks[0], overflow };
+	const bytes = new Uint8Array(retained);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return { bytes, overflow };
+}
+
+type SupervisorMessage =
+	| { type: "ready" }
+	| { type: "held" }
+	| { type: "started"; pid: number }
+	| { type: "target-exit"; code: number }
+	| { type: "target-error"; message: string };
+
+class SupervisorEvents {
+	readonly ready = Promise.withResolvers<void>();
+	readonly held = Promise.withResolvers<void>();
+	readonly started = Promise.withResolvers<number>();
+	readonly targetExit = Promise.withResolvers<number>();
+
+	onMessage(raw: unknown): void {
+		const message = raw as SupervisorMessage;
+		switch (message.type) {
+			case "ready":
+				this.ready.resolve();
+				break;
+			case "held":
+				this.held.resolve();
+				break;
+			case "started":
+				this.started.resolve(message.pid);
+				break;
+			case "target-exit":
+				this.targetExit.resolve(message.code);
+				break;
+			case "target-error":
+				this.targetExit.reject(new Error(message.message));
+				break;
+		}
+	}
+}
+
+/**
+ * A strict bounded subprocess. Streams are intentionally not exposed: both are
+ * drained exactly once into `output`. Supervision and native group mechanics
+ * remain private to this deep lifecycle interface.
+ */
+export class BoundedChildProcess {
+	readonly pid: number;
+	readonly exited: Promise<number>;
+	readonly output: Promise<BoundedOutput>;
+	#proc: PipedSubprocess;
+	#tree: NativeSupervisedProcessTree;
+	#events: SupervisorEvents;
+	#start: { cmd: string[]; options: Record<string, unknown> };
+	#cleanup: Promise<boolean> | undefined;
+	#cleanupMayCancel = false;
+	#cleanupResult: boolean | undefined;
+	#cleanupStarted = Promise.withResolvers<void>();
+	#completed = false;
+	#overflowGracefulMs: number;
+	#overflowTimeoutMs: number;
+
+	constructor(
+		proc: PipedSubprocess,
+		tree: NativeSupervisedProcessTree,
+		events: SupervisorEvents,
+		start: { cmd: string[]; options: Record<string, unknown> },
+		stdoutCap: number,
+		stderrCap: number,
+		overflowGracefulMs: number,
+		overflowTimeoutMs: number,
+		signal?: AbortSignal,
+	) {
+		this.pid = proc.pid;
+		this.#proc = proc;
+		this.#tree = tree;
+		this.#events = events;
+		this.#start = start;
+		this.#overflowGracefulMs = overflowGracefulMs;
+		this.#overflowTimeoutMs = overflowTimeoutMs;
+
+		const abortFailure = Promise.withResolvers<never>();
+		const normalExit = this.#completeNormally();
+		const exited = Promise.race([normalExit, abortFailure.promise]);
+		this.exited = exited;
+
+		const overflow = () => {
+			const cleanup = this.#beginMandatoryCleanup();
+			cleanup.then(
+				cleaned => {
+					if (!cleaned) {
+						abortFailure.reject(new Error("Timed out cleaning supervised process tree after output overflow"));
+					}
+				},
+				error => abortFailure.reject(error),
+			);
+		};
+		const stdout = drainBounded(proc.stdout, stdoutCap, overflow);
+		const stderr = drainBounded(proc.stderr, stderrCap, overflow);
+		this.output = (async () => {
+			const [stdoutResult, stderrResult] = await Promise.all([stdout, stderr]);
+			const exitCode = await exited;
+			return {
+				stdout: stdoutResult.bytes,
+				stderr: stderrResult.bytes,
+				stdoutOverflow: stdoutResult.overflow,
+				stderrOverflow: stderrResult.overflow,
+				exitCode,
+			};
+		})();
+
+		if (signal) {
+			const onAbort = () => {
+				this.#beginMandatoryCleanup().then(
+					cleaned => {
+						if (!cleaned) {
+							abortFailure.reject(new Error("Timed out cleaning supervised process tree after cancellation"));
+							return;
+						}
+						abortFailure.reject(
+							signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason ?? "aborted")),
+						);
+					},
+					error => abortFailure.reject(error),
+				);
+			};
+			signal.addEventListener("abort", onAbort, { once: true });
+			this.exited.then(
+				() => signal.removeEventListener("abort", onAbort),
+				() => signal.removeEventListener("abort", onAbort),
+			);
+		}
+	}
+
+	async #send(message: unknown): Promise<void> {
+		await Promise.resolve(this.#proc.send(message));
+	}
+	async #waitReady(): Promise<void> {
+		await Promise.race([
+			this.#events.ready.promise,
+			this.#proc.exited.then(code => {
+				throw new Error(`Process supervisor exited with code ${code} before startup handshake`);
+			}),
+		]);
+	}
+
+	async #release(): Promise<void> {
+		try {
+			await this.#send({ type: "release" });
+		} catch {
+			// A final group KILL terminates the sentinel before release by design.
+		}
+		await this.#proc.exited;
+		this.#completed = true;
+	}
+
+	async #completeNormally(): Promise<number> {
+		await this.#waitReady();
+		while (this.#cleanup) {
+			try {
+				if (await this.#cleanup) {
+					return await this.#proc.exited;
+				}
+			} catch {
+				// A caller-cancelled cleanup attempt is retryable while the held
+				// sentinel remains alive. It never proves an empty tree.
+			}
+		}
+		await this.#send({ type: "start", ...this.#start });
+
+		let exitCode: number;
+		while (true) {
+			const outcome = await Promise.race([
+				this.#events.targetExit.promise.then(
+					code => ({ type: "target" as const, code }),
+					error => ({
+						type: "target-error" as const,
+						error: error instanceof Error ? error : new Error(String(error)),
+					}),
+				),
+				this.#proc.exited.then(code => ({ type: "supervisor" as const, code })),
+				this.#cleanupStarted.promise.then(() => ({ type: "cleanup" as const })),
+			]);
+			if (outcome.type === "target") {
+				exitCode = outcome.code;
+				break;
+			}
+			if (outcome.type === "target-error") {
+				const cleaned = await this.#beginCleanup();
+				if (!cleaned) {
+					throw new AggregateError(
+						[outcome.error, new Error("Supervised process tree cleanup could not be proven")],
+						"Target startup failed and cleanup could not be proven",
+					);
+				}
+				throw outcome.error;
+			}
+			if (outcome.type === "supervisor") {
+				throw new Error(`Process supervisor exited with code ${outcome.code} before reporting target exit`);
+			}
+			const cleanup = this.#cleanup;
+			if (!cleanup) continue;
+			try {
+				if (await cleanup) {
+					return await Promise.race([this.#events.targetExit.promise, this.#proc.exited]);
+				}
+			} catch {
+				// Retry the target/supervisor race after a caller-cancelled
+				// cleanup. The cleanup promise resets without releasing sentinel.
+			}
+		}
+
+		while (true) {
+			const outcome = await Promise.race([
+				this.#tree.waitForEmpty().then(empty => ({ type: "empty" as const, empty })),
+				this.#proc.exited.then(code => ({ type: "supervisor" as const, code })),
+				this.#cleanupStarted.promise.then(() => ({ type: "cleanup" as const })),
+			]);
+			if (outcome.type === "supervisor") {
+				throw new Error(`Process supervisor exited with code ${outcome.code} before tree cleanup completed`);
+			}
+			if (outcome.type === "cleanup") {
+				const cleanup = this.#cleanup;
+				if (!cleanup) continue;
+				try {
+					if (await cleanup) {
+						return exitCode;
+					}
+				} catch {
+					// Keep observing the held group after a cancelled attempt.
+				}
+				continue;
+			}
+			if (!outcome.empty) throw new Error("Supervised process tree did not become empty");
+			if (this.#cleanup) continue;
+			await this.#release();
+			return exitCode;
+		}
+	}
+
+	#beginCleanup(options?: BoundedTreeTerminateOptions): Promise<boolean> {
+		if (options?.signal?.aborted) {
+			return Promise.reject(
+				options.signal.reason instanceof Error
+					? options.signal.reason
+					: new Error(String(options.signal.reason ?? "aborted")),
+			);
+		}
+		if (this.#cleanup) return this.#cleanup;
+		const gracefulMs = options?.gracefulMs ?? this.#overflowGracefulMs;
+		const timeoutMs = options?.timeoutMs ?? this.#overflowTimeoutMs;
+		const cleanup = (async () => {
+			await this.#waitReady();
+			await this.#send({ type: "hold" });
+			await this.#events.held.promise;
+			const cleaned = await this.#tree.terminate({ gracefulMs, timeoutMs, signal: options?.signal });
+			this.#cleanupResult = cleaned;
+			if (cleaned) {
+				await this.#release();
+			}
+			return cleaned;
+		})();
+		this.#cleanup = cleanup;
+		this.#cleanupMayCancel = options?.signal !== undefined;
+		this.#cleanupStarted.resolve();
+		cleanup.then(
+			cleaned => {
+				if (cleaned || this.#cleanup !== cleanup) return;
+				this.#cleanup = undefined;
+				this.#cleanupResult = undefined;
+				this.#cleanupMayCancel = false;
+				this.#cleanupStarted = Promise.withResolvers<void>();
+			},
+			() => {
+				if (this.#cleanup !== cleanup) return;
+				this.#cleanup = undefined;
+				this.#cleanupResult = undefined;
+				this.#cleanupMayCancel = false;
+				this.#cleanupStarted = Promise.withResolvers<void>();
+			},
+		);
+		return cleanup;
+	}
+
+	async #beginMandatoryCleanup(): Promise<boolean> {
+		const shared = this.#cleanup;
+		if (!shared || !this.#cleanupMayCancel) return await this.#beginCleanup();
+		try {
+			return await shared;
+		} catch {
+			// The rejection handler resets the cancelled shared attempt before
+			// this continuation runs. Retry without a caller cancellation token.
+			return await this.#beginCleanup();
+		}
+	}
+
+	async waitTree(options?: BoundedTreeWaitOptions): Promise<boolean> {
+		if (this.#completed) return this.#cleanupResult ?? true;
+		const started = await Promise.race([
+			this.#events.started.promise.then(() => true),
+			this.exited.then(() => false),
+		]);
+		if (!started) return this.#cleanupResult ?? true;
+		return await Promise.race([
+			this.#tree.waitForEmpty(options),
+			this.exited.then(() => this.#cleanupResult ?? true),
+		]);
+	}
+
+	terminateTree(options?: BoundedTreeTerminateOptions): Promise<boolean> {
+		return this.#beginCleanup(options);
+	}
+}
+
+/**
+ * Spawn with strict identity-pinned supervision and independently bounded
+ * binary stdout/stderr capture. The current proven implementation is macOS.
+ */
+export function spawnBounded<In extends InMask = InMask>(
+	cmd: string[],
+	opts: BoundedSpawnOptions<In>,
+): BoundedChildProcess {
+	const {
+		tree = "required",
+		stdoutCap,
+		stderrCap,
+		signal,
+		overflowGracefulMs = 100,
+		overflowTimeoutMs = 5_000,
+		...rest
+	} = opts;
+	if (tree !== "required") throw new RangeError("spawnBounded requires tree: 'required'");
+	validateCap("stdoutCap", stdoutCap);
+	validateCap("stderrCap", stderrCap);
+	validateTimeout("overflowGracefulMs", overflowGracefulMs, -1);
+	if (overflowGracefulMs > 0x7fff_ffff) {
+		throw new RangeError("overflowGracefulMs must fit a signed 32-bit millisecond duration");
+	}
+	validateTimeout("overflowTimeoutMs", overflowTimeoutMs, 0);
+	if (signal?.aborted) {
+		throw signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason ?? "aborted"));
+	}
+	if (!NativeSupervisedProcessTree.isSupported()) {
+		throw new Error("Strict supervised process-tree containment is unsupported on this platform");
+	}
+
+	const bunPath = Bun.which("bun");
+	if (!bunPath) {
+		throw new Error("Strict supervised process-tree containment requires the Bun executable");
+	}
+	const events = new SupervisorEvents();
+	const proc = Bun.spawn([bunPath, "--eval", BOUNDED_PROCESS_SUPERVISOR_SOURCE], {
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+		windowsHide: true,
+		detached: true,
+		ipc: message => events.onMessage(message),
+	});
+	const supervisedTree = NativeSupervisedProcessTree.fromSpawn(proc.pid);
+	if (!supervisedTree) {
+		proc.kill("SIGKILL");
+		throw new Error("Failed to pin supervised process-group identity before target spawn");
+	}
+	return new BoundedChildProcess(
+		proc,
+		supervisedTree,
+		events,
+		{ cmd, options: rest as Record<string, unknown> },
+		stdoutCap,
+		stderrCap,
+		overflowGracefulMs,
+		overflowTimeoutMs,
+		signal,
+	);
 }
 
 /** Options for exec. */

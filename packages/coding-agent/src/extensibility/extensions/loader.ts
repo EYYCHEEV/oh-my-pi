@@ -32,8 +32,8 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 	ExtensionFactory,
-	ExtensionRuntime as IExtensionRuntime,
 	ExtensionStatusSegmentDefinition,
+	ExtensionRuntime as IExtensionRuntime,
 	LoadExtensionsResult,
 	MessageRenderer,
 	ProviderConfig,
@@ -47,6 +47,108 @@ installLegacyPiSpecifierShim();
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 type LoadedExtensionModule = ExtensionFactory | { default?: ExtensionFactory };
 const statusSegmentIdsByRuntime = new WeakMap<IExtensionRuntime, Set<string>>();
+const requiredAttestations = new WeakMap<LoadExtensionsResult, RequiredExtensionAttestation>();
+const eventBusByExtension = new WeakMap<Extension, EventBus>();
+const disposedExtensions = new WeakSet<Extension>();
+
+interface RuntimeRegistrationSnapshot {
+	flagValues: Map<string, boolean | string>;
+	providerRegistrationCount: number;
+}
+
+interface RequiredExtensionAttestation {
+	spec: Readonly<RequiredExtensionSpec>;
+	extension: Extension;
+	runtime: IExtensionRuntime;
+	toolCallHandlers: object;
+}
+
+function snapshotRuntimeRegistrations(runtime: IExtensionRuntime): RuntimeRegistrationSnapshot {
+	return {
+		flagValues: new Map(runtime.flagValues),
+		providerRegistrationCount: runtime.pendingProviderRegistrations.length,
+	};
+}
+
+function restoreRuntimeRegistrations(runtime: IExtensionRuntime, snapshot: RuntimeRegistrationSnapshot): void {
+	runtime.flagValues.clear();
+	for (const [name, value] of snapshot.flagValues) runtime.flagValues.set(name, value);
+	runtime.pendingProviderRegistrations.splice(snapshot.providerRegistrationCount);
+}
+
+function disposeExtensionRegistrations(extension: Extension, runtime: IExtensionRuntime): void {
+	disposedExtensions.add(extension);
+	const registeredIds = statusSegmentIdsByRuntime.get(runtime);
+	for (const registration of extension.statusSegments?.values() ?? []) {
+		registeredIds?.delete(registration.definition.id);
+		registration.disposeUI?.();
+	}
+	extension.statusSegments?.clear();
+	eventBusByExtension.get(extension)?.disposeSubscriptions(extension);
+	eventBusByExtension.delete(extension);
+}
+
+function disposeLoadedExtensions(result: LoadExtensionsResult): void {
+	requiredAttestations.delete(result);
+	for (const extension of result.extensions) disposeExtensionRegistrations(extension, result.runtime);
+	result.runtime.flagValues.clear();
+	result.runtime.pendingProviderRegistrations.splice(0);
+}
+
+function hasMatchingRequiredAttestation(
+	attested: RequiredExtensionAttestation | undefined,
+	required: RequiredExtensionSpec,
+): boolean {
+	return (
+		attested !== undefined &&
+		!disposedExtensions.has(attested.extension) &&
+		attested.spec.path === required.path &&
+		attested.spec.extensionId === required.extensionId &&
+		attested.spec.expectedSha256 === required.expectedSha256
+	);
+}
+
+export interface RequiredExtensionSpec {
+	readonly path: string;
+	readonly extensionId: string;
+	readonly expectedSha256: string;
+}
+
+export type RequiredExtensionStartupFailure =
+	| "missing"
+	| "disabled"
+	| "hash-mismatch"
+	| "load-failed"
+	| "handler-missing";
+
+export function getRequiredExtensionAttestation(
+	result: LoadExtensionsResult,
+): Readonly<RequiredExtensionSpec> | undefined {
+	return requiredAttestations.get(result)?.spec;
+}
+
+function canonicalizeExtensionPath(extensionPath: string, cwd: string): string {
+	return path.resolve(resolvePath(extensionPath, cwd));
+}
+
+export class RequiredExtensionStartupError extends Error {
+	readonly name = "RequiredExtensionStartupError";
+
+	constructor(
+		readonly code: RequiredExtensionStartupFailure,
+		message: string,
+		readonly extensionPath?: string,
+	) {
+		super(message);
+	}
+}
+
+export type ExtensionLoadSource = { paths: readonly string[] } | { preloaded: LoadExtensionsResult };
+
+export interface RequiredExtensionLoadOptions {
+	required?: RequiredExtensionSpec;
+	disabledExtensionIds?: readonly string[];
+}
 
 function getExtensionFactory(module: LoadedExtensionModule): ExtensionFactory | null {
 	const candidate = typeof module === "function" ? module : module.default;
@@ -146,14 +248,19 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 		private readonly cwd: string,
 		public readonly events: EventBus,
 	) {}
+	private canRegister(): boolean {
+		return !disposedExtensions.has(this.extension);
+	}
 
 	on<F extends HandlerFn>(event: string, handler: F): void {
+		if (!this.canRegister()) return;
 		const list = this.extension.handlers.get(event) ?? [];
 		list.push(handler);
 		this.extension.handlers.set(event, list);
 	}
 
 	registerStatusSegment(definition: ExtensionStatusSegmentDefinition): () => void {
+		if (!this.canRegister()) return () => {};
 		if (ALL_SEGMENT_IDS.includes(definition.id as never)) {
 			throw new Error(`Status segment id "${definition.id}" is reserved by a built-in segment`);
 		}
@@ -185,19 +292,16 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 	}
 
 	rollbackStatusSegments(): void {
-		const registeredIds = statusSegmentIdsByRuntime.get(this.runtime);
-		for (const registration of this.extension.statusSegments?.values() ?? []) {
-			registeredIds?.delete(registration.definition.id);
-			registration.disposeUI?.();
-		}
-		this.extension.statusSegments?.clear();
+		disposeExtensionRegistrations(this.extension, this.runtime);
 	}
 
 	requestStatusLineRender(): void {
+		if (!this.canRegister()) return;
 		this.runtime.requestStatusLineRender();
 	}
 
 	registerTool<TParams extends TSchema = TSchema, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void {
+		if (!this.canRegister()) return;
 		this.extension.tools.set(tool.name, {
 			definition: tool,
 			extensionPath: this.extension.path,
@@ -212,10 +316,12 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 			handler: RegisteredCommand["handler"];
 		},
 	): void {
+		if (!this.canRegister()) return;
 		this.extension.commands.set(name, { name, ...options });
 	}
 
 	setLabel(label: string): void {
+		if (!this.canRegister()) return;
 		this.extension.label = label;
 	}
 
@@ -226,6 +332,7 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 			handler: (ctx: ExtensionContext) => Promise<void> | void;
 		},
 	): void {
+		if (!this.canRegister()) return;
 		this.extension.shortcuts.set(shortcut, { shortcut, extensionPath: this.extension.path, ...options });
 	}
 
@@ -233,6 +340,7 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 		name: string,
 		options: { description?: string; type: "boolean" | "string"; default?: boolean | string },
 	): void {
+		if (!this.canRegister()) return;
 		this.extension.flags.set(name, { name, extensionPath: this.extension.path, ...options });
 		if (options.default !== undefined) {
 			this.runtime.flagValues.set(name, options.default);
@@ -240,10 +348,12 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 	}
 
 	registerMessageRenderer<T>(customType: string, renderer: MessageRenderer<T>): void {
+		if (!this.canRegister()) return;
 		this.extension.messageRenderers.set(customType, renderer as MessageRenderer);
 	}
 
 	registerAssistantThinkingRenderer(renderer: AssistantThinkingRenderer): void {
+		if (!this.canRegister()) return;
 		this.extension.assistantThinkingRenderers.push(renderer);
 	}
 
@@ -311,6 +421,7 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 	}
 
 	registerProvider(name: string, config: ProviderConfig): void {
+		if (!this.canRegister()) return;
 		this.runtime.pendingProviderRegistrations.push({ name, config, sourceId: this.extension.path });
 	}
 }
@@ -339,27 +450,33 @@ async function loadExtension(
 	eventBus: EventBus,
 	runtime: IExtensionRuntime,
 ): Promise<{ extension: Extension | null; error: string | null }> {
-	const resolvedPath = resolvePath(extensionPath, cwd);
+	const resolvedPath = canonicalizeExtensionPath(extensionPath, cwd);
 	const extension = createExtension(extensionPath, resolvedPath);
+	eventBusByExtension.set(extension, eventBus);
 	const api = new ConcreteExtensionAPI(PiCodingAgent, extension, runtime, cwd, eventBus);
+	const runtimeSnapshot = snapshotRuntimeRegistrations(runtime);
 	try {
 		const module = (await withExitGuard(() => loadLegacyPiModule(resolvedPath))) as LoadedExtensionModule;
 		const factory = getExtensionFactory(module);
 
 		if (typeof factory !== "function") {
+			restoreRuntimeRegistrations(runtime, runtimeSnapshot);
 			return {
 				extension: null,
 				error: `Extension does not export a valid factory function: ${extensionPath}`,
 			};
 		}
 
-		await withExitGuard(async () => {
-			await factory(api);
-		});
+		await eventBus.runWithSubscriptionOwner(extension, () =>
+			withExitGuard(async () => {
+				await factory(api);
+			}),
+		);
 
 		return { extension, error: null };
 	} catch (err) {
 		api.rollbackStatusSegments();
+		restoreRuntimeRegistrations(runtime, runtimeSnapshot);
 		const message = err instanceof Error ? err.message : String(err);
 		return { extension: null, error: `Failed to load extension: ${message}` };
 	}
@@ -376,12 +493,240 @@ export async function loadExtensionFromFactory(
 	name = "<inline>",
 ): Promise<Extension> {
 	const extension = createExtension(name, name);
+	eventBusByExtension.set(extension, eventBus);
 	const api = new ConcreteExtensionAPI(PiCodingAgent, extension, runtime, cwd, eventBus);
+	const runtimeSnapshot = snapshotRuntimeRegistrations(runtime);
 	try {
-		await factory(api);
+		await eventBus.runWithSubscriptionOwner(extension, () => factory(api));
 		return extension;
 	} catch (error) {
 		api.rollbackStatusSegments();
+		restoreRuntimeRegistrations(runtime, runtimeSnapshot);
+		throw error;
+	}
+}
+
+function normalizeRequiredExtensionSpec(
+	required: RequiredExtensionSpec,
+	cwd: string,
+	disabledExtensionIds: readonly string[],
+): Readonly<RequiredExtensionSpec> {
+	if (required.path.trim().length === 0) {
+		throw new RequiredExtensionStartupError("missing", "Required extension path must not be empty");
+	}
+	const resolvedPath = canonicalizeExtensionPath(required.path, cwd);
+	if (required.extensionId.trim().length === 0) {
+		throw new RequiredExtensionStartupError("load-failed", "Required extension ID must not be empty", resolvedPath);
+	}
+	const expectedExtensionId = `extension-module:${getExtensionNameFromPath(resolvedPath)}`;
+	if (required.extensionId !== expectedExtensionId) {
+		throw new RequiredExtensionStartupError(
+			"load-failed",
+			`Required extension ID must match its exact path (${expectedExtensionId}): ${resolvedPath}`,
+			resolvedPath,
+		);
+	}
+	if (!/^[a-f0-9]{64}$/.test(required.expectedSha256)) {
+		throw new RequiredExtensionStartupError(
+			"hash-mismatch",
+			`Required extension SHA-256 must be exactly 64 lowercase hexadecimal characters: ${resolvedPath}`,
+			resolvedPath,
+		);
+	}
+	if (disabledExtensionIds.includes(required.extensionId)) {
+		throw new RequiredExtensionStartupError(
+			"disabled",
+			`Required extension is disabled: ${required.extensionId}`,
+			resolvedPath,
+		);
+	}
+	return Object.freeze({
+		path: resolvedPath,
+		extensionId: required.extensionId,
+		expectedSha256: required.expectedSha256,
+	});
+}
+
+async function verifyRequiredExtensionHash(
+	required: Readonly<RequiredExtensionSpec>,
+): Promise<Readonly<RequiredExtensionSpec>> {
+	const resolvedPath = required.path;
+
+	let bytes: Uint8Array;
+	try {
+		bytes = await Bun.file(resolvedPath).bytes();
+	} catch (error) {
+		if (isEnoent(error)) {
+			throw new RequiredExtensionStartupError(
+				"missing",
+				`Required extension is missing: ${resolvedPath}`,
+				resolvedPath,
+			);
+		}
+		throw new RequiredExtensionStartupError(
+			"load-failed",
+			`Failed to read required extension: ${error instanceof Error ? error.message : String(error)}`,
+			resolvedPath,
+		);
+	}
+	const actualSha256 = new Bun.SHA256().update(bytes).digest("hex");
+	if (actualSha256 !== required.expectedSha256) {
+		throw new RequiredExtensionStartupError(
+			"hash-mismatch",
+			`Required extension SHA-256 mismatch: ${resolvedPath}`,
+			resolvedPath,
+		);
+	}
+	return required;
+}
+
+function attestRequiredExtension(
+	result: LoadExtensionsResult,
+	required: RequiredExtensionSpec,
+	cwd: string,
+): Extension {
+	const failedLoad = result.errors.find(error => canonicalizeExtensionPath(error.path, cwd) === required.path);
+	if (failedLoad) {
+		throw new RequiredExtensionStartupError("load-failed", failedLoad.error, required.path);
+	}
+	const exactExtension = result.extensions.find(
+		extension => canonicalizeExtensionPath(extension.resolvedPath, cwd) === required.path,
+	);
+	if (!exactExtension) {
+		throw new RequiredExtensionStartupError(
+			"missing",
+			`Required extension did not load from the exact configured path: ${required.path}`,
+			required.path,
+		);
+	}
+	const handlers = exactExtension.handlers.get("tool_call");
+	if (!handlers?.some(handler => typeof handler === "function")) {
+		throw new RequiredExtensionStartupError(
+			"handler-missing",
+			`Required extension did not register a callable tool_call handler: ${required.path}`,
+			required.path,
+		);
+	}
+	return exactExtension;
+}
+
+async function loadExtensionPaths(
+	paths: readonly string[],
+	cwd: string,
+	eventBus?: EventBus,
+): Promise<LoadExtensionsResult> {
+	const extensions: Extension[] = [];
+	const errors: Array<{ path: string; error: string }> = [];
+	const resolvedEventBus = eventBus ?? new EventBus();
+	const runtime = new ExtensionRuntime();
+	const seen = new Set<string>();
+
+	for (const extPath of paths) {
+		const canonicalPath = canonicalizeExtensionPath(extPath, cwd);
+		if (seen.has(canonicalPath)) continue;
+		seen.add(canonicalPath);
+		const { extension, error } = await loadExtension(extPath, cwd, resolvedEventBus, runtime);
+
+		if (error) {
+			errors.push({ path: extPath, error });
+			continue;
+		}
+
+		if (extension) extensions.push(extension);
+	}
+
+	return {
+		extensions,
+		errors,
+		runtime,
+	};
+}
+
+export async function loadExtensionsWithRequiredAttestation(
+	source: ExtensionLoadSource,
+	cwd: string,
+	eventBus?: EventBus,
+	options: RequiredExtensionLoadOptions = {},
+): Promise<LoadExtensionsResult> {
+	const preloadedSource = "preloaded" in source ? source.preloaded : undefined;
+	const preloadedAttestation = preloadedSource ? requiredAttestations.get(preloadedSource) : undefined;
+	const sourceSnapshot: ExtensionLoadSource =
+		"paths" in source
+			? { paths: [...source.paths] }
+			: {
+					preloaded: {
+						...source.preloaded,
+						extensions: [...source.preloaded.extensions],
+						errors: [...source.preloaded.errors],
+					},
+				};
+	const requiredInput = options.required;
+	if (!requiredInput) {
+		return "paths" in sourceSnapshot
+			? loadExtensionPaths(sourceSnapshot.paths, cwd, eventBus)
+			: sourceSnapshot.preloaded;
+	}
+	const disabledExtensionIds = [...(options.disabledExtensionIds ?? [])];
+
+	let loadedResult: LoadExtensionsResult | undefined;
+	try {
+		const required = normalizeRequiredExtensionSpec(requiredInput, cwd, disabledExtensionIds);
+		const hashedRequired = await verifyRequiredExtensionHash(required);
+		if (
+			"paths" in sourceSnapshot &&
+			!sourceSnapshot.paths.some(
+				extensionPath => canonicalizeExtensionPath(extensionPath, cwd) === hashedRequired.path,
+			)
+		) {
+			throw new RequiredExtensionStartupError(
+				"missing",
+				`Required extension path is not present in the extension load set: ${hashedRequired.path}`,
+				hashedRequired.path,
+			);
+		}
+		if ("preloaded" in sourceSnapshot && !hasMatchingRequiredAttestation(preloadedAttestation, hashedRequired)) {
+			throw new RequiredExtensionStartupError(
+				"load-failed",
+				`Preloaded required extension lacks matching loader attestation: ${hashedRequired.path}`,
+				hashedRequired.path,
+			);
+		}
+		loadedResult =
+			"paths" in sourceSnapshot
+				? await loadExtensionPaths(sourceSnapshot.paths, cwd, eventBus)
+				: sourceSnapshot.preloaded;
+		if ("paths" in sourceSnapshot) await verifyRequiredExtensionHash(hashedRequired);
+		const exactExtension = attestRequiredExtension(loadedResult, hashedRequired, cwd);
+		const toolCallHandlers = exactExtension.handlers.get("tool_call")!;
+		if (
+			"preloaded" in sourceSnapshot &&
+			(preloadedAttestation?.extension !== exactExtension ||
+				preloadedAttestation.runtime !== loadedResult.runtime ||
+				preloadedAttestation.toolCallHandlers !== toolCallHandlers)
+		) {
+			throw new RequiredExtensionStartupError(
+				"load-failed",
+				`Preloaded required extension provenance does not match its loader attestation: ${hashedRequired.path}`,
+				hashedRequired.path,
+			);
+		}
+		Object.freeze(toolCallHandlers);
+		requiredAttestations.set(loadedResult, {
+			spec: Object.freeze({ ...hashedRequired }),
+			extension: exactExtension,
+			runtime: loadedResult.runtime,
+			toolCallHandlers,
+		});
+		return loadedResult;
+	} catch (error) {
+		const resultToDispose = loadedResult ?? ("preloaded" in sourceSnapshot ? sourceSnapshot.preloaded : undefined);
+		if (preloadedAttestation) {
+			disposeExtensionRegistrations(preloadedAttestation.extension, preloadedAttestation.runtime);
+			preloadedAttestation.runtime.flagValues.clear();
+			preloadedAttestation.runtime.pendingProviderRegistrations.splice(0);
+		}
+		if (resultToDispose) disposeLoadedExtensions(resultToDispose);
+		if (preloadedSource) requiredAttestations.delete(preloadedSource);
 		throw error;
 	}
 }
@@ -390,29 +735,7 @@ export async function loadExtensionFromFactory(
  * Load extensions from paths.
  */
 export async function loadExtensions(paths: string[], cwd: string, eventBus?: EventBus): Promise<LoadExtensionsResult> {
-	const extensions: Extension[] = [];
-	const errors: Array<{ path: string; error: string }> = [];
-	const resolvedEventBus = eventBus ?? new EventBus();
-	const runtime = new ExtensionRuntime();
-
-	for (const extPath of paths) {
-		const { extension, error } = await loadExtension(extPath, cwd, resolvedEventBus, runtime);
-
-		if (error) {
-			errors.push({ path: extPath, error });
-			continue;
-		}
-
-		if (extension) {
-			extensions.push(extension);
-		}
-	}
-
-	return {
-		extensions,
-		errors,
-		runtime,
-	};
+	return loadExtensionsWithRequiredAttestation({ paths }, cwd, eventBus);
 }
 
 interface ExtensionManifest {

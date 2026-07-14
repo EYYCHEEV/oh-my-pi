@@ -69,9 +69,11 @@ import {
 	ExtensionRunner,
 	ExtensionToolWrapper,
 	type ExtensionUIContext,
+	getRequiredExtensionAttestation,
 	type LoadExtensionsResult,
 	loadExtensionFromFactory,
-	loadExtensions,
+	loadExtensionsWithRequiredAttestation,
+	type RequiredExtensionSpec,
 	type ToolDefinition,
 	wrapRegisteredTools,
 } from "./extensibility/extensions";
@@ -470,6 +472,11 @@ export interface CreateAgentSessionOptions {
 	 */
 	preloadedExtensionPaths?: string[];
 	/**
+	 * Extension that must be hash-attested and register its own callable
+	 * `tool_call` handler before this session can activate tools.
+	 */
+	requiredExtension?: RequiredExtensionSpec;
+	/**
 	 * Pre-discovered custom-tool source paths from `.omp/tools/`, `.claude/tools/`,
 	 * plugins, etc. When provided, the filesystem-scan inside
 	 * `discoverCustomToolPaths()` is skipped — subagents inherit the parent's
@@ -678,6 +685,22 @@ export async function discoverExtensions(cwd?: string): Promise<LoadExtensionsRe
 	return discoverAndLoadExtensions([], resolvedCwd);
 }
 
+function requiredExtensionFromSettings(
+	options: Pick<CreateAgentSessionOptions, "requiredExtension">,
+	settings: Settings,
+): RequiredExtensionSpec | undefined {
+	if (options.requiredExtension) return options.requiredExtension;
+	const extensionPath = settings.get("requiredExtension.path");
+	const extensionId = settings.get("requiredExtension.id");
+	const expectedSha256 = settings.get("requiredExtension.sha256");
+	if (extensionPath === undefined && extensionId === undefined && expectedSha256 === undefined) return undefined;
+	return {
+		path: extensionPath ?? "",
+		extensionId: extensionId ?? "",
+		expectedSha256: expectedSha256 ?? "",
+	};
+}
+
 /**
  * Path-only counterpart of {@link loadSessionExtensions}: the FS-heavy scan
  * without the per-session module load. Subagents reuse the parent's path list
@@ -708,13 +731,19 @@ export async function discoverSessionExtensionPaths(
  * repeated. Keep this the single source of the discovery branch logic.
  */
 export async function loadSessionExtensions(
-	options: Pick<CreateAgentSessionOptions, "disableExtensionDiscovery" | "additionalExtensionPaths">,
+	options: Pick<
+		CreateAgentSessionOptions,
+		"disableExtensionDiscovery" | "additionalExtensionPaths" | "requiredExtension"
+	>,
 	cwd: string,
 	settings: Settings,
 	eventBus: EventBus,
 ): Promise<LoadExtensionsResult> {
 	const paths = await discoverSessionExtensionPaths(options, cwd, settings);
-	const result = await logger.time("loadExtensions", loadExtensions, paths, cwd, eventBus);
+	const result = await logger.time("loadExtensions", loadExtensionsWithRequiredAttestation, { paths }, cwd, eventBus, {
+		required: requiredExtensionFromSettings(options, settings),
+		disabledExtensionIds: settings.get("disabledExtensions") ?? [],
+	});
 	for (const { path, error } of result.errors) {
 		logger.error("Failed to load extension", { path, error });
 	}
@@ -1152,6 +1181,58 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		options.settingsManager ??
 		logger.time("settings", Settings.init, { cwd, agentDir }));
 	logger.time("initializeWithSettings", initializeWithSettings, settings);
+	const requiredExtension = requiredExtensionFromSettings(options, settings);
+	const requiredExtensionOptions = {
+		required: requiredExtension,
+		disabledExtensionIds: settings.get("disabledExtensions") ?? [],
+	};
+	let extensionPaths: string[];
+	let extensionsResult: LoadExtensionsResult;
+	try {
+		if (options.preloadedExtensions) {
+			extensionsResult = await logger.time(
+				"attestPreloadedExtensions",
+				loadExtensionsWithRequiredAttestation,
+				{ preloaded: options.preloadedExtensions },
+				cwd,
+				eventBus,
+				requiredExtensionOptions,
+			);
+			extensionPaths = extensionsResult.extensions
+				.map(extension => extension.resolvedPath)
+				.filter(extensionPath => !extensionPath.startsWith("<inline"));
+		} else if (options.preloadedExtensionPaths) {
+			extensionPaths = [...options.preloadedExtensionPaths];
+			extensionsResult = await logger.time(
+				"loadExtensions",
+				loadExtensionsWithRequiredAttestation,
+				{ paths: extensionPaths },
+				cwd,
+				eventBus,
+				requiredExtensionOptions,
+			);
+		} else {
+			extensionPaths = await logger.time("discoverSessionExtensionPaths", () =>
+				discoverSessionExtensionPaths(options, cwd, settings),
+			);
+			extensionsResult = await logger.time(
+				"loadExtensions",
+				loadExtensionsWithRequiredAttestation,
+				{ paths: extensionPaths },
+				cwd,
+				eventBus,
+				requiredExtensionOptions,
+			);
+		}
+		for (const { path, error } of extensionsResult.errors) {
+			logger.error("Failed to load extension", { path, error });
+		}
+	} catch (error) {
+		unsubscribeCredentialDisabled?.();
+		if (ownsAuthStorage) authStorage.close();
+		throw error;
+	}
+	const attestedRequiredExtension = getRequiredExtensionAttestation(extensionsResult);
 	if (!options.modelRegistry) {
 		modelRegistry.refreshInBackground();
 	}
@@ -1577,6 +1658,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			skills,
 			rules: allRules,
 			eventBus,
+			requiredExtension: attestedRequiredExtension,
 			outputSchema: options.outputSchema,
 			requireYieldTool: options.requireYieldTool,
 			taskDepth: options.taskDepth ?? 0,
@@ -1861,47 +1943,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			inlineExtensions.push(createCustomToolsExtension(customTools));
 		}
 
-		// Load extensions. Three paths:
-		//   1. `preloadedExtensions` (CLI): caller already loaded — reuse the
-		//      Extension instances. Shallow-clone `extensions` so the inline
-		//      push below cannot mutate the caller's array. `runtime` is shared
-		//      so flag values set pre-creation flow into the live session.
-		//   2. `preloadedExtensionPaths` (subagent): caller resolved paths;
-		//      skip the FS scan but always re-call `loadExtensions` here so
-		//      each `Extension` binds to THIS session's `ExtensionAPI`
-		//      (cwd, eventBus, runtime).
-		//   3. No preload: run the full session discovery.
-		// `disableExtensionDiscovery` is honored implicitly: a caller that set
-		// the flag and pre-resolved the result already reflects that choice.
-		let extensionPaths: string[];
-		let extensionsResult: LoadExtensionsResult;
-		if (options.preloadedExtensions) {
-			extensionsResult = {
-				...options.preloadedExtensions,
-				extensions: [...options.preloadedExtensions.extensions],
-			};
-			// Capture paths for downstream forwarding; filter inline-factory
-			// entries (`<inline-N>`) — those are per-session, not source paths.
-			extensionPaths = extensionsResult.extensions
-				.map(ext => ext.resolvedPath)
-				.filter(p => !p.startsWith("<inline"));
-		} else if (options.preloadedExtensionPaths) {
-			extensionPaths = options.preloadedExtensionPaths;
-			extensionsResult = await logger.time("loadExtensions", loadExtensions, extensionPaths, cwd, eventBus);
-			for (const { path, error } of extensionsResult.errors) {
-				logger.error("Failed to load extension", { path, error });
-			}
-		} else {
-			extensionPaths = await logger.time("discoverSessionExtensionPaths", () =>
-				discoverSessionExtensionPaths(options, cwd, settings),
-			);
-			extensionsResult = await logger.time("loadExtensions", loadExtensions, extensionPaths, cwd, eventBus);
-			for (const { path, error } of extensionsResult.errors) {
-				logger.error("Failed to load extension", { path, error });
-			}
-		}
-		// Forward the source-path list (NOT the loaded instances) so subagents
-		// rebuild their own session-scoped extensions.
+		// File-backed extensions were loaded and, when required, attested before
+		// any tool factory, MCP connection, registry activation, or Agent construction.
+		// Forward only their canonical source paths so descendants re-bind fresh instances.
 		toolSession.extensionPaths = extensionPaths;
 
 		// Load inline extensions from factories

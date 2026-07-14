@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
+import type { RequiredExtensionSpec } from "../extensibility/extensions/loader";
 import { MCPManager } from "../mcp/manager";
 import type { PersistedSubagentReviverFactory } from "../registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
@@ -24,6 +25,10 @@ export interface PersistedSubagentReviveContext {
 	settings: Settings;
 	/** LSP policy of the top-level session; revived subagents inherit it rather than defaulting on. */
 	enableLsp: boolean;
+	/** Required extension contract from the top-level startup. */
+	requiredExtension?: RequiredExtensionSpec;
+	/** Canonical loader-produced paths reloaded into every cold-revived child. */
+	extensionPaths?: readonly string[];
 }
 
 /**
@@ -83,33 +88,41 @@ export function createPersistedSubagentReviverFactory(
 			// re-discovery), exactly as the executor does for live subagents.
 			const mcpManager = MCPManager.instance();
 			const mcpProxyTools = mcpManager ? createMCPProxyTools(mcpManager) : [];
-			const { session } = await createAgentSession({
-				cwd: ctx.session.sessionManager.getCwd(),
-				authStorage: ctx.authStorage,
-				modelRegistry: ctx.modelRegistry,
-				settings: createSubagentSettings(
-					ctx.settings,
-					init.readSummarize === false ? { "read.summarize.enabled": false } : undefined,
-				),
-				sessionManager: reopened,
-				agentId: ref.id,
-				agentDisplayName: ref.displayName,
-				parentTaskPrefix: ref.id,
-				parentAgentId: ref.parentId,
-				taskDepth,
-				toolNames: init.tools,
-				outputSchema: init.outputSchema,
-				requireYieldTool: true,
-				systemPrompt: () => [init.systemPrompt],
-				// Old files predate persisted spawns: deny re-spawning rather than let
-				// createAgentSession default to wildcard ("*").
-				spawns: init.spawns ?? "",
-				hasUI: false,
-				enableLsp: ctx.enableLsp,
-				enableMCP: !mcpManager,
-				mcpManager,
-				customTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,
-			});
+			let session: AgentSession;
+			try {
+				({ session } = await createAgentSession({
+					cwd: ctx.session.sessionManager.getCwd(),
+					authStorage: ctx.authStorage,
+					modelRegistry: ctx.modelRegistry,
+					settings: createSubagentSettings(
+						ctx.settings,
+						init.readSummarize === false ? { "read.summarize.enabled": false } : undefined,
+					),
+					sessionManager: reopened,
+					agentId: ref.id,
+					agentDisplayName: ref.displayName,
+					parentTaskPrefix: ref.id,
+					parentAgentId: ref.parentId,
+					taskDepth,
+					toolNames: init.tools,
+					outputSchema: init.outputSchema,
+					requireYieldTool: true,
+					requiredExtension: ctx.requiredExtension,
+					preloadedExtensionPaths: ctx.extensionPaths ? [...ctx.extensionPaths] : undefined,
+					systemPrompt: () => [init.systemPrompt],
+					// Old files predate persisted spawns: deny re-spawning rather than let
+					// createAgentSession default to wildcard ("*").
+					spawns: init.spawns ?? "",
+					hasUI: false,
+					enableLsp: ctx.enableLsp,
+					enableMCP: !mcpManager,
+					mcpManager,
+					customTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,
+				}));
+			} catch (error) {
+				await reopened.close();
+				throw error;
+			}
 			// Clamp the active set to the persisted list: createAgentSession's
 			// `alwaysInclude` can re-add non-defaultInactive extension/custom tools
 			// the original run didn't carry. Unknown/missing names are ignored.
