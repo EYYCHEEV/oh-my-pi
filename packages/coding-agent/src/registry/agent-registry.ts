@@ -50,7 +50,7 @@ export type RegistryEvent =
 	| { type: "status_changed"; ref: AgentRef }
 	| { type: "removed"; ref: AgentRef };
 
-type RegistryListener = (event: RegistryEvent) => void;
+export type AgentRegistryListener = (event: RegistryEvent) => void;
 
 export interface RegisterInput {
 	id: string;
@@ -78,7 +78,7 @@ export class AgentRegistry {
 	}
 
 	readonly #refs = new Map<string, AgentRef>();
-	readonly #listeners = new Set<RegistryListener>();
+	readonly #listeners = new Set<AgentRegistryListener>();
 
 	register(input: RegisterInput): AgentRef {
 		const now = Date.now();
@@ -173,7 +173,7 @@ export class AgentRegistry {
 		);
 	}
 
-	onChange(listener: RegistryListener): () => void {
+	onChange(listener: AgentRegistryListener): () => void {
 		this.#listeners.add(listener);
 		return () => this.#listeners.delete(listener);
 	}
@@ -187,4 +187,12 @@ export class AgentRegistry {
 			}
 		}
 	}
+}
+
+export function listRegisteredAgents(): AgentRef[] {
+	return AgentRegistry.global().list();
+}
+
+export function onAgentRegistryChange(listener: AgentRegistryListener): () => void {
+	return AgentRegistry.global().onChange(listener);
 }
