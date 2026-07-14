@@ -6,6 +6,7 @@ export type { SlashCommandInfo, SlashCommandLocation, SlashCommandSource } from 
 export type {
 	ExtensionLoadSource,
 	RequiredExtensionLoadOptions,
+	RequiredExtensionHandlerSnapshot,
 	RequiredExtensionSpec,
 	RequiredExtensionStartupFailure,
 } from "./loader";
@@ -13,7 +14,9 @@ export {
 	discoverAndLoadExtensions,
 	discoverExtensionPaths,
 	ExtensionRuntimeNotInitializedError,
+	disposeLoadedExtensions,
 	getRequiredExtensionAttestation,
+	getRequiredExtensionHandlerSnapshot,
 	loadExtensionFromFactory,
 	loadExtensions,
 	loadExtensionsWithRequiredAttestation,

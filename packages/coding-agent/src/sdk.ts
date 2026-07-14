@@ -79,7 +79,9 @@ import {
 	ExtensionRunner,
 	ExtensionToolWrapper,
 	type ExtensionUIContext,
+	disposeLoadedExtensions,
 	getRequiredExtensionAttestation,
+	getRequiredExtensionHandlerSnapshot,
 	type LoadExtensionsResult,
 	loadExtensionFromFactory,
 	loadExtensionsWithRequiredAttestation,
@@ -682,20 +684,20 @@ export async function discoverExtensions(cwd?: string): Promise<LoadExtensionsRe
 	return discoverAndLoadExtensions([], resolvedCwd);
 }
 
-function requiredExtensionFromSettings(
+export function requiredExtensionFromSettings(
 	options: Pick<CreateAgentSessionOptions, "requiredExtension">,
 	settings: Settings,
-): RequiredExtensionSpec | undefined {
-	if (options.requiredExtension) return options.requiredExtension;
-	const extensionPath = settings.get("requiredExtension.path");
-	const extensionId = settings.get("requiredExtension.id");
-	const expectedSha256 = settings.get("requiredExtension.sha256");
+): Readonly<RequiredExtensionSpec> | undefined {
+	if (options.requiredExtension) return Object.freeze({ ...options.requiredExtension });
+	const extensionPath = settings.getHost("requiredExtension.path");
+	const extensionId = settings.getHost("requiredExtension.id");
+	const expectedSha256 = settings.getHost("requiredExtension.sha256");
 	if (extensionPath === undefined && extensionId === undefined && expectedSha256 === undefined) return undefined;
-	return {
+	return Object.freeze({
 		path: extensionPath ?? "",
 		extensionId: extensionId ?? "",
 		expectedSha256: expectedSha256 ?? "",
-	};
+	});
 }
 
 /**
@@ -706,18 +708,25 @@ function requiredExtensionFromSettings(
  * runtime) is its own.
  */
 export async function discoverSessionExtensionPaths(
-	options: Pick<CreateAgentSessionOptions, "disableExtensionDiscovery" | "additionalExtensionPaths">,
+	options: Pick<
+		CreateAgentSessionOptions,
+		"disableExtensionDiscovery" | "additionalExtensionPaths" | "requiredExtension"
+	>,
 	cwd: string,
 	settings: Settings,
 ): Promise<string[]> {
-	if (options.disableExtensionDiscovery) {
-		return options.additionalExtensionPaths ?? [];
+	const requiredExtension = requiredExtensionFromSettings(options, settings);
+	const configuredPaths = [...(options.additionalExtensionPaths ?? [])];
+	if (!options.disableExtensionDiscovery) {
+		configuredPaths.push(...(settings.get("extensions") ?? []));
+		const discovered = await discoverExtensionPaths(configuredPaths, cwd, settings.get("disabledExtensions") ?? []);
+		if (requiredExtension) discovered.push(requiredExtension.path);
+		return discovered;
 	}
-	const configuredPaths = [...(options.additionalExtensionPaths ?? []), ...(settings.get("extensions") ?? [])];
-	const disabledExtensionIds = settings.get("disabledExtensions") ?? [];
-	return discoverExtensionPaths(configuredPaths, cwd, disabledExtensionIds);
-}
+	if (requiredExtension) configuredPaths.push(requiredExtension.path);
+	return configuredPaths;
 
+}
 /**
  * Load the discovered/configured extensions for a session — everything {@link
  * createAgentSession} would load except the inline factory extensions it appends
@@ -736,10 +745,13 @@ export async function loadSessionExtensions(
 	settings: Settings,
 	eventBus: EventBus,
 ): Promise<LoadExtensionsResult> {
-	const paths = await discoverSessionExtensionPaths(options, cwd, settings);
+	const requiredExtension = requiredExtensionFromSettings(options, settings);
+	const paths = await discoverSessionExtensionPaths({ ...options, requiredExtension }, cwd, settings);
 	const result = await logger.time("loadExtensions", loadExtensionsWithRequiredAttestation, { paths }, cwd, eventBus, {
-		required: requiredExtensionFromSettings(options, settings),
-		disabledExtensionIds: settings.get("disabledExtensions") ?? [],
+		required: requiredExtension,
+		disabledExtensionIds: requiredExtension
+			? (settings.getHost("disabledExtensions") ?? [])
+			: (settings.get("disabledExtensions") ?? []),
 	});
 	for (const { path, error } of result.errors) {
 		logger.error("Failed to load extension", { path, error });
@@ -762,7 +774,10 @@ export async function loadCliExtensionProviders(
 	modelRegistry: ModelRegistry,
 	settings: Settings,
 	cwd: string,
-	options: Pick<CreateAgentSessionOptions, "disableExtensionDiscovery" | "additionalExtensionPaths"> = {},
+	options: Pick<
+		CreateAgentSessionOptions,
+		"disableExtensionDiscovery" | "additionalExtensionPaths" | "requiredExtension"
+	> = {},
 ): Promise<void> {
 	const eventBus = new EventBus();
 	const extensionsResult = await loadSessionExtensions(options, cwd, settings, eventBus);
@@ -1225,6 +1240,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const cwd = options.cwd ?? getProjectDir();
 	const agentDir = options.agentDir ?? getAgentDir();
 	const eventBus = options.eventBus ?? new EventBus();
+	const priorMcpManagerInstance = MCPManager.instance();
 
 	registerSshCleanup();
 	registerEvalCleanup();
@@ -1266,7 +1282,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const requiredExtension = restrictToolNames ? undefined : requiredExtensionFromSettings(options, settings);
 	const requiredExtensionOptions = {
 		required: requiredExtension,
-		disabledExtensionIds: settings.get("disabledExtensions") ?? [],
+		disabledExtensionIds: requiredExtension
+			? (settings.getHost("disabledExtensions") ?? [])
+			: (settings.get("disabledExtensions") ?? []),
 	};
 	let extensionPaths: string[];
 	let extensionsResult: LoadExtensionsResult;
@@ -1392,6 +1410,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 
 	const imageProvider = settings.get("providers.image");
+	const ownsSessionManager = !options.sessionManager;
 	if (isImageProviderPreference(imageProvider)) {
 		setPreferredImageProvider(imageProvider);
 	}
@@ -1647,6 +1666,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			advisorConfigsPromise,
 		]);
 
+	let mcpManager: MCPManager | undefined = options.mcpManager;
 	let agent: Agent;
 	let session!: AgentSession;
 	let hasSession = false;
@@ -1881,12 +1901,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			options.parentTaskPrefix ? { parentPrefix: options.parentTaskPrefix } : undefined,
 		);
 
-		// Create built-in tools (already wrapped with meta notice formatting)
 		const builtinTools = await logger.time("createAllTools", createTools, toolSession, options.toolNames);
 
 		// Restricted sessions cannot inherit or discover MCP capabilities.
 		const enableMCP = !restrictToolNames && (options.enableMCP ?? true);
-		let mcpManager: MCPManager | undefined = enableMCP ? options.mcpManager : undefined;
+		mcpManager = enableMCP ? options.mcpManager : undefined;
 		toolSession.mcpManager = mcpManager;
 		toolSession.enableMCP = enableMCP;
 		const deferMCPDiscoveryForUI = enableMCP && !mcpManager && options.hasUI === true;
@@ -2371,6 +2390,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			() => (hasSession ? createSessionMemoryRuntimeContext(session, agentDir, cwd) : undefined),
 			settings,
 			localProtocolOptions,
+			getRequiredExtensionHandlerSnapshot(extensionsResult),
 		);
 
 		credentialDisabledTarget = extensionRunner;
@@ -3013,7 +3033,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			ensureWriteRegistered,
 			getMcpServerInstructions: mcpManager
 				? () => {
-						const raw = mcpManager.getServerInstructions();
+						const raw = mcpManager!.getServerInstructions();
 						if (!raw || raw.size === 0) return raw;
 						const out = new Map<string, string>();
 						for (const [name, text] of raw) {
@@ -3261,7 +3281,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			});
 			// Wire prompt refresh → rebuild MCP prompt slash commands
 			mcpManager.setOnPromptsChanged(serverName => {
-				const promptCommands = buildMCPPromptCommands(mcpManager);
+				const promptCommands = buildMCPPromptCommands(mcpManager!);
 				session.setMCPPromptCommands(promptCommands);
 				logger.debug("MCP prompt commands refreshed", { path: `mcp:${serverName}` });
 			});
@@ -3302,31 +3322,41 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			eventBus,
 		};
 	} catch (error) {
-		// Release the subscription if the throw happened after install but before the
-		// dispose-wrap took ownership. Idempotent with dispose() — Set.delete is a no-op
-		// for already-removed listeners.
 		unsubscribeCredentialDisabled?.();
-		try {
-			if (hasSession) {
-				await session.dispose();
-			} else {
-				if (hasRegistered) unregisterUnlessParked();
-				if (asyncJobManager) {
-					if (AsyncJobManager.instance() === asyncJobManager) {
-						AsyncJobManager.setInstance(undefined);
-					}
-					await asyncJobManager.dispose({ timeoutMs: 3_000 });
+		const cleanupTasks: Array<Promise<unknown>> = [];
+		if (hasSession) {
+			cleanupTasks.push(session.dispose());
+		} else {
+			if (hasRegistered) unregisterUnlessParked();
+			if (asyncJobManager) {
+				if (AsyncJobManager.instance() === asyncJobManager) {
+					AsyncJobManager.setInstance(undefined);
 				}
-				await disposeKernelSessionsByOwner(evalKernelOwnerId);
-				await disposeRubyKernelSessionsByOwner(evalKernelOwnerId);
-				await disposeJuliaKernelSessionsByOwner(evalKernelOwnerId);
-				if (ownsAuthStorage) authStorage.close();
+				cleanupTasks.push(asyncJobManager.dispose({ timeoutMs: 3_000 }));
 			}
-		} catch (cleanupError) {
-			logger.warn("Failed to clean up createAgentSession resources after startup error", {
-				error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
-			});
+			cleanupTasks.push(
+				disposeKernelSessionsByOwner(evalKernelOwnerId),
+				disposeRubyKernelSessionsByOwner(evalKernelOwnerId),
+				disposeJuliaKernelSessionsByOwner(evalKernelOwnerId),
+			);
+			if (mcpManager && !options.mcpManager) cleanupTasks.push(mcpManager.disconnectAll());
+			if (ownsSessionManager) cleanupTasks.push(sessionManager.close());
+			if (ownsAuthStorage) authStorage.close();
 		}
+		for (const result of await Promise.allSettled(cleanupTasks)) {
+			if (result.status === "rejected") {
+				logger.warn("Failed to clean up createAgentSession resource after startup error", {
+					error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+				});
+			}
+		}
+		if (MCPManager.instance() === mcpManager) {
+			MCPManager.setInstance(priorMcpManagerInstance);
+		}
+		for (const sourceId of new Set(extensionsResult.extensions.map(extension => extension.path))) {
+			modelRegistry.clearSourceRegistrations(sourceId);
+		}
+		disposeLoadedExtensions(extensionsResult);
 		throw error;
 	}
 }

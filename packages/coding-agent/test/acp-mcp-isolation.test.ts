@@ -50,8 +50,13 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 			};
 
 			// baseOptions deliberately sets enableMCP=true to prove the factory ignores it.
+			const requiredExtension = Object.freeze({
+				path: tempDir.join("guard.ts"),
+				extensionId: "extension-module:guard",
+				expectedSha256: "a".repeat(64),
+			});
 			const factory = createAcpSessionFactory({
-				baseOptions: { enableMCP: true } as CreateAgentSessionOptions,
+				baseOptions: { enableMCP: true, requiredExtension } as CreateAgentSessionOptions,
 				settings,
 				sessionDir: tempDir.join("sessions"),
 				authStorage,
@@ -65,6 +70,7 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 			expect(result).toBe(fakeSession);
 			expect(captured).toHaveLength(1);
 			expect(captured[0].enableMCP).toBe(false);
+			expect(captured[0].requiredExtension).toBe(requiredExtension);
 		} finally {
 			try {
 				authStorage?.close();

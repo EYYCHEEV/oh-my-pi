@@ -25,6 +25,8 @@ import {
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { CreateAgentSessionOptions } from "@oh-my-pi/pi-coding-agent/sdk";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -207,6 +209,148 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 		expect(subagent.session).toBeDefined();
 	});
 
+	it("rejects required handler replacement before construction and ignores replacement after construction", async () => {
+		const content = `export default function (pi) { pi.on("tool_call", async () => ({ block: true, reason: "original" })); }`;
+		const beforePath = path.join(sharedDir, "required-handler-before.ts");
+		fs.writeFileSync(beforePath, content);
+		const beforeRequired: RequiredExtensionSpec = {
+			path: beforePath,
+			extensionId: "extension-module:required-handler-before",
+			expectedSha256: new Bun.SHA256().update(content).digest("hex"),
+		};
+		const before = await loadExtensionsWithRequiredAttestation({ paths: [beforePath] }, sharedDir, new EventBus(), {
+			required: beforeRequired,
+		});
+		before.extensions[0]!.handlers.delete("tool_call");
+		await expect(
+			createAgentSession({
+				cwd: sharedDir,
+				agentDir: sharedDir,
+				sessionManager: SessionManager.inMemory(),
+				modelRegistry,
+				settings: Settings.isolated(),
+				preloadedExtensions: before,
+				requiredExtension: beforeRequired,
+				enableLsp: false,
+				enableMCP: false,
+				skipPythonPreflight: true,
+				skills: [],
+				rules: [],
+				preloadedCustomToolPaths: [],
+				contextFiles: [],
+				promptTemplates: [],
+			}),
+		).rejects.toMatchObject({ code: "handler-missing" });
+
+		const afterPath = path.join(sharedDir, "required-handler-after.ts");
+		fs.writeFileSync(afterPath, content);
+		const afterRequired: RequiredExtensionSpec = {
+			path: afterPath,
+			extensionId: "extension-module:required-handler-after",
+			expectedSha256: new Bun.SHA256().update(content).digest("hex"),
+		};
+		const after = await loadExtensionsWithRequiredAttestation({ paths: [afterPath] }, sharedDir, new EventBus(), {
+			required: afterRequired,
+		});
+		const created = await createAgentSession({
+			cwd: sharedDir,
+			agentDir: sharedDir,
+			sessionManager: SessionManager.inMemory(),
+			modelRegistry,
+			settings: Settings.isolated(),
+			preloadedExtensions: after,
+			requiredExtension: afterRequired,
+			enableLsp: false,
+			enableMCP: false,
+			skipPythonPreflight: true,
+			skills: [],
+			rules: [],
+			preloadedCustomToolPaths: [],
+			contextFiles: [],
+			promptTemplates: [],
+		});
+		created.extensionsResult.extensions
+			.find(extension => extension.resolvedPath === afterPath)!
+			.handlers.set("tool_call", [async () => ({ block: true, reason: "replacement" })] as never);
+		created.extensionsResult.extensions.splice(0);
+		if (!created.session.extensionRunner) throw new Error("expected extension runner");
+		const result = await created.session.extensionRunner.emitToolCall({
+			type: "tool_call",
+			toolName: "bash",
+			input: {},
+			toolCallId: "immutable-required-handler",
+		});
+		expect(result).toEqual({ block: true, reason: "original" });
+		await created.session.dispose();
+	});
+
+	it("rolls back an attested extension and restores the prior MCP singleton after late failure", async () => {
+		const eventMarker = path.join(sharedDir, "late-startup-stale-event");
+		const content = `import * as fs from "node:fs"; export default function (pi) {
+			pi.events.on("late-startup-probe", () => fs.writeFileSync(${JSON.stringify(eventMarker)}, "stale"));
+			pi.registerFlag("late-startup-flag", { type: "boolean", default: true });
+			pi.registerProvider("late-startup-provider", { baseUrl: "https://late.example.com", api: "openai-completions" });
+			pi.registerStatusSegment({ id: "late-startup-status", render: () => "late" });
+			pi.on("tool_call", async () => {});
+		}`;
+		const extensionPath = path.join(sharedDir, "late-startup-required.ts");
+		fs.writeFileSync(extensionPath, content);
+		const requiredExtension: RequiredExtensionSpec = {
+			path: extensionPath,
+			extensionId: "extension-module:late-startup-required",
+			expectedSha256: new Bun.SHA256().update(content).digest("hex"),
+		};
+		const eventBus = new EventBus();
+		const registry = new AgentRegistry();
+		const register = vi.spyOn(registry, "register").mockImplementationOnce(() => {
+			throw new Error("late registry failure");
+		});
+		const previousMcpManager = MCPManager.instance();
+		const priorMcpManager = new MCPManager(sharedDir, null);
+		MCPManager.setInstance(priorMcpManager);
+		const baseOptions: CreateAgentSessionOptions = {
+			cwd: sharedDir,
+			agentDir: sharedDir,
+			modelRegistry,
+			settings: Settings.isolated(),
+			requiredExtension,
+			disableExtensionDiscovery: true,
+			eventBus,
+			agentRegistry: registry,
+			enableLsp: false,
+			enableMCP: true,
+			hasUI: true,
+			skipPythonPreflight: true,
+			skills: [],
+			rules: [],
+			preloadedCustomToolPaths: [],
+			contextFiles: [],
+			promptTemplates: [],
+		};
+
+		try {
+			await expect(
+				createAgentSession({ ...baseOptions, sessionManager: SessionManager.inMemory() }),
+			).rejects.toThrow("late registry failure");
+			expect(MCPManager.instance()).toBe(priorMcpManager);
+			eventBus.emit("late-startup-probe", undefined);
+			expect(fs.existsSync(eventMarker)).toBe(false);
+
+			register.mockRestore();
+			const retried = await createAgentSession({
+				...baseOptions,
+				enableMCP: false,
+				hasUI: false,
+				sessionManager: SessionManager.inMemory(),
+			});
+			expect(retried.session).toBeDefined();
+			await retried.session.dispose();
+		} finally {
+			MCPManager.setInstance(previousMcpManager);
+			await priorMcpManager.disconnectAll();
+		}
+	});
+
 	it("enforces the settings-backed required extension on fresh main startup", async () => {
 		const content = `export default function (pi) { pi.on("tool_call", async () => {}); }`;
 		const extensionPath = path.join(sharedDir, "settings-required-extension.ts");
@@ -222,7 +366,6 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 				"requiredExtension.sha256": new Bun.SHA256().update(content).digest("hex"),
 			}),
 			disableExtensionDiscovery: true,
-			additionalExtensionPaths: [extensionPath],
 			enableLsp: false,
 			enableMCP: false,
 			skipPythonPreflight: true,
