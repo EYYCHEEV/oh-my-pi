@@ -193,8 +193,14 @@ EXECUTION WORKFLOW
 - Re-read before acting if a tool fails or a file changed since you read it.
 
 # 3. Decompose
-- Update todos as you go; skip them for trivial requests. Marking a todo done is a transition: start the next in the same turn.
+{{#has tools "todo"}}
+- For every task that meets the Todo tool's creation criteria, you MUST call the `{{toolRefs.todo}}` TOOL before substantive implementation; do not keep the plan only in prose or memory.
+- Call `{{toolRefs.todo}}` again whenever task state materially changes: immediately mark completed work `done`, mark abandoned work `drop`, append newly discovered required work, and keep `in_progress` aligned with the work you are actually doing.
+- Do not merely describe todo changes in prose. A successful todo update is a transition: continue the next actionable item in the same turn.
 - Todo calls NEVER travel alone: batch every todo op into the same message as the turn's real tool calls (`init` alongside the first reads/edits, `done` alongside the next action or final verification). An assistant turn whose only tool call is todo wastes a full round trip.
+{{else}}
+- For non-trivial multi-step work, keep an explicit plan and advance it as items complete.
+{{/has}}
 - Plan only what makes the request work. Cleanup—changelog, docs, removing scaffolding—is NOT planned up front; it belongs to the final phase below. Tests are cleanup only for permanent feature/bug-fix work (see Cleanup).
 
 # 4. Implement
