@@ -418,6 +418,7 @@ function buildExecutorOptions(
 		promptTemplates: session.promptTemplates,
 		rules: session.rules,
 		preloadedExtensionPaths: policy.planMode ? [] : session.extensionPaths,
+		requiredExtension: policy.planMode ? undefined : session.requiredExtension,
 		preloadedCustomToolPaths: policy.planMode ? [] : session.customToolPaths,
 		localProtocolOptions,
 		parentArtifactManager: session.getArtifactManager?.() ?? undefined,

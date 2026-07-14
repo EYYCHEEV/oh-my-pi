@@ -27,6 +27,7 @@ import type { ToolPathWithSource } from "../extensibility/custom-tools";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
+import type { RequiredExtensionSpec } from "../extensibility/extensions/loader";
 import { buildSkillPromptMessage, type Skill } from "../extensibility/skills";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
@@ -380,6 +381,8 @@ export interface ExecutorOptions {
 	 * extension against its own `ExtensionAPI` (cwd, eventBus, runtime).
 	 */
 	preloadedExtensionPaths?: string[];
+	/** Required extension contract inherited by this subagent session. */
+	requiredExtension?: RequiredExtensionSpec;
 	/**
 	 * Parent's discovered custom-tool source paths. Forwarded to skip the
 	 * `.omp/tools/` FS scan in the subagent; the subagent then re-binds each
@@ -2562,6 +2565,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				workspaceTree: options.workspaceTree,
 				rules: options.rules,
 				preloadedExtensionPaths: restrictToolNames ? [] : options.preloadedExtensionPaths,
+				requiredExtension: restrictToolNames ? undefined : options.requiredExtension,
 				preloadedCustomToolPaths: restrictToolNames ? [] : options.preloadedCustomToolPaths,
 				systemPrompt: defaultPrompt => {
 					const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
@@ -2613,6 +2617,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				// holding live LSP/MCP child processes — dispose it when it does so
 				// a cancelled subagent cannot leak them.
 				void sessionPromise.then(created => created.session.dispose()).catch(() => {});
+				await sessionManager.close();
 				throw err;
 			}
 			sessionCreatedAt = performance.now();
@@ -2631,7 +2636,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					if (options.parentArtifactManager) {
 						reopened.adoptArtifactManager(options.parentArtifactManager);
 					}
-					const { session: revived } = await createAgentSession(buildSubagentSessionOptions(reopened));
+					let revived: AgentSession;
+					try {
+						({ session: revived } = await createAgentSession(buildSubagentSessionOptions(reopened)));
+					} catch (error) {
+						await reopened.close();
+						throw error;
+					}
 					installRegistryStatusSync(revived);
 					return revived;
 				};
