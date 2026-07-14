@@ -5,7 +5,11 @@ type StartMessage = {
 	options: Record<string, unknown>;
 };
 
-type ControlMessage = StartMessage | { type: "hold" } | { type: "release" };
+type ControlMessage =
+	| StartMessage
+	| { type: "hold" }
+	| { type: "release" }
+	| { type: "signal"; signal: "SIGTERM" | "SIGKILL" };
 
 function send(message: unknown): void {
 	if (typeof process.send !== "function") throw new Error("bounded process supervisor requires Bun IPC");
@@ -17,7 +21,6 @@ process.on("SIGTERM", () => {
 	// SIGKILL intentionally terminates it atomically with the remaining members.
 });
 
-const released = Promise.withResolvers<void>();
 let started = false;
 let targetExitCode = 0;
 
@@ -27,9 +30,19 @@ process.on("message", (raw: unknown) => {
 		send({ type: "held" });
 		return;
 	}
-	if (message.type === "release") {
-		released.resolve();
+	if (message.type === "signal") {
+		if (message.signal === "SIGKILL") {
+			send({ type: "kill-armed" });
+			setTimeout(() => process.kill(-process.pid, "SIGKILL"), 0);
+		} else {
+			process.kill(-process.pid, "SIGTERM");
+			send({ type: "signalled" });
+		}
 		return;
+	}
+	if (message.type === "release") {
+		send({ type: "released", code: targetExitCode });
+		process.exit(targetExitCode);
 	}
 	if (message.type !== "start" || started) return;
 	started = true;
@@ -55,6 +68,5 @@ process.on("message", (raw: unknown) => {
 });
 
 send({ type: "ready" });
-await released.promise;
-process.exit(targetExitCode);
+await new Promise<never>(() => {});
 `;

@@ -405,11 +405,14 @@ async function drainBounded(
 	stream: ReadableStream<Uint8Array>,
 	cap: number,
 	onOverflow: () => void,
+	signal: AbortSignal,
 ): Promise<BoundedStreamResult> {
 	const reader = stream.getReader();
 	const chunks: Uint8Array[] = [];
 	let retained = 0;
 	let overflow = false;
+	const cancel = () => void reader.cancel(signal.reason).catch(() => {});
+	signal.addEventListener("abort", cancel, { once: true });
 	try {
 		while (true) {
 			const { done, value } = await reader.read();
@@ -428,6 +431,7 @@ async function drainBounded(
 			}
 		}
 	} finally {
+		signal.removeEventListener("abort", cancel);
 		reader.releaseLock();
 	}
 
@@ -445,6 +449,9 @@ async function drainBounded(
 type SupervisorMessage =
 	| { type: "ready" }
 	| { type: "held" }
+	| { type: "released"; code: number }
+	| { type: "signalled" }
+	| { type: "kill-armed" }
 	| { type: "started"; pid: number }
 	| { type: "target-exit"; code: number }
 	| { type: "target-error"; message: string };
@@ -452,6 +459,9 @@ type SupervisorMessage =
 class SupervisorEvents {
 	readonly ready = Promise.withResolvers<void>();
 	readonly held = Promise.withResolvers<void>();
+	readonly released = Promise.withResolvers<void>();
+	readonly signalled = Promise.withResolvers<void>();
+	readonly killArmed = Promise.withResolvers<void>();
 	readonly started = Promise.withResolvers<number>();
 	readonly targetExit = Promise.withResolvers<number>();
 
@@ -463,6 +473,16 @@ class SupervisorEvents {
 				break;
 			case "held":
 				this.held.resolve();
+				break;
+			case "released":
+				this.released.resolve();
+				this.targetExit.resolve(message.code);
+				break;
+			case "signalled":
+				this.signalled.resolve();
+				break;
+			case "kill-armed":
+				this.killArmed.resolve();
 				break;
 			case "started":
 				this.started.resolve(message.pid);
@@ -491,12 +511,22 @@ export class BoundedChildProcess {
 	#events: SupervisorEvents;
 	#start: { cmd: string[]; options: Record<string, unknown> };
 	#cleanup: Promise<boolean> | undefined;
-	#cleanupMayCancel = false;
 	#cleanupResult: boolean | undefined;
 	#cleanupStarted = Promise.withResolvers<void>();
+	#startSent = false;
+	#preStartCancellation: Error | undefined;
+	#startSuppressed = false;
+	#terminalFailure: Error | undefined;
+	#overflowFailure: Error | undefined;
+	#releaseRequested = false;
+	#releasePromise: Promise<void> | undefined;
+	#drainAbort = new AbortController();
+	#finalKillSent = false;
 	#completed = false;
 	#overflowGracefulMs: number;
 	#overflowTimeoutMs: number;
+	#lifecycleSignal: AbortSignal | undefined;
+	#emergencyFailure: Promise<never> | undefined;
 
 	constructor(
 		proc: PipedSubprocess,
@@ -516,28 +546,49 @@ export class BoundedChildProcess {
 		this.#start = start;
 		this.#overflowGracefulMs = overflowGracefulMs;
 		this.#overflowTimeoutMs = overflowTimeoutMs;
+		this.#lifecycleSignal = signal;
 
 		const abortFailure = Promise.withResolvers<never>();
+		const drainAbort = this.#drainAbort;
 		const normalExit = this.#completeNormally();
 		const exited = Promise.race([normalExit, abortFailure.promise]);
 		this.exited = exited;
+		void exited.catch(error => drainAbort.abort(error));
 
 		const overflow = () => {
-			const cleanup = this.#beginMandatoryCleanup();
-			cleanup.then(
-				cleaned => {
-					if (!cleaned) {
-						abortFailure.reject(new Error("Timed out cleaning supervised process tree after output overflow"));
-					}
-				},
-				error => abortFailure.reject(error),
+			if (this.#overflowFailure) return;
+			const failure = new Error("Bounded process output exceeded its configured capture limit");
+			this.#overflowFailure = failure;
+			this.#terminalFailure ??= failure;
+			void this.#failAfterCleanup(failure, "Output overflow cleanup could not be proven").catch(error =>
+				abortFailure.reject(error),
 			);
 		};
-		const stdout = drainBounded(proc.stdout, stdoutCap, overflow);
-		const stderr = drainBounded(proc.stderr, stderrCap, overflow);
+		const settleDrain = async (
+			name: "stdout" | "stderr",
+			drain: Promise<BoundedStreamResult>,
+		): Promise<BoundedStreamResult> => {
+			try {
+				return await drain;
+			} catch (cause) {
+				const failure = new Error(`Failed to drain bounded process ${name}`, { cause });
+				this.#terminalFailure ??= failure;
+				return await this.#failAfterCleanup(
+					failure,
+					`${name} drain failed and cleanup could not be proven`,
+				);
+			}
+		};
+		const stdout = settleDrain("stdout", drainBounded(proc.stdout, stdoutCap, overflow, drainAbort.signal));
+		const stderr = settleDrain("stderr", drainBounded(proc.stderr, stderrCap, overflow, drainAbort.signal));
 		this.output = (async () => {
-			const [stdoutResult, stderrResult] = await Promise.all([stdout, stderr]);
-			const exitCode = await exited;
+			const [stdoutResult, stderrResult, exitCode] = await Promise.all([stdout, stderr, exited]);
+			if (this.#overflowFailure) {
+				await this.#failAfterCleanup(
+					this.#overflowFailure,
+					"Output overflow cleanup could not be proven",
+				);
+			}
 			return {
 				stdout: stdoutResult.bytes,
 				stderr: stderrResult.bytes,
@@ -549,15 +600,16 @@ export class BoundedChildProcess {
 
 		if (signal) {
 			const onAbort = () => {
+				const failure =
+					signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason ?? "aborted"));
+				this.#terminalFailure = failure;
 				this.#beginMandatoryCleanup().then(
 					cleaned => {
 						if (!cleaned) {
 							abortFailure.reject(new Error("Timed out cleaning supervised process tree after cancellation"));
 							return;
 						}
-						abortFailure.reject(
-							signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason ?? "aborted")),
-						);
+						abortFailure.reject(failure);
 					},
 					error => abortFailure.reject(error),
 				);
@@ -573,110 +625,268 @@ export class BoundedChildProcess {
 	async #send(message: unknown): Promise<void> {
 		await Promise.resolve(this.#proc.send(message));
 	}
-	async #waitReady(): Promise<void> {
-		await Promise.race([
+	async #waitReady(signal = this.#lifecycleSignal): Promise<void> {
+		await this.#awaitControl(
 			this.#events.ready.promise,
-			this.#proc.exited.then(code => {
-				throw new Error(`Process supervisor exited with code ${code} before startup handshake`);
-			}),
-		]);
+			"startup handshake",
+			this.#overflowTimeoutMs,
+			signal,
+		);
 	}
 
-	async #release(): Promise<void> {
-		try {
+	async #release(timeoutMs = this.#overflowTimeoutMs, signal?: AbortSignal): Promise<void> {
+		if (this.#releasePromise) return await this.#releasePromise;
+		this.#releaseRequested = true;
+		const release = (async () => {
 			await this.#send({ type: "release" });
-		} catch {
-			// A final group KILL terminates the sentinel before release by design.
+			await this.#awaitControl(
+				this.#events.released.promise,
+				"release acknowledgement",
+				timeoutMs,
+				signal,
+			);
+			await this.#proc.exited;
+			this.#completed = true;
+		})();
+		this.#releasePromise = release;
+		await release;
+	}
+	async #awaitControl(
+		ack: Promise<unknown>,
+		phase: string,
+		timeoutMs: number,
+		signal?: AbortSignal,
+	): Promise<void> {
+		const aborted = Promise.withResolvers<void>();
+		const onAbort = () => aborted.resolve();
+		signal?.addEventListener("abort", onAbort, { once: true });
+		if (signal?.aborted) aborted.resolve();
+		try {
+			const outcome = await Promise.race([
+				ack.then(() => "ack" as const),
+				this.#proc.exited.then(() => "exit" as const),
+				Bun.sleep(timeoutMs).then(() => "timeout" as const),
+				aborted.promise.then(() => "abort" as const),
+			]);
+			if (outcome === "ack") return;
+			const failure =
+				outcome === "abort"
+					? signal?.reason instanceof Error
+						? signal.reason
+						: new Error(`Supervisor ${phase} was aborted`)
+					: new Error(
+							outcome === "timeout"
+								? `Supervisor ${phase} timed out after ${timeoutMs}ms`
+								: `Supervisor exited before ${phase}`,
+						);
+			return await this.#failControl(failure, phase, timeoutMs);
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
 		}
-		await this.#proc.exited;
-		this.#completed = true;
 	}
 
+	async #failControl(failure: Error, phase: string, timeoutMs: number): Promise<never> {
+		if (this.#emergencyFailure) return await this.#emergencyFailure;
+		const emergency = (async () => {
+			const failures: unknown[] = [failure];
+			try {
+				const cleaned = await this.#tree.terminate({
+					gracefulMs: -1,
+					timeoutMs,
+				});
+				if (!cleaned) failures.push(new Error("Emergency supervised-tree cleanup timed out"));
+			} catch (error) {
+				failures.push(error);
+			}
+			this.#drainAbort.abort(failure);
+			try {
+				process.kill(this.pid, "SIGKILL");
+			} catch (error) {
+				failures.push(error);
+			}
+			const reaped = await Promise.race([
+				this.#proc.exited.then(() => true),
+				Bun.sleep(timeoutMs).then(() => false),
+			]);
+			this.#completed = reaped;
+			this.#cleanupResult = false;
+			if (!reaped) failures.push(new Error("Emergency supervisor reap timed out"));
+			throw new AggregateError(
+				failures,
+				`Supervisor ${phase} failed; emergency cleanup cannot be reported as success`,
+			);
+		})();
+		this.#emergencyFailure = emergency;
+		return await emergency;
+	}
+	async #failAfterCleanup(failure: Error, aggregateMessage: string): Promise<never> {
+		try {
+			if (await this.#beginMandatoryCleanup()) throw failure;
+			throw new AggregateError(
+				[failure, new Error("Supervised process tree cleanup could not be proven")],
+				aggregateMessage,
+			);
+		} catch (cleanupError) {
+			if (cleanupError === failure || cleanupError instanceof AggregateError) throw cleanupError;
+			throw new AggregateError([failure, cleanupError], aggregateMessage);
+		}
+	}
 	async #completeNormally(): Promise<number> {
 		await this.#waitReady();
-		while (this.#cleanup) {
+		if (this.#startSuppressed) {
+			const cancellation = this.#preStartCancellation;
 			try {
-				if (await this.#cleanup) {
-					return await this.#proc.exited;
+				if (!(await this.#cleanup)) {
+					throw new Error("Supervised process tree cleanup could not be proven");
 				}
-			} catch {
-				// A caller-cancelled cleanup attempt is retryable while the held
-				// sentinel remains alive. It never proves an empty tree.
+			} catch (cleanupError) {
+				const trigger = this.#terminalFailure ?? cancellation;
+				if (trigger) {
+					throw new AggregateError(
+						[trigger, cleanupError],
+						`${trigger.message} and cleanup could not be proven`,
+					);
+				}
+				throw cleanupError;
 			}
+			if (this.#terminalFailure) throw this.#terminalFailure;
+			if (cancellation) throw cancellation;
+			throw new Error("Bounded process startup was suppressed by mandatory cleanup");
 		}
-		await this.#send({ type: "start", ...this.#start });
 
-		let exitCode: number;
-		while (true) {
+		this.#startSent = true;
+		await this.#send({ type: "start", ...this.#start });
+		const targetOutcome = this.#events.targetExit.promise.then(
+			code => ({ type: "target" as const, code }),
+			error => ({
+				type: "target-error" as const,
+				error: error instanceof Error ? error : new Error(String(error)),
+			}),
+		);
+		const startup = await Promise.race([
+			this.#awaitControl(
+				this.#events.started.promise,
+				"target startup acknowledgement",
+				this.#overflowTimeoutMs,
+				this.#lifecycleSignal,
+			).then(() => ({ type: "started" as const })),
+			targetOutcome,
+		]);
+		if (startup.type === "target-error") {
+			await this.#throwAfterFailedTarget(startup.error);
+		}
+
+		const supervisorOutcome = this.#proc.exited.then(code => ({ type: "supervisor" as const, code }));
+		const treeOutcome = this.#tree.waitForEmpty().then(
+			empty => ({ type: "empty" as const, empty }),
+			error => ({
+				type: "tree-error" as const,
+				error: error instanceof Error ? error : new Error(String(error)),
+			}),
+		);
+		let targetCode: number | undefined;
+		let treeEmpty = false;
+		while (targetCode === undefined || !treeEmpty) {
 			const outcome = await Promise.race([
-				this.#events.targetExit.promise.then(
-					code => ({ type: "target" as const, code }),
-					error => ({
-						type: "target-error" as const,
-						error: error instanceof Error ? error : new Error(String(error)),
-					}),
-				),
-				this.#proc.exited.then(code => ({ type: "supervisor" as const, code })),
+				targetCode === undefined ? targetOutcome : new Promise<never>(() => {}),
+				treeEmpty ? new Promise<never>(() => {}) : treeOutcome,
+				supervisorOutcome,
 				this.#cleanupStarted.promise.then(() => ({ type: "cleanup" as const })),
 			]);
 			if (outcome.type === "target") {
-				exitCode = outcome.code;
-				break;
+				targetCode = outcome.code;
+				continue;
 			}
 			if (outcome.type === "target-error") {
-				const cleaned = await this.#beginCleanup();
-				if (!cleaned) {
-					throw new AggregateError(
-						[outcome.error, new Error("Supervised process tree cleanup could not be proven")],
-						"Target startup failed and cleanup could not be proven",
-					);
+				await this.#throwAfterFailedTarget(outcome.error);
+			}
+			if (outcome.type === "tree-error") {
+				try {
+					await this.#beginMandatoryCleanup();
+				} catch (cleanupError) {
+					try {
+						await this.#failControl(
+							new Error("Group-escape cleanup failed"),
+							"group-escape cleanup",
+							this.#overflowTimeoutMs,
+						);
+					} catch (emergencyError) {
+						throw new AggregateError(
+							[outcome.error, cleanupError, emergencyError],
+							"Supervised process escaped its dedicated group and cleanup could not be proven",
+						);
+					}
 				}
 				throw outcome.error;
 			}
 			if (outcome.type === "supervisor") {
-				throw new Error(`Process supervisor exited with code ${outcome.code} before reporting target exit`);
-			}
-			const cleanup = this.#cleanup;
-			if (!cleanup) continue;
-			try {
-				if (await cleanup) {
-					return await Promise.race([this.#events.targetExit.promise, this.#proc.exited]);
+				if ((this.#releaseRequested || this.#finalKillSent) && this.#cleanup) {
+					await this.#cleanup;
+					if (this.#terminalFailure) throw this.#terminalFailure;
+					if (this.#finalKillSent) return 137;
+					const target = await targetOutcome;
+					if (target.type === "target-error") throw target.error;
+					return target.code;
 				}
-			} catch {
-				// Retry the target/supervisor race after a caller-cancelled
-				// cleanup. The cleanup promise resets without releasing sentinel.
-			}
-		}
-
-		while (true) {
-			const outcome = await Promise.race([
-				this.#tree.waitForEmpty().then(empty => ({ type: "empty" as const, empty })),
-				this.#proc.exited.then(code => ({ type: "supervisor" as const, code })),
-				this.#cleanupStarted.promise.then(() => ({ type: "cleanup" as const })),
-			]);
-			if (outcome.type === "supervisor") {
-				throw new Error(`Process supervisor exited with code ${outcome.code} before tree cleanup completed`);
+				throw new Error(
+					`Process supervisor exited with code ${outcome.code} before supervised completion; cleanup cannot be proven`,
+				);
 			}
 			if (outcome.type === "cleanup") {
 				const cleanup = this.#cleanup;
 				if (!cleanup) continue;
 				try {
 					if (await cleanup) {
-						return exitCode;
+						if (this.#terminalFailure) throw this.#terminalFailure;
+						if (this.#finalKillSent) return 137;
+						const target = await targetOutcome;
+						if (target.type === "target-error") throw target.error;
+						return target.code;
 					}
-				} catch {
-					// Keep observing the held group after a cancelled attempt.
+					if (this.#finalKillSent) {
+						throw new Error("Final supervised group kill did not prove cleanup");
+					}
+				} catch (error) {
+					if (this.#cleanup === cleanup) throw error;
 				}
 				continue;
 			}
+			if (outcome.type !== "empty") continue;
 			if (!outcome.empty) throw new Error("Supervised process tree did not become empty");
-			if (this.#cleanup) continue;
-			await this.#release();
-			return exitCode;
+			treeEmpty = true;
 		}
+
+		if (this.#cleanup) {
+			if (!(await this.#cleanup)) {
+				throw new Error("Supervised process tree cleanup could not be proven");
+			}
+			if (this.#terminalFailure) throw this.#terminalFailure;
+			return targetCode;
+		}
+		this.#cleanupResult = true;
+		await this.#release();
+		return targetCode;
 	}
 
-	#beginCleanup(options?: BoundedTreeTerminateOptions): Promise<boolean> {
+	async #throwAfterFailedTarget(targetError: Error): Promise<never> {
+		try {
+			if (await this.#beginMandatoryCleanup()) throw targetError;
+			throw new AggregateError(
+				[targetError, new Error("Supervised process tree cleanup could not be proven")],
+				"Target startup failed and cleanup could not be proven",
+			);
+		} catch (cleanupError) {
+			if (cleanupError === targetError || cleanupError instanceof AggregateError) throw cleanupError;
+			throw new AggregateError(
+				[targetError, cleanupError],
+				"Target startup failed and cleanup could not be proven",
+			);
+		}
+	}
+	#beginCleanup(
+		options?: BoundedTreeTerminateOptions,
+		cancelBeforeStart = true,
+	): Promise<boolean> {
 		if (options?.signal?.aborted) {
 			return Promise.reject(
 				options.signal.reason instanceof Error
@@ -684,36 +894,91 @@ export class BoundedChildProcess {
 					: new Error(String(options.signal.reason ?? "aborted")),
 			);
 		}
+		if (this.#releaseRequested) {
+			const release = this.#releasePromise;
+			return release ? release.then(() => this.#cleanupResult === true) : Promise.resolve(false);
+		}
+		if (!this.#startSent) {
+			this.#startSuppressed = true;
+			if (cancelBeforeStart && !this.#preStartCancellation) {
+				this.#preStartCancellation = new Error("Bounded process terminated before target startup");
+			}
+		}
 		if (this.#cleanup) return this.#cleanup;
 		const gracefulMs = options?.gracefulMs ?? this.#overflowGracefulMs;
 		const timeoutMs = options?.timeoutMs ?? this.#overflowTimeoutMs;
 		const cleanup = (async () => {
-			await this.#waitReady();
-			await this.#send({ type: "hold" });
-			await this.#events.held.promise;
-			const cleaned = await this.#tree.terminate({ gracefulMs, timeoutMs, signal: options?.signal });
-			this.#cleanupResult = cleaned;
-			if (cleaned) {
-				await this.#release();
+			await this.#waitReady(options?.signal ?? this.#lifecycleSignal);
+			if (await this.#tree.waitForEmpty({ timeoutMs: 0, signal: options?.signal })) {
+				this.#cleanupResult = true;
+				await this.#release(timeoutMs, options?.signal);
+				return true;
 			}
-			return cleaned;
+			await this.#send({ type: "hold" });
+			await this.#awaitControl(
+				this.#events.held.promise,
+				"cleanup hold acknowledgement",
+				timeoutMs,
+				options?.signal,
+			);
+			await this.#send({ type: "signal", signal: "SIGTERM" });
+			await this.#awaitControl(
+				this.#events.signalled.promise,
+				"graceful signal acknowledgement",
+				timeoutMs,
+				options?.signal,
+			);
+			const cleanedGracefully =
+				gracefulMs >= 0
+					? await this.#tree.waitForEmpty({ timeoutMs: gracefulMs, signal: options?.signal })
+					: false;
+			if (cleanedGracefully) {
+				this.#cleanupResult = true;
+				await this.#release(timeoutMs, options?.signal);
+				return true;
+			}
+
+			this.#finalKillSent = true;
+			void Promise.resolve(this.#proc.send({ type: "signal", signal: "SIGKILL" })).catch(() => {});
+			await this.#awaitControl(
+				this.#events.killArmed.promise,
+				"final kill acknowledgement",
+				timeoutMs,
+				options?.signal,
+			);
+			this.#drainAbort.abort();
+			const [absence, supervisorExit] = await Promise.allSettled([
+				this.#tree.waitForAbsenceAfterKill({ timeoutMs, signal: options?.signal }),
+				Promise.race([
+					this.#proc.exited.then(() => true),
+					Bun.sleep(timeoutMs).then(() => false),
+				]),
+			]);
+			const supervisorExited = supervisorExit.status === "fulfilled" && supervisorExit.value;
+			this.#completed = supervisorExited;
+			if (absence.status === "rejected") {
+				this.#cleanupResult = false;
+				throw new AggregateError(
+					[absence.reason],
+					"Final supervised group kill cleanup could not be proven",
+				);
+			}
+			this.#cleanupResult = absence.value && supervisorExited;
+			return this.#cleanupResult;
 		})();
 		this.#cleanup = cleanup;
-		this.#cleanupMayCancel = options?.signal !== undefined;
 		this.#cleanupStarted.resolve();
 		cleanup.then(
 			cleaned => {
-				if (cleaned || this.#cleanup !== cleanup) return;
+				if (cleaned || this.#cleanup !== cleanup || this.#finalKillSent) return;
 				this.#cleanup = undefined;
 				this.#cleanupResult = undefined;
-				this.#cleanupMayCancel = false;
 				this.#cleanupStarted = Promise.withResolvers<void>();
 			},
 			() => {
-				if (this.#cleanup !== cleanup) return;
+				if (this.#cleanup !== cleanup || this.#finalKillSent || !options?.signal?.aborted) return;
 				this.#cleanup = undefined;
 				this.#cleanupResult = undefined;
-				this.#cleanupMayCancel = false;
 				this.#cleanupStarted = Promise.withResolvers<void>();
 			},
 		);
@@ -722,26 +987,25 @@ export class BoundedChildProcess {
 
 	async #beginMandatoryCleanup(): Promise<boolean> {
 		const shared = this.#cleanup;
-		if (!shared || !this.#cleanupMayCancel) return await this.#beginCleanup();
+		if (!shared) return await this.#beginCleanup(undefined, false);
 		try {
 			return await shared;
-		} catch {
-			// The rejection handler resets the cancelled shared attempt before
-			// this continuation runs. Retry without a caller cancellation token.
-			return await this.#beginCleanup();
+		} catch (error) {
+			if (this.#cleanup === shared) throw error;
+			return await this.#beginCleanup(undefined, false);
 		}
 	}
 
 	async waitTree(options?: BoundedTreeWaitOptions): Promise<boolean> {
-		if (this.#completed) return this.#cleanupResult ?? true;
+		if (this.#completed) return this.#cleanupResult === true;
 		const started = await Promise.race([
 			this.#events.started.promise.then(() => true),
 			this.exited.then(() => false),
 		]);
-		if (!started) return this.#cleanupResult ?? true;
+		if (!started) return this.#cleanupResult === true;
 		return await Promise.race([
 			this.#tree.waitForEmpty(options),
-			this.exited.then(() => this.#cleanupResult ?? true),
+			this.exited.then(() => this.#cleanupResult === true),
 		]);
 	}
 
@@ -751,8 +1015,16 @@ export class BoundedChildProcess {
 }
 
 /**
- * Spawn with strict identity-pinned supervision and independently bounded
- * binary stdout/stderr capture. The current proven implementation is macOS.
+ * Spawn with identity-pinned, dedicated-group supervision and independently
+ * bounded binary stdout/stderr capture. The current proven implementation is
+ * macOS.
+ *
+ * The containment proof covers members that remain in the dedicated group and
+ * descendants observed before they detach. macOS provides no same-user
+ * primitive that can contain a hostile descendant which calls `setsid()` and
+ * reparents before observation, or clean it after it kills the supervisor.
+ * Detected escape and supervisor loss therefore reject terminally rather than
+ * reporting unproved cleanup.
  */
 export function spawnBounded<In extends InMask = InMask>(
 	cmd: string[],
