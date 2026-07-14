@@ -2,7 +2,7 @@
 
 use std::{collections::HashSet, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use parking_lot::Mutex;
 
 use crate::cancel::CancelToken;
@@ -333,6 +333,7 @@ mod platform {
 	#[link(name = "proc", kind = "dylib")]
 	unsafe extern "C" {
 		fn proc_listallpids(buffer: *mut i32, buffersize: i32) -> i32;
+		fn proc_listpgrppids(pgid: i32, buffer: *mut i32, buffersize: i32) -> i32;
 		fn proc_pidpath(pid: i32, buffer: *mut std::ffi::c_void, buffersize: u32) -> i32;
 	}
 
@@ -541,6 +542,35 @@ mod platform {
 			tree.entry(ppid).or_default().push(pid);
 		}
 		tree
+	}
+
+	/// Atomically snapshot the PIDs in one process group.
+	///
+	/// Unlike an all-PID snapshot followed by per-PID metadata reads, the
+	/// kernel performs the group filter within this single libproc call. Thus a
+	/// forking member cannot disappear between the snapshot and group check and
+	/// make a non-empty group look empty.
+	pub fn process_group_pids(pgid: i32) -> std::io::Result<Vec<i32>> {
+		// `proc_listpgrppids` does not implement the null-buffer sizing form
+		// consistently across current Darwin releases. A generously bounded
+		// buffer is sufficient here: truncation can hide identities but can
+		// never turn a non-empty group into an empty result.
+		let mut pids = vec![0i32; 4096];
+		// SAFETY: `pids` is writable for the supplied byte length and properly
+		// aligned. libproc writes no more than that length.
+		let actual = unsafe {
+			proc_listpgrppids(pgid, pids.as_mut_ptr(), (pids.len() * size_of::<i32>()) as i32)
+		};
+		if actual < 0 {
+			return Err(std::io::Error::last_os_error());
+		}
+		if actual == 0 {
+			return Ok(Vec::new());
+		}
+		// Unlike proc_listallpids, this API returns a PID count, not a byte count.
+		pids.truncate((actual as usize).min(pids.len()));
+		pids.retain(|pid| *pid > 0);
+		Ok(pids)
 	}
 
 	/// Find processes whose libproc-reported executable path equals `target`.
@@ -1276,6 +1306,141 @@ pub struct Process {
 	inner: platform::Process,
 }
 
+/// Strict process-group scope pinned by a live supervisor identity.
+///
+/// Group signals are refused unless the original supervisor is still alive
+/// and still leads the captured group. This prevents a recycled pgid from
+/// receiving a signal after the owned group has disappeared.
+#[derive(Clone)]
+pub struct SupervisedProcessTree {
+	sentinel: Process,
+	pgid:     i32,
+}
+
+impl SupervisedProcessTree {
+	/// Whether this build provides the strict supervised-tree contract.
+	#[must_use]
+	pub const fn is_supported() -> bool {
+		cfg!(target_os = "macos")
+	}
+
+	/// Pin a freshly spawned detached supervisor and its process group.
+	#[must_use]
+	pub fn from_spawn(pid: i32) -> Option<Self> {
+		#[cfg(target_os = "macos")]
+		{
+			let sentinel = Process::from_pid(pid)?;
+			(sentinel.group_id() == Some(pid)).then_some(Self { sentinel, pgid: pid })
+		}
+		#[cfg(not(target_os = "macos"))]
+		{
+			let _ = pid;
+			None
+		}
+	}
+
+	/// Wait until no process except the held supervisor remains in the group.
+	pub async fn wait_for_empty(&self, timeout: Option<Duration>, ct: CancelToken) -> Result<bool> {
+		ct.heartbeat()?;
+		let poll_interval = Duration::from_millis(25);
+		let mut elapsed = Duration::ZERO;
+		loop {
+			self.verify_sentinel()?;
+			if self.members()?.is_empty() {
+				return Ok(true);
+			}
+			let Some(sleep_for) = timeout.map_or(Some(poll_interval), |limit| {
+				(limit > elapsed).then(|| limit.saturating_sub(elapsed).min(poll_interval))
+			}) else {
+				return Ok(false);
+			};
+			ct.heartbeat()?;
+			tokio::time::sleep(sleep_for).await;
+			elapsed += sleep_for;
+		}
+	}
+
+	/// Signal the pinned group with TERM, then issue at most one group KILL
+	/// while the held supervisor identity is still valid.
+	pub async fn terminate(
+		&self,
+		graceful_ms: i32,
+		timeout_ms: u32,
+		ct: CancelToken,
+	) -> Result<bool> {
+		ct.heartbeat()?;
+		self.signal_checked(TERM_SIGNAL)?;
+		if graceful_ms >= 0
+			&& self
+				.wait_for_empty(Some(Duration::from_millis(graceful_ms as u64)), ct.clone())
+				.await?
+		{
+			return Ok(true);
+		}
+
+		// This is the one final group signal. It intentionally includes the
+		// sentinel. Afterward we only enumerate group membership; no identity
+		// check, pgid signal, or other operation can affect a reused group.
+		self.signal_checked(KILL_SIGNAL)?;
+		wait_for_group_absence(self.pgid, Duration::from_millis(u64::from(timeout_ms)), ct).await
+	}
+
+	fn verify_sentinel(&self) -> Result<()> {
+		if self.sentinel.status() == ProcessStatus::Running
+			&& self.sentinel.group_id() == Some(self.pgid)
+		{
+			return Ok(());
+		}
+		Err(anyhow!("supervised process-group identity {} is no longer held", self.pgid))
+	}
+
+	fn members(&self) -> Result<Vec<i32>> {
+		#[cfg(target_os = "macos")]
+		{
+			Ok(platform::process_group_pids(self.pgid)?
+				.into_iter()
+				.filter(|pid| *pid != self.sentinel.pid())
+				.collect())
+		}
+		#[cfg(not(target_os = "macos"))]
+		{
+			Ok(Vec::new())
+		}
+	}
+
+	fn signal_checked(&self, signal: i32) -> Result<()> {
+		self.verify_sentinel()?;
+		if kill_process_group(self.pgid, signal) {
+			return Ok(());
+		}
+		let error = std::io::Error::last_os_error();
+		Err(anyhow!(
+			"failed to signal supervised process group {} with signal {signal}: {error}",
+			self.pgid
+		))
+	}
+}
+
+async fn wait_for_group_absence(pgid: i32, timeout: Duration, ct: CancelToken) -> Result<bool> {
+	let poll_interval = Duration::from_millis(25);
+	let mut elapsed = Duration::ZERO;
+	loop {
+		ct.heartbeat()?;
+		#[cfg(target_os = "macos")]
+		if platform::process_group_pids(pgid)?.is_empty() {
+			return Ok(true);
+		}
+		#[cfg(not(target_os = "macos"))]
+		return Ok(true);
+		if elapsed >= timeout {
+			return Ok(false);
+		}
+		let sleep_for = timeout.saturating_sub(elapsed).min(poll_interval);
+		tokio::time::sleep(sleep_for).await;
+		elapsed += sleep_for;
+	}
+}
+
 impl Process {
 	/// Open a stable process reference from a PID.
 	pub fn from_pid(pid: i32) -> Option<Self> {
@@ -1814,6 +1979,46 @@ const fn platform_process_group_alive(_pgid: i32) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn supervised_tree_refuses_a_foreign_group_after_sentinel_exit() {
+		use std::{os::unix::process::CommandExt, process::Command};
+
+		let mut sentinel = Command::new("sh");
+		sentinel.arg("-c").arg("exit 0").process_group(0);
+		let mut sentinel = sentinel.spawn().expect("spawn sentinel");
+		let sentinel_pid = i32::try_from(sentinel.id()).expect("sentinel pid fits i32");
+		let pinned = Process::from_pid(sentinel_pid).expect("pin sentinel identity");
+		sentinel.wait().expect("reap sentinel");
+
+		let mut foreign = Command::new("sh");
+		foreign
+			.arg("-c")
+			.arg("trap '' TERM; sleep 30")
+			.process_group(0);
+		let mut foreign = foreign.spawn().expect("spawn foreign group");
+		let foreign_pgid = i32::try_from(foreign.id()).expect("foreign pid fits i32");
+		let stale = SupervisedProcessTree { sentinel: pinned, pgid: foreign_pgid };
+
+		assert!(
+			stale.signal_checked(TERM_SIGNAL).is_err(),
+			"a dead pinned sentinel must prevent signaling a live foreign group"
+		);
+		assert!(
+			Process::from_pid(foreign_pgid)
+				.is_some_and(|process| { process.status() == ProcessStatus::Running })
+		);
+		foreign.kill().expect("clean foreign group leader");
+		foreign.wait().expect("reap foreign group leader");
+	}
+
+	#[cfg(not(target_os = "macos"))]
+	#[test]
+	fn supervised_process_tree_is_explicitly_unavailable() {
+		assert!(!SupervisedProcessTree::is_supported());
+		assert!(SupervisedProcessTree::from_spawn(1).is_none());
+	}
 
 	/// `kill_process_group` is the last line of defense: even if a future
 	/// caller manages to feed the harness's own pgid into the signal path,
