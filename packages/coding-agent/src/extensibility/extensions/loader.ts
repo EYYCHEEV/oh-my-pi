@@ -44,12 +44,13 @@ import type {
 
 installLegacyPiSpecifierShim();
 
-type HandlerFn = (...args: unknown[]) => Promise<unknown>;
+export type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 type LoadedExtensionModule = ExtensionFactory | { default?: ExtensionFactory };
 const statusSegmentIdsByRuntime = new WeakMap<IExtensionRuntime, Set<string>>();
 const requiredAttestations = new WeakMap<LoadExtensionsResult, RequiredExtensionAttestation>();
 const eventBusByExtension = new WeakMap<Extension, EventBus>();
 const disposedExtensions = new WeakSet<Extension>();
+const disposedResults = new WeakSet<LoadExtensionsResult>();
 
 interface RuntimeRegistrationSnapshot {
 	flagValues: Map<string, boolean | string>;
@@ -88,7 +89,9 @@ function disposeExtensionRegistrations(extension: Extension, runtime: IExtension
 	eventBusByExtension.delete(extension);
 }
 
-function disposeLoadedExtensions(result: LoadExtensionsResult): void {
+export function disposeLoadedExtensions(result: LoadExtensionsResult): void {
+	if (disposedResults.has(result)) return;
+	disposedResults.add(result);
 	requiredAttestations.delete(result);
 	for (const extension of result.extensions) disposeExtensionRegistrations(extension, result.runtime);
 	result.runtime.flagValues.clear();
@@ -125,6 +128,22 @@ export function getRequiredExtensionAttestation(
 	result: LoadExtensionsResult,
 ): Readonly<RequiredExtensionSpec> | undefined {
 	return requiredAttestations.get(result)?.spec;
+}
+
+export interface RequiredExtensionHandlerSnapshot {
+	readonly extension: Extension;
+	readonly handlers: readonly HandlerFn[];
+}
+
+export function getRequiredExtensionHandlerSnapshot(
+	result: LoadExtensionsResult,
+): RequiredExtensionHandlerSnapshot | undefined {
+	const attestation = requiredAttestations.get(result);
+	if (!attestation) return undefined;
+	return {
+		extension: attestation.extension,
+		handlers: attestation.toolCallHandlers as readonly HandlerFn[],
+	};
 }
 
 function canonicalizeExtensionPath(extensionPath: string, cwd: string): string {
@@ -697,12 +716,12 @@ export async function loadExtensionsWithRequiredAttestation(
 				: sourceSnapshot.preloaded;
 		if ("paths" in sourceSnapshot) await verifyRequiredExtensionHash(hashedRequired);
 		const exactExtension = attestRequiredExtension(loadedResult, hashedRequired, cwd);
-		const toolCallHandlers = exactExtension.handlers.get("tool_call")!;
+		const toolCallHandlers = Object.freeze([...(exactExtension.handlers.get("tool_call") ?? [])]);
 		if (
 			"preloaded" in sourceSnapshot &&
 			(preloadedAttestation?.extension !== exactExtension ||
 				preloadedAttestation.runtime !== loadedResult.runtime ||
-				preloadedAttestation.toolCallHandlers !== toolCallHandlers)
+				exactExtension.handlers.get("tool_call") !== preloadedAttestation.toolCallHandlers)
 		) {
 			throw new RequiredExtensionStartupError(
 				"load-failed",
@@ -710,7 +729,7 @@ export async function loadExtensionsWithRequiredAttestation(
 				hashedRequired.path,
 			);
 		}
-		Object.freeze(toolCallHandlers);
+		exactExtension.handlers.set("tool_call", toolCallHandlers as HandlerFn[]);
 		requiredAttestations.set(loadedResult, {
 			spec: Object.freeze({ ...hashedRequired }),
 			extension: exactExtension,
