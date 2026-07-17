@@ -26,7 +26,6 @@ import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
