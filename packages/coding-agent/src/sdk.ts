@@ -74,12 +74,12 @@ import type { CustomTool, CustomToolContext, CustomToolSessionEvent } from "./ex
 import {
 	discoverAndLoadExtensions,
 	discoverExtensionPaths,
+	disposeLoadedExtensions,
 	type ExtensionContext,
 	type ExtensionFactory,
 	ExtensionRunner,
 	ExtensionToolWrapper,
 	type ExtensionUIContext,
-	disposeLoadedExtensions,
 	getRequiredExtensionAttestation,
 	getRequiredExtensionHandlerSnapshot,
 	type LoadExtensionsResult,
@@ -194,7 +194,6 @@ import {
 } from "./tools";
 import { isMCPToolName, normalizeToolNames } from "./tools/builtin-names";
 import { ToolContextStore } from "./tools/context";
-import { isIrcEnabled } from "./tools/hub";
 import { getImageGenTools } from "./tools/image-gen";
 import { wrapToolWithMetaNotice } from "./tools/output-meta";
 import { isAutoQaEnabled } from "./tools/report-tool-issue";
@@ -725,7 +724,6 @@ export async function discoverSessionExtensionPaths(
 	}
 	if (requiredExtension) configuredPaths.push(requiredExtension.path);
 	return configuredPaths;
-
 }
 /**
  * Load the discovered/configured extensions for a session — everything {@link
@@ -2605,7 +2603,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				eagerTasksAlways,
 				taskBatch: settings.get("task.batch"),
 				taskMaxConcurrency: settings.get("task.maxConcurrency"),
-				taskIrcEnabled: !restrictToolNames && isIrcEnabled(settings, options.taskDepth ?? 0),
+
 				secretsEnabled,
 				workspaceTree: workspaceTreePromise,
 				includeWorkspaceTree,
