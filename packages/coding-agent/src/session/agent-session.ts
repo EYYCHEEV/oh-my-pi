@@ -310,7 +310,6 @@ import {
 	obfuscateProviderContext,
 	type SecretObfuscator,
 } from "../secrets/obfuscator";
-import { usesCodexTaskPrompt } from "../task/prompt-policy";
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
@@ -7300,17 +7299,15 @@ export class AgentSession {
 		return resolveEditMode(this.#getEditModeSession());
 	}
 
-	/** Cache key for model-dependent prompt content: displayed id or hidden-policy cohort. */
+	/** Cache key for model-dependent prompt content. */
 	#currentPromptModelKey(): string | undefined {
-		const model = this.model ? formatModelString(this.model) : undefined;
-		if (!model || this.settings.get("includeModelInPrompt")) return model;
-		return usesCodexTaskPrompt(model) ? "task-policy:gpt-5.6" : "task-policy:default";
+		return this.model ? formatModelString(this.model) : undefined;
 	}
 
 	async #syncAfterModelChange(previousEditMode: EditMode): Promise<void> {
 		const currentEditMode = this.#resolveActiveEditMode();
 		const editModeChanged = previousEditMode !== currentEditMode && this.getActiveToolNames().includes("edit");
-		// The system prompt selects model-specific policy even when it does not display the model id.
+		// Tool presentation and examples can change even when the model identifier is hidden.
 		const modelChanged = this.#currentPromptModelKey() !== this.#promptModelKey;
 		if (editModeChanged || modelChanged) {
 			await this.refreshBaseSystemPrompt();
