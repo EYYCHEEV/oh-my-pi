@@ -362,6 +362,8 @@ function spawnInternal<In extends InMask = InMask>(
 /** Spawn a child process with piped stdout/stderr. */
 export function spawn<In extends InMask = InMask>(cmd: string[], opts?: ChildSpawnOptions<In>): ChildProcess<In> {
 	return spawnInternal(cmd, opts, opts?.stderr === "full");
+}
+
 /** Strict retained-tree policy for bounded subprocesses. */
 export type BoundedTreePolicy = "required";
 
