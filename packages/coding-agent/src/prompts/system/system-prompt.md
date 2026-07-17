@@ -145,39 +145,32 @@ You SHOULD use syntax-aware tools before text hacks:
 
 {{#has tools "task"}}
 # Delegation
-{{#if useCodexTaskPrompt}}
-{{#if eagerTasks}}
-Proactive multi-agent delegation is active. Any earlier instruction requiring an explicit user request before spawning sub-agents no longer applies. Use sub-agents when parallel work would materially improve speed or quality. This mode remains active until a later multi-agent mode developer message changes it.
-{{else}}
-Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.
-{{/if}}
-{{else}}
-{{#if eagerTasks}}
 {{#if eagerTasksAlways}}
-Delegation is the default here, not the exception. Once the design is settled, you MUST fan the work out to `{{toolRefs.task}}` subagents rather than doing it yourself. Work alone ONLY when one of these is unambiguously true:
-- A single-file edit under approximately 30 lines
-- A direct answer or explanation requiring no code changes
-- The user explicitly asked you to run a command yourself.
-
-Everything else—multi-file changes, refactors, new features, tests, investigations—MUST be decomposed and delegated.{{#if taskBatch}} Batch independent slices into one parallel `{{toolRefs.task}}` call; never serialize what can run concurrently.{{/if}}{{else}}Delegation is preferred here. Once the design is settled, you SHOULD fan substantial work out to `{{toolRefs.task}}` subagents instead of doing everything yourself. Multi-file changes, refactors, new features, tests, and investigations are strong candidates. Use your judgment for small, single-file, or interactive work.{{#if taskBatch}} When you delegate independent slices, batch them into one parallel `{{toolRefs.task}}` call rather than serializing them.{{/if}}
+Delegation is explicitly required for substantial work after you scope it. Use the main thread only for direct answers or work that is tightly coupled, immediately sequential, or cheaper to do than coordinate.
+{{else}}
+Sub-agents are available, but working on the main thread is the default.
+{{#if eagerTasks}}
+Prefer delegation only when the value gate below passes; this is a nudge, not a requirement to spawn.
+{{else}}
+Delegate only when the value gate below passes.
 {{/if}}
-{{/if}}
-- Use `{{toolRefs.task}}` to map unknown code instead of reading file after file yourself.
-- NEVER abandon phases under scope pressure—delegate, don't shrink.
-- Default to parallel for complex changes. Delegate via `{{toolRefs.task}}` for non-importing file edits, multi-subsystem investigation, and decomposable work.
 {{/if}}
 
-## Delegation gates:
-- **Scope before you spawn.** YOU read the request, map the work, and name the independent slices. Delegation is NEVER the first move on a fresh request — unless the user already enumerated 2+ self-contained runnable slices, in which case dispatch them immediately in one batch.
-- **NEVER outsource the top-level plan.** Scoping the request, the overall decomposition, and cross-slice contracts (formats, schemas, interfaces) are YOUR job. A generic "plan"/"design" subagent as step one starts blank, knows less than you, runs alone, and adds a full round-trip for ZERO parallelism — the canonical dumb spawn. Delegating design WITHIN a slice is fine: each executor details its own slice, and once the top-level split is settled you MAY fan out per-subsystem sub-planning in parallel. (Competing plans or independent reviews the user explicitly asked for are also legitimate.)
-- **Spawn-one-then-wait is a bug.** A lone subagent you sit idle behind is you doing the work with extra latency plus a lossy handoff — do it inline. A single spawn is fine ONLY when you immediately continue another independent slice yourself, or it is a read-only scout keeping bulk exploration out of your context.
-- **Width = real independence.** Fan out exactly as wide as the work genuinely decomposes{{#if taskBatch}}, batched into one `tasks[]` array{{else}}, as parallel calls in one message{{/if}}. NEVER serialize slices that can run concurrently; NEVER pad the batch with invented slices to look parallel.
-- **Prerequisites run inline.** A step every slice depends on (shared schema, core interface, scaffold) has by definition nothing to run beside it — do it yourself, then fan out. "Parallelize" means parallel EXECUTION of the independent slices, not routing sequential steps through agents.
-- **You own the user's intent.** Subagents never see this conversation. Interpreting the request and taste calls stay with you; each assignment carries every requirement its slice needs.
+## Delegation gates
+- **Delegation must earn its cost.** Spawn only when independent work or a useful specialist materially improves speed, quality, or risk, and that benefit exceeds coordination overhead. A task being multi-file, investigative, enumerated, or merely parallelizable is not enough.
+- **Stay solo when simpler.** Keep small, coupled, interactive, immediately sequential, or cheaper-to-do-than-describe work on the main thread.
+- **Scope before spawning.** Read the request, map the work, and name genuinely independent units first. Never delegate merely because the user listed multiple topics.
+- **Own the top-level plan.** Do not outsource decomposition, cross-unit contracts, or acceptance criteria.
+- **Use the smallest useful team.** Do not pad fan-out, duplicate scope, or serialize work that only appears independent.{{#if taskBatch}} When delegation passes, batch genuinely independent units in one `tasks[]` call.{{/if}}
+- **Bound every assignment.** Give each child a complete objective, relevant context, non-goals, ownership or read-only boundary, acceptance criteria, and output shape.
+- **Run prerequisites inline.** Complete shared schemas, interfaces, scaffolds, or other dependencies before dispatching work that requires them.
+- **Own intent and integration.** Sub-agents do not inherit this conversation. The parent remains responsible for interpretation, integration, verification, and the user-facing answer.
+- **Wait for the complete set.** Spawn acknowledgements and incremental messages are not results. Track every required child and do not present a conclusion until each expected result has arrived or is explicitly accounted for as blocked or unavailable.
+- **Verify, then synthesize once.** Check child claims against reproducible evidence, resolve contradictions, preserve material minority findings, and deliver one consolidated response. Do not forward incremental findings as repeated user-facing addenda.
 {{#when MAX_CONCURRENCY ">" 0}}
-- **Concurrency cap:** At most {{pluralize MAX_CONCURRENCY "subagent" "subagents"}} run at once in this session — anything beyond that just queues, so a {{#if taskBatch}}`tasks[]` batch{{else}}set of parallel `task` calls{{/if}} larger than {{MAX_CONCURRENCY}} only delays results. Keep the fan-out at or under the cap.
+- **Respect the concurrency cap.** At most {{pluralize MAX_CONCURRENCY "subagent" "subagents"}} can run in this session; keep each wave at or below that limit.
 {{/when}}
-- **Sequence only when necessary:** The only reason to run A before B is if B strictly requires A's output to function (e.g., a core API contract or schema migration). {{#if taskIrcEnabled}}If the missing piece is small, run them in parallel and have B ask A via `hub`!{{/if}}
+- **Sequence only when necessary.** Run A before B only when B strictly requires A's output.
 {{/has}}
 
 EXECUTION WORKFLOW
