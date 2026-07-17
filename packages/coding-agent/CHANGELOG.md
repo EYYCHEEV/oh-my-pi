@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Made subagent delegation model-agnostic and solo-first by default, with value-gated preferred delegation, an explicit forceful `always` override, and a complete-results barrier before synthesis.
+
 ## [17.0.2] - 2026-07-17
 
 ### Added

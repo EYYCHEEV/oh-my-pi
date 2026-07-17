@@ -4139,11 +4139,23 @@ export const SETTINGS_SCHEMA = {
 			tab: "tasks",
 			group: "Subagents",
 			label: "Prefer Task Delegation",
-			description: "How strongly to push delegating work to subagents",
+			description: "How strongly to prefer delegating work to subagents",
 			options: [
-				{ value: "default", label: "Default", description: "Model decides when to delegate" },
-				{ value: "preferred", label: "Preferred", description: "Adds delegation guidance to the system prompt" },
-				{ value: "always", label: "Always", description: "Prompt guidance plus a first-turn delegation reminder" },
+				{
+					value: "default",
+					label: "Default",
+					description: "Solo-first; model delegates only when coordination pays off",
+				},
+				{
+					value: "preferred",
+					label: "Preferred",
+					description: "Soft delegation nudge when value exceeds coordination cost",
+				},
+				{
+					value: "always",
+					label: "Always",
+					description: "Requires delegation for substantial work plus a first-turn reminder",
+				},
 			],
 		},
 	},
