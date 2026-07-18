@@ -123,10 +123,9 @@ describe("ProcessTerminal stdin recovery", () => {
 		expect(settled).toBe(true);
 	});
 
-	it("routes unrelated stdin errors through terminal disconnect", () => {
+	it("keeps unrelated stdin errors fatal", () => {
 		const stdin = new FakeStdin();
 		const reopenStdin = vi.fn(() => new FakeStdin() as unknown as NodeJS.ReadStream);
-		const disconnect = vi.fn();
 		terminal = new ProcessTerminal({
 			stdin: stdin as unknown as NodeJS.ReadStream,
 			reopenStdin,
@@ -134,12 +133,10 @@ describe("ProcessTerminal stdin recovery", () => {
 		terminal.start(
 			() => {},
 			() => {},
-			disconnect,
 		);
 		const failure = Object.assign(new Error("device failure"), { code: "EIO", syscall: "read" });
 
-		expect(() => stdin.emit("error", failure)).not.toThrow();
-		expect(disconnect).toHaveBeenCalledTimes(1);
+		expect(() => stdin.emit("error", failure)).toThrow(failure);
 		expect(reopenStdin).not.toHaveBeenCalled();
 	});
 });

@@ -501,11 +501,7 @@ export class ProcessTerminal implements Terminal {
 		this.#markTerminalDisconnected("stdin closed");
 	};
 	#stdinErrorHandler = (err: Error) => {
-		if (isTransientReadEintr(err)) {
-			this.#recoverStdin(err);
-			return;
-		}
-		this.#markTerminalDisconnected("stdin failed", err);
+		this.#recoverStdin(err);
 	};
 	#dead = false;
 	// Captured at construction and re-read at start(): when true, every real
