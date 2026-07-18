@@ -162,6 +162,7 @@ function renderDescription(
 	isolationEnabled: boolean,
 	disabledAgents: string[],
 	batchEnabled: boolean,
+	batchBlocking: boolean,
 	asyncEnabled: boolean,
 	ircEnabled: boolean,
 	parentSpawns: string,
@@ -188,6 +189,7 @@ function renderDescription(
 		allowedAgentsText: spawnPolicy.allowedPromptText,
 		isolationEnabled,
 		batchEnabled,
+		batchBlocking,
 		asyncEnabled,
 		hasBlockingAgents: renderedAgents.some(agent => agent.blocking),
 		ircEnabled,
@@ -477,8 +479,8 @@ function discoverAgentsForCreate(cwd: string): Promise<DiscoveryResult> {
  * Task tool - Delegate tasks to specialized agents.
  *
  * Each call spawns one subagent — or, with `task.batch`, one per `tasks[]`
- * item. When `async.enabled` is on, spawns run as AsyncJobManager jobs; when
- * disabled, the tool blocks until every spawn finishes.
+ * item. Non-blocking spawns normally use AsyncJobManager when async execution
+ * is enabled; `task.batchBlocking` keeps multi-item fan-out inline and merged.
  */
 export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetails, Theme> {
 	readonly name = "task";
@@ -557,6 +559,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			!planMode && isolationMode !== "none",
 			disabledAgents,
 			this.#isBatchEnabled(),
+			this.session.settings.get("task.batchBlocking"),
 			this.session.settings.get("async.enabled"),
 			isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 			this.session.getSessionSpawns() ?? "*",
@@ -639,16 +642,19 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const spawnItems = resolveSpawnItems(params);
 		const normalizedSpawnParams = spawnItems.map(item => spawnParamsFor(params, item, defaultAgent));
 		const resolvedAgents = normalizedSpawnParams.map(spawn => spawn.agent ?? defaultAgent);
-		// Execution mode is per item: an item whose agent type declares
-		// `blocking: true` runs inline on this turn (the parent waits on its
-		// result); every other item becomes a background job when async
+		const blockingBatch =
+			Array.isArray(params.tasks) && spawnItems.length > 1 && this.session.settings.get("task.batchBlocking");
+		// Multi-item batches can opt into one inline, merged result. Otherwise
+		// execution mode is per item: an agent type declaring `blocking: true`
+		// runs inline while every other item becomes a background job when async
 		// execution is available.
 		const provisionalBlocking = resolvedAgents.map(
 			name => this.#discoveredAgents.find(agent => agent.name === name)?.blocking === true,
 		);
 		const asyncEnabled = this.session.settings.get("async.enabled");
 		const manager = asyncEnabled ? this.session.asyncJobManager : undefined;
-		const provisionalAsyncItems = manager ? spawnItems.filter((_, index) => !provisionalBlocking[index]) : [];
+		const provisionalAsyncItems =
+			manager && !blockingBatch ? spawnItems.filter((_, index) => !provisionalBlocking[index]) : [];
 		const depthCapacity = canSpawnAtDepth(
 			this.session.settings.get("task.maxRecursionDepth") ?? 2,
 			this.session.taskDepth ?? 0,
@@ -1181,10 +1187,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	}
 
 	/**
-	 * Sync fan-out (async unavailable, or every item's agent type is
-	 * `blocking: true`): run every spawn to completion inline and merge the
-	 * per-spawn payloads into a single tool result. The session-scoped
-	 * semaphore still bounds concurrency across parallel task calls.
+	 * Sync fan-out (blocking multi-item batch, async unavailable, or every
+	 * item's agent type is `blocking: true`): run every spawn to completion
+	 * inline and merge the per-spawn payloads into a single tool result. The
+	 * session-scoped semaphore still bounds concurrency across parallel calls.
 	 */
 	async #executeSyncFanout(
 		toolCallId: string,

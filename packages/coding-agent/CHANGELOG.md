@@ -270,6 +270,10 @@
 ### Removed
 
 - Removed the unreliable Bing and Yahoo HTML-scraping web search providers
+### Added
+
+- Added `task.batchBlocking` to keep multi-item task batches concurrent while returning one merged result only after every child finishes.
+
 ### Changed
 
 - Made subagent delegation model-agnostic and solo-first by default, with value-gated preferred delegation, an explicit forceful `always` override, and a complete-results barrier before synthesis.

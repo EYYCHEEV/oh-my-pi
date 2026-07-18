@@ -1,7 +1,7 @@
-{{#if asyncEnabled}}{{#if batchEnabled}}Delegate work to background subagents by passing multiple items in a single `tasks[]` batch.
-Execution does not block — you receive IDs immediately.{{else}}Delegate work to ONE background subagent per call.
+{{#if asyncEnabled}}{{#if batchEnabled}}Delegate work to subagents by passing multiple items in a single `tasks[]` batch.
+{{#if batchBlocking}}Multi-item batches run concurrently and block until every item finishes, returning one merged result. A one-item batch of a non-blocking agent remains asynchronous and returns an ID immediately.{{else}}Execution does not block — you receive IDs immediately.{{/if}}{{else}}Delegate work to ONE background subagent per call.
 Execution does not block — you receive an ID immediately.{{/if}}{{#if hasBlockingAgents}}
-Agents marked BLOCKING run inline — results return in this call; non-blocking items in the same batch still spawn as background jobs.{{/if}}{{else}}{{#if batchEnabled}}Run subagents synchronously by passing items in a `tasks[]` batch. Execution blocks until all work finishes.{{else}}Run ONE subagent synchronously. Execution blocks until work finishes.{{/if}}{{/if}}
+Agents marked BLOCKING run inline — results return in this call.{{/if}}{{else}}{{#if batchEnabled}}Run subagents synchronously by passing items in a `tasks[]` batch. Execution blocks until all work finishes.{{else}}Run ONE subagent synchronously. Execution blocks until work finishes.{{/if}}{{/if}}
 {{#if asyncEnabled}}
 
 # Async Job Contract
