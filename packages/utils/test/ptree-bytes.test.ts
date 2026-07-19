@@ -4,7 +4,7 @@ import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SupervisedProcessTree } from "@oh-my-pi/pi-natives";
-import { spawn, spawnBounded } from "@oh-my-pi/pi-utils/ptree";
+import { type BoundedChildProcess, spawn, spawnBounded } from "@oh-my-pi/pi-utils/ptree";
 import type { Spawn } from "bun";
 
 describe("ptree.ChildProcess.bytes()", () => {
@@ -285,6 +285,7 @@ describe("ptree.spawnBounded()", () => {
 		async () => {
 			const originalRead = ReadableStreamDefaultReader.prototype.read;
 			const readSpy = spyOn(ReadableStreamDefaultReader.prototype, "read");
+			let child: BoundedChildProcess | undefined;
 			let injected = false;
 			readSpy.mockImplementation(function (this: ReadableStreamDefaultReader<unknown>) {
 				if (!injected) {
@@ -300,7 +301,7 @@ describe("ptree.spawnBounded()", () => {
 				return originalWait.call(this, options);
 			});
 			try {
-				const child = spawnBounded(["bun", "-e", "await Bun.sleep(30_000)"], {
+				child = spawnBounded(["bun", "-e", "await Bun.sleep(30_000)"], {
 					tree: "required",
 					stdoutCap: 8,
 					stderrCap: 8,
@@ -312,6 +313,15 @@ describe("ptree.spawnBounded()", () => {
 			} finally {
 				waitSpy.mockRestore();
 				readSpy.mockRestore();
+				if (child && processIsAlive(child.pid)) {
+					// This case deliberately makes normal cleanup unprovable. Its test-only
+					// fallback must reap its own group or a passing run leaves a busy Bun supervisor.
+					process.kill(-child.pid, "SIGKILL");
+					for (let attempt = 0; attempt < 100 && processIsAlive(child.pid); attempt++) {
+						await Bun.sleep(10);
+					}
+					expect(processIsAlive(child.pid)).toBe(false);
+				}
 			}
 		},
 	);
@@ -535,6 +545,10 @@ describe("ptree.spawnBounded()", () => {
 				expect(processIsAlive(escapedPid)).toBe(true);
 			} finally {
 				if (processIsAlive(escapedPid)) process.kill(escapedPid, "SIGKILL");
+				for (let attempt = 0; attempt < 100 && processIsAlive(escapedPid); attempt++) {
+					await Bun.sleep(10);
+				}
+				expect(processIsAlive(escapedPid)).toBe(false);
 				unlinkSync(marker);
 			}
 		},
@@ -546,7 +560,8 @@ describe("ptree.spawnBounded()", () => {
 			stdoutCap: 0,
 			stderrCap: 256,
 		});
-		await expect(child.output).rejects.toThrow();
+		const error = await child.output.catch(error => error);
+		expect(error).toBeInstanceOf(Error);
 		expect(await child.waitTree({ timeoutMs: 1_000 })).toBe(true);
 	});
 
