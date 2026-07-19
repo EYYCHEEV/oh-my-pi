@@ -109,10 +109,12 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("forwards rules, required extension, extension paths, and custom-tool paths to createAgentSession", async () => {
+	it("forwards parent-discovered capabilities and resolved instruction context to createAgentSession", async () => {
 		const session = yieldEmittingSession();
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
 
+		const contextFiles = [{ path: "/tmp/AGENTS.md", content: "# Parent policy" }];
+		const appendSystemPrompt = "Parent outcome policy";
 		const rules: Rule[] = [{ name: "rule-a" } as unknown as Rule];
 		const preloadedExtensionPaths = ["/abs/parent/.omp/extensions/foo.ts"];
 		const requiredExtension: RequiredExtensionSpec = {
@@ -126,6 +128,8 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 
 		const result = await runSubprocess({
 			...baseOptions,
+			contextFiles,
+			appendSystemPrompt,
 			rules,
 			preloadedExtensionPaths,
 			requiredExtension,
@@ -140,6 +144,8 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(forwarded?.preloadedExtensionPaths).toBe(preloadedExtensionPaths);
 		expect(forwarded?.requiredExtension).toBe(requiredExtension);
 		expect(forwarded?.preloadedCustomToolPaths).toBe(preloadedCustomToolPaths);
+		expect(forwarded?.contextFiles).toBe(contextFiles);
+		expect(forwarded?.appendSystemPrompt).toBe(appendSystemPrompt);
 	});
 
 	it("forwards undefined when the parent has not pre-discovered state", async () => {
