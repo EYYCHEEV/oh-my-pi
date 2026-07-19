@@ -370,6 +370,8 @@ export interface ExecutorOptions {
 	artifactsDir?: string;
 	eventBus?: EventBus;
 	contextFiles?: ContextFileEntry[];
+	/** Parent's already-resolved append system prompt. */
+	appendSystemPrompt?: string;
 	skills?: Skill[];
 	promptTemplates?: PromptTemplate[];
 	workspaceTree?: WorkspaceTree;
@@ -2515,6 +2517,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				restrictToolNames: options.restrictToolNames,
 				requireYieldTool: true,
 				contextFiles: options.contextFiles,
+				appendSystemPrompt: options.appendSystemPrompt,
 				skills: options.skills,
 				promptTemplates: options.promptTemplates,
 				workspaceTree: options.workspaceTree,

@@ -1776,6 +1776,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			},
 			skipPythonPreflight: options.skipPythonPreflight,
 			contextFiles,
+			appendSystemPrompt: options.appendSystemPrompt,
 			workspaceTree: resolvedWorkspaceTree,
 			get skills() {
 				return session?.skills ?? skills;

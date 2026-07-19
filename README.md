@@ -80,6 +80,7 @@ An upgrade fails before build or installation if the block is stale, any declare
 <!-- stronk-omp:fork-contracts:start -->
 - `required-extension-enforcement`: Required safety extension enforcement
 - `terminal-eintr-worker-ownership`: Terminal EINTR recovery and shared-worker ownership
+- `subagent-policy-inheritance`: Resolved parent policy inheritance for subagents
 - `turn-status-lifecycle`: Root and subagent turn-status lifecycle
 - `goal-objective-skill-picker`: Goal objective skill-picker routing
 - `mcp-image-forwarding`: Ordered MCP image forwarding
