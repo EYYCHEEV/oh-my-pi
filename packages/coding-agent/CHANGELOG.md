@@ -165,6 +165,9 @@
 - Fixed bash command timeouts rendering with an incorrect error border, and resolved Windows bash crashes when piped commands time out.
 - Migrated legacy nested/quoted-dotted config keys (e.g., `dev.autoqa.consent` -> `dev.autoqaConsent`) on settings load.
 - Added managed `ctx.setInterval` / `ctx.setTimeout` / `ctx.clearTimer` helpers on extension contexts to prevent uncaught exceptions from crashing sessions.
+### Fixed
+
+- Subagents now inherit the parent session's resolved AGENTS.md context and appended system prompt.
 
 ## [17.0.4] - 2026-07-18
 
