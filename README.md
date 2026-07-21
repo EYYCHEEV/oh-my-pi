@@ -90,6 +90,7 @@ An upgrade fails before build or installation if the block is stale, any declare
 - `interrupted-transcript-artifact-ids`: Collision-free interrupted transcript artifact IDs
 - `agent-registry-observation`: Read-only global agent-registry observation
 - `todo-update-prompt-contract`: Visible Todo update prompt contract
+- `kimi-usage-account-identity`: Per-account Kimi usage report identity
 <!-- stronk-omp:fork-contracts:end -->
 
 ## Upstream alignment
