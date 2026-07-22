@@ -783,6 +783,7 @@ export interface ToolApprovalResolvedEvent {
 interface ToolCallEventBase {
 	type: "tool_call";
 	toolCallId: string;
+	signal?: AbortSignal;
 }
 
 export interface BashToolCallEvent extends ToolCallEventBase {

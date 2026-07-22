@@ -1604,6 +1604,60 @@ describe("ExtensionRunner", () => {
 			};
 		}
 
+		it("passes the caller abort signal to the awaited extension gate", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_call", async (event) => {
+						(globalThis as typeof globalThis & { __ompToolCallSignal?: AbortSignal }).__ompToolCallSignal = event.signal;
+						if (!event.signal) return { block: true, reason: "missing caller signal" };
+						if (event.signal.aborted) return { block: true, reason: "caller cancelled" };
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-signal.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			let backendCalls = 0;
+			const tool: AgentTool = {
+				name: "signal_test",
+				label: "Signal test",
+				description: "Test caller signal propagation",
+				parameters: Type.Object({}),
+				strict: true,
+				execute: async () => {
+					backendCalls += 1;
+					return { content: [{ type: "text", text: "ok" }] };
+				},
+			};
+			const wrapped = new ExtensionToolWrapper(tool, runner);
+			const globalState = globalThis as typeof globalThis & { __ompToolCallSignal?: AbortSignal };
+
+			const cancelled = new AbortController();
+			cancelled.abort();
+			await expect(wrapped.execute("cancelled", {}, cancelled.signal)).rejects.toThrow("caller cancelled");
+			expect({ backendCalls, signal: globalState.__ompToolCallSignal }).toEqual({
+				backendCalls: 0,
+				signal: cancelled.signal,
+			});
+
+			const active = new AbortController();
+			expect(await wrapped.execute("active", {}, active.signal)).toEqual({
+				content: [{ type: "text", text: "ok" }],
+			});
+			expect({ backendCalls, signal: globalState.__ompToolCallSignal }).toEqual({
+				backendCalls: 1,
+				signal: active.signal,
+			});
+			delete globalState.__ompToolCallSignal;
+		});
+
 		it("exposes a single hashline edit path to extension gate handlers", async () => {
 			const eventsPath = path.join(tempDir.path(), "tool-call-events.jsonl");
 			const extCode = `
