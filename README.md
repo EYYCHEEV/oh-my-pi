@@ -83,6 +83,7 @@ An upgrade fails before build or installation if the block is stale, any declare
 - `subagent-policy-inheritance`: Resolved parent policy inheritance for subagents
 - `turn-status-lifecycle`: Root and subagent turn-status lifecycle
 - `goal-objective-skill-picker`: Goal objective skill-picker routing
+- `tool-call-abort-signal`: Tool-call abort signal propagation
 - `mcp-image-forwarding`: Ordered MCP image forwarding
 - `bounded-process-tree-cleanup`: Identity-safe bounded process-tree cleanup
 - `task-delegation-gate`: Policy-gated task delegation
