@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `read` crashing on valid tar/tar.gz archives with Unicode member names under Bun 1.3.14.
+
 ## [17.0.7] - 2026-07-21
 
 ### Fixed
