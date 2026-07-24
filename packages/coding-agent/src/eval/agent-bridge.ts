@@ -221,5 +221,4 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 		if (error instanceof StructuredSubagentError) throw new ToolError(error.message);
 		throw error;
 	}
-
 }

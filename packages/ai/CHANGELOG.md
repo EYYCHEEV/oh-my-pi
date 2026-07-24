@@ -2,6 +2,55 @@
 
 ## [Unreleased]
 
+## [17.1.0] - 2026-07-24
+
+### Added
+
+- Added support for caller-owned `cachedContent` on Google Generative AI and Google Vertex AI `GenerateContent` options, allowing passing of opaque cache resource names.
+- Added Anthropic extra-usage reporting across CLI, interactive, and ACP usage endpoints, normalizing the authoritative `spend` payload into a 'Claude Extra Usage' USD row with accurate limit, remaining, and status details.
+- Added process-scoped OAuth account pools for trusted auth-broker clients via `OMP_AUTH_BROKER_ACCOUNT_POOL_FILE` to filter snapshots, updates, refreshes, and usage reports to selected OAuth identities.
+- Added opt-in Vercel AI Gateway automatic prompt caching for OpenAI Chat Completions, including support for cache anchors and cache lifetimes.
+- Added opt-in explicit prompt-cache controls for OpenAI GPT-5.6+ Responses and Chat Completions, supporting stable boundary selection, stateful Responses markers, and future GPT-5.x/6.x models.
+- Added support for forwarding `statefulResponses` through `streamSimple` to allow diagnostic callers to explicitly disable OpenAI Responses `previous_response_id` chaining.
+- Added native QwenCloud Token Plan support, including API-key login, model discovery, and an optional interactive console-Cookie prompt for quota reporting.
+- Added interactive Meta Model API key login and support for `MODEL_API_KEY` and `META_API_KEY` environment variables.
+- Added model-scoped usage health tracking and same-provider reselection for native coding-plan credential pools.
+
+### Fixed
+
+- Fixed AWS Bedrock cache checkpoints to use resolved model compatibility, falling back to the provider-default 5-minute cache for unsupported 1-hour retentions, emitting AWS-recommended explicit checkpoints for Nova models (Lite, Micro, Pro, Premier, Nova 2 Lite), and honoring configured checkpoint maxima.
+- Fixed Pi-native and compatibility-wrapper requests dropping cache controls required by `omp bench --cache` to preserve explicit prompt-cache affinity and allow disabling OpenAI Responses chaining.
+- Fixed outbound credential-pattern redaction running unconditionally; it is now opt-in via `configureCredentialRedaction` and disabled by default.
+- Fixed SuperGrok (`xai-oauth`) `/usage` reporting for unified-billing accounts by falling back to the default monthly limit and usage payload when credit usage percentages are absent.
+- Fixed sessions wedging with a `400 Invalid signature in thinking block` error when switching Anthropic-compatible providers by stripping signatures whose issuing provider differs from the target.
+- Fixed OAuth callback servers aborting login on premature invalid callbacks, and restricted `localhost` callback listeners to the IPv4 loopback interface.
+- Fixed Google Gemini CLI and Antigravity OAuth login hanging indefinitely during Cloud Code Assist project provisioning by introducing request timeouts, cancellation checks, and bounded polling.
+
+## [17.0.9] - 2026-07-23
+
+### Added
+
+- Added Synthetic (synthetic.new) usage provider: `/usage` now reports the rolling 5-hour request limit and weekly credit quota via `GET /v2/quotas`, including per-tick regeneration rates in the window labels.
+- Added optional `UsageWindow.resetLabel` so rolling windows can render their countdown with an accurate verb (e.g. "tick in 12m" / "regen in 51m" instead of "resets in") — both quota windows on Synthetic regenerate incrementally rather than hard-resetting.
+
+### Fixed
+
+- Fixed GitHub Copilot OpenAI-compatible requests being rejected when the session's native OpenAI service tier was set to `priority` ([#5160](https://github.com/can1357/oh-my-pi/pull/5160) by [@audreyt](https://github.com/audreyt)).
+- Fixed OpenAI Responses token-cap truncations suppressing fully streamed function and custom tool calls whose inputs are complete.
+- Added SuperGrok (`xai-oauth`) usage tracking for weekly credits, product limits, and positive on-demand caps.
+
+## [17.0.8] - 2026-07-22
+
+### Fixed
+
+- Fixed Gemini Flash Cloud Code Assist empty-response retries when responses contain only intercepted planning-leak JSON.
+- Fixed Antigravity auto-routing to correctly fail over to the sandbox endpoint when the daily endpoint exhausts its retries.
+- Fixed OpenAI-compatible providers configured with auth: none incorrectly sending an Authorization: Bearer N/A header, which broke custom endpoints using alternative authentication headers.
+- Fixed auth-gateway model listings exposing duplicate or ambiguous model IDs by ensuring only provider-qualified routing IDs are advertised.
+- Improved connection error handling by classifying generic connection failures as transient, allowing them to be retried, while keeping explicit authentication rejections non-retryable.
+- Fixed custom Anthropic base URLs losing native thinking signatures during continuation requests.
+- Fixed Alibaba Coding Plan Custom login rejecting valid API keys on endpoints that do not serve the default validation model by validating against the model catalog instead.
+
 ## [17.0.6] - 2026-07-20
 
 ### Fixed

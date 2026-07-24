@@ -23,10 +23,10 @@ import {
 	type RequiredExtensionStartupFailure,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { CreateAgentSessionOptions } from "@oh-my-pi/pi-coding-agent/sdk";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -553,19 +553,21 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 			createdAt: Date.now(),
 			lastActivity: Date.now(),
 		} as const;
-		const revive = await factory(ref);
+		const registeredRef = AgentRegistry.global().register(ref);
+		const revive = await factory(registeredRef);
 		if (!revive) throw new Error("expected cold reviver");
 
 		settings.set("requiredExtension.path", path.join(sharedDir, "wrong.ts"));
 		settings.set("requiredExtension.id", "extension-module:wrong");
 		settings.set("requiredExtension.sha256", "0".repeat(64));
-		const revived = await revive();
+		const revived = await revive(registeredRef);
 		expect(revived).toBeDefined();
 		await revived.dispose();
 
 		fs.writeFileSync(extensionPath, `${content}\n// changed`);
-		const mismatchedRevive = await factory(ref);
+		const mismatchRef = AgentRegistry.global().register(ref);
+		const mismatchedRevive = await factory(mismatchRef);
 		if (!mismatchedRevive) throw new Error("expected mismatch cold reviver");
-		await expect(mismatchedRevive()).rejects.toMatchObject({ code: "hash-mismatch" });
+		await expect(mismatchedRevive(mismatchRef)).rejects.toMatchObject({ code: "hash-mismatch" });
 	});
 });

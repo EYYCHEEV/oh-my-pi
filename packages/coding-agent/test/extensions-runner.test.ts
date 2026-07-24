@@ -2,7 +2,7 @@
  * Tests for ExtensionRunner - conflict detection, error handling, tool wrapping.
  */
 
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, expectTypeOf, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
@@ -19,7 +19,7 @@ import {
 	ExtensionRunner,
 	testSetExtensionHandlerTimeoutMs,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
-import type { ExtensionError } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { ExtensionError, ExtensionServiceTier } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { Type } from "@oh-my-pi/pi-coding-agent/extensibility/typebox";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -1237,6 +1237,98 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	describe("service tier API", () => {
+		it("restricts tiers to values supported by each provider family", () => {
+			expectTypeOf<"scale">().toExtend<ExtensionServiceTier<"openai">>();
+			expectTypeOf<"flex">().toExtend<ExtensionServiceTier<"google">>();
+			expectTypeOf<"priority">().toExtend<ExtensionServiceTier<"anthropic">>();
+			expectTypeOf<"scale">().not.toExtend<ExtensionServiceTier<"google">>();
+			expectTypeOf<"flex">().not.toExtend<ExtensionServiceTier<"anthropic">>();
+		});
+
+		it("returns a detached snapshot, forwards valid changes, and rejects invalid family tiers", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("session_start", () => {
+						const tiers = pi.getServiceTiers();
+						tiers.openai = "scale";
+						pi.appendEntry("service-tier-snapshot", tiers);
+						pi.setServiceTier("google", "flex");
+						pi.setServiceTier("openai", undefined);
+					});
+					pi.on("session_start", () => {
+						pi.setServiceTier("anthropic", "scale");
+					});
+					pi.on("session_start", () => {
+						pi.setServiceTier("bogus", "priority");
+					});
+				}
+			`;
+			const explicitExtensionPath = path.join(tempDir.path(), "service-tiers.ts");
+			await Bun.write(explicitExtensionPath, extCode);
+			const result = await loadTestExtensions([explicitExtensionPath]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const serviceTiers = { openai: "priority" as const };
+			const snapshots: unknown[] = [];
+			const setCalls: Array<[string, unknown]> = [];
+			const errors: string[] = [];
+			runner.onError(error => {
+				errors.push(error.error);
+			});
+			runner.initialize(
+				{
+					sendMessage: () => {},
+					sendUserMessage: () => {},
+					appendEntry: (_customType, data) => {
+						snapshots.push(data);
+					},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getServiceTiers: () => serviceTiers,
+					setServiceTier: (family, tier) => {
+						setCalls.push([family, tier]);
+					},
+					getSessionName: () => undefined,
+					setSessionName: async () => {},
+				},
+				{
+					getModel: () => undefined,
+					isIdle: () => true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => [],
+				},
+			);
+
+			await runner.emit({ type: "session_start" });
+
+			expect(serviceTiers).toEqual({ openai: "priority" });
+			expect(snapshots).toEqual([{ openai: "scale" }]);
+			expect(setCalls).toEqual([
+				["google", "flex"],
+				["openai", undefined],
+			]);
+			expect(errors).toHaveLength(2);
+			expect(errors[0]).toContain('Invalid service tier "scale" for family "anthropic"');
+			expect(errors[1]).toContain('Invalid service tier "priority" for family "bogus"');
+		});
+	});
+
 	describe("session name API", () => {
 		it("lets extensions read and set the session name after initialization", async () => {
 			const extCode = `
@@ -2202,7 +2294,9 @@ describe("ExtensionRunner", () => {
 			const firstPath = path.join(tempDir.path(), "status-first.ts");
 			const duplicatePath = path.join(tempDir.path(), "status-duplicate.ts");
 			const builtinPath = path.join(tempDir.path(), "status-builtin.ts");
-			fs.writeFileSync(firstPath, `
+			fs.writeFileSync(
+				firstPath,
+				`
 				export default function(pi) {
 					globalThis.__statusApi = pi;
 					globalThis.__disposeFirstStatus = pi.registerStatusSegment({
@@ -2211,8 +2305,11 @@ describe("ExtensionRunner", () => {
 						render: () => "FIRST",
 					});
 				}
-			`);
-			fs.writeFileSync(duplicatePath, `
+			`,
+			);
+			fs.writeFileSync(
+				duplicatePath,
+				`
 				export default function(pi) {
 					pi.registerStatusSegment({
 						id: "turn_timer",
@@ -2220,8 +2317,11 @@ describe("ExtensionRunner", () => {
 						render: () => "SECOND",
 					});
 				}
-			`);
-			fs.writeFileSync(builtinPath, `
+			`,
+			);
+			fs.writeFileSync(
+				builtinPath,
+				`
 				export default function(pi) {
 					pi.registerStatusSegment({
 						id: "cost",
@@ -2229,7 +2329,8 @@ describe("ExtensionRunner", () => {
 						render: () => "BUILTIN",
 					});
 				}
-			`);
+			`,
+			);
 
 			const result = await loadTestExtensions([firstPath, duplicatePath, builtinPath]);
 			expect(result.errors.map(error => error.error)).toEqual([
@@ -2250,14 +2351,29 @@ describe("ExtensionRunner", () => {
 			);
 			runner.initialize(
 				{
-					sendMessage: () => {}, sendUserMessage: () => {}, appendEntry: () => {}, setLabel: () => {},
-					getActiveTools: () => [], getAllTools: () => [], setActiveTools: async () => {}, getCommands: () => [],
-					setModel: async () => false, getThinkingLevel: () => undefined, setThinkingLevel: () => {},
-					getSessionName: () => undefined, setSessionName: async () => {},
+					sendMessage: () => {},
+					sendUserMessage: () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getSessionName: () => undefined,
+					setSessionName: async () => {},
 				} as never,
 				{
-					getModel: () => undefined, isIdle: () => true, abort: () => {}, hasPendingMessages: () => false,
-					shutdown: () => {}, getContextUsage: () => undefined, compact: async () => {}, getSystemPrompt: () => [],
+					getModel: () => undefined,
+					isIdle: () => true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => [],
 				} as never,
 				undefined,
 				{
@@ -2322,7 +2438,9 @@ describe("ExtensionRunner", () => {
 		it("rolls back status IDs reserved by throwing file and inline factories", async () => {
 			const throwingPath = path.join(tempDir.path(), "status-throwing.ts");
 			const validPath = path.join(tempDir.path(), "status-valid.ts");
-			fs.writeFileSync(throwingPath, `
+			fs.writeFileSync(
+				throwingPath,
+				`
 				export default function(pi) {
 					pi.registerStatusSegment({
 						id: "turn_timer",
@@ -2331,8 +2449,11 @@ describe("ExtensionRunner", () => {
 					});
 					throw new Error("factory failed");
 				}
-			`);
-			fs.writeFileSync(validPath, `
+			`,
+			);
+			fs.writeFileSync(
+				validPath,
+				`
 				export default function(pi) {
 					pi.registerStatusSegment({
 						id: "turn_timer",
@@ -2340,7 +2461,8 @@ describe("ExtensionRunner", () => {
 						render: () => "VALID",
 					});
 				}
-			`);
+			`,
+			);
 
 			const fileResult = await loadTestExtensions([throwingPath, validPath]);
 			expect(fileResult.errors).toHaveLength(1);
@@ -2354,14 +2476,29 @@ describe("ExtensionRunner", () => {
 			const runner = new ExtensionRunner([], runtime, tempDir.path(), sessionManager, modelRegistry);
 			runner.initialize(
 				{
-					sendMessage: () => {}, sendUserMessage: () => {}, appendEntry: () => {}, setLabel: () => {},
-					getActiveTools: () => [], getAllTools: () => [], setActiveTools: async () => {}, getCommands: () => [],
-					setModel: async () => false, getThinkingLevel: () => undefined, setThinkingLevel: () => {},
-					getSessionName: () => undefined, setSessionName: async () => {},
+					sendMessage: () => {},
+					sendUserMessage: () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getSessionName: () => undefined,
+					setSessionName: async () => {},
 				} as never,
 				{
-					getModel: () => undefined, isIdle: () => true, abort: () => {}, hasPendingMessages: () => false,
-					shutdown: () => {}, getContextUsage: () => undefined, compact: async () => {}, getSystemPrompt: () => [],
+					getModel: () => undefined,
+					isIdle: () => true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => [],
 				} as never,
 				undefined,
 				{
@@ -2410,7 +2547,9 @@ describe("ExtensionRunner", () => {
 
 		it("keeps noninteractive hosting and invalidation as idempotent no-ops", async () => {
 			const extensionPath = path.join(tempDir.path(), "status-process.ts");
-			fs.writeFileSync(extensionPath, `
+			fs.writeFileSync(
+				extensionPath,
+				`
 				export default function(pi) {
 					globalThis.__disposeProcessStatus = pi.registerStatusSegment({
 						id: "process_timer",
@@ -2420,20 +2559,42 @@ describe("ExtensionRunner", () => {
 					pi.requestStatusLineRender();
 					pi.requestStatusLineRender();
 				}
-			`);
+			`,
+			);
 			const result = await loadTestExtensions([extensionPath]);
 			expect(result.errors).toEqual([]);
-			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir.path(), sessionManager, modelRegistry);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
 			runner.initialize(
 				{
-					sendMessage: () => {}, sendUserMessage: () => {}, appendEntry: () => {}, setLabel: () => {},
-					getActiveTools: () => [], getAllTools: () => [], setActiveTools: async () => {}, getCommands: () => [],
-					setModel: async () => false, getThinkingLevel: () => undefined, setThinkingLevel: () => {},
-					getSessionName: () => undefined, setSessionName: async () => {},
+					sendMessage: () => {},
+					sendUserMessage: () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getSessionName: () => undefined,
+					setSessionName: async () => {},
 				} as never,
 				{
-					getModel: () => undefined, isIdle: () => true, abort: () => {}, hasPendingMessages: () => false,
-					shutdown: () => {}, getContextUsage: () => undefined, compact: async () => {}, getSystemPrompt: () => [],
+					getModel: () => undefined,
+					isIdle: () => true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => [],
 				} as never,
 			);
 			const state = globalThis as typeof globalThis & { __disposeProcessStatus: () => void };

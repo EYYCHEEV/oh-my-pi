@@ -6,7 +6,7 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 // Contract: subagent output ids are the requested name, used verbatim the first
 // time and suffixed (`-2`, `-3`, …) only when the same name recurs. A parent
 // prefix nests ids under it. On resume the manager scans existing output and
-// transcript artifacts so it never reuses a name from an interrupted run.
+// child-session/transcript artifacts so it never reuses a name from an interrupted run.
 
 describe("AgentOutputManager", () => {
 	it("uses the requested name verbatim and suffixes only on repeat", async () => {
@@ -55,6 +55,15 @@ describe("AgentOutputManager", () => {
 		expect(await mgr.allocate("Carol")).toBe("Carol");
 	});
 
+	it("awaits one disk scan before concurrent allocations", async () => {
+		using tmp = TempDir.createSync("@omp-output-manager-");
+		const dir = tmp.path();
+		await Bun.write(path.join(dir, "Anna.jsonl"), "persisted child session");
+		const mgr = new AgentOutputManager(() => dir);
+
+		expect(await Promise.all([mgr.allocate("Anna"), mgr.allocate("Anna")])).toEqual(["Anna-2", "Anna-3"]);
+	});
+
 	it("only counts files within its own prefix scope on resume", async () => {
 		using tmp = TempDir.createSync("@omp-output-manager-");
 		const dir = tmp.path();
@@ -68,6 +77,14 @@ describe("AgentOutputManager", () => {
 
 		expect(await mgr.allocate("Bob")).toBe("Anna.Bob-2");
 		expect(await mgr.allocate("Dave")).toBe("Anna.Dave-2");
+	});
+
+	it("reserves lifecycle-known ids that no longer have files on disk", async () => {
+		const mgr = new AgentOutputManager(() => null);
+		await mgr.reserve(["Gone", "Other"]);
+
+		expect(await mgr.allocate("Gone")).toBe("Gone-2");
+		expect(await mgr.allocate("Fresh")).toBe("Fresh");
 	});
 
 	it("reserves the advisor transcript stem so a task can't clobber __advisor.jsonl", async () => {

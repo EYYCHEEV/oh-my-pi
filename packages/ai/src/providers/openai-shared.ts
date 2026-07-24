@@ -13,6 +13,7 @@ import type {
 	ResolvedOpenAISharedCompat,
 	VercelGatewayRouting,
 } from "@oh-my-pi/pi-catalog/types";
+import { parseAlibabaTokenPlanCredential } from "@oh-my-pi/pi-catalog/wire/alibaba-token-plan";
 import {
 	COREWEAVE_PROJECT_HEADER,
 	coreWeaveProjectHeaders,
@@ -54,6 +55,9 @@ import {
 	type ToolResultMessage,
 	type Usage,
 } from "../types";
+
+export type { OpenAIPromptCacheOptions } from "../types";
+
 import {
 	getOpenAIResponsesHistoryItems,
 	getOpenAIResponsesHistoryPayload,
@@ -100,6 +104,16 @@ import type {
 } from "./openai-responses-wire";
 import { transformMessages } from "./transform-messages";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER, partitionVisionContent } from "./vision-guard";
+
+/**
+ * Keyless-provider sentinel. Custom providers configured with `auth: none`
+ * (models.yml) have no credential, so the coding-agent resolves their API key
+ * to this literal instead of a real secret. Providers must treat it as "no
+ * credential" and suppress any credential-bearing header (e.g. `Authorization:
+ * Bearer …`) rather than forwarding the sentinel on the wire. See #6188; the
+ * google-vertex and amazon-bedrock transports apply the same guard inline.
+ */
+export const NO_AUTH_SENTINEL = "N/A";
 
 export interface OpenAIModelIdentity {
 	provider: string;
@@ -245,6 +259,18 @@ export function resolveOpenAIRequestSetup(
 		baseUrl = resolveGitHubCopilotBaseUrl(model.baseUrl, rawApiKey) ?? model.baseUrl;
 	}
 
+	if (model.provider === "alibaba-token-plan") {
+		// Require an explicitly resolved Token Plan credential. The generic
+		// `$env.OPENAI_API_KEY` fallback above matches the broad `sk-*` token
+		// grammar and would otherwise be sent to QwenCloud as bearer material.
+		if (!options.apiKey) {
+			throw new AIError.MissingApiKeyError("alibaba-token-plan");
+		}
+		const credential = parseAlibabaTokenPlanCredential(rawApiKey);
+		if (!credential) throw new AIError.ConfigurationError("Invalid QwenCloud Token Plan credential");
+		apiKey = credential.token;
+	}
+
 	if (options.alibabaCodingPlanAuth && model.provider === "alibaba-coding-plan") {
 		try {
 			const parsed = JSON.parse(rawApiKey);
@@ -279,7 +305,15 @@ export function resolveOpenAIRequestSetup(
 		baseUrl = baseUrl ?? ($env.OPENAI_BASE_URL?.trim() || options.defaultBaseUrl);
 	}
 	const requestHeaders = { ...headers };
-	headers.Authorization ??= `Bearer ${apiKey}`;
+	// A keyless provider (`auth: none` in models.yml) resolves to the `N/A`
+	// sentinel rather than a real key. Injecting `Authorization: Bearer N/A`
+	// breaks custom endpoints that authenticate via their own headers (e.g.
+	// `headers.x-api-key`) and reject the bogus bearer — mirror the sentinel
+	// guards in google-vertex / amazon-bedrock and send no Authorization here
+	// (#6188). A caller-supplied Authorization in `model.headers` still wins.
+	if (apiKey !== NO_AUTH_SENTINEL) {
+		headers.Authorization ??= `Bearer ${apiKey}`;
+	}
 	return { copilotPremiumRequests, baseUrl, headers, query, requestHeaders };
 }
 
@@ -580,7 +614,7 @@ export function resolveOpenAIOutputTokenParam(
 
 export interface OpenAIGatewayRoutingParams {
 	provider?: OpenRouterRouting;
-	providerOptions?: { gateway?: { only?: string[]; order?: string[] } };
+	providerOptions?: { gateway?: Pick<VercelGatewayRouting, "only" | "order" | "caching"> };
 }
 
 export interface OpenAIGatewayRoutingCompat {
@@ -592,26 +626,68 @@ export interface OpenAIGatewayRoutingCompat {
 
 /**
  * Apply gateway routing preferences to the request body. OpenRouter routes via
- * the top-level `provider` field; the Vercel AI Gateway routes via
- * `providerOptions.gateway`. Both Chat Completions and Responses call this; the
- * Vercel branch is inert for Responses, whose resolved compat never sets
- * `isVercelGatewayHost`.
+ * the top-level `provider` field; the Vercel AI Gateway routes Chat
+ * Completions through `providerOptions.gateway`.
  */
 export function applyOpenAIGatewayRouting(
 	params: OpenAIGatewayRoutingParams,
 	compat: OpenAIGatewayRoutingCompat,
+	cacheEnabled = true,
 ): void {
 	if (compat.isOpenRouterHost && compat.openRouterRouting) {
 		params.provider = compat.openRouterRouting;
 	}
 	if (compat.isVercelGatewayHost && compat.vercelGatewayRouting) {
 		const routing = compat.vercelGatewayRouting;
-		if (routing.only || routing.order) {
-			const gatewayOptions: { only?: string[]; order?: string[] } = {};
+		if (routing.only || routing.order || (cacheEnabled && routing.caching)) {
+			const gatewayOptions: Pick<VercelGatewayRouting, "only" | "order" | "caching"> = {};
 			if (routing.only) gatewayOptions.only = routing.only;
 			if (routing.order) gatewayOptions.order = routing.order;
+			if (cacheEnabled && routing.caching) gatewayOptions.caching = routing.caching;
 			params.providerOptions = { gateway: gatewayOptions };
 		}
+	}
+}
+
+export interface VercelResponsesCacheParams {
+	caching?: "auto";
+	cache_anchor_items?: number;
+	cache_ttl?: "5m" | "1h";
+	providerOptions?: { gateway?: Pick<VercelGatewayRouting, "only" | "order"> };
+}
+
+export interface VercelResponsesCacheCompat {
+	isVercelGatewayHost: boolean;
+	vercelGatewayRouting?: VercelGatewayRouting;
+}
+
+/**
+ * Apply Vercel AI Gateway's Responses-only automatic cache controls and
+ * provider routing. Cache settings are top-level Responses fields, while
+ * `only` and `order` remain under `providerOptions.gateway`.
+ */
+export function applyVercelResponsesCacheControls(
+	params: VercelResponsesCacheParams,
+	compat: VercelResponsesCacheCompat,
+	cacheRetention: CacheRetention = "short",
+): void {
+	const routing = compat.vercelGatewayRouting;
+	if (!compat.isVercelGatewayHost) return;
+
+	if (routing?.only || routing?.order) {
+		const gateway: Pick<VercelGatewayRouting, "only" | "order"> = {};
+		if (routing.only) gateway.only = routing.only;
+		if (routing.order) gateway.order = routing.order;
+		params.providerOptions = { gateway };
+	}
+
+	if (cacheRetention === "none" || routing?.caching !== "auto") return;
+
+	params.caching = "auto";
+	if (routing.cacheAnchorItems !== undefined) params.cache_anchor_items = routing.cacheAnchorItems;
+	// A configured 1h TTL is capped by resolved retention; default and short intentionally omit it.
+	if (routing.cacheTtl !== undefined && (routing.cacheTtl !== "1h" || cacheRetention === "long")) {
+		params.cache_ttl = routing.cacheTtl;
 	}
 }
 
@@ -1045,6 +1121,20 @@ export function resolveOpenAICompletionsOutputClamp(
 		return model.maxTokens ?? OPENAI_MAX_OUTPUT_TOKENS;
 	}
 	if (model.provider === "moonshot" && isKimiK3ModelId(model.id)) {
+		return model.maxTokens ?? OPENAI_MAX_OUTPUT_TOKENS;
+	}
+	return undefined;
+}
+
+/**
+ * Provider-specific Responses API output clamp.
+ *
+ * Meta documents a 131,072-token output limit for Muse Spark 1.1, so native
+ * Meta requests may use the model's full advertised cap instead of the
+ * conservative 64k OpenAI-compatible default.
+ */
+export function resolveOpenAIResponsesOutputClamp(model: Pick<Model, "provider" | "maxTokens">): number | undefined {
+	if (model.provider === "meta") {
 		return model.maxTokens ?? OPENAI_MAX_OUTPUT_TOKENS;
 	}
 	return undefined;
@@ -2483,6 +2573,7 @@ export async function processResponsesStream<TApi extends Api>(
 			const entry = lookupOpenToolCallAlias(event, "custom_tool_call");
 			if (entry?.item.type === "custom_tool_call" && entry.block.type === "toolCall") {
 				finalizeCustomToolCallInputDone(entry.block, event.input);
+				entry.block[kStreamingArgumentsDone] = true;
 			}
 		} else if (event.type === "response.output_item.done") {
 			const item = structuredCloneJSON(event.item);
@@ -2602,6 +2693,10 @@ export async function processResponsesStream<TApi extends Api>(
 			}
 		} else if (terminalEvent) {
 			const response = terminalEvent.response;
+			const shouldPromoteIncompleteToolUse =
+				response?.status === "incomplete" &&
+				response.incomplete_details?.reason === "max_output_tokens" &&
+				hasExecutableIncompleteResponsesToolCalls(output);
 			finalizePendingResponsesToolCalls(output);
 			if (response?.id) {
 				output.responseId = response.id;
@@ -2638,7 +2733,11 @@ export async function processResponsesStream<TApi extends Api>(
 					kind: "content-blocked",
 				});
 			}
-			promoteResponsesToolUseStopReason(output, (response as { end_turn?: boolean } | undefined)?.end_turn);
+			promoteResponsesToolUseStopReason(
+				output,
+				(response as { end_turn?: boolean } | undefined)?.end_turn,
+				shouldPromoteIncompleteToolUse,
+			);
 			options?.onCompleted?.();
 			// `response.completed`/`response.incomplete`/`response.done` is the last event of a
 			// Responses stream. Stop pulling instead of waiting for the server to
@@ -2694,6 +2793,28 @@ export function mapOpenAIResponsesStopReason(status: ResponseStatus | undefined)
 	}
 }
 
+function hasExecutableIncompleteResponsesToolCalls(output: AssistantMessage): boolean {
+	let hasToolCall = false;
+	for (const block of output.content) {
+		if (block.type !== "toolCall") continue;
+		hasToolCall = true;
+		const pending = block as ToolCall & {
+			[kStreamingPartialJson]?: string;
+			[kStreamingArgumentsDone]?: boolean;
+		};
+		const rawArguments = pending[kStreamingPartialJson];
+		// `output_item.done` is not positive completion proof: our Responses
+		// compatibility encoder force-closes still-open calls before forwarding an
+		// upstream `length` stop. Only an explicit arguments/input-done event sets
+		// this marker; an open ordinary call can instead prove completion with its
+		// retained strict-complete JSON.
+		if (pending[kStreamingArgumentsDone]) continue;
+		if (pending.customWireName !== undefined || rawArguments === undefined) return false;
+		if (classifyJsonPrefix(rawArguments) !== "complete") return false;
+	}
+	return hasToolCall;
+}
+
 /**
  * Finalize any streamed toolCall block whose `output_item.done` never arrived
  * (lossy proxy, or a terminal event that raced the per-item done): parse the
@@ -2727,8 +2848,15 @@ export function finalizePendingResponsesToolCalls(output: AssistantMessage): voi
  * re-samples instead of ending. Callers set `output.stopReason` from the wire
  * status first via {@link mapOpenAIResponsesStopReason}.
  */
-export function promoteResponsesToolUseStopReason(output: AssistantMessage, endTurn: boolean | undefined): void {
-	if (output.content.some(block => block.type === "toolCall") && output.stopReason === "stop") {
+export function promoteResponsesToolUseStopReason(
+	output: AssistantMessage,
+	endTurn: boolean | undefined,
+	promoteIncompleteToolUse = false,
+): void {
+	if (
+		output.content.some(block => block.type === "toolCall") &&
+		(output.stopReason === "stop" || (promoteIncompleteToolUse && output.stopReason === "length"))
+	) {
 		output.stopReason = "toolUse";
 	}
 	if (endTurn === false && output.stopReason === "stop") {
@@ -2793,7 +2921,7 @@ export function applyCommonResponsesSamplingParams<P extends CommonResponsesPara
 		params.max_output_tokens = Math.min(
 			options.maxTokens,
 			model.maxTokens ?? Number.POSITIVE_INFINITY,
-			OPENAI_MAX_OUTPUT_TOKENS,
+			resolveOpenAIResponsesOutputClamp(model) ?? OPENAI_MAX_OUTPUT_TOKENS,
 		);
 	}
 	// OpenAI proprietary reasoning models (o-series, gpt-5+) reject explicit

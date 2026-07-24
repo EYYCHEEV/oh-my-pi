@@ -138,10 +138,7 @@ describe("ptree.spawnBounded()", () => {
 			const releaseSent = Promise.withResolvers<void>();
 			const releaseGate = Promise.withResolvers<void>();
 			const spawnSpy = spyOn(Bun, "spawn");
-			const spawnMock = (
-				command: string[],
-				options?: Spawn.SpawnOptions<"ignore", "pipe", "pipe">,
-			) => {
+			const spawnMock = (command: string[], options?: Spawn.SpawnOptions<"ignore", "pipe", "pipe">) => {
 				const proc = originalSpawn(command, options);
 				return new Proxy(proc, {
 					get(target, key) {
@@ -190,10 +187,7 @@ describe("ptree.spawnBounded()", () => {
 		async () => {
 			const originalSpawn = Bun.spawn;
 			const spawnSpy = spyOn(Bun, "spawn");
-			const spawnMock = (
-				command: string[],
-				options?: Spawn.SpawnOptions<"ignore", "pipe", "pipe">,
-			) => {
+			const spawnMock = (command: string[], options?: Spawn.SpawnOptions<"ignore", "pipe", "pipe">) => {
 				const proc = originalSpawn(command, options);
 				return new Proxy(proc, {
 					get(target, key) {
@@ -392,9 +386,7 @@ describe("ptree.spawnBounded()", () => {
 			const targetPid = Number(readFileSync(marker, "utf8").trim());
 			process.kill(child.pid, "SIGSTOP");
 			try {
-				const error = await child
-					.terminateTree({ gracefulMs: 20, timeoutMs: 100 })
-					.catch(error => error);
+				const error = await child.terminateTree({ gracefulMs: 20, timeoutMs: 100 }).catch(error => error);
 				expect(error).toBeInstanceOf(AggregateError);
 				if (!(error instanceof Error)) throw new TypeError("expected hold acknowledgement failure");
 				expect(error.message).toMatch(/cleanup hold acknowledgement failed.*emergency cleanup/i);

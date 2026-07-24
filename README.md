@@ -26,6 +26,12 @@ It exists because a capable harness still becomes painful when a required safety
 - Model Context Protocol (MCP) image results reach the model instead of being lost at the boundary.
 - Task delegation, blocking task batches, transcript artifact identifiers, process-tree cleanup, and Todo progress keep their tested workstation contracts.
 
+> [!NOTE]
+> Pull requests are **temporarily open to everyone** as a trial. We previously
+> required a vouch before accepting PRs; that requirement is lifted for now
+> while we evaluate how open contributions go. Depending on the results, the
+> vouch system may return.
+
 ## Install
 
 > [!NOTE]
@@ -313,6 +319,13 @@ Three standalone, lowercase words opt a turn into specialized agent behavior:
 - `workflowz` — build a deterministic multi-subagent workflow with the active `task` tool.
 
 They trigger only in prose, not inside code spans, fenced code blocks, XML/HTML sections, identifiers, or paths. See [Magic keywords](docs/magic-keywords.md) for exact matching rules and configuration.
+
+### Session controls
+
+Slash commands shift how a whole session runs:
+
+- `/vibe` — enter [Vibe mode](docs/vibe-mode.md): act as a director driving persistent `fast`/`good` worker sessions with a `read`-only toolset.
+- `/fresh` — reset the provider stream state (stale prompt cache, wedged stream) without changing the local transcript. See [Session operations](docs/session-operations-export-share-fork-resume.md#fresh).
 
 ## Forty-plus providers, hundreds of models, _one /model away_.
 
@@ -623,9 +636,10 @@ For architecture and contribution guidelines, see [packages/coding-agent/DEVELOP
 ## Contributing
 
 Report Stronk OMP fork problems in the [fork issue tracker](https://github.com/EYYCHEEV/oh-my-pi/issues).
-For upstream OMP contributions, issues are open to everyone and pull requests require a vouch.
-If you are not yet vouched, open an [upstream Discussion](https://github.com/can1357/oh-my-pi/discussions) and ask a maintainer to `!vouch` before opening a pull request.
-See **[CONTRIBUTING.md](CONTRIBUTING.md)** and [`.github/VOUCHED.td`](.github/VOUCHED.td) for the upstream policy.
+Upstream issues and pull requests are open to everyone. Open PRs are currently a
+**trial** — the previous vouch requirement is lifted while we evaluate how it
+goes, and it may return. See **[CONTRIBUTING.md](CONTRIBUTING.md)** for
+guidelines on contributing.
 
 ---
 

@@ -23,18 +23,38 @@ function session(options: { cost?: number; subscription?: boolean } = {}) {
 	const model = { name: "test", contextWindow: 128000 };
 	return {
 		state: { messages: [], model },
-		messages: [], model, contextUsageRevision: 0,
-		systemPrompt: [], agent: { state: { tools: [] } }, skills: [], isStreaming: false,
-		isAutoThinking: false, autoResolvedThinkingLevel: () => undefined, isAdvisorActive: () => false,
-		isFastModeActive: () => false, getAsyncJobSnapshot: () => ({ running: [] }),
-		getCurrentModel: () => undefined, isFastModeEnabled: () => false,
-		getContextUsage: () => ({ tokens: 0, contextWindow: 128000 }), getGoalModeState: () => null,
+		messages: [],
+		model,
+		contextUsageRevision: 0,
+		systemPrompt: [],
+		agent: { state: { tools: [] } },
+		skills: [],
+		isStreaming: false,
+		isAutoThinking: false,
+		autoResolvedThinkingLevel: () => undefined,
+		isAdvisorActive: () => false,
+		isFastModeActive: () => false,
+		getAsyncJobSnapshot: () => ({ running: [] }),
+		getCurrentModel: () => undefined,
+		isFastModeEnabled: () => false,
+		getContextUsage: () => ({ tokens: 0, contextWindow: 128000 }),
+		getGoalModeState: () => null,
 		modelRegistry: { isUsingOAuth: () => options.subscription ?? false },
-		sessionManager: { getSessionName: () => "session", getUsageStatistics: () => ({
-			input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-			orchestrationInput: 0, orchestrationOutput: 0, orchestrationCacheRead: 0,
-			premiumRequests: 0, cost: options.cost ?? 0,
-		}) },
+		sessionManager: {
+			getSessionName: () => "session",
+			getUsageStatistics: () => ({
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				orchestrationInput: 0,
+				orchestrationOutput: 0,
+				orchestrationCacheRead: 0,
+				premiumRequests: 0,
+				cost: options.cost ?? 0,
+			}),
+		},
 	} as unknown as ConstructorParameters<typeof StatusLineComponent>[0];
 }
 
@@ -58,15 +78,14 @@ function plain(value: string): string {
 	return value.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
 }
 
-
 describe("extension status-line segments", () => {
 	it("renders immediately after actual cost on the left and right", () => {
 		for (const side of ["left", "right"] as const) {
-			const status = component(
-				side === "left" ? ["cost"] : [],
-				side === "right" ? ["cost"] : [],
-				{ cost: 0.74, subscription: true, separator: "pipe" },
-			);
+			const status = component(side === "left" ? ["cost"] : [], side === "right" ? ["cost"] : [], {
+				cost: 0.74,
+				subscription: true,
+				separator: "pipe",
+			});
 			status.registerExtensionSegment(`${side}-timer`, {
 				id: `${side}-timer`,
 				placement: { afterBuiltin: "cost", fallback: "anchor-side-end-else-right" },
@@ -103,7 +122,13 @@ describe("extension status-line segments", () => {
 		const baseline = component(["pi"], ["session_name"]);
 		const expected = baseline.getTopBorder(100);
 		const status = component(["pi"], ["session_name"]);
-		status.registerExtensionSegment("fault", { id: "fault", placement: { afterBuiltin: "pi", fallback: "anchor-side-end-else-right" }, render: () => { throw new Error("boom"); } });
+		status.registerExtensionSegment("fault", {
+			id: "fault",
+			placement: { afterBuiltin: "pi", fallback: "anchor-side-end-else-right" },
+			render: () => {
+				throw new Error("boom");
+			},
+		});
 		expect(status.getTopBorder(100)).toEqual(expected);
 	});
 
@@ -117,9 +142,16 @@ describe("extension status-line segments", () => {
 		};
 		for (const preset of ["default", "compact", "full", "ascii", "custom"] as const) {
 			const status = new StatusLineComponent(session());
-			const settings = preset === "custom"
-				? { preset, leftSegments: ["pi"], rightSegments: ["session_name"], separator: "pipe", sessionAccent: false }
-				: { preset };
+			const settings =
+				preset === "custom"
+					? {
+							preset,
+							leftSegments: ["pi"],
+							rightSegments: ["session_name"],
+							separator: "pipe",
+							sessionAccent: false,
+						}
+					: { preset };
 			status.updateSettings(settings as never);
 			expect(plain(status.getTopBorder(20).content)).toBe(goldens[preset]);
 		}
@@ -128,7 +160,11 @@ describe("extension status-line segments", () => {
 	it("invalidates on registration and idempotent disposal", () => {
 		const status = component(["pi"], []);
 		const invalidate = vi.spyOn(status, "invalidate");
-		const dispose = status.registerExtensionSegment("live", { id: "live", placement: { afterBuiltin: "pi", fallback: "anchor-side-end-else-right" }, render: () => "LIVE" });
+		const dispose = status.registerExtensionSegment("live", {
+			id: "live",
+			placement: { afterBuiltin: "pi", fallback: "anchor-side-end-else-right" },
+			render: () => "LIVE",
+		});
 		expect(invalidate).toHaveBeenCalledTimes(1);
 		dispose();
 		dispose();
@@ -157,15 +193,26 @@ describe("extension status-line segments", () => {
 
 	it("drops the newest extension first when width overflows", () => {
 		const status = component(["pi"], []);
-		status.registerExtensionSegment("first", { id: "first", placement: { afterBuiltin: "pi", fallback: "anchor-side-end-else-right" }, render: () => "FIRST" });
-		status.registerExtensionSegment("second", { id: "second", placement: { afterBuiltin: "pi", fallback: "anchor-side-end-else-right" }, render: () => "SECOND_LONG" });
+		status.registerExtensionSegment("first", {
+			id: "first",
+			placement: { afterBuiltin: "pi", fallback: "anchor-side-end-else-right" },
+			render: () => "FIRST",
+		});
+		status.registerExtensionSegment("second", {
+			id: "second",
+			placement: { afterBuiltin: "pi", fallback: "anchor-side-end-else-right" },
+			render: () => "SECOND_LONG",
+		});
 		const wide = plain(status.getTopBorder(80).content);
 		expect(wide).toContain("FIRST");
 		expect(wide).toContain("SECOND_LONG");
 		let observed: string | undefined;
 		for (let width = 79; width > 0; width--) {
 			const rendered = plain(status.getTopBorder(width).content);
-			if (rendered.includes("FIRST") && !rendered.includes("SECOND_LONG")) { observed = rendered; break; }
+			if (rendered.includes("FIRST") && !rendered.includes("SECOND_LONG")) {
+				observed = rendered;
+				break;
+			}
 		}
 		expect(observed).toContain("FIRST");
 	});

@@ -141,13 +141,17 @@ function isOpenAIServiceTierApi(api: Api | undefined): boolean {
 	return api === "openai-completions" || api === "openai-responses" || api === "openai-codex-responses";
 }
 
-function hasDedicatedServiceTierControl(provider: Provider | undefined): boolean {
-	return provider === "fireworks";
+function excludesInferredOpenAIServiceTier(provider: Provider | undefined): boolean {
+	// Fireworks has its own priority-only control. GitHub Copilot proxies OpenAI
+	// models but rejects OpenAI's `service_tier` request field.
+	return provider === "fireworks" || provider === "github-copilot";
 }
 
 function isOpenAIServiceTierModel(model: ServiceTierModel): boolean {
 	return (
-		!hasDedicatedServiceTierControl(model.provider) && isOpenAIServiceTierApi(model.api) && isOpenAIModelId(model.id)
+		!excludesInferredOpenAIServiceTier(model.provider) &&
+		isOpenAIServiceTierApi(model.api) &&
+		isOpenAIModelId(model.id)
 	);
 }
 
@@ -159,7 +163,8 @@ function isOpenAIServiceTierModel(model: ServiceTierModel): boolean {
  * `openai/`); Claude on Bedrock/Vertex (api `anthropic-messages`) is the
  * anthropic family even though its provider is `amazon-bedrock`/`google-vertex`.
  * Custom OpenAI-compatible relays that serve OpenAI model ids are OpenAI family
- * too unless that provider owns a separate tier control such as Fireworks.
+ * too unless the provider owns a separate tier control (Fireworks) or rejects
+ * OpenAI's service-tier field (GitHub Copilot).
  */
 export function serviceTierFamily(model: ServiceTierModel): ServiceTierFamily | undefined {
 	const provider = model.provider;
@@ -347,6 +352,16 @@ export interface CodexCompactionRequestContext extends CodexCompactionMetadata {
 	operationId: string;
 }
 
+/** OpenAI's GPT-5.6+ explicit prompt-cache controls. */
+export interface OpenAIPromptCacheOptions {
+	/** `explicit` disables OpenAI's automatic latest-message breakpoint. */
+	mode: "implicit" | "explicit";
+	/** The only currently supported minimum breakpoint lifetime. */
+	ttl?: "30m";
+	/** By default, mark one existing block from stable history; `none` suppresses that marker. */
+	breakpoint?: "latest-stable-message" | "none";
+}
+
 export interface StreamOptions {
 	temperature?: number;
 	topP?: number;
@@ -417,6 +432,18 @@ export interface StreamOptions {
 	 * `x-grok-conv-id`; when omitted, they fall back to `sessionId`.
 	 */
 	promptCacheKey?: string;
+	/**
+	 * OpenAI GPT-5.6+ prompt-cache policy. Ignored by providers that do not
+	 * support explicit OpenAI cache breakpoints; explicit mode fails locally on
+	 * incompatible OpenAI-compatible endpoints.
+	 */
+	promptCache?: OpenAIPromptCacheOptions;
+	/**
+	 * Disable OpenAI Responses server-side turn chaining for this request.
+	 * Diagnostic callers that compare independent requests can set this to
+	 * `false` so `previous_response_id` cannot explain a result.
+	 */
+	statefulResponses?: boolean;
 	/**
 	 * Provider-scoped mutable state store for this agent session.
 	 * Providers can use this to persist transport/session state between turns.
@@ -555,6 +582,12 @@ export interface SimpleStreamOptions extends Omit<StreamOptions, "apiKey"> {
 	 * or the catalog entry already names the variant).
 	 */
 	openrouterVariant?: string;
+	/**
+	 * Caller-owned Google context-cache resource name. Forwarded only to the
+	 * direct Gemini GenerateContent and Vertex GenerateContent APIs; all other
+	 * providers ignore it. Callers own the cache lifecycle and compatibility.
+	 */
+	cachedContent?: string;
 	/** Antigravity endpoint routing mode: "auto" (default with failover), "production", "sandbox". */
 	antigravityEndpointMode?: "auto" | "production" | "sandbox";
 	/**

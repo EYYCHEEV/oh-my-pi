@@ -589,10 +589,7 @@ export class BoundedChildProcess {
 			} catch (cause) {
 				const failure = new Error(`Failed to drain bounded process ${name}`, { cause });
 				this.#terminalFailure ??= failure;
-				return await this.#failAfterCleanup(
-					failure,
-					`${name} drain failed and cleanup could not be proven`,
-				);
+				return await this.#failAfterCleanup(failure, `${name} drain failed and cleanup could not be proven`);
 			}
 		};
 		const stdout = settleDrain("stdout", drainBounded(proc.stdout, stdoutCap, overflow, drainAbort.signal));
@@ -600,10 +597,7 @@ export class BoundedChildProcess {
 		this.output = (async () => {
 			const [stdoutResult, stderrResult, exitCode] = await Promise.all([stdout, stderr, exited]);
 			if (this.#overflowFailure) {
-				await this.#failAfterCleanup(
-					this.#overflowFailure,
-					"Output overflow cleanup could not be proven",
-				);
+				await this.#failAfterCleanup(this.#overflowFailure, "Output overflow cleanup could not be proven");
 			}
 			return {
 				stdout: stdoutResult.bytes,
@@ -642,12 +636,7 @@ export class BoundedChildProcess {
 		await Promise.resolve(this.#proc.send(message));
 	}
 	async #waitReady(signal = this.#lifecycleSignal): Promise<void> {
-		await this.#awaitControl(
-			this.#events.ready.promise,
-			"startup handshake",
-			this.#overflowTimeoutMs,
-			signal,
-		);
+		await this.#awaitControl(this.#events.ready.promise, "startup handshake", this.#overflowTimeoutMs, signal);
 	}
 
 	async #release(timeoutMs = this.#overflowTimeoutMs, signal?: AbortSignal): Promise<void> {
@@ -655,24 +644,14 @@ export class BoundedChildProcess {
 		this.#releaseRequested = true;
 		const release = (async () => {
 			await this.#send({ type: "release" });
-			await this.#awaitControl(
-				this.#events.released.promise,
-				"release acknowledgement",
-				timeoutMs,
-				signal,
-			);
+			await this.#awaitControl(this.#events.released.promise, "release acknowledgement", timeoutMs, signal);
 			await this.#proc.exited;
 			this.#completed = true;
 		})();
 		this.#releasePromise = release;
 		await release;
 	}
-	async #awaitControl(
-		ack: Promise<unknown>,
-		phase: string,
-		timeoutMs: number,
-		signal?: AbortSignal,
-	): Promise<void> {
+	async #awaitControl(ack: Promise<unknown>, phase: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
 		const aborted = Promise.withResolvers<void>();
 		const onAbort = () => aborted.resolve();
 		signal?.addEventListener("abort", onAbort, { once: true });
@@ -758,10 +737,7 @@ export class BoundedChildProcess {
 			} catch (cleanupError) {
 				const trigger = this.#terminalFailure ?? cancellation;
 				if (trigger) {
-					throw new AggregateError(
-						[trigger, cleanupError],
-						`${trigger.message} and cleanup could not be proven`,
-					);
+					throw new AggregateError([trigger, cleanupError], `${trigger.message} and cleanup could not be proven`);
 				}
 				throw cleanupError;
 			}
@@ -893,16 +869,10 @@ export class BoundedChildProcess {
 			);
 		} catch (cleanupError) {
 			if (cleanupError === targetError || cleanupError instanceof AggregateError) throw cleanupError;
-			throw new AggregateError(
-				[targetError, cleanupError],
-				"Target startup failed and cleanup could not be proven",
-			);
+			throw new AggregateError([targetError, cleanupError], "Target startup failed and cleanup could not be proven");
 		}
 	}
-	#beginCleanup(
-		options?: BoundedTreeTerminateOptions,
-		cancelBeforeStart = true,
-	): Promise<boolean> {
+	#beginCleanup(options?: BoundedTreeTerminateOptions, cancelBeforeStart = true): Promise<boolean> {
 		if (options?.signal?.aborted) {
 			return Promise.reject(
 				options.signal.reason instanceof Error
@@ -945,9 +915,7 @@ export class BoundedChildProcess {
 				options?.signal,
 			);
 			const cleanedGracefully =
-				gracefulMs >= 0
-					? await this.#tree.waitForEmpty({ timeoutMs: gracefulMs, signal: options?.signal })
-					: false;
+				gracefulMs >= 0 ? await this.#tree.waitForEmpty({ timeoutMs: gracefulMs, signal: options?.signal }) : false;
 			if (cleanedGracefully) {
 				this.#cleanupResult = true;
 				await this.#release(timeoutMs, options?.signal);
@@ -965,19 +933,13 @@ export class BoundedChildProcess {
 			this.#drainAbort.abort();
 			const [absence, supervisorExit] = await Promise.allSettled([
 				this.#tree.waitForAbsenceAfterKill({ timeoutMs, signal: options?.signal }),
-				Promise.race([
-					this.#proc.exited.then(() => true),
-					Bun.sleep(timeoutMs).then(() => false),
-				]),
+				Promise.race([this.#proc.exited.then(() => true), Bun.sleep(timeoutMs).then(() => false)]),
 			]);
 			const supervisorExited = supervisorExit.status === "fulfilled" && supervisorExit.value;
 			this.#completed = supervisorExited;
 			if (absence.status === "rejected") {
 				this.#cleanupResult = false;
-				throw new AggregateError(
-					[absence.reason],
-					"Final supervised group kill cleanup could not be proven",
-				);
+				throw new AggregateError([absence.reason], "Final supervised group kill cleanup could not be proven");
 			}
 			this.#cleanupResult = absence.value && supervisorExited;
 			return this.#cleanupResult;

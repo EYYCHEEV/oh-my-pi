@@ -10,10 +10,10 @@ import {
 	createAgentSession as legacyCreateAgentSession,
 } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-coding-agent-shim";
 import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
-import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 // Issue #4567: every published version of pi-schedule-prompt (and every pi

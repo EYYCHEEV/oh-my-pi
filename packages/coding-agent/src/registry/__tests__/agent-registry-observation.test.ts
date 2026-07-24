@@ -1,12 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 
 import type { AgentSession } from "../../session/agent-session";
-import {
-	AgentRegistry,
-	listRegisteredAgents,
-	onAgentRegistryChange,
-	type RegistryEvent,
-} from "../agent-registry";
+import { AgentRegistry, listRegisteredAgents, onAgentRegistryChange, type RegistryEvent } from "../agent-registry";
 
 afterEach(() => {
 	AgentRegistry.resetGlobalForTests();

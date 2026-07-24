@@ -5,17 +5,16 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { KeybindingsManager } from "@oh-my-pi/pi-coding-agent/config/keybindings";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { HookEditorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/hook-editor";
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
-import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { TempDir } from "@oh-my-pi/pi-utils";
 import {
 	type AutocompleteProvider,
 	CombinedAutocompleteProvider,
@@ -24,6 +23,7 @@ import {
 	setKeybindings,
 	type TUI,
 } from "@oh-my-pi/pi-tui";
+import { TempDir } from "@oh-my-pi/pi-utils";
 
 beforeAll(async () => {
 	const theme = await getThemeByName("dark");
@@ -166,7 +166,6 @@ function createPromptAutocompleteProvider(): AutocompleteProvider {
 function createSkillAutocompleteProvider(): AutocompleteProvider {
 	return new CombinedAutocompleteProvider([{ name: "skill:security-scan", description: "Security scan" }], "/tmp");
 }
-
 
 async function flushAutocomplete(): Promise<void> {
 	await Promise.resolve();
@@ -406,7 +405,6 @@ describe("HookEditorComponent prompt-style mode", () => {
 		expect(provider.getSuggestions).toHaveBeenCalledWith(["/"], 0, 1);
 		expect(renderText(component)).toContain("/goal");
 	});
-
 
 	it("absorbs enhanced-paste payloads delivered via pasteText (kitty OSC 5522 routing)", () => {
 		// Regression: pasting into the ask tool's "Other" editor on OSC 5522
@@ -743,10 +741,13 @@ describe("ExtensionUiController hook editor abort", () => {
 				}
 			}),
 		};
-		const pickerPromise = extensionUi.custom<string | undefined>((_tui, _theme, _keybindings, done) => {
-			finishPicker = done;
-			return picker;
-		}, { overlay: true });
+		const pickerPromise = extensionUi.custom<string | undefined>(
+			(_tui, _theme, _keybindings, done) => {
+				finishPicker = done;
+				return picker;
+			},
+			{ overlay: true },
+		);
 		await Promise.resolve();
 
 		expect(ui.setFocus).toHaveBeenLastCalledWith(picker);
@@ -785,10 +786,13 @@ describe("ExtensionUiController hook editor abort", () => {
 				}
 			}),
 		};
-		const pickerPromise = extensionUi.custom<string | undefined>((_tui, _theme, _keybindings, done) => {
-			finishPicker = done;
-			return picker;
-		}, { overlay: true });
+		const pickerPromise = extensionUi.custom<string | undefined>(
+			(_tui, _theme, _keybindings, done) => {
+				finishPicker = done;
+				return picker;
+			},
+			{ overlay: true },
+		);
 		await Promise.resolve();
 
 		picker.handleInput("\x1b");
@@ -848,9 +852,9 @@ describe("InteractiveMode goal objective editor", () => {
 			expect(prefill).toBeUndefined();
 			expect(dialogOptions).toBeUndefined();
 			expect(editorOptions?.promptStyle).toBe(true);
-			expect((editorOptions as { autocompleteProvider?: AutocompleteProvider } | undefined)?.autocompleteProvider).toBe(
-				providerSlot.current,
-			);
+			expect(
+				(editorOptions as { autocompleteProvider?: AutocompleteProvider } | undefined)?.autocompleteProvider,
+			).toBe(providerSlot.current);
 		} finally {
 			harness.mode.stop();
 			await harness.session.dispose();

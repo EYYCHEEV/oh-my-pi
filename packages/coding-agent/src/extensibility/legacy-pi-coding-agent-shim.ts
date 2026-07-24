@@ -33,8 +33,8 @@ import type { CreateAgentSessionOptions, CreateAgentSessionResult, LoadExtension
 import {
 	discoverContextFiles,
 	discoverPromptTemplates,
-	loadSessionExtensions,
 	discoverSkills,
+	loadSessionExtensions,
 	createAgentSession as ompCreateAgentSession,
 } from "../sdk";
 import {
@@ -52,11 +52,7 @@ import { ReadTool } from "../tools/read";
 import { formatBytes } from "../tools/render-utils";
 import { WriteTool } from "../tools/write";
 import { EventBus } from "../utils/event-bus";
-import {
-	discoverExtensionPaths,
-	getRequiredExtensionAttestation,
-	loadExtensionFromFactory,
-} from "./extensions";
+import { discoverExtensionPaths, getRequiredExtensionAttestation, loadExtensionFromFactory } from "./extensions";
 import { ExtensionRuntime } from "./extensions/loader";
 import type { ExtensionFactory, ToolDefinition } from "./extensions/types";
 import { getEnabledPlugins, resolvePluginExtensionPaths, type ScopedInstalledPlugin } from "./plugins/loader";
@@ -1365,4 +1361,5 @@ export function getPackageDir(): string {
 
 export * from "../index";
 export { formatBytes as formatSize } from "../tools/render-utils";
+export { copyToClipboard } from "../utils/clipboard";
 export { Type } from "./typebox";

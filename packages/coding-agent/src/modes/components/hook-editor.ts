@@ -7,16 +7,9 @@
  *   (Ctrl+Q / Ctrl+Enter) submits, bordered popup
  * - Prompt-style (ask): Enter submits, Shift+Enter inserts newline, legacy ask chrome
  */
-import {
-	Container,
-	Editor,
-	type Focusable,
-	getKeybindings,
-	matchesKey,
-	Spacer,
-	Text,
-} from "@oh-my-pi/pi-tui";
+
 import type { AutocompleteProvider, TUI } from "@oh-my-pi/pi-tui";
+import { Container, Editor, type Focusable, getKeybindings, matchesKey, Spacer, Text } from "@oh-my-pi/pi-tui";
 import { getEditorTheme, theme } from "../../modes/theme/theme";
 import {
 	matchesAppExternalEditor,

@@ -243,7 +243,8 @@ impl SupervisedProcessTree {
 		})
 	}
 
-	/// Observe group absence after the held sentinel performs a final group KILL.
+	/// Observe group absence after the held sentinel performs a final group
+	/// KILL.
 	#[napi]
 	pub fn wait_for_absence_after_kill<'env>(
 		&self,

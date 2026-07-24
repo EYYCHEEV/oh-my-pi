@@ -1331,8 +1331,11 @@ impl SupervisedProcessTree {
 		#[cfg(target_os = "macos")]
 		{
 			let sentinel = Process::from_pid(pid)?;
-			(sentinel.group_id() == Some(pid))
-				.then_some(Self { sentinel, pgid: pid, tracked: Arc::new(Mutex::new(Vec::new())) })
+			(sentinel.group_id() == Some(pid)).then_some(Self {
+				sentinel,
+				pgid: pid,
+				tracked: Arc::new(Mutex::new(Vec::new())),
+			})
 		}
 		#[cfg(not(target_os = "macos"))]
 		{
@@ -1361,6 +1364,7 @@ impl SupervisedProcessTree {
 			elapsed += sleep_for;
 		}
 	}
+
 	/// Observe the old group after the sentinel performs the final group KILL.
 	///
 	/// This method never signals the numeric pgid. A recycled foreign group can
@@ -1375,11 +1379,10 @@ impl SupervisedProcessTree {
 		loop {
 			ct.heartbeat()?;
 			for process in self.tracked.lock().iter() {
-				if process.status() == ProcessStatus::Running
-					&& process.group_id() != Some(self.pgid)
-				{
+				if process.status() == ProcessStatus::Running && process.group_id() != Some(self.pgid) {
 					return Err(anyhow!(
-						"tracked supervised process {} escaped process group {}; cleanup cannot be proven",
+						"tracked supervised process {} escaped process group {}; cleanup cannot be \
+						 proven",
 						process.pid(),
 						self.pgid
 					));
@@ -1419,7 +1422,8 @@ impl SupervisedProcessTree {
 		}
 
 		self.signal_members(KILL_SIGNAL)?;
-		self.wait_for_empty(Some(Duration::from_millis(u64::from(timeout_ms))), ct)
+		self
+			.wait_for_empty(Some(Duration::from_millis(u64::from(timeout_ms))), ct)
 			.await
 	}
 
@@ -1448,7 +1452,10 @@ impl SupervisedProcessTree {
 			self.validate_tracked()?;
 			let snapshot = platform::process_group_pids(self.pgid)?;
 			let mut members = Vec::with_capacity(snapshot.len());
-			for pid in snapshot.into_iter().filter(|pid| *pid != self.sentinel.pid()) {
+			for pid in snapshot
+				.into_iter()
+				.filter(|pid| *pid != self.sentinel.pid())
+			{
 				let Some(process) = Process::from_pid(pid) else {
 					return Ok(None);
 				};
@@ -1456,9 +1463,10 @@ impl SupervisedProcessTree {
 					return Ok(None);
 				}
 				if process.group_id() != Some(self.pgid) {
-					self.merge_tracked(std::iter::once(process.clone()));
+					self.merge_tracked(std::iter::once(process));
 					return Err(anyhow!(
-						"pinned supervised process {pid} no longer belongs to process group {}; cleanup cannot be proven",
+						"pinned supervised process {pid} no longer belongs to process group {}; cleanup \
+						 cannot be proven",
 						self.pgid
 					));
 				}
@@ -1491,9 +1499,7 @@ impl SupervisedProcessTree {
 
 	fn validate_tracked(&self) -> Result<()> {
 		for process in self.tracked.lock().iter() {
-			if process.status() == ProcessStatus::Running
-				&& process.group_id() != Some(self.pgid)
-			{
+			if process.status() == ProcessStatus::Running && process.group_id() != Some(self.pgid) {
 				return Err(anyhow!(
 					"tracked supervised process {} escaped process group {}; cleanup cannot be proven",
 					process.pid(),
@@ -1526,7 +1532,6 @@ impl SupervisedProcessTree {
 		))
 	}
 }
-
 
 impl Process {
 	/// Open a stable process reference from a PID.
@@ -2088,8 +2093,8 @@ mod tests {
 		let foreign_pgid = i32::try_from(foreign.id()).expect("foreign pid fits i32");
 		let stale = SupervisedProcessTree {
 			sentinel: pinned,
-			pgid: foreign_pgid,
-			tracked: Arc::new(Mutex::new(Vec::new())),
+			pgid:     foreign_pgid,
+			tracked:  Arc::new(Mutex::new(Vec::new())),
 		};
 
 		assert!(

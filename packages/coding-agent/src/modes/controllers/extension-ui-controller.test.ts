@@ -28,6 +28,7 @@ function makeHarness() {
 		session: {
 			extensionRunner: undefined,
 			setActivityWaiting,
+			setUsageFallbackConfirmer: vi.fn(),
 		},
 		setToolUIContext(context: ExtensionUIContext, hasUI: boolean): void {
 			expect(hasUI).toBe(true);

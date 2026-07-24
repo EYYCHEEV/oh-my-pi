@@ -25,6 +25,9 @@ import type {
 	Model,
 	ModelSpec,
 	ProviderResponseMetadata,
+	ServiceTier,
+	ServiceTierByFamily,
+	ServiceTierFamily,
 	SimpleStreamOptions,
 	Static,
 	TextContent,
@@ -267,10 +270,7 @@ export interface ExtensionUIContext {
 	/** Request a status-line redraw. A safe no-op when no interactive UI is attached. */
 	requestStatusLineRender?(): void;
 	/** @internal Attach a declaratively registered extension status segment. */
-	registerStatusSegment?(
-		key: string,
-		definition: ExtensionStatusSegmentDefinition,
-	): () => void;
+	registerStatusSegment?(key: string, definition: ExtensionStatusSegmentDefinition): () => void;
 
 	/** Set the terminal window/tab title. */
 	setTitle(title: string): void;
@@ -551,6 +551,9 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	/** Tool approval tier. Defaults to `"exec"` when omitted.
 	 *  `"read"`: read-only operations. `"write"`: mutations. `"exec"`: code execution. */
 	approval?: ToolApproval;
+	/** Structured-output strict grammar opt-in/out. `false` is meaningful: OpenAI-family
+	 *  serializers preserve an explicit `strict: false` on the wire (#4336/#4340). */
+	strict?: boolean;
 	/** MCP server name for discovery/search metadata when this tool fronts an MCP server. */
 	mcpServerName?: string;
 	/** Original MCP tool name for discovery/search metadata. */
@@ -1063,6 +1066,13 @@ export interface ExtensionStatusSegmentDefinition {
 	render: () => string | undefined;
 }
 
+/** Service tiers accepted by each provider family. */
+export type ExtensionServiceTier<Family extends ServiceTierFamily> = Family extends "anthropic"
+	? "priority"
+	: Family extends "google"
+		? "flex" | "priority"
+		: ServiceTier;
+
 /**
  * ExtensionAPI passed to extension factory functions.
  */
@@ -1156,7 +1166,6 @@ export interface ExtensionAPI {
 
 	/** Request a status-line redraw. Safe in headless modes. */
 	requestStatusLineRender(): void;
-
 
 	/** Register a tool that the LLM can call. */
 	registerTool<TParams extends TSchema = TSchema, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void;
@@ -1258,6 +1267,18 @@ export interface ExtensionAPI {
 
 	/** Set thinking level for the current session. */
 	setThinkingLevel(level: ThinkingLevel): void;
+
+	/** Get a snapshot of the current session's per-family service tiers. */
+	getServiceTiers(): Readonly<ServiceTierByFamily>;
+
+	/**
+	 * Set one provider family's service tier for subsequent requests, or clear
+	 * its session override with `undefined`.
+	 */
+	setServiceTier<Family extends ServiceTierFamily>(
+		family: Family,
+		tier: ExtensionServiceTier<Family> | undefined,
+	): void;
 
 	/** Get the current session name. */
 	getSessionName(): string | undefined;
@@ -1438,15 +1459,16 @@ export type GetThinkingLevelHandler = () => ThinkingLevel | undefined;
 
 export type SetThinkingLevelHandler = (level: ThinkingLevel, persist?: boolean) => void;
 
+export type GetServiceTiersHandler = () => ServiceTierByFamily;
+
+export type SetServiceTierHandler = (family: ServiceTierFamily, tier: ServiceTier | undefined) => void;
+
 /** Shared state created by loader, used during registration and runtime. */
 export interface ExtensionRuntimeState {
 	flagValues: Map<string, boolean | string>;
 	requestStatusLineRender: () => void;
 	/** @internal Host a status segment when an interactive UI is attached. */
-	hostStatusSegment: (
-		key: string,
-		definition: ExtensionStatusSegmentDefinition,
-	) => (() => void) | undefined;
+	hostStatusSegment: (key: string, definition: ExtensionStatusSegmentDefinition) => (() => void) | undefined;
 	/** Provider registrations queued during extension loading, processed during session initialization */
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; sourceId: string }>;
 }
@@ -1464,6 +1486,8 @@ export interface ExtensionActions {
 	setModel: SetModelHandler;
 	getThinkingLevel: GetThinkingLevelHandler;
 	setThinkingLevel: SetThinkingLevelHandler;
+	getServiceTiers?: GetServiceTiersHandler;
+	setServiceTier?: SetServiceTierHandler;
 	getSessionName: () => string | undefined;
 	setSessionName: (name: string) => Promise<void>;
 }
@@ -1495,8 +1519,11 @@ export interface ExtensionCommandContextActions {
 	reload: () => Promise<void>;
 }
 
-/** Full runtime = state + actions. */
-export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionActions {}
+/** Full runtime = state + actions, including host-compatible service-tier fallbacks. */
+export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionActions {
+	getServiceTiers: GetServiceTiersHandler;
+	setServiceTier: SetServiceTierHandler;
+}
 
 export interface RegisteredStatusSegment {
 	key: string;
