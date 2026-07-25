@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [17.1.2] - 2026-07-24
+
+### Added
+
+- Added `resolveFallbackTool` option to allow routing unadvertised tool calls to host-side transports (e.g., device mounts)
+
+## [17.1.1] - 2026-07-24
+
+### Added
+
+- Added the provider-neutral native computer-call lifecycle, preserving observation outputs and input actions across pending and acknowledged tool results.
+
+### Changed
+
+- Queued steering no longer hard-aborts non-interruptible tools (e.g. `bash`): it aborts interruptible waits only and raises a cooperative steering signal (`ToolCallContext.steeringSignal`) that long-running tools may observe to finish early or background themselves. The mid-batch steering/IRC watch now runs for every tool batch instead of only batches containing an interruptible tool.
+
 ## [17.1.0] - 2026-07-24
 
 ### Added

@@ -42,6 +42,7 @@ import { BashTool } from "./bash";
 import { BrowserTool } from "./browser";
 import { type BuiltinToolName, type HiddenToolName, normalizeToolNames } from "./builtin-names";
 import { type CheckpointState, CheckpointTool, type CompletedRewindState, RewindTool } from "./checkpoint";
+import { ComputerTool } from "./computer";
 import { DebugTool } from "./debug";
 import { EvalTool } from "./eval";
 import { resolveEvalBackends } from "./eval-backends";
@@ -76,6 +77,8 @@ export * from "./ast-grep";
 export * from "./bash";
 export * from "./browser";
 export * from "./checkpoint";
+export * from "./computer";
+export * from "./computer/supervisor";
 export * from "./debug";
 export * from "./essential-tools";
 export * from "./eval";
@@ -404,6 +407,7 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	lsp: LspTool.createIf,
 	inspect_image: s => new InspectImageTool(s),
 	browser: s => new BrowserTool(s),
+	computer: s => new ComputerTool(s),
 	checkpoint: CheckpointTool.createIf,
 	rewind: RewindTool.createIf,
 	task: s => TaskTool.create(s),
@@ -560,6 +564,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		if (name === "web_search") return session.settings.get("web_search.enabled");
 		if (name === "ask") return session.settings.get("ask.enabled");
 		if (name === "browser") return session.settings.get("browser.enabled");
+		if (name === "computer") return session.settings.get("computer.enabled");
 		if (name === "checkpoint" || name === "rewind") return session.settings.get("checkpoint.enabled");
 		if (name === "hub") {
 			return (

@@ -181,6 +181,7 @@ import { shutdownTinyTitleClient } from "../tiny/title-client";
 import { type AskToolDetails, type AskToolInput, recoverAskQuestions } from "../tools/ask";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import type { CheckpointState, CompletedRewindState } from "../tools/checkpoint";
+import { releaseComputerSessionsForOwner } from "../tools/computer/supervisor";
 import { normalizeLocalScheme, resolveToCwd } from "../tools/path-utils";
 import {
 	buildResolveReminderMessage,
@@ -218,6 +219,7 @@ import type {
 	RoleModelCycle,
 	RoleModelCycleResult,
 	SessionHandoffOptions,
+	SessionOAuthAccountList,
 	SessionStats,
 	UsageFallbackConfirmation,
 } from "./agent-session-types";
@@ -1177,6 +1179,7 @@ export class AgentSession {
 			autoApprove: config.autoApprove,
 			toolRegistry: config.toolRegistry,
 			createVibeTools: config.createVibeTools,
+			createComputerTool: config.createComputerTool,
 			builtInToolNames: config.builtInToolNames,
 			presentationPinnedToolNames: config.presentationPinnedToolNames,
 			ensureWriteRegistered: config.ensureWriteRegistered,
@@ -2469,6 +2472,20 @@ export class AgentSession {
 						baseUrl: this.#modelRegistry.getProviderBaseUrl?.(assistantMsg.provider),
 					});
 				}
+				// Broker deployments: report this request's burn so the broker can
+				// attribute token usage per install. No-op with a local auth store.
+				this.#modelRegistry.authStorage.recordObservedUsage({
+					provider: assistantMsg.provider,
+					model: assistantMsg.model,
+					at: assistantMsg.timestamp,
+					usage: {
+						input: assistantMsg.usage.input,
+						output: assistantMsg.usage.output,
+						cacheRead: assistantMsg.usage.cacheRead,
+						cacheWrite: assistantMsg.usage.cacheWrite,
+					},
+					costUsd: assistantMsg.usage.cost.total,
+				});
 			}
 			if (event.message.role === "toolResult") {
 				const { toolName, toolCallId, isError, content } = event.message;
@@ -3516,6 +3533,19 @@ export class AgentSession {
 		}
 	}
 
+	async #releaseOwnedComputerSessions(ownerId: string | undefined): Promise<void> {
+		if (!ownerId) return;
+		try {
+			await withTimeout(
+				releaseComputerSessionsForOwner(ownerId),
+				3_000,
+				"Timed out releasing native computer session during dispose",
+			);
+		} catch (error) {
+			logger.warn("Failed to release native computer session during dispose", { error: String(error) });
+		}
+	}
+
 	async #disconnectOwnedMcp(): Promise<void> {
 		if (!this.#disconnectOwnedMcpManager) return;
 		try {
@@ -3574,6 +3604,7 @@ export class AgentSession {
 			this.#disposeOwnedAsyncJobs(),
 			this.#eval.disposeKernels(),
 			this.#releaseOwnedBrowserTabs(this.sessionManager.getSessionId()),
+			this.#releaseOwnedComputerSessions(this.#eval.getKernelOwnerId()),
 			this.#ownedAsyncJobManager ? shutdownTinyTitleClient() : Promise.resolve(),
 			this.#disconnectOwnedMcp(),
 			advisorRecorderClosed,
@@ -4009,6 +4040,20 @@ export class AgentSession {
 		return this.#tools.setActiveToolPresentation(toolNames, mountedToolNames);
 	}
 
+	/**
+	 * Session-scoped enable/disable for the settings-gated `computer` tool.
+	 *
+	 * Enabling builds the tool through {@link AgentSessionConfig.createComputerTool}
+	 * on first use and activates it; disabling drops it from the active set while
+	 * keeping the registry entry so repeated toggles reuse one desktop controller.
+	 *
+	 * @returns false when enabling was requested but this session cannot build the
+	 * tool (e.g. restricted child sessions have no factory).
+	 */
+	setComputerToolEnabled(enabled: boolean): Promise<boolean> {
+		return this.#tools.setComputerToolEnabled(enabled);
+	}
+
 	/** Cancels the local rollout-memory startup owned by this session. */
 	cancelLocalMemoryStartup(): void {
 		this.#memory.cancelLocalMemoryStartup();
@@ -4191,6 +4236,9 @@ export class AgentSession {
 	}
 	getEvalSessionId(): string | null {
 		return this.#eval.getSessionId();
+	}
+	getEvalKernelOwnerId(): string {
+		return this.#eval.getKernelOwnerId();
 	}
 
 	/** Current session display name, if set */
@@ -7813,6 +7861,28 @@ export class AgentSession {
 			for (const modelId of modelIds) selectors.add(`${provider}/${modelId}`);
 		}
 		return [...selectors].sort((left, right) => left.localeCompare(right));
+	}
+
+	/** List stored OAuth accounts for the current model provider and mark this session's active account. */
+	async listCurrentProviderOAuthAccounts(): Promise<SessionOAuthAccountList | undefined> {
+		const provider = this.model?.provider;
+		if (!provider) return undefined;
+		const authStorage = this.#modelRegistry.authStorage;
+		await authStorage.reload();
+		return {
+			provider,
+			accounts: authStorage.listOAuthAccounts(provider, this.sessionId),
+		};
+	}
+
+	/**
+	 * Pin a stored OAuth account to the current model provider for this session.
+	 * Returns false while streaming or when the credential is no longer available.
+	 */
+	pinCurrentProviderOAuthAccount(credentialId: number): boolean {
+		const provider = this.model?.provider;
+		if (!provider || this.isStreaming) return false;
+		return this.#modelRegistry.authStorage.pinSessionOAuthAccount(provider, this.sessionId, credentialId);
 	}
 
 	/**

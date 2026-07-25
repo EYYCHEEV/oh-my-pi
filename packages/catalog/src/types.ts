@@ -342,6 +342,12 @@ export interface OpenAICompat {
 	 */
 	toolSchemaFlavor?: "moonshot-mfjs" | "grammar" | "none";
 	/**
+	 * Stream-watchdog first-event timeout in ms.
+	 * Set to `0` to allow unbounded prompt processing. Default: auto-detected
+	 * (disabled for local OpenAI-compatible backends).
+	 */
+	streamFirstEventTimeoutMs?: number;
+	/**
 	 * Stream-watchdog idle-timeout floor in ms for slow reasoning hosts.
 	 * Default: auto-detected (GLM coding-plan hosts, direct DeepSeek reasoning).
 	 */
@@ -565,6 +571,8 @@ export interface ResolvedOpenAISharedCompat {
 	requiresAssistantContentForToolCalls: boolean;
 	stripDeepseekSpecialTokens: boolean;
 	streamMarkupHealingPattern?: OpenAIStreamMarkupHealingPattern;
+	/** See {@link OpenAICompat.streamFirstEventTimeoutMs}. */
+	streamFirstEventTimeoutMs?: number;
 	reasoningDeltasMayBeCumulative: boolean;
 	emptyLengthFinishIsContextError: boolean;
 	usesOpenAIToolCallIdLimit: boolean;
@@ -645,6 +653,7 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 			| "extraBody"
 			| "toolStrictMode"
 			| "toolSchemaFlavor"
+			| "streamFirstEventTimeoutMs"
 			| "streamIdleTimeoutMs"
 			| "cacheControlFormat"
 			| "thinkingKeep"
@@ -814,6 +823,8 @@ export interface Model<TApi extends Api = Api> {
 	 * reports that native tool calling is unsupported.
 	 */
 	supportsTools?: boolean;
+	/** Whether this model accepts the GA OpenAI Responses `{ type: "computer" }` native tool. */
+	supportsComputerUse?: boolean;
 	/** GitLab Duo Workflow root namespace selected during catalog discovery. */
 	gitlabDuoWorkflowRootNamespaceId?: string;
 	/** Cursor `max_mode` request flag returned by `GetUsableModels` for premium models that require max mode. */

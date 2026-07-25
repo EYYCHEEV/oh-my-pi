@@ -495,7 +495,8 @@ const streamOpenAIResponsesOnce = (
 			const idleTimeoutMs =
 				options?.streamIdleTimeoutMs ?? getOpenAIStreamIdleTimeoutMs(model.compat.streamIdleTimeoutMs);
 			const firstEventTimeoutMs =
-				options?.streamFirstEventTimeoutMs ?? getOpenAIStreamFirstEventTimeoutMs(idleTimeoutMs);
+				options?.streamFirstEventTimeoutMs ??
+				getOpenAIStreamFirstEventTimeoutMs(idleTimeoutMs, model.compat.streamFirstEventTimeoutMs);
 			const requestTimeoutMs =
 				firstEventTimeoutMs !== undefined && firstEventTimeoutMs > 0 ? firstEventTimeoutMs : undefined;
 			const requestUrl = `${resolvedBaseUrl}/responses`;
@@ -930,6 +931,25 @@ function isStableStringResponsesInstruction(item: unknown): item is ResponsesStr
 	);
 }
 
+function matchesResponsesCacheBaseline(
+	baseline: ResponsesPromptCacheableMessage,
+	current: ResponsesPromptCacheableMessage,
+): boolean {
+	if (baseline.role !== current.role || baseline.content.length !== current.content.length) return false;
+	for (let index = 0; index < baseline.content.length; index++) {
+		const baselineBlock = baseline.content[index];
+		const currentBlock = current.content[index];
+		if (!baselineBlock || !currentBlock) return false;
+		const breakpoint = baselineBlock.prompt_cache_breakpoint;
+		if (breakpoint) {
+			if (!Bun.deepEquals(baselineBlock, { ...currentBlock, prompt_cache_breakpoint: breakpoint })) return false;
+		} else if (!Bun.deepEquals(baselineBlock, currentBlock)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 function restoreResponsesCacheBreakpointsFromBaseline(
 	input: ResponseInput | undefined,
 	baseline: ResponseInput | undefined,
@@ -944,7 +964,7 @@ function restoreResponsesCacheBreakpointsFromBaseline(
 		if (isStableStringResponsesInstruction(message)) {
 			const [baselineBlock] = baselineMessage.content;
 			if (
-				baselineMessage.content.length === 1 &&
+				baselineMessage.role === message.role &&
 				baselineBlock?.type === "input_text" &&
 				baselineBlock.text === message.content &&
 				baselineBlock.prompt_cache_breakpoint
@@ -963,11 +983,12 @@ function restoreResponsesCacheBreakpointsFromBaseline(
 			continue;
 		}
 
-		if (!isResponsesPromptCacheableMessage(message)) continue;
-		for (let j = 0; j < baselineMessage.content.length && j < message.content.length; j++) {
+		if (!isResponsesPromptCacheableMessage(message) || !matchesResponsesCacheBaseline(baselineMessage, message))
+			continue;
+		for (let j = 0; j < baselineMessage.content.length; j++) {
 			const baselineBlock = baselineMessage.content[j];
 			const block = message.content[j];
-			if (!baselineBlock?.prompt_cache_breakpoint || !isResponsesPromptCacheableContentBlock(block)) continue;
+			if (!baselineBlock?.prompt_cache_breakpoint || !block) continue;
 			Object.assign(block, { prompt_cache_breakpoint: baselineBlock.prompt_cache_breakpoint });
 			restored = true;
 		}
@@ -1138,6 +1159,7 @@ export function buildParams(
 		store: false,
 		stream_options: model.compat.supportsObfuscationOptOut ? { include_obfuscation: false } : undefined,
 	};
+	if (options?.include?.length) params.include = Array.from(new Set(options.include));
 	maybeAddOpenRouterAnthropicCacheControl(params, model, cacheRetention);
 	const outputToken = resolveOpenAIOutputTokenParam({
 		field: "max_output_tokens",
@@ -1248,6 +1270,13 @@ export function mapOpenAIResponsesToolChoiceForTools(
 	model: Model<"openai-responses">,
 ): OpenAIResponsesToolChoice {
 	if (!model.compat.supportsToolChoice) return undefined;
+	if (
+		typeof choice !== "string" &&
+		choice?.type === "computer" &&
+		(model.supportsComputerUse !== true || !tools.some(tool => tool.native?.type === "computer"))
+	) {
+		return undefined;
+	}
 	if (isForcedToolChoice(choice) && !model.compat.supportsForcedToolChoice) {
 		return "auto";
 	}
@@ -1280,6 +1309,13 @@ export function convertTools(
 	const allowFreeform = supportsFreeformApplyPatch(model);
 	const out: OpenAITool[] = [];
 	for (const tool of tools) {
+		if (tool.native?.type === "computer" && model.supportsComputerUse === true) {
+			out.push({ type: "computer" });
+			continue;
+		}
+		// Models without native computer support fall through and receive the
+		// tool as a plain function tool (name/description/schema below), so
+		// function-calling models can still drive the desktop.
 		if (allowFreeform && tool.customFormat) {
 			out.push({
 				type: "custom",
