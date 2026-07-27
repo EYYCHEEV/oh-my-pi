@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
+import { pathToFileURL } from "node:url";
 import {
 	handleRpcSessionChange,
 	type RpcSessionChangeCommand,
@@ -24,6 +24,7 @@ import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 
 const tempPaths: string[] = [];
+const rpcClientModuleUrl = pathToFileURL(path.join(import.meta.dir, "../src/modes/rpc/rpc-client.ts")).href;
 
 afterEach(() => {
 	for (const tempPath of tempPaths.splice(0)) {
@@ -420,28 +421,78 @@ function handle(frame) {
 `,
 		);
 
-		using client = new RpcClient({ cliPath: scriptPath });
-		const lifecycleIds: string[] = [];
-		const progressTasks: string[] = [];
-		const rawEventTypes: string[] = [];
-		const sessionEventTypes: string[] = [];
-		client.onSubagentLifecycle(payload => lifecycleIds.push(payload.id));
-		client.onSubagentProgress(payload => progressTasks.push(payload.task));
-		client.onSubagentEvent(payload => rawEventTypes.push(payload.event.type));
-		client.onSessionEvent(event => sessionEventTypes.push(event.type));
+		const probePath = path.join(os.tmpdir(), `omp-rpc-subagent-probe-${Date.now()}.ts`);
+		const reportPath = path.join(os.tmpdir(), `omp-rpc-subagent-report-${Date.now()}.json`);
+		tempPaths.push(probePath, reportPath);
+		await Bun.write(
+			probePath,
+			`
+import { RpcClient } from ${JSON.stringify(rpcClientModuleUrl)};
 
-		await client.start();
-		await expect(client.setSubagentSubscription("events")).resolves.toBe("events");
-		await client.promptAndWait("Trigger subagent frames");
-		expect(await client.getSubagents()).toHaveLength(1);
-		expect(await client.getSubagentMessages({ sessionFile: "/tmp/subagent.jsonl" })).toMatchObject({
-			sessionFile: "/tmp/subagent.jsonl",
+const client = new RpcClient({ cliPath: process.argv[2] });
+const lifecycleIds = [];
+const progressTasks = [];
+const rawEventTypes = [];
+const sessionEventTypes = [];
+client.onSubagentLifecycle(payload => lifecycleIds.push(payload.id));
+client.onSubagentProgress(payload => progressTasks.push(payload.task));
+client.onSubagentEvent(payload => rawEventTypes.push(payload.event.type));
+client.onSessionEvent(event => sessionEventTypes.push(event.type));
+
+try {
+	await client.start();
+	const subscription = await client.setSubagentSubscription("events");
+	await client.promptAndWait("Trigger subagent frames");
+	const subagentCount = (await client.getSubagents()).length;
+	const messages = await client.getSubagentMessages({ sessionFile: "/tmp/subagent.jsonl" });
+	await client.stop();
+	await Bun.write(process.argv[3], JSON.stringify({
+		subscription,
+		subagentCount,
+		messageSessionFile: messages.sessionFile,
+		lifecycleIds,
+		progressTasks,
+		rawEventTypes,
+		sessionEventTypes,
+	}));
+} catch (error) {
+	await client.stop().catch(() => {});
+	await Bun.write(process.argv[3], JSON.stringify({
+		error: error instanceof Error ? error.stack || error.message : String(error),
+	}));
+	process.exitCode = 1;
+}
+`,
+		);
+
+		const probe = Bun.spawn([process.execPath, probePath, scriptPath, reportPath], {
+			cwd: path.resolve(import.meta.dir, "../../.."),
+			stdout: "ignore",
+			stderr: "ignore",
+			timeout: 5000,
 		});
+		const exitCode = await probe.exited;
+		const report = (await Bun.file(reportPath).json()) as {
+			error?: string;
+			subscription?: string;
+			subagentCount?: number;
+			messageSessionFile?: string;
+			lifecycleIds?: string[];
+			progressTasks?: string[];
+			rawEventTypes?: string[];
+			sessionEventTypes?: string[];
+		};
 
-		expect(lifecycleIds).toEqual(["SubagentA"]);
-		expect(progressTasks).toEqual(["Do work"]);
-		expect(rawEventTypes).toEqual(["agent_start"]);
-		expect(sessionEventTypes).toContain("notice");
-		expect(sessionEventTypes.filter(type => type === "agent_activity_state")).toEqual(["agent_activity_state"]);
+		expect(exitCode, report.error).toBe(0);
+		expect(report.subscription).toBe("events");
+		expect(report.subagentCount).toBe(1);
+		expect(report.messageSessionFile).toBe("/tmp/subagent.jsonl");
+		expect(report.lifecycleIds).toEqual(["SubagentA"]);
+		expect(report.progressTasks).toEqual(["Do work"]);
+		expect(report.rawEventTypes).toEqual(["agent_start"]);
+		expect(report.sessionEventTypes).toContain("notice");
+		expect(report.sessionEventTypes?.filter(type => type === "agent_activity_state")).toEqual([
+			"agent_activity_state",
+		]);
 	});
 });
