@@ -12,12 +12,14 @@ async function runPostmortemProbe(
 ): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
 	const root = await mkdtemp(join(tmpdir(), "omp-postmortem-probe-"));
 	const probePath = join(root, "probe.ts");
+	const stdoutPath = join(root, "stdout.log");
+	const stderrPath = join(root, "stderr.log");
 	try {
 		await Bun.write(probePath, source);
 		const proc = Bun.spawn([process.execPath, probePath], {
 			cwd: process.cwd(),
-			stdout: "pipe",
-			stderr: "pipe",
+			stdout: Bun.file(stdoutPath),
+			stderr: Bun.file(stderrPath),
 			env: { ...process.env, OMP_AGENT_DIR: join(root, "agent") },
 		});
 		// Process-level regressions can hang the child; the watchdog bounds the fixture without slowing green runs.
@@ -25,11 +27,9 @@ async function runPostmortemProbe(
 			proc.kill();
 			return -999;
 		});
-		const [stdout, stderr, exitCode] = await Promise.all([
-			new Response(proc.stdout).text(),
-			new Response(proc.stderr).text(),
-			Promise.race([proc.exited, watchdog]),
-		]);
+		const exitCode = await Promise.race([proc.exited, watchdog]);
+		if (exitCode === -999) await proc.exited;
+		const [stdout, stderr] = await Promise.all([Bun.file(stdoutPath).text(), Bun.file(stderrPath).text()]);
 		return { exitCode, stdout, stderr };
 	} finally {
 		await rm(root, { recursive: true, force: true });
