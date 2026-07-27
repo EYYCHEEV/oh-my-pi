@@ -103,6 +103,16 @@ def _xwin_sysroot_impl(rctx):
         stripPrefix = prefix,
     )
     rctx.report_progress("Splatting MSVC CRT + Windows SDK via xwin (first fetch ~1 GiB from the Microsoft CDN)")
+
+    # OMP_XWIN_CACHE_DIR points at a persistent location (CI: the runner-cache
+    # PVC via --repo_env) so ephemeral pods reuse the ~1 GiB CDN download the
+    # repository cache cannot hold. Unset (dev machines): a repo-local cache,
+    # deleted after the --copy splat.
+    cache_dir = rctx.os.environ.get("OMP_XWIN_CACHE_DIR", "")
+    ephemeral_cache = cache_dir == ""
+    if ephemeral_cache:
+        cache_dir = ".xwin-cache"
+
     result = rctx.execute(
         [
             rctx.path("xwin"),
@@ -114,7 +124,7 @@ def _xwin_sysroot_impl(rctx):
             "--manifest-version",
             _XWIN_MANIFEST_VERSION,
             "--cache-dir",
-            ".xwin-cache",
+            cache_dir,
             "splat",
             "--copy",
             "--output",
@@ -130,7 +140,8 @@ def _xwin_sysroot_impl(rctx):
         ))
 
     # Drop the download cache (the splat is a --copy, not links into it).
-    rctx.delete(".xwin-cache")
+    if ephemeral_cache:
+        rctx.delete(cache_dir)
 
     # xwin drops `<sdk-version> -> .` alias symlinks (e.g. sdk/lib/10.0.26100)
     # so version-qualified include/lib paths resolve. They are self-referential
@@ -153,4 +164,7 @@ def _xwin_sysroot_impl(rctx):
 xwin_sysroot_repository = repository_rule(
     implementation = _xwin_sysroot_impl,
     doc = "MSVC CRT + Windows SDK sysroot splatted by a pinned xwin release.",
+    # Persistent splat cache location; changing it only changes where the CDN
+    # payload lands, not the splat contents, but Bazel still refetches.
+    environ = ["OMP_XWIN_CACHE_DIR"],
 )

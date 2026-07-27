@@ -412,7 +412,14 @@ bazel build \
 On omp-kata the credentials come from the injected pod env
 (`bazel-remote-ci` secret) and `.github/actions/bazel-cache` composes the rc
 fragment. GitHub-hosted jobs get the disk-cache branch of the same action —
-no remote endpoint, no credentials, no infrastructure knowledge.
+no remote endpoint, no credentials, no infrastructure knowledge. The bridge
+between the two worlds is the **disk-cache export**: main-push rust jobs
+write a bazel disk cache alongside the remote cache and save it to the
+GitHub Actions cache (once per lockfile change, `linux` scope). GitHub only
+shares caches from the default branch across pull requests, so this export
+is what keeps PR builds warm; kata jobs otherwise skip artifact downloads
+entirely (`--remote_download_toplevel`), and the xwin MSVC splat persists on
+the runner-cache PVC (`OMP_XWIN_CACHE_DIR`).
 
 **(b) Cargo registry cache** - the scale-set pod template mounts only the
 immutable download cache and sparse index at
