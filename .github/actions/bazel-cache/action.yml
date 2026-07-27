@@ -1,0 +1,71 @@
+name: "Compose bazel cache config"
+description: >
+   Single source of truth for how a CI job caches bazel work, emitted as a
+   bazelrc fragment (rc output) consumers pass via `bazelisk --bazelrc=...`.
+   omp-kata pods (detected via BAZEL_REMOTE_USER/BAZEL_REMOTE_PASSWORD from the
+   bazel-remote-ci secret) get read-write gRPC access to the in-cluster
+   bazel-remote service — an address that only resolves inside the cluster, so
+   nothing about the infrastructure leaks from this public repo. GitHub-hosted
+   runners never talk to that infrastructure: they use a local bazel disk cache
+   persisted with actions/cache, keyed on the crate lockfile and module
+   definition.
+
+inputs:
+   scope:
+      description: >
+         Disk-cache key discriminator for GitHub-hosted runners; jobs building
+         different target sets (linux pair, darwin-all, msvc, validation) use
+         separate scopes so they don't evict each other's entries.
+      required: true
+
+outputs:
+   rc:
+      description: Path to the generated bazelrc fragment
+      value: ${{ steps.compose.outputs.rc }}
+
+runs:
+   using: composite
+   steps:
+      - name: Restore bazel disk cache (GitHub-hosted)
+        if: env.BAZEL_REMOTE_USER == ''
+        uses: actions/cache@v4
+        with:
+           path: |
+              ~/.cache/omp-bazel-disk
+              ~/.cache/omp-bazel-repo
+           key: bazel-disk-${{ inputs.scope }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.Bazel.lock', 'MODULE.bazel', 'rust-toolchain.toml') }}
+           restore-keys: |
+              bazel-disk-${{ inputs.scope }}-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Compose cache config
+        id: compose
+        shell: bash
+        run: |
+           set -euo pipefail
+           rc="$RUNNER_TEMP/bazel-cache.rc"
+           if [ -n "${BAZEL_REMOTE_USER:-}" ]; then
+             auth="$(printf %s "${BAZEL_REMOTE_USER}:${BAZEL_REMOTE_PASSWORD}" | base64 | tr -d '\n')"
+             {
+               # The PVC repo-cache mount lives OUTSIDE $HOME (/opt): kubelet
+               # creates missing mountpoint parents root-owned, and a
+               # root-owned $HOME/.cache breaks bazel's default
+               # output_user_root and zig's wrapper cache. Pods are
+               # single-job ephemeral, so RUNNER_TEMP hosts the output root.
+               echo "startup --output_user_root=$RUNNER_TEMP/bazel-root"
+               echo "common --config=ci"
+               echo "common --config=cache-rw"
+               echo "common --remote_cache=grpcs://bazel-remote.bazel-cache.svc.cluster.local:9092"
+               echo "common --tls_certificate=infra/bazel-remote/ca.crt"
+               echo "common --remote_header='authorization=Basic ${auth}'"
+               # PVC-backed shared repository cache (pods are ephemeral; without
+               # it every job re-downloads toolchains + crate archives).
+               echo "common --repository_cache=/opt/bazel-repo-cache"
+             } > "$rc"
+           else
+             {
+               echo "common --config=ci"
+               echo "common --disk_cache=$HOME/.cache/omp-bazel-disk"
+               echo "common --repository_cache=$HOME/.cache/omp-bazel-repo"
+             } > "$rc"
+           fi
+           echo "rc=$rc" >> "$GITHUB_OUTPUT"

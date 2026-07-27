@@ -93,3 +93,10 @@ packages/coding-agent/bench/boot-baseline.json
 /.gemini/
 /.super-agents/
 /docs/exec-plans/
+
+# Bazel
+/bazel-bin
+/bazel-out
+/bazel-testlogs
+/bazel-pi
+/.bazelrc.user

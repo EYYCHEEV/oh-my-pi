@@ -37,6 +37,7 @@ import {
 	clampKimiK27CodeMaxTokens,
 	isFireworksKimiK2ModelId,
 	isKimiK27CodeModelId,
+	kimiCodeMaxTokens,
 	META_MUSE_STATIC_MODELS,
 	MODELS_DEV_PROVIDER_DESCRIPTORS,
 	mapModelsDevToModels,
@@ -52,6 +53,7 @@ import {
 	applyCanonicalLimitFallback,
 	applyGeneratedModelPolicies,
 	CLOUDFLARE_FALLBACK_MODEL,
+	dropUnsupportedBedrockGeoIds,
 	linkOpenAIPromotionTargets,
 } from "./generated-policies";
 
@@ -301,6 +303,12 @@ function applyKimiMaxTokensCap(models: readonly ModelSpec[]): ModelSpec[] {
 		}
 		if (model.provider === "venice" && isKimiK27CodeModelId(model.id)) {
 			const capped = clampKimiK27CodeMaxTokens(model.id, model.maxTokens);
+			return capped === model.maxTokens ? model : { ...model, maxTokens: capped };
+		}
+		if (model.provider === "kimi-code") {
+			// Discovery snapshots carried maxTokens=32000 uniformly (#6711); pin the
+			// documented per-family output ceilings and leave legacy K2 rows as-is.
+			const capped = kimiCodeMaxTokens(model.id, model.maxTokens);
 			return capped === model.maxTokens ? model : { ...model, maxTokens: capped };
 		}
 		return model;
@@ -634,6 +642,7 @@ async function generateModels() {
 	allModels = dropFireworksWireIds(allModels);
 	allModels = dropUnusableZaiContextTierIds(allModels);
 	allModels = dropXiaomiAudioOnlyIds(allModels);
+	allModels = dropUnsupportedBedrockGeoIds(allModels);
 	allModels = normalizeAntigravityEndpoint(allModels);
 	// Normalize display names: gateway author prefixes ("OpenAI: …"), alias
 	// markers ("(latest)"), provider attribution ("(Antigravity)"), and
