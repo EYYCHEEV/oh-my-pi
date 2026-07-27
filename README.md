@@ -96,7 +96,7 @@ An upgrade fails before build or installation if the block is stale, any declare
 - `blocking-task-batches`: Blocking task-batch execution
 - `interrupted-transcript-artifact-ids`: Collision-free interrupted transcript artifact IDs
 - `agent-registry-observation`: Read-only global agent-registry observation
-- `todo-update-prompt-contract`: Visible Todo update prompt contract
+- `outcome-first-scope-control`: Outcome-first reviewer and Todo scope control
 - `kimi-usage-account-identity`: Per-account Kimi usage report identity
 - `archive-read-crash-containment`: Crash-safe tar and tar.gz reads
 <!-- stronk-omp:fork-contracts:end -->

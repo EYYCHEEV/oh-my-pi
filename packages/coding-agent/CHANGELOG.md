@@ -4,7 +4,9 @@
 
 ### Fixed
 
+- Prevented reviewer findings, optional hardening, and stale Todo state from silently expanding accepted work or restarting implementation without an existing acceptance failure or evidenced material risk.
 - Fixed `read` crashing on valid tar/tar.gz archives with Unicode member names under Bun 1.3.14.
+
 ## [17.1.3] - 2026-07-24
 
 ### Fixed
