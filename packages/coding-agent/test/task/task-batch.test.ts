@@ -9,9 +9,10 @@
  *    is disabled, top-level `task` in batch calls, empty/invalid items,
  *    duplicate names, and a missing shared `context`.
  * 3. With `async.enabled=true`, a batch call registers one background job per
- *    item; with `async.enabled=false`, it blocks and returns merged results.
- *    Both modes forward the shared `context`; the flat form stays accepted at
- *    runtime for internal callers.
+ *    item unless `task.batchBlocking=true` and the batch has multiple items;
+ *    blocking multi-item batches run concurrently and return one merged result.
+ *    With `async.enabled=false`, every batch blocks. All modes forward the
+ *    shared `context`; non-blocking flat and one-item forms stay asynchronous.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
@@ -386,6 +387,88 @@ describe("task.batch spawning", () => {
 		for (const spawn of seen) expect(spawn.parentAgentId).toBe("ParentA");
 	});
 
+	it("blocks enabled multi-item batches until every concurrent child finishes without async delivery", async () => {
+		mockDiscovery();
+		const bothStarted = Promise.withResolvers<void>();
+		const alphaGate = Promise.withResolvers<void>();
+		const betaGate = Promise.withResolvers<void>();
+		const alphaTerminal = Promise.withResolvers<void>();
+		const started: string[] = [];
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			const id = options.id ?? "?";
+			started.push(id);
+			if (started.length === 2) bothStarted.resolve();
+			if (id === "Alpha") {
+				await alphaGate.promise;
+				const result = makeResult(id);
+				Object.defineProperty(result, "output", {
+					get: () => {
+						alphaTerminal.resolve();
+						return "Alpha done.";
+					},
+				});
+				return result;
+			}
+			await betaGate.promise;
+			return makeResult(id, { output: "Beta done." });
+		});
+
+		const onJobComplete = vi.fn();
+		const manager = new AsyncJobManager({ onJobComplete });
+		managers.push(manager);
+		const tool = await TaskTool.create(
+			createSession({
+				manager,
+				settings: { "async.enabled": true, "task.batch": true, "task.batchBlocking": true },
+			}),
+		);
+		expect(tool.description).toContain("Multi-item batches run concurrently and block until every item finishes");
+		expect(tool.description).toContain("one-item batch of a non-blocking agent remains asynchronous");
+
+		let settled = false;
+		const execution = tool.execute("tc-blocking-batch", {
+			context: "# Goal\nShared blocking context.",
+			tasks: [
+				{ name: "Alpha", task: "Do A." },
+				{ name: "Beta", task: "Do B." },
+			],
+		} as TaskParams);
+		void execution.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+
+		await bothStarted.promise;
+		try {
+			expect(started.slice().sort()).toEqual(["Alpha", "Beta"]);
+			expect(settled).toBe(false);
+			expect(manager.getJob("Alpha")).toBeUndefined();
+			expect(manager.getJob("Beta")).toBeUndefined();
+			expect(onJobComplete).not.toHaveBeenCalled();
+
+			alphaGate.resolve();
+			await alphaTerminal.promise;
+			const nextTurn = Promise.withResolvers<void>();
+			setImmediate(nextTurn.resolve);
+			await nextTurn.promise;
+			expect(settled).toBe(false);
+			expect(onJobComplete).not.toHaveBeenCalled();
+		} finally {
+			alphaGate.resolve();
+			betaGate.resolve();
+		}
+
+		const result = await execution;
+		expect(result.details?.async).toBeUndefined();
+		expect(result.details?.results.map(item => item.id)).toEqual(["Alpha", "Beta"]);
+		expect(result.details?.results.map(item => item.output)).toEqual(["Alpha done.", "Beta done."]);
+		expect(onJobComplete).not.toHaveBeenCalled();
+	});
+
 	it("routes each mixed-agent item through its selected definition while preserving caller overrides", async () => {
 		const scoutSchema = { type: "object", properties: { findings: { type: "array" } } };
 		const reviewerSchema = { type: "object", properties: { verdict: { type: "string" } } };
@@ -477,7 +560,10 @@ describe("task.batch spawning", () => {
 
 		const manager = createManager();
 		const tool = await TaskTool.create(
-			createSession({ manager, settings: { "async.enabled": true, "task.batch": true } }),
+			createSession({
+				manager,
+				settings: { "async.enabled": true, "task.batch": true, "task.batchBlocking": true },
+			}),
 		);
 
 		const result = await tool.execute("tc-single", {

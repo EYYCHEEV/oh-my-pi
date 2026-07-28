@@ -15,7 +15,7 @@ import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-m
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import * as toolTimeouts from "@oh-my-pi/pi-coding-agent/tools/tool-timeouts";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
-import { unzip } from "@oh-my-pi/pi-coding-agent/utils/zip";
+import { extractArchive, openArchive, readArchiveEntries, unzip } from "@oh-my-pi/pi-coding-agent/utils/zip";
 import { $which, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { GlobTool } from "../src/tools/glob";
 import { DEFAULT_FILE_LIMIT, GrepTool, MULTI_FILE_PER_FILE_MATCHES } from "../src/tools/grep";
@@ -77,6 +77,15 @@ function writeTarOctal(buffer: Buffer, offset: number, length: number, value: nu
 	buffer[offset + length - 1] = 0;
 }
 
+function refreshTarChecksum(header: Buffer): void {
+	header.fill(0x20, 148, 156);
+	let checksum = 0;
+	for (const byte of header) checksum += byte;
+	header.write(checksum.toString(8).padStart(6, "0"), 148, 6, "ascii");
+	header[154] = 0;
+	header[155] = 0x20;
+}
+
 function createTarArchive(entries: ArchiveFixtureEntry[]): Buffer {
 	const parts: Buffer[] = [];
 
@@ -94,13 +103,7 @@ function createTarArchive(entries: ArchiveFixtureEntry[]): Buffer {
 		header[156] = "0".charCodeAt(0);
 		writeTarString(header, 257, 6, "ustar");
 		writeTarString(header, 263, 2, "00");
-
-		let checksum = 0;
-		for (const byte of header) checksum += byte;
-		const checksumText = checksum.toString(8).padStart(6, "0");
-		header.write(checksumText, 148, 6, "ascii");
-		header[154] = 0;
-		header[155] = 0x20;
+		refreshTarChecksum(header);
 
 		parts.push(header, content);
 		const remainder = content.length % 512;
@@ -111,6 +114,21 @@ function createTarArchive(entries: ArchiveFixtureEntry[]): Buffer {
 
 	parts.push(Buffer.alloc(1024, 0));
 	return Buffer.concat(parts);
+}
+
+function createPaxExtension(type: "g" | "x", fields: ReadonlyArray<readonly [string, string]>): Buffer {
+	const records = fields.map(([key, value]) => {
+		const body = `${key}=${value}\n`;
+		let length = Buffer.byteLength(body) + 2;
+		while (Buffer.byteLength(`${length} ${body}`) !== length) length = Buffer.byteLength(`${length} ${body}`);
+		return `${length} ${body}`;
+	});
+	const archive = createTarArchive([{ path: "PaxHeader", content: records.join("") }]);
+	const payloadSize = Buffer.byteLength(records.join(""));
+	const extensionSize = 512 + Math.ceil(payloadSize / 512) * 512;
+	archive[156] = type.charCodeAt(0);
+	refreshTarChecksum(archive.subarray(0, 512));
+	return archive.subarray(0, extensionSize);
 }
 
 const CRC32_TABLE = (() => {
@@ -752,6 +770,138 @@ describe("Coding Agent Tools", () => {
 			expect(result.details?.isDirectory).toBe(true);
 		});
 
+		it("should read Unicode tar.gz members without destabilizing the process", async () => {
+			const archivePath = path.join(testDir, "unicode-short.tgz");
+			fs.writeFileSync(
+				archivePath,
+				Buffer.from(
+					"H4sICFAxYmoC/3VuaWNvZGUtc2hvcnQudGd6AO3IwQnCQBRF0V/KVJBMZIj1uFBwGyeQDuzAUtzYjliHgytxLULwnM19vK4/HJc6T/v+cTnfb9euLjW+LDdjKa82n22Gt93+YVPGbaQcPzCf6m5KKf5UDgAAAAAAAAAAANboCZJ5S6QAKAAA",
+					"base64",
+				),
+			);
+
+			const result = await readTool.execute("test-call-unicode-tar", {
+				path: `${archivePath}:fixture/文件.txt`,
+			});
+			expect(getTextOutput(result)).toContain("0");
+
+			const followUp = await readTool.execute("test-call-after-unicode-tar", { path: archivePath });
+			expect(getTextOutput(followUp)).toContain("fixture/");
+		});
+
+		for (const archiveCase of [
+			{
+				label: "PAX extended paths",
+				path: `fixture/${"深".repeat(60)}.txt`,
+				base64:
+					"H4sIAAAAAAAC/+3TQUoDQRCF4V7nFH2CmaqanklcBF269AoN02IWI2GsQF8rK2/kOYxKsosuJELw/2ioR28aqnlN27R3D7nelzyWOVyEfDk3pUt2yp/3KqYpxBr+wO7F83x4PvxPJha32Z/Wj5vqu7m0b6/7qzuNV19YipNvprJW61I/LFc30qj1i4BvHL/99hc+1v9T/4eUzvZfzIKqpj6JdocsuhxEQxT6f3Glenkeyxin4nnMnukLAAAAAAAAAAAAAADAVXkHbWqtYAAoAAA=",
+			},
+			{
+				label: "GNU long names",
+				path: `fixture/${"a".repeat(140)}.txt`,
+				base64:
+					"H4sIAAAAAAAC/+3TTQ6CQAxA4a49xZwAOswgWw/AJSZhNMSICZaE46shcccS48/7Nm26bV5RFuWhvQ6nth/Osg1drE2tgn/ty71pai+ulTeYbpZG5+RPHfvZpjGX6YMUNpvgZ/7/jHof42r/WlXivY91VB8euwZt6iBO6X9zebY8dLlzl2ypS5Z2NAEAAAAAAAAAAAAAAPBN7kynkGkAKAAA",
+			},
+		]) {
+			it(`should read ${archiveCase.label} from tar.gz`, async () => {
+				const archivePath = path.join(testDir, `${archiveCase.label}.tgz`);
+				fs.writeFileSync(archivePath, Buffer.from(archiveCase.base64, "base64"));
+
+				const result = await readTool.execute("test-call-extended-tar", {
+					path: `${archivePath}:${archiveCase.path}`,
+				});
+				expect(getTextOutput(result)).toContain("extended metadata");
+			});
+		}
+
+		it("should apply PAX size and mtime before validating ustar placeholders", async () => {
+			const extension = createPaxExtension("x", [
+				["path", "fixture/precedence.txt"],
+				["size", "4"],
+				["mtime", "1234.5"],
+			]);
+			const file = createTarArchive([{ path: "fallback.txt", content: "data" }]);
+			file.write("invalid-size", 124, 12, "ascii");
+			file.write("invalid-time", 136, 12, "ascii");
+			refreshTarChecksum(file.subarray(0, 512));
+			const bytes = Buffer.concat([extension, file]);
+
+			const archive = await openArchive({ bytes, format: "tar" });
+			expect(new TextDecoder().decode((await archive.readFile("fixture/precedence.txt")).bytes)).toBe("data");
+			expect(archive.getNode("fixture/precedence.txt")?.mtimeMs).toBe(1_234_500);
+		});
+
+		for (const deletionType of ["x", "g"] as const) {
+			it(`should apply PAX ${deletionType === "x" ? "local" : "global"} deletion values`, async () => {
+				const inherited = createPaxExtension("g", [
+					["path", "global.txt"],
+					["size", "99"],
+					["mtime", "999"],
+				]);
+				const deletion = createPaxExtension(deletionType, [
+					["path", ""],
+					["size", ""],
+					["mtime", ""],
+				]);
+				const file = createTarArchive([{ path: "fallback.txt", content: "data" }]);
+				writeTarOctal(file, 136, 12, 123);
+				refreshTarChecksum(file.subarray(0, 512));
+				const archive = await openArchive({ bytes: Buffer.concat([inherited, deletion, file]), format: "tar" });
+
+				expect(new TextDecoder().decode((await archive.readFile("fallback.txt")).bytes)).toBe("data");
+				expect(archive.getNode("fallback.txt")?.mtimeMs).toBe(123_000);
+				expect(archive.getNode("global.txt")).toBeUndefined();
+			});
+		}
+
+		it("should reject truncated tar data", async () => {
+			const archivePath = path.join(testDir, "truncated.tar");
+			fs.writeFileSync(archivePath, createTarArchive([{ path: "file.txt", content: "data" }]).subarray(0, 700));
+
+			await expect(readTool.execute("test-call-truncated-tar", { path: archivePath })).rejects.toThrow(
+				/Invalid tar archive/,
+			);
+		});
+
+		it("should use the last duplicate tar member", async () => {
+			const archivePath = path.join(testDir, "duplicate.tar");
+			fs.writeFileSync(
+				archivePath,
+				createTarArchive([
+					{ path: "same.txt", content: "first\n" },
+					{ path: "same.txt", content: "last\n" },
+				]),
+			);
+
+			const result = await readTool.execute("test-call-duplicate-tar", { path: `${archivePath}:same.txt` });
+			expect(getTextOutput(result)).toContain("last");
+			expect(getTextOutput(result)).not.toContain("first");
+		});
+
+		it("should reject unsafe raw tar names during extraction", async () => {
+			for (const rawPath of ["/rooted.txt", "a/../drop.txt"]) {
+				const archive = createTarArchive([{ path: rawPath, content: "unsafe\n" }]);
+				await expect(
+					extractArchive({ bytes: archive, format: "tar" }, path.join(testDir, "extract")),
+				).rejects.toThrow(/escapes extraction dir/);
+			}
+		});
+
+		it("should reject oversized path-backed tar files before reading bytes", async () => {
+			const bytes = vi.fn(async () => {
+				throw new Error("bytes should not be called");
+			});
+			vi.spyOn(Bun, "file").mockReturnValue({
+				size: 256 * 1024 * 1024 + 1,
+				bytes,
+			} as never);
+
+			await expect(
+				extractArchive(path.join(testDir, "oversize.tar"), path.join(testDir, "extract")),
+			).rejects.toThrow(/too large to read in memory/);
+			expect(bytes).not.toHaveBeenCalled();
+		});
+
 		it("should list archive subdirectories", async () => {
 			const archivePath = path.join(testDir, "fixture.zip");
 			fs.writeFileSync(
@@ -1092,6 +1242,39 @@ describe("Coding Agent Tools", () => {
 			const files = await archive.files();
 			expect(await files.get("pkg/README.md")?.text()).toBe(content);
 			expect(await files.get("pkg/src/index.ts")?.text()).toBe("export const archiveValue = 1;\n");
+		});
+
+		it("should preserve raw tar member names when rewriting", async () => {
+			const archivePath = path.join(testDir, "raw-names.tar");
+			fs.writeFileSync(
+				archivePath,
+				createTarArchive([
+					{ path: "same.txt", content: "plain\n" },
+					{ path: "./same.txt", content: "dot\n" },
+					{ path: "a//b.txt", content: "double slash\n" },
+					{ path: "/rooted.txt", content: "rooted\n" },
+					{ path: "a/../drop.txt", content: "traversal\n" },
+				]),
+			);
+
+			await writeTool.execute("test-call-archive-raw-rewrite", {
+				path: `${archivePath}:added.txt`,
+				content: "added\n",
+			});
+
+			const entries = await readArchiveEntries(archivePath);
+			expect([...entries.keys()]).toEqual([
+				"same.txt",
+				"./same.txt",
+				"a//b.txt",
+				"/rooted.txt",
+				"a/../drop.txt",
+				"added.txt",
+			]);
+			for (const rawPath of ["same.txt", "./same.txt", "a//b.txt", "/rooted.txt", "a/../drop.txt"]) {
+				expect(entries.get(rawPath)).toBeInstanceOf(File);
+				expect((entries.get(rawPath) as File).name).toBe(rawPath);
+			}
 		});
 
 		it("should treat a plain archive filename as a regular file write", async () => {

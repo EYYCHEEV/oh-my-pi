@@ -668,4 +668,26 @@ describe("system prompt tool inventory", () => {
 		expect(text).toContain("<skills>");
 		expect(text).toContain("- frontend-design: Frontend UI workflow");
 	});
+
+	it("requires todo tool updates only when the tool is active", async () => {
+		const renderWithToolNames = async (toolNames: string[]): Promise<string> => {
+			const { systemPrompt } = await buildSystemPrompt({
+				cwd: tempDir,
+				contextFiles: [],
+				skills: [],
+				rules: [],
+				toolNames,
+				workspaceTree: { ...EMPTY_TREE, rootPath: tempDir },
+			});
+			return systemPrompt.join("\n\n");
+		};
+
+		const withTodo = await renderWithToolNames(["todo"]);
+		expect(withTodo).toContain("MUST call the `todo` TOOL");
+		expect(withTodo).toContain("whenever task state materially changes");
+		expect(withTodo).toContain("Do not merely describe todo changes in prose");
+
+		const withoutTodo = await renderWithToolNames([]);
+		expect(withoutTodo).not.toContain("MUST call the `todo` TOOL");
+	});
 });
