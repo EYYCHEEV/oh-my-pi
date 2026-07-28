@@ -1,5 +1,5 @@
 // The single archive boundary for the codebase: ZIP (framed here, over the raw
-// DEFLATE codec in `node:zlib`) and tar / tar.gz (via `Bun.Archive`). This is
+// DEFLATE and gzip codecs in `node:zlib`) and tar / tar.gz. This is
 // the ONLY module that frames ZIP containers or touches `Bun.Archive`; the
 // markit document converters, the read/search/write tools, the URL fetcher, the
 // debug report bundler, and the tool-binary installer all go through here so
@@ -45,7 +45,7 @@ export function unzip(bytes: Uint8Array): Unzipped {
 
 /**
  * Cap on the on-disk size of tar/tar.gz archives, which are loaded fully into
- * memory (and decompressed by `Bun.Archive`) just to index entries. ZIP is
+ * memory just to index entries. ZIP is
  * exempt: it is read via ranged central-directory access.
  */
 const MAX_TAR_ARCHIVE_BYTES = 256 * 1024 * 1024;
@@ -144,7 +144,7 @@ function memoryByteSource(buffer: Uint8Array): ByteSource {
 
 interface TarStorage {
 	type: "tar";
-	file: File;
+	bytes: Uint8Array;
 }
 
 interface ZipStorage {
@@ -160,6 +160,7 @@ type EntryStorage = TarStorage | ZipStorage;
 
 interface ArchiveIndexEntry extends ArchiveNode {
 	storage?: EntryStorage;
+	rawPath?: string;
 }
 
 function normalizeArchiveLookupPath(rawPath?: string): string | undefined {
@@ -193,6 +194,13 @@ function isArchiveDirectoryName(rawPath: string): boolean {
 	return rawPath.endsWith("/") || rawPath.endsWith("\\");
 }
 
+function isUnsafeArchiveEntryPath(rawPath: string): boolean {
+	const normalized = rawPath.replace(/\\/g, "/");
+	return (
+		path.posix.isAbsolute(normalized) || path.win32.isAbsolute(normalized) || normalized.split("/").includes("..")
+	);
+}
+
 function upsertArchiveEntry(map: Map<string, ArchiveIndexEntry>, entry: ArchiveIndexEntry): void {
 	const existing = map.get(entry.path);
 	if (!existing) {
@@ -206,6 +214,11 @@ function upsertArchiveEntry(map: Map<string, ArchiveIndexEntry>, entry: ArchiveI
 	}
 
 	if (!existing.isDirectory && entry.isDirectory) {
+		return;
+	}
+
+	if (!existing.isDirectory) {
+		map.set(entry.path, entry);
 		return;
 	}
 
@@ -604,36 +617,196 @@ async function readZipFileBytes(storage: ZipStorage, uncompressedSize: number): 
 	return decodeZipMember(compressedBytes, storage.compression, uncompressedSize);
 }
 
-async function readTarEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
-	let archive: Bun.Archive;
-	try {
-		archive = new Bun.Archive(bytes);
-	} catch (error) {
-		throw new ToolError(error instanceof Error ? error.message : String(error));
-	}
+interface PaxFields {
+	path?: string | null;
+	size?: number | null;
+	mtimeMs?: number | null;
+}
 
-	let files: Map<string, File>;
-	try {
-		files = await archive.files();
-	} catch (error) {
-		throw new ToolError(error instanceof Error ? error.message : String(error));
+function tarString(bytes: Uint8Array): string {
+	const end = bytes.indexOf(0);
+	return UTF8_DECODER.decode(end === -1 ? bytes : bytes.subarray(0, end));
+}
+
+function tarNumber(bytes: Uint8Array, field: string): number {
+	let value: bigint;
+	if ((bytes[0]! & 0x80) !== 0) {
+		const bits = BigInt(bytes.byteLength * 8 - 1);
+		value = BigInt(bytes[0]! & 0x7f);
+		for (let index = 1; index < bytes.byteLength; index++) value = (value << 8n) | BigInt(bytes[index]!);
+		if ((bytes[0]! & 0x40) !== 0) value -= 1n << bits;
+	} else {
+		const text = UTF8_DECODER.decode(bytes).replaceAll("\0", "").trim();
+		if (!text) return 0;
+		if (!/^[0-7]+$/.test(text)) throw new ToolError(`Invalid tar archive: malformed ${field}`);
+		value = BigInt(`0o${text}`);
+	}
+	const number = Number(value);
+	if (!Number.isSafeInteger(number)) throw new ToolError(`Tar archive ${field} is too large to read safely`);
+	return number;
+}
+
+function tarPayloadEnd(dataStart: number, size: number, archiveSize: number): number {
+	if (!Number.isSafeInteger(size) || size < 0 || size > archiveSize - dataStart) {
+		throw new ToolError("Invalid tar archive: truncated entry data");
+	}
+	const end = dataStart + Math.ceil(size / 512) * 512;
+	if (!Number.isSafeInteger(end) || end > archiveSize) {
+		throw new ToolError("Invalid tar archive: truncated entry padding");
+	}
+	return end;
+}
+
+function parsePax(bytes: Uint8Array): PaxFields {
+	const fields: PaxFields = {};
+	let offset = 0;
+	while (offset < bytes.byteLength) {
+		const space = bytes.indexOf(0x20, offset);
+		if (space === -1) throw new ToolError("Invalid tar archive: malformed PAX record");
+		const lengthText = UTF8_DECODER.decode(bytes.subarray(offset, space));
+		if (!/^[1-9][0-9]*$/.test(lengthText)) throw new ToolError("Invalid tar archive: malformed PAX record");
+		const length = Number(lengthText);
+		const end = offset + length;
+		if (!Number.isSafeInteger(length) || end > bytes.byteLength || bytes[end - 1] !== 0x0a) {
+			throw new ToolError("Invalid tar archive: malformed PAX record");
+		}
+		const record = UTF8_DECODER.decode(bytes.subarray(space + 1, end - 1));
+		const equals = record.indexOf("=");
+		if (equals <= 0) throw new ToolError("Invalid tar archive: malformed PAX record");
+		const key = record.slice(0, equals);
+		const rawValue = record.slice(equals + 1);
+		if (key === "path") {
+			fields.path = rawValue || null;
+		} else if (key === "size") {
+			if (!rawValue) {
+				fields.size = null;
+			} else {
+				if (!/^[0-9]+$/.test(rawValue)) throw new ToolError("Invalid tar archive: malformed PAX size");
+				const size = Number(rawValue);
+				if (!Number.isSafeInteger(size)) throw new ToolError("Tar archive size is too large to read safely");
+				fields.size = size;
+			}
+		} else if (key === "mtime") {
+			if (!rawValue) {
+				fields.mtimeMs = null;
+			} else {
+				const mtimeMs = Number(rawValue) * 1000;
+				if (!Number.isFinite(mtimeMs) || !Number.isSafeInteger(Math.trunc(mtimeMs))) {
+					throw new ToolError("Invalid tar archive: malformed PAX mtime");
+				}
+				fields.mtimeMs = mtimeMs;
+			}
+		}
+		offset = end;
+	}
+	return fields;
+}
+
+function readTarEntries(input: Uint8Array): ArchiveIndexEntry[] {
+	if (input.byteLength > MAX_TAR_ARCHIVE_BYTES) {
+		throw new ToolError(
+			`Archive is too large to read in memory (${formatBytes(input.byteLength)} > ${formatBytes(MAX_TAR_ARCHIVE_BYTES)} limit)`,
+		);
+	}
+	let bytes = input;
+	if (bytes[0] === 0x1f && bytes[1] === 0x8b) {
+		try {
+			bytes = zlib.gunzipSync(bytes, { maxOutputLength: MAX_TAR_ARCHIVE_BYTES });
+		} catch (error) {
+			throw new ToolError(error instanceof Error ? error.message : String(error));
+		}
+	}
+	if (bytes.byteLength > MAX_TAR_ARCHIVE_BYTES) {
+		throw new ToolError(`Archive expands beyond the in-memory limit (${formatBytes(MAX_TAR_ARCHIVE_BYTES)})`);
 	}
 
 	const entries: ArchiveIndexEntry[] = [];
-	for (const [rawPath, file] of files) {
+	let offset = 0;
+	let globalPax: PaxFields = {};
+	let nextPax: PaxFields = {};
+	let longPath: string | undefined;
+	while (offset + 512 <= bytes.byteLength) {
+		const header = bytes.subarray(offset, offset + 512);
+		if (header.every(byte => byte === 0)) {
+			if (
+				offset + 1024 > bytes.byteLength ||
+				!bytes.subarray(offset + 512, offset + 1024).every(byte => byte === 0)
+			) {
+				throw new ToolError("Invalid tar archive: truncated end marker");
+			}
+			return entries;
+		}
+
+		const storedChecksum = tarNumber(header.subarray(148, 156), "header checksum");
+		let unsignedChecksum = 0;
+		let signedChecksum = 0;
+		for (let index = 0; index < 512; index++) {
+			const byte = index >= 148 && index < 156 ? 0x20 : header[index]!;
+			unsignedChecksum += byte;
+			signedChecksum += byte > 0x7f ? byte - 0x100 : byte;
+		}
+		if (storedChecksum !== unsignedChecksum && storedChecksum !== signedChecksum) {
+			throw new ToolError("Invalid tar archive: header checksum mismatch");
+		}
+
+		const dataStart = offset + 512;
+		const type = String.fromCharCode(header[156]!);
+		if (type === "x" || type === "g" || type === "L" || type === "K") {
+			const metadataSize = tarNumber(header.subarray(124, 136), "entry size");
+			if (metadataSize < 0) throw new ToolError("Invalid tar archive: negative entry size");
+			const metadataEnd = tarPayloadEnd(dataStart, metadataSize, bytes.byteLength);
+			const payload = bytes.subarray(dataStart, dataStart + metadataSize);
+			if (type === "x" || type === "g") {
+				const pax = parsePax(payload);
+				if (type === "g") globalPax = { ...globalPax, ...pax };
+				else nextPax = { ...nextPax, ...pax };
+			} else if (type === "L") {
+				longPath = UTF8_DECODER.decode(payload).replace(/\0.*$/s, "").replace(/\n$/, "");
+			}
+			offset = metadataEnd;
+			continue;
+		}
+
+		const pax = { ...globalPax, ...nextPax };
+		const size = pax.size ?? tarNumber(header.subarray(124, 136), "entry size");
+		if (size < 0) throw new ToolError("Invalid tar archive: negative entry size");
+		const dataEnd = tarPayloadEnd(dataStart, size, bytes.byteLength);
+		const name = tarString(header.subarray(0, 100));
+		const prefix = tarString(header.subarray(345, 500));
+		const headerPath = prefix ? `${prefix}/${name}` : name;
+		const rawPath = pax.path === null ? headerPath : (pax.path ?? longPath ?? headerPath);
 		const normalizedPath = normalizeArchiveEntryPath(rawPath);
-		if (!normalizedPath) continue;
-		const mtimeMs = file.lastModified > 0 ? file.lastModified : undefined;
-		entries.push({
-			path: normalizedPath,
-			isDirectory: false,
-			size: file.size,
-			mtimeMs,
-			storage: { type: "tar", file },
-		});
+		const isDirectory = type === "5" || isArchiveDirectoryName(rawPath);
+		if (rawPath && (isDirectory || type === "\0" || type === "0" || type === "7")) {
+			let mtimeMs = pax.mtimeMs ?? undefined;
+			if (mtimeMs === undefined) {
+				const headerMtime = tarNumber(header.subarray(136, 148), "mtime");
+				mtimeMs = Number.isSafeInteger(headerMtime * 1000) ? headerMtime * 1000 : undefined;
+			}
+			entries.push({
+				path: normalizedPath ?? rawPath,
+				isDirectory,
+				size: isDirectory ? 0 : size,
+				mtimeMs,
+				storage: isDirectory ? undefined : { type: "tar", bytes: bytes.subarray(dataStart, dataStart + size) },
+				rawPath,
+			});
+		}
+		nextPax = {};
+		longPath = undefined;
+		offset = dataEnd;
 	}
 
-	return entries;
+	throw new ToolError("Invalid tar archive: truncated header");
+}
+
+async function readTarArchiveEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
+	try {
+		return readTarEntries(bytes);
+	} catch (error) {
+		if (error instanceof ToolError) throw error;
+		throw new ToolError(error instanceof Error ? error.message : String(error));
+	}
 }
 
 async function readZipEntries(source: ByteSource): Promise<ArchiveIndexEntry[]> {
@@ -675,7 +848,7 @@ export function parseArchivePathCandidates(filePath: string): ArchivePathCandida
 /**
  * An indexed, read-only view over a single archive. ZIP archives are indexed
  * from the central directory and members are inflated on demand; tar archives
- * are fully materialized by `Bun.Archive` up front.
+ * are parsed from a bounded in-memory buffer.
  */
 export class ArchiveReader {
 	readonly format: ArchiveFormat;
@@ -684,7 +857,10 @@ export class ArchiveReader {
 	constructor(format: ArchiveFormat, entries: ArchiveIndexEntry[]) {
 		this.format = format;
 		for (const entry of entries) {
-			upsertArchiveEntry(this.#entries, entry);
+			if (entry.rawPath && isUnsafeArchiveEntryPath(entry.rawPath)) continue;
+			const normalizedPath = normalizeArchiveEntryPath(entry.path);
+			if (!normalizedPath) continue;
+			upsertArchiveEntry(this.#entries, { ...entry, path: normalizedPath });
 		}
 		ensureParentDirectories(this.#entries);
 	}
@@ -776,9 +952,7 @@ export class ArchiveReader {
 		}
 
 		const bytes =
-			entry.storage.type === "tar"
-				? await entry.storage.file.bytes()
-				: await readZipFileBytes(entry.storage, entry.size);
+			entry.storage.type === "tar" ? entry.storage.bytes : await readZipFileBytes(entry.storage, entry.size);
 
 		return {
 			path: entry.path,
@@ -812,7 +986,7 @@ export async function openArchive(source: ArchiveSource): Promise<ArchiveReader>
 				`Archive is too large to read in memory (${formatBytes(archiveSize)} > ${formatBytes(MAX_TAR_ARCHIVE_BYTES)} limit)`,
 			);
 		}
-		return new ArchiveReader(format, await readTarEntries(await file.bytes()));
+		return new ArchiveReader(format, await readTarArchiveEntries(await file.bytes()));
 	}
 
 	const { bytes, format } = source;
@@ -824,7 +998,7 @@ export async function openArchive(source: ArchiveSource): Promise<ArchiveReader>
 			`Archive is too large to read in memory (${formatBytes(bytes.byteLength)} > ${formatBytes(MAX_TAR_ARCHIVE_BYTES)} limit)`,
 		);
 	}
-	return new ArchiveReader(format, await readTarEntries(bytes));
+	return new ArchiveReader(format, await readTarArchiveEntries(bytes));
 }
 
 /** Render the top-level entries of an in-memory archive as one line each. */
@@ -846,7 +1020,13 @@ async function resolveArchiveBytes(source: ArchiveSource): Promise<{ bytes: Uint
 	if (!format) {
 		throw new ToolError(`Unsupported archive format: ${source}`);
 	}
-	return { bytes: await Bun.file(source).bytes(), format };
+	const file = Bun.file(source);
+	if (format !== "zip" && file.size > MAX_TAR_ARCHIVE_BYTES) {
+		throw new ToolError(
+			`Archive is too large to read in memory (${formatBytes(file.size)} > ${formatBytes(MAX_TAR_ARCHIVE_BYTES)} limit)`,
+		);
+	}
+	return { bytes: await file.bytes(), format };
 }
 
 async function memberToBytes(content: ArchiveMemberContent): Promise<Uint8Array> {
@@ -857,7 +1037,7 @@ async function memberToBytes(content: ArchiveMemberContent): Promise<Uint8Array>
 
 /**
  * Fully materialize every file member into a `path → content` map: ZIP members
- * are inflated in memory, tar members are returned as lazy `File`s. Use this
+ * are inflated in memory and tar members are returned as `File`s. Use this
  * when you need every entry (rewrite, extract); for browsing or single-member
  * reads prefer `openArchive`, which is lazy for ZIP.
  */
@@ -871,9 +1051,15 @@ export async function readArchiveEntries(source: ArchiveSource): Promise<Map<str
 		}
 		return entries;
 	}
-	const files = await new Bun.Archive(bytes).files();
-	for (const [name, file] of files) {
-		entries.set(name.replace(/\\/g, "/"), file);
+	for (const entry of await readTarArchiveEntries(bytes)) {
+		if (entry.isDirectory || entry.storage?.type !== "tar" || !entry.rawPath) continue;
+		const rawPath = entry.rawPath;
+		entries.set(
+			rawPath.replace(/\\/g, "/"),
+			new File([entry.storage.bytes], rawPath, {
+				lastModified: entry.mtimeMs,
+			}),
+		);
 	}
 	return entries;
 }
@@ -915,6 +1101,9 @@ export async function extractArchive(source: ArchiveSource, destDir: string): Pr
 	let count = 0;
 	for (const [name, content] of entries) {
 		if (name.endsWith("/")) continue;
+		if (isUnsafeArchiveEntryPath(name)) {
+			throw new ToolError(`Archive entry escapes extraction dir: ${name}`);
+		}
 		const outputPath = path.resolve(extractRoot, name);
 		if (!outputPath.startsWith(extractRoot + path.sep)) {
 			throw new ToolError(`Archive entry escapes extraction dir: ${name}`);

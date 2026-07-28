@@ -41,6 +41,7 @@
   },
   "files": [
     "src",
+    "private",
     "README.md",
     "CHANGELOG.md"
   ],

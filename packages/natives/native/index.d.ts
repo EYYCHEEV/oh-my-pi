@@ -234,6 +234,23 @@ export declare class Shell {
   liveBackgroundJobCount(): Promise<number>
 }
 
+/** Identity-pinned process group held by a dedicated supervisor. */
+export declare class SupervisedProcessTree {
+  /** Whether strict supervised process groups are available. */
+  static isSupported(): boolean
+  /** Pin a freshly spawned detached supervisor before it starts a target. */
+  static fromSpawn(pid: number): SupervisedProcessTree | null
+  /** Wait until the held group contains only the supervisor. */
+  waitForEmpty(options?: ProcessWaitOptions | undefined | null): Promise<boolean>
+  /**
+   * Observe group absence after the held sentinel performs a final group
+   * KILL.
+   */
+  waitForAbsenceAfterKill(options?: ProcessWaitOptions | undefined | null): Promise<boolean>
+  /** TERM the held group and, if needed, issue one final group KILL. */
+  terminate(options?: SupervisedProcessTreeTerminateOptions | undefined | null): Promise<boolean>
+}
+
 /**
  * Install the bounded Tokio runtime napi-rs adopts for async exports and the
  * bounded Rayon global pool used by native parallel iterators.
@@ -1942,6 +1959,15 @@ export interface SummarySegment {
   endLine: number
   /** Verbatim text for kept segments; absent for elided segments. */
   text?: string
+}
+
+export interface SupervisedProcessTreeTerminateOptions {
+  /** Milliseconds to wait after SIGTERM before escalating to SIGKILL. */
+  gracefulMs?: number
+  /** Milliseconds to wait after SIGKILL for the retained tree to exit. */
+  timeoutMs?: number
+  /** Abort signal for cancelling termination while waiting. */
+  signal?: unknown
 }
 
 /**

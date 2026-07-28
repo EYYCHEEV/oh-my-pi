@@ -18,7 +18,7 @@ import { ADVISOR_TRANSCRIPT_STEM } from "../advisor/transcript-recorder";
  *
  * The first allocation of a given name keeps the name as-is; subsequent
  * allocations of the same name get a `-2`, `-3`, … suffix. On resume, scans
- * existing output and child-session files so prior state is never overwritten.
+ * existing output and child-session/transcript artifacts so interrupted runs are never reused.
  */
 export class AgentOutputManager {
 	#initialized = false;
@@ -38,8 +38,8 @@ export class AgentOutputManager {
 	}
 
 	/**
-	 * Seed the taken-id set from output files already on disk so a resumed
-	 * session never reuses a name that would clobber a prior subagent's output.
+	 * Seed the taken-id set from artifacts already on disk so a resumed session
+	 * never reuses a name that belongs to a completed or interrupted subagent.
 	 */
 	async #ensureInitialized(): Promise<void> {
 		if (this.#initialized) return;

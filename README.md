@@ -1,30 +1,30 @@
+<h1 align="center">Stronk OMP</h1>
+
 <p align="center">
-  <img src="https://github.com/can1357/oh-my-pi/blob/main/assets/hero.png?raw=true" alt="omp">
+  <strong>Oh My Pi with the reliability boundaries needed for long-running agent work.</strong>
 </p>
 
 <p align="center">
-  <strong>A coding agent with the IDE wired in.</strong>
-  <strong><a href="https://omp.sh">omp.sh</a></strong>
+  Required safety extensions · Recoverable terminal input · Visible worker state · Reliable task and process cleanup
 </p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/@oh-my-pi/pi-coding-agent"><img src="https://img.shields.io/npm/v/@oh-my-pi/pi-coding-agent?style=flat&colorA=222222&colorB=CB3837" alt="npm version"></a>
-  <a href="https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-keep-E05735?style=flat&colorA=222222" alt="Changelog"></a>
-  <a href="https://github.com/can1357/oh-my-pi/actions"><img src="https://img.shields.io/github/actions/workflow/status/can1357/oh-my-pi/ci.yml?style=flat&colorA=222222&colorB=3FB950" alt="CI"></a>
-  <a href="https://github.com/can1357/oh-my-pi/blob/main/LICENSE"><img src="https://img.shields.io/github/license/can1357/oh-my-pi?style=flat&colorA=222222&colorB=58A6FF" alt="License"></a>
-  <a href="https://www.typescriptlang.org"><img src="https://img.shields.io/badge/TypeScript-3178C6?style=flat&colorA=222222&logo=typescript&logoColor=white" alt="TypeScript"></a>
-  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Rust-DEA584?style=flat&colorA=222222&logo=rust&logoColor=white" alt="Rust"></a>
-  <a href="https://bun.sh"><img src="https://img.shields.io/badge/runtime-Bun-f472b6?style=flat&colorA=222222" alt="Bun"></a>
-  <a href="https://discord.gg/4NMW9cdXZa"><img src="https://img.shields.io/badge/Discord-5865F2?style=flat&colorA=222222&logo=discord&logoColor=white" alt="Discord"></a>
+  <a href="https://github.com/EYYCHEEV/oh-my-pi/releases/latest">Download</a> ·
+  <a href="https://omp.sh">Upstream OMP docs</a> ·
+  <a href="https://github.com/EYYCHEEV/oh-my-pi/issues">Issues</a>
 </p>
 
-<p align="center">
-  Fork of <a href="https://github.com/badlogic/pi-mono">Pi</a> by <a href="https://github.com/mariozechner">@mariozechner</a> 
-</p>
+Stronk OMP is a focused fork of [Oh My Pi](https://github.com/can1357/oh-my-pi) for agent-heavy workstation use.
+It exists because a capable harness still becomes painful when a required safety extension silently disappears, terminal input dies after an interrupt, worker progress is invisible, or a failed task leaves shared processes in the wrong lifecycle state.
 
-The most capable agent surface that ships. Continuously tuned by real-world use — complete out of the box, open all the way down.
+## What the fork fixes
 
-**60+** providers · **31** built-in tools · **14** lsp ops · **28** dap ops · **~80k** lines of Rust core.
+- Required extensions fail closed across the main command, Software Development Kit (SDK), Agent Client Protocol (ACP), and delegated-agent entry points.
+- Terminal input recovers from an interrupted read without swallowing unrelated fatal errors or letting a parked subagent terminate process-global workers.
+- Turn, subagent, and status-line lifecycle is visible and cleaned up consistently.
+- `/goal` can route explicit objectives through the workstation skill picker.
+- Model Context Protocol (MCP) image results reach the model instead of being lost at the boundary.
+- Task delegation, blocking task batches, transcript artifact identifiers, process-tree cleanup, and Todo progress keep their tested workstation contracts.
 
 > [!NOTE]
 > Pull requests are **temporarily open to everyone** as a trial. We previously
@@ -34,54 +34,82 @@ The most capable agent surface that ships. Continuously tuned by real-world use 
 
 ## Install
 
-**macOS · Linux**
+> [!NOTE]
+> Prebuilt Stronk OMP releases currently target macOS on Apple Silicon.
+> The upstream installer, Homebrew tap, Bun package, and mise source install provide upstream OMP, not this fork.
 
-```sh
-curl -fsSL https://omp.sh/install | sh
+### Managed workstation upgrade
+
+On an `agentic-workstation` machine, preview the exact upstream baseline, fork-boundary audit, protected tests, build, installation, and release plan first:
+
+```zsh
+upgrade-omp --dry-run
+upgrade-omp --apply
 ```
 
-> **Alpine / musl:** the prebuilt musl binary links `libstdc++`/`libgcc` dynamically, which stock Alpine does not ship. Install them first: `apk add libstdc++ libgcc`.
+Use `upgrade-omp --local-only --apply` when you want the verified local install without publishing the fork branch, tag, or GitHub Release.
 
-**Homebrew**
+### macOS Apple Silicon release
 
-```sh
-brew install can1357/tap/omp
+Using the [GitHub CLI](https://cli.github.com/):
+
+```zsh
+release_dir="$(mktemp -d)"
+install_dir="$HOME/.local/bin"
+
+gh release download \
+  --repo EYYCHEEV/oh-my-pi \
+  --dir "$release_dir" \
+  --pattern 'omp-darwin-arm64' \
+  --pattern 'SHA256SUMS.txt'
+
+(
+  cd "$release_dir"
+  grep '  omp-darwin-arm64$' SHA256SUMS.txt > selected-SHA256SUMS.txt
+  test "$(wc -l < selected-SHA256SUMS.txt | tr -d ' ')" = 1
+  shasum -a 256 -c selected-SHA256SUMS.txt
+)
+
+mkdir -p "$install_dir"
+install -m 755 "$release_dir/omp-darwin-arm64" "$install_dir/omp"
+"$install_dir/omp" --version
 ```
 
-**Bun (recommended)**
+Make sure `~/.local/bin` is on your `PATH`, or choose a directory that already is.
+The release `RELEASE_MANIFEST.json` records the fork commit, upstream baseline, and binary SHA-256 provenance.
 
-```sh
-bun install -g @oh-my-pi/pi-coding-agent
-```
+## Exact active fork contract map
 
-**Windows (PowerShell)**
+This block is generated from the same manifest that gates every `upgrade-omp` run.
+An upgrade fails before build or installation if the block is stale, any declared fork path disappears, a required contract disappears, or any fork-relative path is unclassified.
 
-```powershell
-irm https://omp.sh/install.ps1 | iex
-```
+<!-- stronk-omp:fork-contracts:start -->
+- `required-extension-enforcement`: Required safety extension enforcement
+- `terminal-eintr-worker-ownership`: Terminal EINTR recovery and shared-worker ownership
+- `subagent-policy-inheritance`: Resolved parent policy inheritance for subagents
+- `turn-status-lifecycle`: Root and subagent turn-status lifecycle
+- `goal-objective-skill-picker`: Goal objective skill-picker routing
+- `tool-call-abort-signal`: Tool-call abort signal propagation
+- `mcp-image-forwarding`: Ordered MCP image forwarding
+- `bounded-process-tree-cleanup`: Identity-safe bounded process-tree cleanup
+- `task-delegation-gate`: Policy-gated task delegation
+- `blocking-task-batches`: Blocking task-batch execution
+- `interrupted-transcript-artifact-ids`: Collision-free interrupted transcript artifact IDs
+- `agent-registry-observation`: Read-only global agent-registry observation
+- `outcome-first-scope-control`: Outcome-first reviewer and Todo scope control
+- `kimi-usage-account-identity`: Per-account Kimi usage report identity
+- `archive-read-crash-containment`: Crash-safe tar and tar.gz reads
+<!-- stronk-omp:fork-contracts:end -->
 
-**Pinned versions (mise)**
+## Upstream alignment
 
-```sh
-mise use -g github:can1357/oh-my-pi
-```
+The fork stays close to `can1357/oh-my-pi` and keeps the upstream feature surface below.
+Each upgrade resolves one exact upstream commit, audits the current fork delta, syncs, audits the resulting delta again, and only then installs dependencies, builds, tests, or replaces the managed binary.
+Fork paths are exact and manifest-owned, so a new sibling file is reported as unknown rather than silently absorbed into a broad pattern.
 
-macOS · Linux · Windows · bun ≥ 1.3.14
+Stronk OMP is an independent distribution based on [Oh My Pi](https://github.com/can1357/oh-my-pi), licensed under [MIT](LICENSE), and supported through this repository's [issue tracker](https://github.com/EYYCHEEV/oh-my-pi/issues).
 
-### Shell completions
-
-`omp` generates its own completion scripts for **bash**, **zsh**, and **fish** from the live command/flag metadata, so they never drift from the actual CLI. Subcommands, flags, and enum values complete statically; model names (`--model`, `--smol`, `--slow`, `--plan`) resolve against the bundled model catalog and `--resume` against your on-disk sessions.
-
-```sh
-# zsh — add to ~/.zshrc (or write the output into a file on your $fpath)
-eval "$(omp completions zsh)"
-
-# bash — add to ~/.bashrc
-eval "$(omp completions bash)"
-
-# fish
-omp completions fish > ~/.config/fish/completions/omp.fish
-```
+## Upstream OMP capabilities
 
 ## Every tool, _benchmaxxed_.
 
@@ -640,7 +668,8 @@ For architecture and contribution guidelines, see [packages/coding-agent/DEVELOP
 
 ## Contributing
 
-Issues and pull requests are open to everyone. Open PRs are currently a
+Report Stronk OMP fork problems in the [fork issue tracker](https://github.com/EYYCHEEV/oh-my-pi/issues).
+Upstream issues and pull requests are open to everyone. Open PRs are currently a
 **trial** — the previous vouch requirement is lifted while we evaluate how it
 goes, and it may return. See **[CONTRIBUTING.md](CONTRIBUTING.md)** for
 guidelines on contributing.
@@ -656,9 +685,10 @@ MIT. See [LICENSE](LICENSE).
 
 _made for terminals that stay open_
 
-- [omp.sh](https://omp.sh)
-- [GitHub](https://github.com/can1357/oh-my-pi)
-- [Changelog](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/CHANGELOG.md)
+- [Stronk OMP releases](https://github.com/EYYCHEEV/oh-my-pi/releases/latest)
+- [Stronk OMP issues](https://github.com/EYYCHEEV/oh-my-pi/issues)
+- [Upstream OMP](https://github.com/can1357/oh-my-pi)
+- [Upstream changelog](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/CHANGELOG.md)
 - [npm](https://www.npmjs.com/package/@oh-my-pi/pi-coding-agent)
 - [Discord](https://discord.gg/4NMW9cdXZa)
 - [MIT](https://github.com/can1357/oh-my-pi/blob/main/LICENSE)

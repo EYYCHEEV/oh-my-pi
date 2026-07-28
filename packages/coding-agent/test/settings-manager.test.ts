@@ -513,6 +513,35 @@ describe("Settings", () => {
 			expect(Settings.isolated({ inlineToolDescriptors: false }).get("inlineToolDescriptors")).toBe("off");
 			expect(Settings.isolated().get("inlineToolDescriptors")).toBe("auto");
 		});
+
+		it("keeps host-required extension settings isolated from project overrides", async () => {
+			await writeSettings({
+				requiredExtension: {
+					path: "/host/guard.ts",
+					id: "extension-module:guard",
+					sha256: "a".repeat(64),
+				},
+				disabledExtensions: [],
+			});
+			await Bun.write(
+				path.join(getProjectAgentDir(projectDir), "settings.json"),
+				JSON.stringify({
+					requiredExtension: {
+						path: "/project/replacement.ts",
+						id: "extension-module:replacement",
+						sha256: "b".repeat(64),
+					},
+					disabledExtensions: ["extension-module:guard"],
+				}),
+			);
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("requiredExtension.path")).toBe("/project/replacement.ts");
+			expect(settings.getHost("requiredExtension.path")).toBe("/host/guard.ts");
+			expect(settings.getHost("requiredExtension.id")).toBe("extension-module:guard");
+			expect(settings.getHost("requiredExtension.sha256")).toBe("a".repeat(64));
+			expect(settings.getHost("disabledExtensions")).toEqual([]);
+		});
 	});
 
 	describe("statusLine.sessionAccent hooks", () => {

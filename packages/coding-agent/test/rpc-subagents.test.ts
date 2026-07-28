@@ -417,6 +417,7 @@ function handle(frame) {
 		write({ type: "subagent_lifecycle", payload: { id: "SubagentA", index: 0, agent: "task", agentSource: "bundled", status: "started", sessionFile: "/tmp/subagent.jsonl" } });
 		write({ type: "subagent_progress", payload: { index: 0, agent: "task", agentSource: "bundled", task: "Do work", assignment: "Implement work", sessionFile: "/tmp/subagent.jsonl", progress } });
 		write({ type: "subagent_event", payload: { id: "SubagentA", event: { type: "agent_start" } } });
+		write({ type: "agent_activity_state", runId: "root-run", state: "running" });
 		write({ type: "agent_end", messages: [] });
 	}
 }
@@ -445,5 +446,6 @@ function handle(frame) {
 		expect(progressTasks).toEqual(["Do work"]);
 		expect(rawEventTypes).toEqual(["agent_start"]);
 		expect(sessionEventTypes).toContain("notice");
+		expect(sessionEventTypes.filter(type => type === "agent_activity_state")).toEqual(["agent_activity_state"]);
 	});
 });

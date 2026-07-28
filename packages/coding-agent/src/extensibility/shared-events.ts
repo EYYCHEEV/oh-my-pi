@@ -189,6 +189,21 @@ export interface AgentStartEvent {
 	type: "agent_start";
 }
 
+export type AgentActivityState = "running" | "waiting_for_human" | "settled";
+export type AgentActivityOutcome = "completed" | "interrupted" | "error";
+
+/**
+ * Fired for the user-visible lifecycle of one root prompt. Unlike the raw
+ * agent_start/agent_end pair, continuation and retry loops do not create new
+ * activity runs.
+ */
+export interface AgentActivityStateEvent {
+	type: "agent_activity_state";
+	runId: string;
+	state: AgentActivityState;
+	outcome?: AgentActivityOutcome;
+}
+
 /** Fired when an agent loop ends */
 export interface AgentEndEvent {
 	type: "agent_end";
