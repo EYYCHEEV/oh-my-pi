@@ -493,6 +493,36 @@ describe("vibe session registry", () => {
 		expect(entry.turns).toBe(1);
 	});
 
+	it("inherits the parent's resolved instruction context when spawning a persistent worker", async () => {
+		let dispatched: Parameters<typeof executorModule.runSubprocess>[0] | undefined;
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			dispatched = options;
+			AgentRegistry.global().register({
+				id: options.id,
+				displayName: options.id,
+				kind: "sub",
+				parentId: "Main",
+				session: createFakeWorkerSession().session,
+				status: "idle",
+			});
+			return makeResult(options.id);
+		});
+
+		const manager = createManager();
+		const session = createSession({ manager });
+		const contextFiles = [{ path: "/tmp/AGENTS.md", content: "# Parent policy" }];
+		const appendSystemPrompt = "Parent outcome policy";
+		session.contextFiles = contextFiles;
+		session.appendSystemPrompt = appendSystemPrompt;
+		const registry = VibeSessionRegistry.global();
+
+		const { jobId } = await registry.spawn(session, { cli: "fast", name: "Fast", prompt: "Build it." });
+		await manager.getJob(jobId)!.promise;
+
+		expect(dispatched?.contextFiles).toBe(contextFiles);
+		expect(dispatched?.appendSystemPrompt).toBe(appendSystemPrompt);
+	});
+
 	it("retains a failed spawn when its tombstone cannot flush and retries it on mode exit", async () => {
 		const parentManager = await createPersistedParent();
 		parentManager.appendModeChange("vibe");

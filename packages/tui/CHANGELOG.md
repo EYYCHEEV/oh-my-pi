@@ -169,6 +169,9 @@
 ### Fixed
 
 - Fixed a rendering issue where resizing the terminal during forced renders (such as tool finalization or image reconciliation) caused the entire transcript to visibly replay and flicker. Forced renders are now consolidated into a single paint once the resize settles.
+### Fixed
+
+- Recovered terminal input after Bun surfaces a macOS `read` interruption (`EINTR`) by reopening the destroyed TTY stream and restoring its raw-mode input pipeline, including active shutdown-drain listeners; unrelated stream errors remain fatal.
 
 ## [16.4.7] - 2026-07-12
 

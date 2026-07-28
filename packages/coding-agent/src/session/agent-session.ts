@@ -134,6 +134,7 @@ import { ManagedTimers } from "../extensibility/extensions/managed-timers";
 import { createExtensionModelQuery } from "../extensibility/extensions/model-api";
 import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
 import type { HookCommandContext } from "../extensibility/hooks/types";
+import type { AgentActivityOutcome, AgentActivityStateEvent } from "../extensibility/shared-events";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { normalizeToolEventInput, resolveToolEventInput } from "../extensibility/tool-event-input";
@@ -550,7 +551,12 @@ export class AgentSession {
 	readonly #streamingEditGuard: StreamingEditGuard;
 	readonly #loopGuards: LoopGuards;
 	#promptInFlightCount = 0;
+	#nextActivityRunId = 0;
+	#activityRun:
+		| { runId: string; state: "armed" | "running" | "waiting_for_human"; outcome: AgentActivityOutcome }
+		| undefined;
 	#abortInProgress = false;
+	#currentRawLoopProducedTerminalAssistant = false;
 	// Wire-level agent_end emission deferred until #promptInFlightCount drops to 0.
 	// Internal extension hooks and post-emit work (auto-retry, auto-compaction, todo
 	// checks in #handleAgentEvent) still fire on the original schedule — only the
@@ -558,6 +564,7 @@ export class AgentSession {
 	// Cursor exec, TUI listeners) is held back. Without this, a client that resumes
 	// on `agent_end` can fire its next `prompt` before #promptWithMessage's finally
 	#promptGeneration = 0;
+	#inFlightGeneration = 0;
 	#pendingAgentEndEmit: AgentSessionEvent | undefined;
 	#sessionStopContinuationCount = 0;
 	#sessionStopHookActive = false;
@@ -617,17 +624,52 @@ export class AgentSession {
 		}
 	}
 
-	#beginInFlight(): void {
+	#emitActivityState(state: "running" | "waiting_for_human" | "settled", outcome?: AgentActivityOutcome): void {
+		const run = this.#activityRun;
+		if (!run) return;
+		if (state !== "settled" && run.state === state) return;
+		if (state !== "settled") run.state = state;
+		const event: AgentActivityStateEvent = { type: "agent_activity_state", runId: run.runId, state };
+		if (outcome !== undefined) event.outcome = outcome;
+		this.#emit(event);
+		void this.#emitExtensionEvent(event);
+	}
+
+	/** Pause or resume the current root activity while an interactive modal owns focus. */
+	setActivityWaiting(waiting: boolean): void {
+		const run = this.#activityRun;
+		if (!run || run.state === "armed") return;
+		this.#emitActivityState(waiting ? "waiting_for_human" : "running");
+	}
+
+	#armActivityRoot(): void {
+		if (this.#promptInFlightCount !== 0) return;
+		this.#activityRun = {
+			runId: `${this.sessionId}:${++this.#nextActivityRunId}`,
+			state: "armed",
+			outcome: "completed",
+		};
+	}
+
+	#beginInFlight(): number {
+		const generation = this.#inFlightGeneration;
 		this.#promptInFlightCount++;
 		if (this.#promptInFlightCount === 1) {
 			this.#acquirePowerAssertion();
 		}
+		return generation;
 	}
 
-	#endInFlight(): void {
+	#endInFlight(generation: number): void {
+		if (generation !== this.#inFlightGeneration) return;
 		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
 		if (this.#promptInFlightCount === 0) {
 			this.#releasePowerAssertion();
+			const activity = this.#activityRun;
+			if (activity) {
+				if (activity.state !== "armed") this.#emitActivityState("settled", activity.outcome);
+				this.#activityRun = undefined;
+			}
 			this.#flushPendingAgentEnd();
 			this.#drainStrandedQueuedMessages();
 		}
@@ -714,7 +756,7 @@ export class AgentSession {
 			this.agent.replaceQueues([...this.agent.peekSteeringQueue()], []);
 		}
 		this.#resetPromptMaintenanceState();
-		this.#beginInFlight();
+		const inFlightGeneration = this.#beginInFlight();
 		void this.agent
 			.prompt(records)
 			.catch(error => {
@@ -727,7 +769,7 @@ export class AgentSession {
 						[...parkedFollowUps, ...this.agent.peekFollowUpQueue()],
 					);
 				}
-				this.#endInFlight();
+				this.#endInFlight(inFlightGeneration);
 			});
 	}
 
@@ -765,8 +807,14 @@ export class AgentSession {
 	}
 
 	#resetInFlight(): void {
+		this.#inFlightGeneration++;
 		this.#promptInFlightCount = 0;
 		this.#releasePowerAssertion();
+		const activity = this.#activityRun;
+		if (activity) {
+			if (activity.state !== "armed") this.#emitActivityState("settled", activity.outcome);
+			this.#activityRun = undefined;
+		}
 		this.#flushPendingAgentEnd();
 		this.#drainStrandedQueuedMessages();
 	}
@@ -2151,10 +2199,28 @@ export class AgentSession {
 	}
 
 	#processAgentEvent = async (event: AgentEvent): Promise<void> => {
-		// A fresh run supersedes the previously settled (and pruned) refusal
-		// turn: state-based lookups take over again.
 		if (event.type === "agent_start") {
+			// A fresh run supersedes the previously settled (and pruned) refusal
+			// turn: state-based lookups take over again.
 			this.#prunedTerminalRefusal = undefined;
+			this.#currentRawLoopProducedTerminalAssistant = false;
+			if (this.#activityRun?.state === "armed") this.#emitActivityState("running");
+		} else if (event.type === "message_end" && event.message.role === "assistant") {
+			this.#currentRawLoopProducedTerminalAssistant = true;
+		} else if (event.type === "agent_end" && this.#activityRun) {
+			if (!this.#currentRawLoopProducedTerminalAssistant) {
+				this.#activityRun.outcome = this.agent.state.error ? "error" : "interrupted";
+			} else {
+				const lastAssistant = [...event.messages].reverse().find(message => message.role === "assistant");
+				if (lastAssistant?.role === "assistant") {
+					this.#activityRun.outcome =
+						lastAssistant.stopReason === "aborted"
+							? "interrupted"
+							: lastAssistant.stopReason === "error"
+								? "error"
+								: "completed";
+				}
+			}
 		}
 		// Step the mid-run todo counter synchronously, BEFORE any await in this
 		// handler. The agent loop's next-turn `getAsideMessages` poll can run
@@ -2816,7 +2882,7 @@ export class AgentSession {
 					this.#skipAgentContinue("should-continue-false", options);
 					return;
 				}
-				this.#beginInFlight();
+				const inFlightGeneration = this.#beginInFlight();
 				try {
 					await this.#recovery.maybeRestoreRetryFallbackPrimary();
 					if (
@@ -2839,7 +2905,7 @@ export class AgentSession {
 					});
 					options?.onError?.(error);
 				} finally {
-					this.#endInFlight();
+					this.#endInFlight(inFlightGeneration);
 				}
 			},
 			{
@@ -3141,6 +3207,11 @@ export class AgentSession {
 		if (event.type === "agent_start") {
 			this.#turnIndex = 0;
 			await this.#extensionRunner.emit({ type: "agent_start" });
+			return;
+		}
+
+		if (event.type === "agent_activity_state") {
+			await this.#extensionRunner.emit(event);
 			return;
 		}
 
@@ -3524,8 +3595,9 @@ export class AgentSession {
 		try {
 			await state?.dispose({ timeoutMs: consolidateTimeoutMs });
 		} finally {
-			// Consolidation may embed final memories, so terminate its worker only afterward.
-			await shutdownMnemopiEmbedClient();
+			// Consolidation may embed final memories, so the primary process owner
+			// terminates its shared worker only afterward.
+			if (this.#ownedAsyncJobManager) await shutdownMnemopiEmbedClient();
 		}
 	}
 
@@ -3562,7 +3634,7 @@ export class AgentSession {
 			this.#eval.disposeKernels(),
 			this.#releaseOwnedBrowserTabs(this.sessionManager.getSessionId()),
 			this.#releaseOwnedComputerSessions(this.#eval.getKernelOwnerId()),
-			shutdownTinyTitleClient(),
+			this.#ownedAsyncJobManager ? shutdownTinyTitleClient() : Promise.resolve(),
 			this.#disconnectOwnedMcp(),
 			advisorRecorderClosed,
 			hindsightState?.flushRetainQueue() ?? Promise.resolve(),
@@ -4878,7 +4950,8 @@ export class AgentSession {
 			acceptTerminalEmptyStop?: boolean;
 		},
 	): Promise<void> {
-		this.#beginInFlight();
+		this.#armActivityRoot();
+		const inFlightGeneration = this.#beginInFlight();
 		const generation = this.#promptGeneration;
 		try {
 			await this.#recovery.maybeRestoreRetryFallbackPrimary();
@@ -5086,7 +5159,7 @@ export class AgentSession {
 				await this.#waitForPostPromptRecovery(generation);
 			}
 		} finally {
-			this.#endInFlight();
+			this.#endInFlight(inFlightGeneration);
 		}
 	}
 
@@ -5478,7 +5551,7 @@ export class AgentSession {
 		message: CustomMessage,
 		options?: { acceptTerminalEmptyStop?: boolean },
 	): Promise<void> {
-		this.#beginInFlight();
+		const inFlightGeneration = this.#beginInFlight();
 		try {
 			if (!(await this.#runUsageAwarePreflight())) return;
 			const acceptTerminalEmptyStop = options?.acceptTerminalEmptyStop === true;
@@ -5490,7 +5563,7 @@ export class AgentSession {
 			await this.#waitForPostPromptRecovery();
 		} finally {
 			this.#recovery.setAcceptTerminalEmptyStop(false);
-			this.#endInFlight();
+			this.#endInFlight(inFlightGeneration);
 		}
 	}
 

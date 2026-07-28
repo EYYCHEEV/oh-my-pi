@@ -191,6 +191,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					type: "tool_call",
 					toolName: this.tool.name,
 					toolCallId,
+					signal,
 					input: normalizeToolEventInput(
 						this.tool.name,
 						resolveToolEventInput(this.tool, toolEventArgs(params, context)),
@@ -313,6 +314,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				context.providerSafetyApproved = true;
 			}
 		}
+
 
 		// Execute the actual tool
 		let result: AgentToolResult<TDetails, TParameters>;

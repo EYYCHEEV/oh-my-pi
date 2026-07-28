@@ -191,30 +191,38 @@ export interface MCPToolDetails {
 	meta?: OutputMeta;
 }
 /**
- * Format MCP content for LLM consumption.
+ * Format one MCP text-like content item for LLM consumption.
+ * Resource blobs intentionally retain their existing marker-only behavior.
  */
-function formatMCPContent(content: MCPContent[]): string {
-	const parts: string[] = [];
+function formatMCPTextContent(content: Exclude<MCPContent, { type: "image" }>): string {
+	if (content.type === "text") return content.text;
+	if (content.resource.text) {
+		return `[Resource: ${content.resource.uri}]\n${content.resource.text}`;
+	}
+	return `[Resource: ${content.resource.uri}]`;
+}
+
+/** Convert ordered MCP content into OMP text/image blocks. */
+function convertMCPContent(content: MCPContent[]): CustomToolResult<MCPToolDetails>["content"] {
+	const blocks: CustomToolResult<MCPToolDetails>["content"] = [];
+	let pendingText: string[] = [];
+
+	const flushText = () => {
+		if (pendingText.length === 0) return;
+		blocks.push({ type: "text", text: pendingText.join("\n\n") });
+		pendingText = [];
+	};
 
 	for (const item of content) {
-		switch (item.type) {
-			case "text":
-				parts.push(item.text);
-				break;
-			case "image":
-				parts.push(`[Image: ${item.mimeType}]`);
-				break;
-			case "resource":
-				if (item.resource.text) {
-					parts.push(`[Resource: ${item.resource.uri}]\n${item.resource.text}`);
-				} else {
-					parts.push(`[Resource: ${item.resource.uri}]`);
-				}
-				break;
+		if (item.type === "image") {
+			flushText();
+			blocks.push({ type: "image", data: item.data, mimeType: item.mimeType });
+		} else {
+			pendingText.push(formatMCPTextContent(item));
 		}
 	}
-
-	return parts.join("\n\n");
+	flushText();
+	return blocks;
 }
 
 /** Build a CustomToolResult from a callTool response. */
@@ -225,7 +233,7 @@ function buildResult(
 	provider?: string,
 	providerName?: string,
 ): CustomToolResult<MCPToolDetails> {
-	const text = formatMCPContent(result.content);
+	const content = convertMCPContent(result.content);
 	const details: MCPToolDetails = {
 		serverName,
 		mcpToolName,
@@ -235,8 +243,16 @@ function buildResult(
 		provider,
 		providerName,
 	};
-	const contentText = result.isError ? `Error: ${text}` : text;
-	const toolResult: CustomToolResult<MCPToolDetails> = { content: [{ type: "text", text: contentText }], details };
+	if (result.isError) {
+		if (content[0]?.type === "text") {
+			content[0] = { type: "text", text: `Error: ${content[0].text}` };
+		} else if (content.length > 0) {
+			content.unshift({ type: "text", text: "Error:" });
+		} else {
+			content.push({ type: "text", text: "Error: " });
+		}
+	}
+	const toolResult: CustomToolResult<MCPToolDetails> = { content, details };
 	if (result.isError) {
 		toolResult.isError = true;
 	}

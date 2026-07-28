@@ -51,6 +51,7 @@ import {
 } from "./discovery/helpers";
 import { injectOmpExtensionCliRoots } from "./discovery/omp-extension-roots";
 import { formatExtensionLoadNotifications } from "./extensibility/extensions/load-errors";
+import { getRequiredExtensionAttestation } from "./extensibility/extensions/loader";
 import { ExtensionRunner } from "./extensibility/extensions/runner";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
@@ -70,6 +71,7 @@ import {
 	createAgentSession,
 	discoverAuthStorage,
 	loadSessionExtensions,
+	requiredExtensionFromSettings,
 } from "./sdk";
 import type { AgentSession } from "./session/agent-session";
 import type { AuthStorage } from "./session/auth-storage";
@@ -139,6 +141,7 @@ const HOST_DEFAULTED_SETTING_PATHS: SettingPath[] = [
 	"task.isolation.commits",
 	"task.eager",
 	"task.batch",
+	"task.batchBlocking",
 	"task.maxConcurrency",
 	"task.maxRecursionDepth",
 	"task.disabledAgents",
@@ -376,27 +379,34 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 		const nextSettings = await args.settings.cloneForCwd(cwd);
 		const nextSessionManager = SessionManager.create(cwd, args.sessionDir);
 		const agentId = `acp:${nextSessionManager.getSessionId()}`;
-		// `baseOptions.titleSystemPrompt` is resolved from the launch cwd; an ACP
-		// host can open `session/new` for any client-supplied workspace, so
-		// re-discover `TITLE_SYSTEM.md` against THIS session's `cwd` to keep the
-		// replan-driven title refresh consistent with the target project's
-		// policy (PR #3736 follow-up).
-		const titleSystemPromptSource = discoverTitleSystemPromptFile(cwd);
-		const titleSystemPrompt = await resolvePromptInput(titleSystemPromptSource, "title system prompt");
-		const { session: nextSession } = await args.createSession({
-			...args.baseOptions,
-			cwd,
-			sessionManager: nextSessionManager,
-			settings: nextSettings,
-			authStorage: args.authStorage,
-			modelRegistry: args.modelRegistry,
-			agentId,
-			// Preserve reserve-policy confirmation until ACP capabilities are known
-			// without enabling AskTool or other UI-only session behavior.
-			deferUsageReserveConfirmation: true,
-			enableMCP: false,
-			titleSystemPrompt,
-		});
+		let nextSession: AgentSession;
+		try {
+			// `baseOptions.titleSystemPrompt` is resolved from the launch cwd; an ACP
+			// host can open `session/new` for any client-supplied workspace, so
+			// re-discover `TITLE_SYSTEM.md` against THIS session's `cwd` to keep the
+			// replan-driven title refresh consistent with the target project's
+			// policy (PR #3736 follow-up).
+			const titleSystemPromptSource = discoverTitleSystemPromptFile(cwd);
+			const titleSystemPrompt = await resolvePromptInput(titleSystemPromptSource, "title system prompt");
+			({ session: nextSession } = await args.createSession({
+				...args.baseOptions,
+				cwd,
+				sessionManager: nextSessionManager,
+				settings: nextSettings,
+				authStorage: args.authStorage,
+				modelRegistry: args.modelRegistry,
+				agentId,
+				hasUI: false,
+				// Preserve reserve-policy confirmation until ACP capabilities are known
+				// without enabling AskTool or other UI-only session behavior.
+				deferUsageReserveConfirmation: true,
+				enableMCP: false,
+				titleSystemPrompt,
+			}));
+		} catch (error) {
+			await nextSessionManager.close();
+			throw error;
+		}
 		if (args.parsedArgs.apiKey && !args.baseOptions.model && nextSession.model) {
 			args.authStorage.setRuntimeApiKey(nextSession.model.provider, args.parsedArgs.apiKey);
 		}
@@ -1444,9 +1454,10 @@ export async function runRootCommand(
 		return result;
 	};
 
+	const hostRequiredExtension = requiredExtensionFromSettings(sessionOptions, settingsInstance);
 	if (mode === "acp") {
 		const createAcpSession = createAcpSessionFactory({
-			baseOptions: sessionOptions,
+			baseOptions: { ...sessionOptions, requiredExtension: hostRequiredExtension },
 			settings: settingsInstance,
 			sessionDir: parsedArgs.sessionDir,
 			authStorage,
@@ -1473,6 +1484,12 @@ export async function runRootCommand(
 
 		const eventBus = new EventBus();
 		const extensionsResult = await loadSessionExtensions(sessionOptions, cwd, settingsInstance, eventBus);
+		const requiredExtensionAttestation = getRequiredExtensionAttestation(extensionsResult);
+		const attestedExtensionPaths = Object.freeze(
+			extensionsResult.extensions
+				.map(extension => extension.resolvedPath)
+				.filter(extensionPath => !extensionPath.startsWith("<inline")),
+		);
 		const extensionFlagSink: ExtensionFlagSink = {
 			getFlags: () => ExtensionRunner.aggregateFlags(extensionsResult.extensions),
 			setFlagValue: (name, value) => {
@@ -1526,6 +1543,7 @@ export async function runRootCommand(
 			...sessionOptions,
 			eventBus,
 			preloadedExtensions: extensionsResult,
+			requiredExtension: requiredExtensionAttestation,
 		});
 
 		// Cold-revive support: a `parked` subagent ref restored from disk (Agent Hub
@@ -1542,6 +1560,8 @@ export async function runRootCommand(
 				modelRegistry,
 				settings: settingsInstance,
 				enableLsp: sessionOptions.enableLsp ?? true,
+				requiredExtension: requiredExtensionAttestation,
+				extensionPaths: attestedExtensionPaths,
 			}),
 			Math.trunc(Number(settingsInstance.get("task.agentIdleTtlMs") ?? 420_000) || 0),
 		);
