@@ -1,10 +1,22 @@
 import { afterEach, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
+import * as path from "node:path";
+import { Agent } from "@oh-my-pi/pi-agent-core";
+import type { Model } from "@oh-my-pi/pi-ai";
 import { KeybindingsManager } from "@oh-my-pi/pi-coding-agent/config/keybindings";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { HookEditorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/hook-editor";
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
+import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
+import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
-import { CURSOR_MARKER, isFocusable, setKeybindings, type TUI } from "@oh-my-pi/pi-tui";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { type AutocompleteProvider, CURSOR_MARKER, isFocusable, setKeybindings, type TUI } from "@oh-my-pi/pi-tui";
+import { TempDir } from "@oh-my-pi/pi-utils";
 
 beforeAll(async () => {
 	const theme = await getThemeByName("dark");
@@ -50,7 +62,17 @@ type TestContext = InteractiveModeContext & {
 };
 
 function createControllerContext() {
-	const editor = { id: "core-editor" };
+	let editorText = "";
+	const editor = {
+		id: "core-editor",
+		getText: vi.fn(() => editorText),
+		setText: vi.fn((text: string) => {
+			editorText = text;
+		}),
+		pasteText: vi.fn((text: string) => {
+			editorText += text;
+		}),
+	};
 	const editorContainer = {
 		children: [] as unknown[],
 		clear() {
@@ -60,24 +82,122 @@ function createControllerContext() {
 			this.children.push(child);
 		},
 	};
+	let focused: unknown;
+	let toolUiContext: ExtensionUIContext | undefined;
 	const ui = {
 		requestRender: vi.fn(),
-		setFocus: vi.fn(),
+		setFocus: vi.fn((component: unknown) => {
+			focused = component;
+		}),
+		getFocused: vi.fn(() => focused),
+		showOverlay: vi.fn((component: unknown) => {
+			const preFocus = focused;
+			ui.setFocus(component);
+			return {
+				hide: vi.fn(() => {
+					ui.setFocus(preFocus ?? null);
+					ui.requestRender();
+				}),
+				setHidden: vi.fn(),
+				isHidden: vi.fn(() => false),
+			};
+		}),
 		start: vi.fn(),
 		stop: vi.fn(),
 		terminal: { columns: 120 },
 	} as unknown as TestContext["ui"] & {
 		setFocus: Mock<any>;
+		getFocused: Mock<any>;
 		requestRender: Mock<any>;
+		showOverlay: Mock<any>;
 	};
 	const ctx = {
 		editor,
 		editorContainer,
 		ui,
 		hookEditor: undefined,
+		session: { extensionRunner: undefined },
+		setToolUIContext(context: ExtensionUIContext): void {
+			toolUiContext = context;
+		},
 	} as unknown as TestContext;
 
-	return { ctx, editor, editorContainer, ui };
+	return {
+		ctx,
+		editor,
+		editorContainer,
+		ui,
+		getToolUiContext() {
+			if (!toolUiContext) throw new Error("expected extension UI context");
+			return toolUiContext;
+		},
+	};
+}
+
+function createPromptAutocompleteProvider(): AutocompleteProvider {
+	return {
+		getSuggestions: vi.fn(async () => ({
+			prefix: "/",
+			items: [{ value: "goal", label: "/goal", description: "Set a goal objective" }],
+		})),
+		applyCompletion: vi.fn((lines, cursorLine, cursorCol, item, prefix) => {
+			const line = lines[cursorLine] ?? "";
+			const before = line.slice(0, Math.max(0, cursorCol - prefix.length));
+			const after = line.slice(cursorCol);
+			const nextLine = `${before}/${item.value} ${after}`;
+			const nextLines = [...lines];
+			nextLines[cursorLine] = nextLine;
+			return {
+				lines: nextLines,
+				cursorLine,
+				cursorCol: before.length + item.value.length + 2,
+			};
+		}),
+	};
+}
+
+async function flushAutocomplete(): Promise<void> {
+	await Promise.resolve();
+	await Promise.resolve();
+}
+
+async function createInteractiveGoalHarness(): Promise<{
+	mode: InteractiveMode;
+	session: AgentSession;
+	tempDir: TempDir;
+	authDir: TempDir;
+}> {
+	resetSettingsForTest();
+	const tempDir = TempDir.createSync("@pi-goal-hook-editor-");
+	const authDir = TempDir.createSync("@pi-goal-hook-editor-auth-");
+	await Settings.init({ inMemory: true, cwd: tempDir.path() });
+	const settings = Settings.isolated({
+		"compaction.enabled": false,
+		"goal.enabled": true,
+		"plan.enabled": true,
+	});
+	const authStorage = await AuthStorage.create(path.join(authDir.path(), "testauth.db"));
+	const modelRegistry = new ModelRegistry(authStorage);
+	const model = modelRegistry.find("anthropic", "claude-sonnet-4-5") as Model | undefined;
+	if (!model) {
+		throw new Error("Expected claude-sonnet-4-5 to exist in registry");
+	}
+	const session = new AgentSession({
+		agent: new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+		}),
+		sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+		settings,
+		modelRegistry,
+		rebuildSystemPrompt: async () => ({ systemPrompt: ["Test"] }),
+	});
+	const mode = new InteractiveMode(session, "test");
+	return { mode, session, tempDir, authDir };
 }
 
 describe("HookEditorComponent default (hook) mode", () => {
@@ -251,6 +371,28 @@ describe("HookEditorComponent prompt-style mode", () => {
 		expect(onSubmit).toHaveBeenCalledTimes(1);
 		expect(onSubmit).toHaveBeenCalledWith("a");
 		expect(onCancel).not.toHaveBeenCalled();
+	});
+
+	it("uses the supplied command autocomplete provider while editing a prompt-style objective", async () => {
+		const provider = createPromptAutocompleteProvider();
+		const objectiveEditorOptions = {
+			promptStyle: true,
+			autocompleteProvider: provider,
+		};
+		const component = new HookEditorComponent(
+			createTui(),
+			"Goal objective",
+			undefined,
+			vi.fn(),
+			vi.fn(),
+			objectiveEditorOptions,
+		);
+
+		component.handleInput("/");
+		await flushAutocomplete();
+
+		expect(provider.getSuggestions).toHaveBeenCalledWith(["/"], 0, 1);
+		expect(renderText(component)).toContain("/goal");
 	});
 
 	it("absorbs enhanced-paste payloads delivered via pasteText (kitty OSC 5522 routing)", () => {
@@ -514,6 +656,201 @@ describe("ExtensionUiController hook editor abort", () => {
 		const result = await promise;
 		// Result depends on what the editor captured. The key thing is it resolved.
 		expect(result).toBeDefined();
+	});
+
+	it("routes clipboard text paste into the focused objective editor instead of the hidden main composer", async () => {
+		const { ctx, editor } = createControllerContext();
+		const controller = new ExtensionUiController(ctx) as unknown as {
+			showHookEditor: (
+				title: string,
+				prefill?: string,
+				dialogOptions?: { signal?: AbortSignal },
+				editorOptions?: { promptStyle?: boolean },
+			) => Promise<string | undefined>;
+		};
+		const promise = controller.showHookEditor("Goal objective", undefined, undefined, { promptStyle: true });
+		const hookEditor = ctx.hookEditor;
+		if (!hookEditor) throw new Error("expected focused objective editor");
+
+		const inputController = new InputController(ctx, {
+			readImage: async () => null,
+			readText: async () => "Ship autocomplete for goal objectives",
+			readMacFileUrls: async () => [],
+		});
+
+		expect(await inputController.handleImagePaste()).toBe(true);
+		expect(editor.pasteText).not.toHaveBeenCalled();
+
+		hookEditor.handleInput("\r");
+		expect(await promise).toBe("Ship autocomplete for goal objectives");
+	});
+
+	it("restores focus to the main composer when a prompt-style objective editor is dismissed", async () => {
+		const { ctx, editor, editorContainer, ui } = createControllerContext();
+		const controller = new ExtensionUiController(ctx) as unknown as {
+			showHookEditor: (
+				title: string,
+				prefill?: string,
+				dialogOptions?: { signal?: AbortSignal },
+				editorOptions?: { promptStyle?: boolean },
+			) => Promise<string | undefined>;
+		};
+		const promise = controller.showHookEditor("Goal objective", undefined, undefined, { promptStyle: true });
+		const hookEditor = ctx.hookEditor;
+		if (!hookEditor) throw new Error("expected focused objective editor");
+
+		expect(editorContainer.children).toEqual([hookEditor]);
+		expect(ui.setFocus).toHaveBeenLastCalledWith(hookEditor);
+
+		hookEditor.handleInput("\x1b");
+
+		expect(await promise).toBeUndefined();
+		expect(ctx.hookEditor).toBeUndefined();
+		expect(editorContainer.children).toEqual([editor]);
+		expect(ui.setFocus).toHaveBeenLastCalledWith(editor);
+	});
+
+	it("routes extension dollar picker selection into the focused objective editor", async () => {
+		const { ctx, editor, ui, getToolUiContext } = createControllerContext();
+		const controller = new ExtensionUiController(ctx);
+		await controller.initHooksAndCustomTools();
+		const extensionUi = getToolUiContext();
+
+		const objectivePromise = controller.showHookEditor("Goal objective", undefined, undefined, { promptStyle: true });
+		const hookEditor = ctx.hookEditor;
+		if (!hookEditor) throw new Error("expected focused objective editor");
+		hookEditor.handleInput("run a ");
+
+		let finishPicker: ((result: string | undefined) => void) | undefined;
+		const picker = {
+			render: () => ["Skill"],
+			handleInput: vi.fn((keyData: string) => {
+				if (keyData === "\r" || keyData === "\t") {
+					finishPicker?.("$security-scan ");
+				}
+			}),
+		};
+		const pickerPromise = extensionUi.custom<string | undefined>(
+			(_tui, _theme, _keybindings, done) => {
+				finishPicker = done;
+				return picker;
+			},
+			{ overlay: true },
+		);
+		await Promise.resolve();
+
+		expect(ui.setFocus).toHaveBeenLastCalledWith(picker);
+		picker.handleInput("\r");
+		const selected = await pickerPromise;
+		expect(selected).toBe("$security-scan ");
+		expect(ui.setFocus).toHaveBeenLastCalledWith(hookEditor);
+
+		extensionUi.pasteToEditor(selected!);
+
+		expect(editor.pasteText).not.toHaveBeenCalled();
+		expect(renderText(hookEditor)).toContain("run a $security-scan ");
+
+		hookEditor.handleInput("\r");
+		expect(await objectivePromise).toBe("run a $security-scan ");
+		expect(ctx.hookEditor).toBeUndefined();
+	});
+
+	it("restores objective focus after extension dollar picker Escape so a second Escape cancels", async () => {
+		const { ctx, editor, editorContainer, ui, getToolUiContext } = createControllerContext();
+		const controller = new ExtensionUiController(ctx);
+		await controller.initHooksAndCustomTools();
+		const extensionUi = getToolUiContext();
+
+		const objectivePromise = controller.showHookEditor("Goal objective", undefined, undefined, { promptStyle: true });
+		const hookEditor = ctx.hookEditor;
+		if (!hookEditor) throw new Error("expected focused objective editor");
+		hookEditor.handleInput("run a ");
+
+		let finishPicker: ((result: string | undefined) => void) | undefined;
+		const picker = {
+			render: () => ["Skill"],
+			handleInput: vi.fn((keyData: string) => {
+				if (keyData === "\x1b") {
+					finishPicker?.(undefined);
+				}
+			}),
+		};
+		const pickerPromise = extensionUi.custom<string | undefined>(
+			(_tui, _theme, _keybindings, done) => {
+				finishPicker = done;
+				return picker;
+			},
+			{ overlay: true },
+		);
+		await Promise.resolve();
+
+		picker.handleInput("\x1b");
+
+		expect(await pickerPromise).toBeUndefined();
+		expect(ctx.hookEditor).toBe(hookEditor);
+		expect(editorContainer.children).toEqual([hookEditor]);
+		expect(ui.setFocus).toHaveBeenLastCalledWith(hookEditor);
+		let resolvedAfterPickerEscape = false;
+		const observedObjectivePromise = objectivePromise.then(() => {
+			resolvedAfterPickerEscape = true;
+		});
+		await Promise.resolve();
+		expect(resolvedAfterPickerEscape).toBe(false);
+
+		hookEditor.handleInput("\x1b");
+
+		expect(await observedObjectivePromise).toBeUndefined();
+		expect(ctx.hookEditor).toBeUndefined();
+		expect(editorContainer.children).toEqual([editor]);
+		expect(ui.setFocus).toHaveBeenLastCalledWith(editor);
+
+		const reopened = controller.showHookEditor("Goal objective", undefined, undefined, { promptStyle: true });
+		const reopenedHookEditor = ctx.hookEditor;
+		if (!reopenedHookEditor) throw new Error("expected reopened objective editor");
+		expect(reopenedHookEditor).not.toBe(hookEditor);
+		expect(editorContainer.children).toEqual([reopenedHookEditor]);
+		expect(ui.setFocus).toHaveBeenLastCalledWith(reopenedHookEditor);
+
+		reopenedHookEditor.handleInput("new goal");
+		reopenedHookEditor.handleInput("\r");
+		expect(await reopened).toBe("new goal");
+		expect(ctx.hookEditor).toBeUndefined();
+		expect(editorContainer.children).toEqual([editor]);
+		expect(ui.setFocus).toHaveBeenLastCalledWith(editor);
+	});
+});
+
+describe("InteractiveMode goal objective editor", () => {
+	it("passes the main prompt autocomplete provider to the bare /goal objective editor", async () => {
+		const harness = await createInteractiveGoalHarness();
+		try {
+			const providerSlot: { current?: AutocompleteProvider } = {};
+			vi.spyOn(harness.mode.editor, "setAutocompleteProvider").mockImplementation(provider => {
+				providerSlot.current = provider;
+			});
+			await harness.mode.refreshSlashCommandState(harness.tempDir.path());
+			expect(providerSlot.current).toBeDefined();
+
+			const showHookEditor = vi.spyOn(harness.mode, "showHookEditor").mockResolvedValue(undefined);
+
+			await harness.mode.handleGoalModeCommand();
+
+			expect(showHookEditor).toHaveBeenCalledTimes(1);
+			const [title, prefill, dialogOptions, editorOptions] = showHookEditor.mock.calls[0]!;
+			expect(title).toBe("Goal objective");
+			expect(prefill).toBeUndefined();
+			expect(dialogOptions).toBeUndefined();
+			expect(editorOptions?.promptStyle).toBe(true);
+			expect(
+				(editorOptions as { autocompleteProvider?: AutocompleteProvider } | undefined)?.autocompleteProvider,
+			).toBe(providerSlot.current);
+		} finally {
+			harness.mode.stop();
+			await harness.session.dispose();
+			harness.tempDir.removeSync();
+			harness.authDir.removeSync();
+			resetSettingsForTest();
+		}
 	});
 });
 

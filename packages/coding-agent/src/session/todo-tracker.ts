@@ -247,7 +247,7 @@ export class TodoTracker {
 		const reminder =
 			`<system-reminder>\n` +
 			`You stopped with ${incomplete.length} incomplete todo item(s):\n${todoList}\n\n` +
-			`Please continue working on these tasks or mark them complete if finished.\n` +
+			`Reconcile them against the current user scope and acceptance contract. Continue only actionable acceptance or material-risk work; otherwise mark finished items done and stale, withdrawn, or optional items dropped or blocked. A todo is not acceptance authority.\n` +
 			`(Reminder ${this.#reminderCount}/${remindersMax})\n` +
 			`</system-reminder>`;
 		logger.debug("Todo completion: sending reminder", {

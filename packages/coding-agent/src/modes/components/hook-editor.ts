@@ -7,7 +7,9 @@
  *   (Ctrl+Q / Ctrl+Enter) submits, bordered popup
  * - Prompt-style (ask): Enter submits, Shift+Enter inserts newline, legacy ask chrome
  */
-import { Container, Editor, type Focusable, matchesKey, Spacer, Text, type TUI } from "@oh-my-pi/pi-tui";
+
+import type { AutocompleteProvider, TUI } from "@oh-my-pi/pi-tui";
+import { Container, Editor, type Focusable, getKeybindings, matchesKey, Spacer, Text } from "@oh-my-pi/pi-tui";
 import { getEditorTheme, theme } from "../../modes/theme/theme";
 import {
 	matchesAppExternalEditor,
@@ -27,6 +29,10 @@ export interface HookEditorOptions {
 	 * hint out of view.
 	 */
 	maxHeight?: number;
+	/** Optional autocomplete provider for prompt-like hook editors. */
+	autocompleteProvider?: AutocompleteProvider;
+	/** Optional maximum visible autocomplete rows, mirroring the main editor setting. */
+	autocompleteMaxVisible?: number;
 }
 
 /** Interactive multiline dialog used by hooks and the ask tool's Other response. */
@@ -69,13 +75,21 @@ export class HookEditorComponent extends Container implements Focusable {
 		if (this.#promptStyle) {
 			this.#editor.setBorderVisible(false);
 			this.#editor.setPromptGutter("> ");
-			this.#editor.disableSubmit = true;
+			this.#editor.onSubmit = value => this.#onSubmitCallback(value);
 		}
 		// Bound the editor so long content scrolls instead of pushing the
 		// submit hint off-screen. Caller may override via options.maxHeight.
 		const termRows = this.#tui.terminal?.rows ?? process.stdout.rows ?? 40;
 		this.#editor.setMaxHeight(options?.maxHeight ?? Math.max(3, termRows - 12));
 		this.#editor.setScrollbarVisible(true);
+		if (options?.autocompleteProvider) {
+			this.#editor.setAutocompleteProvider(options.autocompleteProvider);
+			this.#editor.onAutocompleteCancel = () => this.#tui.requestRender(true);
+			this.#editor.onAutocompleteUpdate = () => this.#tui.requestRender();
+		}
+		if (options?.autocompleteMaxVisible !== undefined) {
+			this.#editor.setAutocompleteMaxVisible(options.autocompleteMaxVisible);
+		}
 		if (prefill) {
 			this.#editor.setText(prefill);
 		}
@@ -125,6 +139,29 @@ export class HookEditorComponent extends Container implements Focusable {
 		this.#editor.pasteText(text);
 	}
 
+	isShowingAutocomplete(): boolean {
+		return this.#editor.isShowingAutocomplete();
+	}
+
+	#routeAutocompleteInputToEditor(keyData: string): boolean {
+		if (!this.#editor.isShowingAutocomplete()) return false;
+		const keybindings = getKeybindings();
+		if (
+			keybindings.matches(keyData, "tui.select.cancel") ||
+			keybindings.matches(keyData, "tui.select.up") ||
+			keybindings.matches(keyData, "tui.select.down") ||
+			keybindings.matches(keyData, "tui.select.pageUp") ||
+			keybindings.matches(keyData, "tui.select.pageDown") ||
+			keybindings.matches(keyData, "tui.input.submit") ||
+			keyData === "\n" ||
+			keybindings.matches(keyData, "tui.input.tab")
+		) {
+			this.#editor.handleInput(keyData);
+			return true;
+		}
+		return false;
+	}
+
 	/**
 	 * Prompt-style: raw Enter submits; Editor owns newline-producing sequences.
 	 * The follow-up chord (`app.message.followUp` → Ctrl+Q / Ctrl+Enter) also
@@ -133,6 +170,14 @@ export class HookEditorComponent extends Container implements Focusable {
 	 * event (#1903) — still has a working chord via Ctrl+Q (#3353).
 	 */
 	#handlePromptStyleInput(keyData: string): void {
+		// While the inner editor's autocomplete picker is open, route picker
+		// navigation/accept/cancel to it before prompt-style submit/cancel
+		// shortcuts. This keeps prompt-style dialogs behaviorally aligned with
+		// the main composer: Enter/Tab accepts the selected completion and Escape
+		// closes the picker first; a following Escape cancels the dialog.
+		if (this.#routeAutocompleteInputToEditor(keyData)) {
+			return;
+		}
 		// Submit on the follow-up chord first so it wins over Editor's own
 		// Ctrl+Enter newline handling. Mirrors #handleHookStyleInput.
 		if (matchesAppFollowUp(keyData)) {

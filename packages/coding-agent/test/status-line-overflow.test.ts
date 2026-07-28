@@ -448,3 +448,81 @@ describe("overflow: path survives before model", () => {
 		expect(rendered).not.toContain("MODEL_SHOULD_DROP");
 	});
 });
+
+describe("extension segment overflow integrity", () => {
+	it("drops the timer before protected built-ins without exceeding width", () => {
+		const component = new StatusLineComponent(createStatusLineSession("CORE"));
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: ["pi"],
+			rightSegments: ["session_name"],
+			separator: "pipe",
+			sessionAccent: false,
+			transparent: true,
+		});
+		component.registerExtensionSegment("timer-owner", {
+			id: "turn_timer",
+			placement: { afterBuiltin: "pi", fallback: "anchor-side-end-else-right" },
+			render: () => "42s",
+		});
+
+		let exactWidth = 80;
+		while (exactWidth > 1 && stripAnsi(component.getTopBorder(exactWidth - 1).content).includes("42s")) {
+			exactWidth--;
+		}
+		const cases = [
+			{ width: 80, timer: true },
+			{ width: exactWidth, timer: true },
+			{ width: exactWidth - 1, timer: false },
+			{ width: 5, timer: false },
+		];
+		for (const { width, timer } of cases) {
+			const raw = component.getTopBorder(width).content;
+			const rendered = stripAnsi(raw);
+			expect(visibleWidth(raw)).toBeLessThanOrEqual(width);
+			expect(rendered.includes("42s")).toBe(timer);
+			expect(rendered).not.toMatch(/(?:^|\s)\|(?:\s*$|\s*\|)/);
+			expect(raw.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "")).not.toContain("\x1B");
+		}
+		expect(stripAnsi(component.getTopBorder(exactWidth - 1).content)).toContain("π");
+	});
+
+	it("drops an extension by identity when its content equals a protected built-in", () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-overflow-identity-"));
+		setProjectDir(cwd);
+		try {
+			const component = new StatusLineComponent(createStatusLineSession("identity"));
+			component.updateSettings({
+				preset: "custom",
+				leftSegments: ["pi", "path"],
+				rightSegments: [],
+				separator: "pipe",
+				sessionAccent: false,
+				transparent: true,
+			});
+			const piGlyph = theme.icon.pi.trim();
+			const piContent = theme.fg("accent", theme.icon.pi ? `${theme.icon.pi} ` : "");
+			component.registerExtensionSegment("same-as-pi", {
+				id: "same_as_pi",
+				placement: { afterBuiltin: "path", fallback: "anchor-side-end-else-right" },
+				render: () => piContent,
+			});
+
+			let overflowWidth = 200;
+			while (
+				overflowWidth > 1 &&
+				stripAnsi(component.getTopBorder(overflowWidth).content).split(piGlyph).length - 1 === 2
+			) {
+				overflowWidth--;
+			}
+			const rendered = stripAnsi(component.getTopBorder(overflowWidth).content);
+			expect(rendered.split(piGlyph).length - 1).toBe(1);
+			expect(rendered).toContain(path.basename(cwd));
+			expect(rendered.indexOf(piGlyph)).toBeLessThan(rendered.indexOf(path.basename(cwd)));
+			expect(visibleWidth(component.getTopBorder(overflowWidth).content)).toBeLessThanOrEqual(overflowWidth);
+		} finally {
+			setProjectDir(originalProjectDir);
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+});
