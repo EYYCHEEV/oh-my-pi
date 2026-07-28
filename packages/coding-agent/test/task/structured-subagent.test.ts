@@ -351,6 +351,30 @@ describe("structured subagent primitive", () => {
 		expect(path.basename(settled.artifactsDir)).toStartWith("omp-task-");
 		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
 	});
+
+	it("inherits the parent's resolved instruction context when dispatching a child", async () => {
+		mockDiscovery();
+		const contextFiles = [
+			{ path: "/tmp/AGENTS.md", content: "# Parent policy" },
+			{ path: "/tmp/project-context.md", content: "Project context" },
+		];
+		const appendSystemPrompt = "Parent outcome policy";
+		const parentSession = session();
+		parentSession.contextFiles = contextFiles;
+		parentSession.appendSystemPrompt = appendSystemPrompt;
+		let dispatched: Parameters<typeof executorModule.runSubprocess>[0] | undefined;
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			dispatched = options;
+			return result();
+		});
+
+		const settled = await runStructuredSubagent(request({ session: parentSession, retainArtifacts: true }));
+
+		expect(dispatched?.contextFiles).toBe(contextFiles);
+		expect(dispatched?.appendSystemPrompt).toBe(appendSystemPrompt);
+		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
+	});
+
 	it("uses identical non-plan LSP and IRC policy for task and eval invocations", async () => {
 		mockDiscovery();
 		const taskPolicy = await resolveEffectiveSubagentPolicy(request());

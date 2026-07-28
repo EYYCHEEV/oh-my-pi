@@ -23,6 +23,7 @@ import type {
 } from "../../extensibility/extensions";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
 import { AskDialogComponent, boundPromptTitle } from "../../modes/components/ask-dialog";
+import type { HookEditorOptions } from "../../modes/components/hook-editor";
 import { HookEditorComponent } from "../../modes/components/hook-editor";
 import { HookInputComponent } from "../../modes/components/hook-input";
 import { HookSelectorComponent, type HookSelectorSlider } from "../../modes/components/hook-selector";
@@ -35,6 +36,14 @@ const MAX_WIDGET_LINES = 10;
 const ASK_OTHER_OPTION = "Other (type your own)";
 const ASK_CHAT_OPTION = "Chat about this";
 const ASK_NEXT_OPTION = "Next →";
+
+interface PasteTarget {
+	pasteText(text: string): void;
+}
+
+function hasPasteText(value: unknown): value is PasteTarget {
+	return typeof value === "object" && value !== null && typeof (value as PasteTarget).pasteText === "function";
+}
 
 interface CollabDialogWinner {
 	source: "local" | "remote";
@@ -71,6 +80,7 @@ export class ExtensionUiController {
 	// the rest queue. See `#presentDialog`.
 	#dialogActive = false;
 	#dialogQueue: Array<() => void> = [];
+	#dialogActivityPaused = false;
 	/**
 	 * Built once in `initHooksAndCustomTools()`. Reused directly by `/tree`
 	 * `ask` re-answer (issue #5642) to drive a standalone `AskTool.execute()`
@@ -102,8 +112,7 @@ export class ExtensionUiController {
 				this.ctx.ui.requestRender();
 			},
 			pasteToEditor: text => {
-				this.ctx.editor.handleInput(`\x1b[200~${text}\x1b[201~`);
-				this.ctx.ui.requestRender();
+				this.pasteToActiveEditor(text);
 			},
 			getEditorText: () => this.ctx.editor.getText(),
 			editor: (title, prefill, dialogOptions, editorOptions) =>
@@ -123,6 +132,11 @@ export class ExtensionUiController {
 			},
 			setFooter: () => {},
 			setHeader: () => {},
+			requestStatusLineRender: () => {
+				this.ctx.statusLine.invalidate();
+				this.ctx.ui.requestRender();
+			},
+			registerStatusSegment: (key, definition) => this.ctx.statusLine.registerExtensionSegment(key, definition),
 			setEditorComponent: factory => this.ctx.setEditorComponent(factory),
 			getToolsExpanded: () => this.ctx.toolOutputExpanded,
 			setToolsExpanded: expanded => this.ctx.setToolsExpanded(expanded),
@@ -995,7 +1009,7 @@ export class ExtensionUiController {
 		title: string,
 		prefill?: string,
 		dialogOptions?: ExtensionUIDialogOptions,
-		editorOptions?: { promptStyle?: boolean },
+		editorOptions?: HookEditorOptions,
 	): Promise<string | undefined> {
 		return this.#presentDialog(dialogOptions?.signal, settle => {
 			this.ctx.hookEditor = new HookEditorComponent(
@@ -1067,8 +1081,8 @@ export class ExtensionUiController {
 				this.ctx.editorContainer.clear();
 				this.ctx.editorContainer.addChild(this.ctx.editor);
 				this.ctx.editor.setText(savedText);
+				this.ctx.ui.setFocus(this.ctx.editor);
 			}
-			this.ctx.ui.setFocus(this.ctx.editor);
 			this.ctx.ui.requestRender();
 		};
 		const finish = (settle: () => void) => {
@@ -1123,8 +1137,20 @@ export class ExtensionUiController {
 		return promise;
 	}
 
+	pasteToActiveEditor(text: string): void {
+		const focused = this.ctx.ui.getFocused?.();
+		const target =
+			focused && focused !== this.ctx.editor && hasPasteText(focused)
+				? focused
+				: this.ctx.hookEditor && hasPasteText(this.ctx.hookEditor)
+					? this.ctx.hookEditor
+					: this.ctx.editor;
+		target.pasteText(text);
+		this.ctx.ui.requestRender();
+	}
+
 	/**
-	 * Show an extension error in the UI.
+	 * Register a terminal-input listener for extensions.
 	 */
 	addExtensionTerminalInputListener(handler: TerminalInputHandler): () => void {
 		const unsubscribe = this.ctx.ui.addInputListener(handler);
@@ -1154,6 +1180,9 @@ export class ExtensionUiController {
 		this.#extensionTerminalInputUnsubscribers.clear();
 	}
 
+	/**
+	 * Show an extension error in the UI.
+	 */
 	showExtensionError(extensionPath: string, error: string): void {
 		const errorText = new Text(`Extension "${extensionPath}" error: ${error}`, 1, 0).setStyleFn(t =>
 			theme.fg("error", t),
@@ -1239,6 +1268,10 @@ export class ExtensionUiController {
 			}
 			started = true;
 			this.#dialogActive = true;
+			if (!this.#dialogActivityPaused) {
+				this.#dialogActivityPaused = true;
+				this.ctx.session.setActivityWaiting?.(true);
+			}
 			try {
 				hide = present(settle);
 			} catch (error) {
@@ -1265,6 +1298,14 @@ export class ExtensionUiController {
 	}
 
 	#advanceDialogQueue(): void {
-		this.#dialogQueue.shift()?.();
+		const next = this.#dialogQueue.shift();
+		if (next) {
+			next();
+			return;
+		}
+		if (this.#dialogActivityPaused) {
+			this.#dialogActivityPaused = false;
+			this.ctx.session.setActivityWaiting?.(false);
+		}
 	}
 }

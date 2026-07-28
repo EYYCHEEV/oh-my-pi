@@ -359,6 +359,8 @@ export class Settings {
 	#overrides: RawSettings = {};
 	/** Merged view (global + project + overrides) */
 	#merged: RawSettings = {};
+	/** Host-owned view (global + explicit overlays + runtime overrides). */
+	#host: RawSettings = {};
 	/** Cached resolved values from the merged view, including defaults/path scoping */
 	#resolvedCache = new Map<SettingPath, unknown>();
 	#editVariantCache: readonly EditVariantEntry[] | undefined;
@@ -504,6 +506,19 @@ export class Settings {
 			value !== undefined ? (resolvePathScopedStringArray(path, value, this.#cwd) ?? value) : getDefault(path);
 		this.#resolvedCache.set(path, resolved);
 		return resolved as SettingValue<P>;
+	}
+
+	/**
+	 * Get a host-owned setting without applying project-local settings.
+	 *
+	 * Runtime overrides and explicit config overlays are host inputs, while
+	 * `.claude`/project settings are untrusted for startup prerequisites.
+	 */
+	getHost<P extends SettingPath>(path: P): SettingValue<P> {
+		const value = getByPath(this.#host, SETTING_PATH_SEGMENTS[path]);
+		return (
+			value !== undefined ? (resolvePathScopedStringArray(path, value, this.#cwd) ?? value) : getDefault(path)
+		) as SettingValue<P>;
 	}
 
 	/**
@@ -2340,6 +2355,8 @@ export class Settings {
 	}
 
 	#rebuildMerged(): void {
+		this.#host = this.#deepMerge(this.#deepMerge({}, this.#global), this.#configOverlay);
+		this.#host = this.#deepMerge(this.#host, this.#overrides);
 		this.#merged = this.#deepMerge(this.#deepMerge({}, this.#global), this.#projectSettingsForMerge());
 		this.#merged = this.#deepMerge(this.#merged, this.#configOverlay);
 		this.#merged = this.#deepMerge(this.#merged, this.#overrides);

@@ -11,7 +11,11 @@ import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { ExtensionRuntime, loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import {
+	ExtensionRuntime,
+	loadExtensionFromFactory,
+	loadExtensions,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import {
 	EXTENSION_HANDLER_TIMEOUT_MS,
 	ExtensionRunner,
@@ -30,6 +34,7 @@ import type {
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
 
 describe("ExtensionRunner", () => {
@@ -546,7 +551,7 @@ describe("ExtensionRunner", () => {
 
 	describe("before_provider_request chaining", () => {
 		it("exposes the request model instead of the primary session model", async () => {
-			const primaryModel = getBundledModel("openai-codex", "gpt-5.6-sol");
+			const primaryModel = getBundledModel("openai-codex", "gpt-5.6-luna");
 			const requestModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 			if (!primaryModel || !requestModel) throw new Error("Expected bundled cross-provider models to exist");
 
@@ -2533,6 +2538,60 @@ describe("ExtensionRunner", () => {
 			};
 		}
 
+		it("passes the caller abort signal to the awaited extension gate", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_call", async (event) => {
+						(globalThis as typeof globalThis & { __ompToolCallSignal?: AbortSignal }).__ompToolCallSignal = event.signal;
+						if (!event.signal) return { block: true, reason: "missing caller signal" };
+						if (event.signal.aborted) return { block: true, reason: "caller cancelled" };
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-signal.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			let backendCalls = 0;
+			const tool: AgentTool = {
+				name: "signal_test",
+				label: "Signal test",
+				description: "Test caller signal propagation",
+				parameters: Type.Object({}),
+				strict: true,
+				execute: async () => {
+					backendCalls += 1;
+					return { content: [{ type: "text", text: "ok" }] };
+				},
+			};
+			const wrapped = new ExtensionToolWrapper(tool, runner);
+			const globalState = globalThis as typeof globalThis & { __ompToolCallSignal?: AbortSignal };
+
+			const cancelled = new AbortController();
+			cancelled.abort();
+			await expect(wrapped.execute("cancelled", {}, cancelled.signal)).rejects.toThrow("caller cancelled");
+			expect({ backendCalls, signal: globalState.__ompToolCallSignal }).toEqual({
+				backendCalls: 0,
+				signal: cancelled.signal,
+			});
+
+			const active = new AbortController();
+			expect(await wrapped.execute("active", {}, active.signal)).toEqual({
+				content: [{ type: "text", text: "ok" }],
+			});
+			expect({ backendCalls, signal: globalState.__ompToolCallSignal }).toEqual({
+				backendCalls: 1,
+				signal: active.signal,
+			});
+			delete globalState.__ompToolCallSignal;
+		});
+
 		it("exposes a single hashline edit path to extension gate handlers", async () => {
 			const eventsPath = path.join(tempDir.path(), "tool-call-events.jsonl");
 			const extCode = `
@@ -3835,6 +3894,323 @@ describe("ExtensionRunner", () => {
 			const image: ImageContent = { type: "image", mimeType: "image/png", data: "aW1hZ2U=" };
 
 			expect(await runner.emitInput("rewrite me", [image], "interactive")).toEqual({ text: "REWRITE ME" });
+		});
+	});
+
+	describe("declarative status hosting", () => {
+		it("enforces global public IDs and disposes the hosted registration exactly once", async () => {
+			const firstPath = path.join(tempDir.path(), "status-first.ts");
+			const duplicatePath = path.join(tempDir.path(), "status-duplicate.ts");
+			const builtinPath = path.join(tempDir.path(), "status-builtin.ts");
+			fs.writeFileSync(
+				firstPath,
+				`
+				export default function(pi) {
+					globalThis.__statusApi = pi;
+					globalThis.__disposeFirstStatus = pi.registerStatusSegment({
+						id: "turn_timer",
+						placement: { afterBuiltin: "cost", fallback: "anchor-side-end-else-right" },
+						render: () => "FIRST",
+					});
+				}
+			`,
+			);
+			fs.writeFileSync(
+				duplicatePath,
+				`
+				export default function(pi) {
+					pi.registerStatusSegment({
+						id: "turn_timer",
+						placement: { afterBuiltin: "cost", fallback: "anchor-side-end-else-right" },
+						render: () => "SECOND",
+					});
+				}
+			`,
+			);
+			fs.writeFileSync(
+				builtinPath,
+				`
+				export default function(pi) {
+					pi.registerStatusSegment({
+						id: "cost",
+						placement: { afterBuiltin: "cost", fallback: "anchor-side-end-else-right" },
+						render: () => "BUILTIN",
+					});
+				}
+			`,
+			);
+
+			const result = await loadTestExtensions([firstPath, duplicatePath, builtinPath]);
+			expect(result.errors.map(error => error.error)).toEqual([
+				expect.stringContaining("Duplicate status segment: turn_timer"),
+				expect.stringContaining('Status segment id "cost" is reserved'),
+			]);
+
+			const registered = new Map<string, { render: () => string | undefined }>();
+			const invalidations = vi.fn();
+			const hostRegistrations = vi.fn();
+			const hostedDisposals = vi.fn();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			runner.initialize(
+				{
+					sendMessage: () => {},
+					sendUserMessage: () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getSessionName: () => undefined,
+					setSessionName: async () => {},
+				} as never,
+				{
+					getModel: () => undefined,
+					isIdle: () => true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => [],
+				} as never,
+				undefined,
+				{
+					registerStatusSegment: (key: string, definition: { render: () => string | undefined }) => {
+						hostRegistrations(key);
+						registered.set(key, definition);
+						return () => {
+							hostedDisposals();
+							registered.delete(key);
+							invalidations();
+						};
+					},
+					requestStatusLineRender: invalidations,
+				} as never,
+			);
+
+			expect(registered.size).toBe(1);
+			expect([...registered.values()][0]?.render()).toBe("FIRST");
+			expect(invalidations).not.toHaveBeenCalled();
+			expect(hostRegistrations).toHaveBeenCalledTimes(1);
+
+			await runner.emit({
+				type: "session_switch",
+				reason: "resume",
+				previousSessionFile: "previous-session.jsonl",
+			});
+			expect(hostRegistrations).toHaveBeenCalledTimes(1);
+			expect(registered.size).toBe(1);
+			expect(hostedDisposals).not.toHaveBeenCalled();
+
+			runner.getUIContext().requestStatusLineRender?.();
+			expect(invalidations).toHaveBeenCalledTimes(1);
+
+			const state = globalThis as typeof globalThis & {
+				__disposeFirstStatus: () => void;
+				__statusApi: { registerStatusSegment: (definition: unknown) => () => void };
+			};
+			invalidations.mockClear();
+			state.__disposeFirstStatus();
+			state.__disposeFirstStatus();
+			expect(registered.size).toBe(0);
+			expect(hostedDisposals).toHaveBeenCalledTimes(1);
+			expect(invalidations).toHaveBeenCalledTimes(1);
+
+			const disposeReplacement = state.__statusApi.registerStatusSegment({
+				id: "turn_timer",
+				placement: { afterBuiltin: "cost", fallback: "anchor-side-end-else-right" },
+				render: () => "REPLACEMENT",
+			});
+			expect(hostRegistrations).toHaveBeenCalledTimes(2);
+			expect(registered.size).toBe(1);
+			expect([...registered.values()][0]?.render()).toBe("REPLACEMENT");
+			expect(invalidations).toHaveBeenCalledTimes(1);
+			disposeReplacement();
+			expect(registered.size).toBe(0);
+			expect(hostedDisposals).toHaveBeenCalledTimes(2);
+			expect(invalidations).toHaveBeenCalledTimes(2);
+			delete (globalThis as Record<string, unknown>).__disposeFirstStatus;
+			delete (globalThis as Record<string, unknown>).__statusApi;
+		});
+
+		it("rolls back status IDs reserved by throwing file and inline factories", async () => {
+			const throwingPath = path.join(tempDir.path(), "status-throwing.ts");
+			const validPath = path.join(tempDir.path(), "status-valid.ts");
+			fs.writeFileSync(
+				throwingPath,
+				`
+				export default function(pi) {
+					pi.registerStatusSegment({
+						id: "turn_timer",
+						placement: { afterBuiltin: "cost", fallback: "anchor-side-end-else-right" },
+						render: () => "FAILED",
+					});
+					throw new Error("factory failed");
+				}
+			`,
+			);
+			fs.writeFileSync(
+				validPath,
+				`
+				export default function(pi) {
+					pi.registerStatusSegment({
+						id: "turn_timer",
+						placement: { afterBuiltin: "cost", fallback: "anchor-side-end-else-right" },
+						render: () => "VALID",
+					});
+				}
+			`,
+			);
+
+			const fileResult = await loadTestExtensions([throwingPath, validPath]);
+			expect(fileResult.errors).toHaveLength(1);
+			expect(fileResult.extensions).toHaveLength(1);
+			expect([...fileResult.extensions[0]!.statusSegments!.values()][0]?.definition.render()).toBe("VALID");
+
+			const runtime = new ExtensionRuntime();
+			const eventBus = new EventBus();
+			const hosted = new Map<string, { render: () => string | undefined }>();
+			const hostedDisposals = vi.fn();
+			const runner = new ExtensionRunner([], runtime, tempDir.path(), sessionManager, modelRegistry);
+			runner.initialize(
+				{
+					sendMessage: () => {},
+					sendUserMessage: () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getSessionName: () => undefined,
+					setSessionName: async () => {},
+				} as never,
+				{
+					getModel: () => undefined,
+					isIdle: () => true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => [],
+				} as never,
+				undefined,
+				{
+					registerStatusSegment: (key: string, definition: { render: () => string | undefined }) => {
+						hosted.set(key, definition);
+						return () => {
+							hostedDisposals();
+							hosted.delete(key);
+						};
+					},
+				} as never,
+			);
+			await expect(
+				loadExtensionFromFactory(
+					pi => {
+						pi.registerStatusSegment({
+							id: "inline_timer",
+							placement: { afterBuiltin: "cost", fallback: "anchor-side-end-else-right" },
+							render: () => "FAILED",
+						});
+						throw new Error("inline failed");
+					},
+					tempDir.path(),
+					eventBus,
+					runtime,
+				),
+			).rejects.toThrow("inline failed");
+			expect(hosted.size).toBe(0);
+			expect(hostedDisposals).toHaveBeenCalledTimes(1);
+			const validInline = await loadExtensionFromFactory(
+				pi => {
+					pi.registerStatusSegment({
+						id: "inline_timer",
+						placement: { afterBuiltin: "cost", fallback: "anchor-side-end-else-right" },
+						render: () => "VALID",
+					});
+				},
+				tempDir.path(),
+				eventBus,
+				runtime,
+			);
+			expect([...validInline.statusSegments!.values()][0]?.definition.render()).toBe("VALID");
+			expect(hosted.size).toBe(1);
+			expect([...hosted.values()][0]?.render()).toBe("VALID");
+		});
+
+		it("keeps noninteractive hosting and invalidation as idempotent no-ops", async () => {
+			const extensionPath = path.join(tempDir.path(), "status-process.ts");
+			fs.writeFileSync(
+				extensionPath,
+				`
+				export default function(pi) {
+					globalThis.__disposeProcessStatus = pi.registerStatusSegment({
+						id: "process_timer",
+						placement: { afterBuiltin: "cost", fallback: "anchor-side-end-else-right" },
+						render: () => "42s",
+					});
+					pi.requestStatusLineRender();
+					pi.requestStatusLineRender();
+				}
+			`,
+			);
+			const result = await loadTestExtensions([extensionPath]);
+			expect(result.errors).toEqual([]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			runner.initialize(
+				{
+					sendMessage: () => {},
+					sendUserMessage: () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getSessionName: () => undefined,
+					setSessionName: async () => {},
+				} as never,
+				{
+					getModel: () => undefined,
+					isIdle: () => true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => [],
+				} as never,
+			);
+			const state = globalThis as typeof globalThis & { __disposeProcessStatus: () => void };
+			expect(() => {
+				state.__disposeProcessStatus();
+				state.__disposeProcessStatus();
+			}).not.toThrow();
+			delete (globalThis as Record<string, unknown>).__disposeProcessStatus;
 		});
 	});
 });

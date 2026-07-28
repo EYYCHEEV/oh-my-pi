@@ -257,6 +257,9 @@ Test the contract the system exposes — not the easiest internal detail to asse
 - Prefer contract-level tests over implementation details. Avoid asserting internal helper wiring, field assignment, singleton identity, incidental ordering, prompt boilerplate, or passthrough option forwarding unless another component depends on that exact detail.
 - Don't duplicate coverage across abstraction levels. If an integration test already proves the behavior, drop the narrower unit test that restates it through mocks.
 - Tests **must be full-suite safe**, not just file-local safe. No long-lived file-wide mutations of `Bun.*`, `process.platform`, `process.env`, or `Bun.env` when a narrower seam exists. Prefer per-test `vi.spyOn(...)` with `vi.restoreAllMocks()` in `afterEach`. A test that passes alone but poisons later files is broken.
+- Tests that create child processes or process groups must prove cleanup on success and injected-failure paths.
+  If a test deliberately disables production cleanup, it must use test-only fallback cleanup in `finally`, target only its own exact process or process group, wait for exit, and assert that no owned worker remains.
+  A test that passes while leaving an orphaned supervisor is broken.
 - **Never use `mock.module()`**. Bun's `mock.module()` mutates the global module registry and leaks across files ([oven-sh/bun#12823](https://github.com/oven-sh/bun/issues/12823)). Use `spyOn` on the imported module object instead. For pass deps, import the pass and spy on `.run`. For package deps, namespace-import and spy on the exported function.
 - For lifecycle/stateful code, prefer one test per invariant or transition over several tiny tests asserting one field each from the same transition.
 - For error handling, trigger the real failure path and assert the surfaced contract — don't instantiate error classes directly or inspect internal metadata.
@@ -296,3 +299,12 @@ Location: `packages/*/CHANGELOG.md` (per package).
 2. Run `bun run release`.
 
 The script handles version bump, CHANGELOG finalization, commit, tag, publish, and adding new `[Unreleased]` sections.
+
+<!-- exec-plan:init:start -->
+## ExecPlans
+
+When writing complex features or significant refactors, use an ExecPlan aligned with `.agents/PLANS.md`.
+
+For this repo, active exec-plan workspaces live under `docs/exec-plans/active/<slug>/` and completed exec-plan workspaces live under `docs/exec-plans/completed/<slug>/`.
+Each workspace must include `PLAN.md` and `LOGS.md`.
+<!-- exec-plan:init:end -->

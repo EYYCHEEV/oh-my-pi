@@ -248,6 +248,7 @@ describe("ACP lazy startup", () => {
 			"task.isolation.commits": "ai",
 			"task.eager": "always",
 			"task.batch": false,
+			"task.batchBlocking": true,
 			"task.maxConcurrency": 4,
 			"task.maxRecursionDepth": 5,
 			"task.disabledAgents": ["scout"],

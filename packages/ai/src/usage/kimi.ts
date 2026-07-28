@@ -22,6 +22,7 @@ const USAGE_PATH = "usages";
 interface KimiUsagePayload {
 	usage?: unknown;
 	limits?: unknown;
+	user?: unknown;
 }
 
 type KimiUsageRow = {
@@ -189,10 +190,19 @@ function toUsageLimit(row: KimiUsageRow, provider: string, index: number, accoun
 	};
 }
 
-function parseUsagePayload(payload: unknown, nowMs: number): { rows: KimiUsageRow[]; raw: KimiUsagePayload } | null {
+function parseUsagePayload(
+	payload: unknown,
+	nowMs: number,
+): { rows: KimiUsageRow[]; raw: KimiUsagePayload; accountId?: string } | null {
 	if (!isRecord(payload)) return null;
 	const data = payload as KimiUsagePayload;
 	const rows: KimiUsageRow[] = [];
+	// `user.userId` identifies the underlying Kimi account; surfacing it lets
+	// omp usage label and dedupe multi-account pools per account.
+	const accountId =
+		isRecord(data.user) && typeof data.user.userId === "string" && data.user.userId.trim()
+			? data.user.userId.trim()
+			: undefined;
 
 	if (isRecord(data.usage)) {
 		const summary = buildUsageRow(data.usage, "Total quota", nowMs);
@@ -226,7 +236,7 @@ function parseUsagePayload(payload: unknown, nowMs: number): { rows: KimiUsageRo
 		});
 	}
 
-	return { rows, raw: data };
+	return { rows, raw: data, ...(accountId !== undefined ? { accountId } : {}) };
 }
 
 export const kimiUsageProvider: UsageProvider = {
@@ -288,6 +298,7 @@ export const kimiUsageProvider: UsageProvider = {
 			metadata: {
 				accountId: credential.accountId,
 				endpoint: url,
+				...(parsed.accountId !== undefined ? { accountId: parsed.accountId } : {}),
 			},
 			raw: parsed.raw,
 		};

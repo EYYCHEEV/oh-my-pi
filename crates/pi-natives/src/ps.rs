@@ -42,6 +42,17 @@ pub struct ProcessWaitOptions<'env> {
 	pub signal:     Option<Unknown<'env>>,
 }
 
+#[derive(Default)]
+#[napi(object)]
+pub struct SupervisedProcessTreeTerminateOptions<'env> {
+	/// Milliseconds to wait after SIGTERM before escalating to SIGKILL.
+	pub graceful_ms: Option<i32>,
+	/// Milliseconds to wait after SIGKILL for the retained tree to exit.
+	pub timeout_ms:  Option<u32>,
+	/// Abort signal for cancelling termination while waiting.
+	pub signal:      Option<Unknown<'env>>,
+}
+
 /// Current state of a process reference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[napi(string_enum)]
@@ -186,6 +197,90 @@ impl Process {
 	#[napi]
 	pub fn status(&self) -> ProcessStatus {
 		self.inner.status().into()
+	}
+}
+
+/// Identity-pinned process group held by a dedicated supervisor.
+#[napi]
+#[derive(Clone)]
+pub struct SupervisedProcessTree {
+	inner: core_process::SupervisedProcessTree,
+}
+
+#[napi]
+#[allow(clippy::use_self, reason = "napi return types must name the exported class")]
+impl SupervisedProcessTree {
+	/// Whether strict supervised process groups are available.
+	#[napi]
+	pub const fn is_supported() -> bool {
+		core_process::SupervisedProcessTree::is_supported()
+	}
+
+	/// Pin a freshly spawned detached supervisor before it starts a target.
+	#[napi]
+	pub fn from_spawn(pid: i32) -> Option<SupervisedProcessTree> {
+		core_process::SupervisedProcessTree::from_spawn(pid).map(|inner| Self { inner })
+	}
+
+	/// Wait until the held group contains only the supervisor.
+	#[napi]
+	pub fn wait_for_empty<'env>(
+		&self,
+		env: &'env Env,
+		options: Option<ProcessWaitOptions<'env>>,
+	) -> Result<PromiseRaw<'env, bool>> {
+		let options = options.unwrap_or_default();
+		let ct = task::CancelToken::new(None, options.signal);
+		let timeout = options
+			.timeout_ms
+			.map(|ms| Duration::from_millis(u64::from(ms)));
+		let tree = self.inner.clone();
+		task::future(env, "supervised_process_tree.wait_for_empty", async move {
+			tree
+				.wait_for_empty(timeout, ct.into_core())
+				.await
+				.map_err(|err| napi::Error::from_reason(err.to_string()))
+		})
+	}
+
+	/// Observe group absence after the held sentinel performs a final group
+	/// KILL.
+	#[napi]
+	pub fn wait_for_absence_after_kill<'env>(
+		&self,
+		env: &'env Env,
+		options: Option<ProcessWaitOptions<'env>>,
+	) -> Result<PromiseRaw<'env, bool>> {
+		let options = options.unwrap_or_default();
+		let timeout = Duration::from_millis(u64::from(options.timeout_ms.unwrap_or(5_000)));
+		let ct = task::CancelToken::new(None, options.signal);
+		let tree = self.inner.clone();
+		task::future(env, "supervised_process_tree.wait_for_absence_after_kill", async move {
+			tree
+				.wait_for_absence_after_kill(timeout, ct.into_core())
+				.await
+				.map_err(|err| napi::Error::from_reason(err.to_string()))
+		})
+	}
+
+	/// TERM the held group and, if needed, issue one final group KILL.
+	#[napi]
+	pub fn terminate<'env>(
+		&self,
+		env: &'env Env,
+		options: Option<SupervisedProcessTreeTerminateOptions<'env>>,
+	) -> Result<PromiseRaw<'env, bool>> {
+		let options = options.unwrap_or_default();
+		let graceful_ms = options.graceful_ms.unwrap_or(1_000);
+		let timeout_ms = options.timeout_ms.unwrap_or(5_000);
+		let ct = task::CancelToken::new(None, options.signal);
+		let tree = self.inner.clone();
+		task::future(env, "supervised_process_tree.terminate", async move {
+			tree
+				.terminate(graceful_ms, timeout_ms, ct.into_core())
+				.await
+				.map_err(|err| napi::Error::from_reason(err.to_string()))
+		})
 	}
 }
 

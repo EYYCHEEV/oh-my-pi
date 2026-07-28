@@ -61,6 +61,35 @@ describe("kimi usage provider", () => {
 		expect(fiveHour.scope?.windowId).toBe("5h");
 	});
 
+	it("surfaces the payload user id as report accountId metadata", async () => {
+		// Live payload shape: `user.userId` identifies the underlying Kimi
+		// account. Reports must carry it so `omp usage` labels accounts and
+		// AuthStorage dedupes/attributes per account instead of falling back
+		// to generic "account N" rows.
+		const report = await kimiUsageProvider.fetchUsage!(
+			{ provider: "kimi-code", credential: makeCredential(), signal: undefined },
+			makeCtx({
+				user: { userId: "d8ombrsdeijirk63r0tg", membership: { level: "LEVEL_ADVANCED" } },
+				usage: { limit: "100", used: "56", remaining: "44", resetTime: "2026-07-24T01:25:38.188285Z" },
+			}),
+		);
+
+		expect(report).not.toBeNull();
+		expect(report!.metadata?.accountId).toBe("d8ombrsdeijirk63r0tg");
+	});
+
+	it("omits accountId metadata when the payload has no user id", async () => {
+		const report = await kimiUsageProvider.fetchUsage!(
+			{ provider: "kimi-code", credential: makeCredential(), signal: undefined },
+			makeCtx({
+				usage: { limit: "100", used: "1", remaining: "99", resetTime: "2026-07-24T01:25:38.188285Z" },
+			}),
+		);
+
+		expect(report).not.toBeNull();
+		expect(report!.metadata?.accountId).toBeUndefined();
+	});
+
 	it("keeps an explicit window resetTime authoritative over the detail one", async () => {
 		const windowReset = "2026-07-18T06:00:00.000Z";
 		const detailReset = "2026-07-18T05:43:35.355947Z";

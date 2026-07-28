@@ -32,7 +32,7 @@ import type { AssistantMessageComponent } from "./components/assistant-message";
 import type { BashExecutionComponent } from "./components/bash-execution";
 import type { CustomEditor } from "./components/custom-editor";
 import type { EvalExecutionComponent } from "./components/eval-execution";
-import type { HookEditorComponent } from "./components/hook-editor";
+import type { HookEditorComponent, HookEditorOptions } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent, HookSelectorOptions } from "./components/hook-selector";
 import type { StatusLineComponent } from "./components/status-line";
@@ -499,7 +499,7 @@ export interface InteractiveModeContext {
 		title: string,
 		prefill?: string,
 		dialogOptions?: ExtensionUIDialogOptions,
-		editorOptions?: { promptStyle?: boolean },
+		editorOptions?: HookEditorOptions,
 	): Promise<string | undefined>;
 	hideHookEditor(): void;
 	showHookNotify(message: string, type?: "info" | "warning" | "error"): void;

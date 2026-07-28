@@ -46,6 +46,11 @@ packages/ai/test/.temp-images/
 # Project specific
 !.omp/
 .omp/plugins/
+/.omp/*
+!/.omp/commands/
+!/.omp/commands/**
+!/.omp/skills/
+!/.omp/skills/**
 .pi_config/
 .opencode/
 .worktrees/
@@ -83,6 +88,16 @@ python/robomp/.env
 
 # Local, machine-specific boot perf baseline (see packages/coding-agent/scripts/bench-guard.ts)
 packages/coding-agent/bench/boot-baseline.json
+/.symphony/
+
+# Local agent workspaces and runtime state
+/.agents/*
+!/.agents/PLANS.md
+/.claude/
+/.codex/
+/.gemini/
+/.super-agents/
+/docs/exec-plans/
 
 # Bazel
 /bazel-bin

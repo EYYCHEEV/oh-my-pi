@@ -12,12 +12,13 @@
  * `enableMCP: false`, regardless of what `baseOptions` carries.
  */
 
-import { afterAll, describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it, vi } from "bun:test";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAcpSessionFactory } from "@oh-my-pi/pi-coding-agent/main";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
@@ -54,8 +55,13 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 			};
 
 			// baseOptions deliberately sets enableMCP=true to prove the factory ignores it.
+			const requiredExtension = Object.freeze({
+				path: tempDir.join("guard.ts"),
+				extensionId: "extension-module:guard",
+				expectedSha256: "a".repeat(64),
+			});
 			const factory = createAcpSessionFactory({
-				baseOptions: { enableMCP: true } as CreateAgentSessionOptions,
+				baseOptions: { enableMCP: true, requiredExtension } as CreateAgentSessionOptions,
 				settings,
 				sessionDir: tempDir.join("sessions"),
 				authStorage,
@@ -69,6 +75,7 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 			expect(result).toBe(fakeSession);
 			expect(captured).toHaveLength(1);
 			expect(captured[0].enableMCP).toBe(false);
+			expect(captured[0].requiredExtension).toBe(requiredExtension);
 		} finally {
 			await tempDir.remove();
 		}
@@ -182,6 +189,39 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 			await expect(factory(tempDir.path())).rejects.toThrow(/Trusted extension failed to load.*fixture/);
 			expect(createCalls).toBe(0);
 		} finally {
+			await tempDir.remove();
+		}
+	});
+
+	it("closes its newly-created session manager when startup rejects", async () => {
+		const tempDir = TempDir.createSync("@pi-acp-gate-failure-");
+		let authStorage: AuthStorage | undefined;
+		try {
+			authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+			const modelRegistry = new ModelRegistry(authStorage);
+			let closeCalls = 0;
+			const factory = createAcpSessionFactory({
+				baseOptions: {},
+				settings: Settings.isolated(),
+				sessionDir: tempDir.join("sessions"),
+				authStorage,
+				modelRegistry,
+				parsedArgs: {},
+				rawArgs: [],
+				createSession: async options => {
+					if (!options.sessionManager) throw new Error("expected factory-owned manager");
+					vi.spyOn(options.sessionManager, "close").mockImplementation(async () => {
+						closeCalls++;
+					});
+					throw new Error("required extension gate rejected");
+				},
+			});
+
+			await expect(factory(tempDir.path())).rejects.toThrow("required extension gate rejected");
+			expect(closeCalls).toBe(1);
+		} finally {
+			authStorage?.close();
+			vi.restoreAllMocks();
 			await tempDir.remove();
 		}
 	});

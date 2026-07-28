@@ -21,6 +21,7 @@ import type { AsyncJobSnapshot } from "../../session/agent-session";
 import type { SessionManager } from "../../session/session-manager";
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
 import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
+import type { RequiredExtensionHandlerSnapshot } from "./loader";
 import { ManagedTimers } from "./managed-timers";
 import { createExtensionModelQuery } from "./model-api";
 import type {
@@ -408,6 +409,7 @@ const noOpUIContext: ExtensionUIContext = {
 	setWidget: () => {},
 	setFooter: () => {},
 	setHeader: () => {},
+	requestStatusLineRender: () => {},
 	setTitle: () => {},
 	custom: async () => undefined as never,
 	setEditorText: () => {},
@@ -433,6 +435,7 @@ interface ToolRegistrationScope {
 }
 
 export class ExtensionRunner {
+	private readonly extensions: readonly Extension[];
 	#uiContext: ExtensionUIContext;
 	#mode: ExtensionMode = "print";
 	#toolApprovalPreviewWaiter?: (toolCallId: string) => Promise<void>;
@@ -465,6 +468,7 @@ export class ExtensionRunner {
 	 * {@link MAX_PENDING_CREDENTIAL_DISABLED}; oldest entries are dropped under pressure.
 	 */
 	#pendingCredentialDisabled: CredentialDisabledEvent[] = [];
+	#requiredToolCallHandlers?: RequiredExtensionHandlerSnapshot;
 
 	/**
 	 * Buffer for `mcp_notification` events received via {@link emitMcpNotification} before
@@ -596,7 +600,7 @@ export class ExtensionRunner {
 	}
 
 	constructor(
-		private readonly extensions: Extension[],
+		extensions: readonly Extension[],
 		private readonly runtime: ExtensionRuntime,
 		/** Ignored: `cwd` is always read live via the `cwd` getter below, not cached here. */
 		_initialCwd: string,
@@ -606,10 +610,18 @@ export class ExtensionRunner {
 		private readonly settings?: Settings,
 		private readonly localProtocolOptions?: LocalProtocolOptions,
 		getAsyncJobSnapshot?: () => AsyncJobSnapshot | null,
+		requiredHandlerSnapshot?: RequiredExtensionHandlerSnapshot,
 	) {
+		this.extensions = Object.freeze([...extensions]);
 		this.#uiContext = noOpUIContext;
 		this.#getMemoryFn = getMemory;
 		this.#getAsyncJobSnapshotFn = getAsyncJobSnapshot ?? (() => null);
+		this.#requiredToolCallHandlers = requiredHandlerSnapshot
+			? {
+					extension: requiredHandlerSnapshot.extension,
+					handlers: Object.freeze([...requiredHandlerSnapshot.handlers]),
+				}
+			: undefined;
 	}
 
 	/**
@@ -697,6 +709,18 @@ export class ExtensionRunner {
 
 		this.#uiContext = uiContext ?? noOpUIContext;
 		this.#mode = mode;
+		this.runtime.requestStatusLineRender = () => this.#uiContext.requestStatusLineRender?.();
+		this.runtime.hostStatusSegment = (key, definition) => this.#uiContext.registerStatusSegment?.(key, definition);
+		for (const extension of this.extensions) {
+			for (const registration of extension.statusSegments?.values() ?? []) {
+				const disposeUI = this.#uiContext.registerStatusSegment?.(registration.key, {
+					...registration.definition,
+					render: () =>
+						extension.statusSegments?.has(registration.key) ? registration.definition.render() : undefined,
+				});
+				if (disposeUI) registration.disposeUI = disposeUI;
+			}
+		}
 		this.#initialized = true;
 
 		// Re-initialize (e.g. a mode switch rewiring UI/runtime actions) must not
@@ -1065,7 +1089,10 @@ export class ExtensionRunner {
 
 	hasHandlers(eventType: string): boolean {
 		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get(eventType);
+			const handlers =
+				eventType === "tool_call" && ext === this.#requiredToolCallHandlers?.extension
+					? this.#requiredToolCallHandlers.handlers
+					: ext.handlers.get(eventType);
 			if (handlers && handlers.length > 0) {
 				return true;
 			}
@@ -1449,7 +1476,10 @@ export class ExtensionRunner {
 		let result: ToolCallEventResult | undefined;
 
 		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get("tool_call");
+			const handlers =
+				ext === this.#requiredToolCallHandlers?.extension
+					? this.#requiredToolCallHandlers.handlers
+					: ext.handlers.get("tool_call");
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {

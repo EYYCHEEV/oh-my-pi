@@ -1,3 +1,3 @@
 <system-reminder>
-{{incompleteCount}} todo item{{#if plural}}s{{else}}{{/if}} still open. If you finished a task since last `{{toolRefs.todo}}` update, mark it done now so progress stays visible; otherwise keep working.
+Gentle reminder: {{incompleteCount}} todo item{{#if plural}}s are{{else}} is{{/if}} still open. Reconcile them against current user scope: mark finished work done, drop or block stale and optional work, and continue only actionable acceptance or material-risk items.
 </system-reminder>

@@ -2,10 +2,11 @@
 
 use std::{
 	collections::{HashMap, HashSet},
+	sync::Arc,
 	time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use parking_lot::Mutex;
 /// Current state of a process reference.
 ///
@@ -333,6 +334,7 @@ mod platform {
 	#[link(name = "proc", kind = "dylib")]
 	unsafe extern "C" {
 		fn proc_listallpids(buffer: *mut i32, buffersize: i32) -> i32;
+		fn proc_listpgrppids(pgid: i32, buffer: *mut i32, buffersize: i32) -> i32;
 		fn proc_pidpath(pid: i32, buffer: *mut std::ffi::c_void, buffersize: u32) -> i32;
 	}
 
@@ -541,6 +543,35 @@ mod platform {
 			tree.entry(ppid).or_default().push(pid);
 		}
 		tree
+	}
+
+	/// Atomically snapshot the PIDs in one process group.
+	///
+	/// Unlike an all-PID snapshot followed by per-PID metadata reads, the
+	/// kernel performs the group filter within this single libproc call. Thus a
+	/// forking member cannot disappear between the snapshot and group check and
+	/// make a non-empty group look empty.
+	pub fn process_group_pids(pgid: i32) -> std::io::Result<Vec<i32>> {
+		// `proc_listpgrppids` does not implement the null-buffer sizing form
+		// consistently across current Darwin releases. A generously bounded
+		// buffer is sufficient here: truncation can hide identities but can
+		// never turn a non-empty group into an empty result.
+		let mut pids = vec![0i32; 4096];
+		// SAFETY: `pids` is writable for the supplied byte length and properly
+		// aligned. libproc writes no more than that length.
+		let actual = unsafe {
+			proc_listpgrppids(pgid, pids.as_mut_ptr(), (pids.len() * size_of::<i32>()) as i32)
+		};
+		if actual < 0 {
+			return Err(std::io::Error::last_os_error());
+		}
+		if actual == 0 {
+			return Ok(Vec::new());
+		}
+		// Unlike proc_listallpids, this API returns a PID count, not a byte count.
+		pids.truncate((actual as usize).min(pids.len()));
+		pids.retain(|pid| *pid > 0);
+		Ok(pids)
 	}
 
 	/// Find processes whose libproc-reported executable path equals `target`.
@@ -1276,6 +1307,233 @@ pub struct Process {
 	inner: platform::Process,
 }
 
+/// Strict process-group scope pinned by a live supervisor identity.
+///
+/// The sentinel is never signalled directly. Group members are pinned and
+/// signalled individually so sentinel validation and delivery cannot be split
+/// by a recycled process-group identifier.
+#[derive(Clone)]
+pub struct SupervisedProcessTree {
+	sentinel: Process,
+	pgid:     i32,
+	tracked:  Arc<Mutex<Vec<Process>>>,
+}
+
+impl SupervisedProcessTree {
+	/// Whether this build provides the strict supervised-tree contract.
+	#[must_use]
+	pub const fn is_supported() -> bool {
+		cfg!(target_os = "macos")
+	}
+
+	/// Pin a freshly spawned detached supervisor and its process group.
+	#[must_use]
+	pub fn from_spawn(pid: i32) -> Option<Self> {
+		#[cfg(target_os = "macos")]
+		{
+			let sentinel = Process::from_pid(pid)?;
+			(sentinel.group_id() == Some(pid)).then_some(Self {
+				sentinel,
+				pgid: pid,
+				tracked: Arc::new(Mutex::new(Vec::new())),
+			})
+		}
+		#[cfg(not(target_os = "macos"))]
+		{
+			let _ = pid;
+			None
+		}
+	}
+
+	/// Wait until no process except the held supervisor remains in the group.
+	pub async fn wait_for_empty(&self, timeout: Option<Duration>, ct: CancelToken) -> Result<bool> {
+		ct.heartbeat()?;
+		let poll_interval = Duration::from_millis(25);
+		let mut elapsed = Duration::ZERO;
+		loop {
+			self.verify_sentinel()?;
+			if self.members()?.is_some_and(|members| members.is_empty()) {
+				return Ok(true);
+			}
+			let Some(sleep_for) = timeout.map_or(Some(poll_interval), |limit| {
+				(limit > elapsed).then(|| limit.saturating_sub(elapsed).min(poll_interval))
+			}) else {
+				return Ok(false);
+			};
+			ct.heartbeat()?;
+			tokio::time::sleep(sleep_for).await;
+			elapsed += sleep_for;
+		}
+	}
+
+	/// Observe the old group after the sentinel performs the final group KILL.
+	///
+	/// This method never signals the numeric pgid. A recycled foreign group can
+	/// therefore only make cleanup fail closed by appearing non-empty.
+	pub async fn wait_for_absence_after_kill(
+		&self,
+		timeout: Duration,
+		ct: CancelToken,
+	) -> Result<bool> {
+		let poll_interval = Duration::from_millis(25);
+		let mut elapsed = Duration::ZERO;
+		loop {
+			ct.heartbeat()?;
+			for process in self.tracked.lock().iter() {
+				if process.status() == ProcessStatus::Running && process.group_id() != Some(self.pgid) {
+					return Err(anyhow!(
+						"tracked supervised process {} escaped process group {}; cleanup cannot be \
+						 proven",
+						process.pid(),
+						self.pgid
+					));
+				}
+			}
+			#[cfg(target_os = "macos")]
+			if platform::process_group_pids(self.pgid)?.is_empty() {
+				return Ok(true);
+			}
+			#[cfg(not(target_os = "macos"))]
+			return Ok(true);
+			if elapsed >= timeout {
+				return Ok(false);
+			}
+			let sleep_for = timeout.saturating_sub(elapsed).min(poll_interval);
+			tokio::time::sleep(sleep_for).await;
+			elapsed += sleep_for;
+		}
+	}
+
+	/// Signal every identity-pinned member with TERM, then escalate remaining
+	/// members with KILL. The held sentinel is deliberately excluded.
+	pub async fn terminate(
+		&self,
+		graceful_ms: i32,
+		timeout_ms: u32,
+		ct: CancelToken,
+	) -> Result<bool> {
+		ct.heartbeat()?;
+		self.signal_members(TERM_SIGNAL)?;
+		if graceful_ms >= 0
+			&& self
+				.wait_for_empty(Some(Duration::from_millis(graceful_ms as u64)), ct.clone())
+				.await?
+		{
+			return Ok(true);
+		}
+
+		self.signal_members(KILL_SIGNAL)?;
+		self
+			.wait_for_empty(Some(Duration::from_millis(u64::from(timeout_ms))), ct)
+			.await
+	}
+
+	fn verify_sentinel(&self) -> Result<()> {
+		if self.sentinel.status() == ProcessStatus::Running
+			&& self.sentinel.group_id() == Some(self.pgid)
+		{
+			return Ok(());
+		}
+		Err(anyhow!("supervised process-group identity {} is no longer held", self.pgid))
+	}
+
+	fn members(&self) -> Result<Option<Vec<Process>>> {
+		#[cfg(target_os = "macos")]
+		{
+			self.verify_sentinel()?;
+			let descendants = self
+				.sentinel
+				.inner
+				.descendants()
+				.into_iter()
+				.filter(|process| process.pid() != self.sentinel.pid())
+				.map(|inner| Process { inner })
+				.collect::<Vec<_>>();
+			self.merge_tracked(descendants);
+			self.validate_tracked()?;
+			let snapshot = platform::process_group_pids(self.pgid)?;
+			let mut members = Vec::with_capacity(snapshot.len());
+			for pid in snapshot
+				.into_iter()
+				.filter(|pid| *pid != self.sentinel.pid())
+			{
+				let Some(process) = Process::from_pid(pid) else {
+					return Ok(None);
+				};
+				if process.status() != ProcessStatus::Running {
+					return Ok(None);
+				}
+				if process.group_id() != Some(self.pgid) {
+					self.merge_tracked(std::iter::once(process));
+					return Err(anyhow!(
+						"pinned supervised process {pid} no longer belongs to process group {}; cleanup \
+						 cannot be proven",
+						self.pgid
+					));
+				}
+				members.push(process);
+			}
+
+			self.verify_sentinel()?;
+			self.merge_tracked(members.iter().cloned());
+			self.validate_tracked()?;
+			Ok(Some(members))
+		}
+		#[cfg(not(target_os = "macos"))]
+		{
+			Ok(Some(Vec::new()))
+		}
+	}
+
+	fn merge_tracked(&self, processes: impl IntoIterator<Item = Process>) {
+		let mut tracked = self.tracked.lock();
+		for process in processes {
+			if tracked
+				.iter()
+				.any(|known| known.pid() == process.pid() && known.status() == ProcessStatus::Running)
+			{
+				continue;
+			}
+			tracked.push(process);
+		}
+	}
+
+	fn validate_tracked(&self) -> Result<()> {
+		for process in self.tracked.lock().iter() {
+			if process.status() == ProcessStatus::Running && process.group_id() != Some(self.pgid) {
+				return Err(anyhow!(
+					"tracked supervised process {} escaped process group {}; cleanup cannot be proven",
+					process.pid(),
+					self.pgid
+				));
+			}
+		}
+		Ok(())
+	}
+
+	fn signal_members(&self, signal: i32) -> Result<()> {
+		for _ in 0..3 {
+			let Some(members) = self.members()? else {
+				continue;
+			};
+			for member in members {
+				self.verify_sentinel()?;
+				if !member.inner.kill(signal) && member.status() == ProcessStatus::Running {
+					return Err(anyhow!(
+						"failed to signal supervised process {} with signal {signal}",
+						member.pid()
+					));
+				}
+			}
+			return Ok(());
+		}
+		Err(anyhow!(
+			"could not pin every member of supervised process group {}; refusing signal {signal}",
+			self.pgid
+		))
+	}
+}
+
 impl Process {
 	/// Open a stable process reference from a PID.
 	pub fn from_pid(pid: i32) -> Option<Self> {
@@ -1981,6 +2239,50 @@ mod tests {
 			!pid_in_protected_subtree(1, &protected, &parents),
 			"the sweep root must not be pruned",
 		);
+	}
+
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn supervised_tree_refuses_a_foreign_group_after_sentinel_exit() {
+		use std::{os::unix::process::CommandExt, process::Command};
+
+		let mut sentinel = Command::new("sh");
+		sentinel.arg("-c").arg("exit 0").process_group(0);
+		let mut sentinel = sentinel.spawn().expect("spawn sentinel");
+		let sentinel_pid = i32::try_from(sentinel.id()).expect("sentinel pid fits i32");
+		let pinned = Process::from_pid(sentinel_pid).expect("pin sentinel identity");
+		sentinel.wait().expect("reap sentinel");
+
+		let mut foreign = Command::new("sh");
+		foreign
+			.arg("-c")
+			.arg("trap '' TERM; sleep 30")
+			.process_group(0);
+		let mut foreign = foreign.spawn().expect("spawn foreign group");
+		let foreign_pgid = i32::try_from(foreign.id()).expect("foreign pid fits i32");
+		let stale = SupervisedProcessTree {
+			sentinel: pinned,
+			pgid:     foreign_pgid,
+			tracked:  Arc::new(Mutex::new(Vec::new())),
+		};
+
+		assert!(
+			stale.members().is_err(),
+			"a dead pinned sentinel must prevent signaling a live foreign group"
+		);
+		assert!(
+			Process::from_pid(foreign_pgid)
+				.is_some_and(|process| { process.status() == ProcessStatus::Running })
+		);
+		foreign.kill().expect("clean foreign group leader");
+		foreign.wait().expect("reap foreign group leader");
+	}
+
+	#[cfg(not(target_os = "macos"))]
+	#[test]
+	fn supervised_process_tree_is_explicitly_unavailable() {
+		assert!(!SupervisedProcessTree::is_supported());
+		assert!(SupervisedProcessTree::from_spawn(1).is_none());
 	}
 
 	/// `kill_process_group` is the last line of defense: even if a future

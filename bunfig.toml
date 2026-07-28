@@ -25,6 +25,7 @@ pathIgnorePatterns = [
   "**/.git/**",
   "**/target/**",
   "**/dist/**",
+  "bazel-*/**",
   "python/**",
   "docs/**",
   "runs/**",

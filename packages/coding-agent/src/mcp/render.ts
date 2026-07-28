@@ -5,6 +5,7 @@
  * showing args and output in JSON tree format similar to task tool.
  */
 import { type Component, Markdown } from "@oh-my-pi/pi-tui";
+import { sanitizeText } from "@oh-my-pi/pi-utils";
 import { settings } from "../config/settings";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { getMarkdownTheme, type Theme } from "../modes/theme/theme";
@@ -19,7 +20,7 @@ import {
 	renderJsonTreeLines,
 } from "../tools/json-tree";
 import { formatStyledTruncationWarning, stripOutputNotice } from "../tools/output-meta";
-import { formatExpandHint, truncateToWidth } from "../tools/render-utils";
+import { formatExpandHint, replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "../tools/render-utils";
 import { renderStatusLine, WidthAwareText } from "../tui";
 import type { MCPToolDetails } from "./tool-bridge";
 
@@ -108,20 +109,41 @@ function renderMarkdownMCPResult(
  * Render MCP tool result.
  */
 export function renderMCPResult(
-	result: { content: Array<{ type: string; text?: string }>; details?: MCPToolDetails; isError?: boolean },
+	result: {
+		content: Array<
+			{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string } | { type: string }
+		>;
+		details?: MCPToolDetails;
+		isError?: boolean;
+	},
 	options: RenderResultOptions,
 	theme: Theme,
 	args?: Record<string, unknown>,
 ): Component {
 	const { expanded } = options;
-	const textContent = result.content?.find(c => c.type === "text")?.text ?? "";
-	const trimmedOutput = stripOutputNotice(textContent, result.details?.meta).trimEnd();
+	const displayBlocks = result.content.flatMap(block => {
+		if (block.type === "image" && "mimeType" in block) {
+			const mimeType = truncateToWidth(
+				replaceTabs(sanitizeText(block.mimeType)).replace(/\s+/g, " ").trim(),
+				TRUNCATE_LENGTHS.CONTENT,
+			);
+			return [`[Image: ${mimeType || "unknown"}]`];
+		}
+		if (block.type === "text" && "text" in block) {
+			const text = stripOutputNotice(block.text, result.details?.meta).trimEnd();
+			return text ? [text] : [];
+		}
+		return [];
+	});
+	const trimmedOutput = displayBlocks.join("\n");
+	const singleTextOutput =
+		result.content.length === 1 && result.content[0]?.type === "text" ? trimmedOutput : undefined;
 	const truncationWarning = result.details?.meta?.truncation
 		? formatStyledTruncationWarning(result.details.meta, theme)
 		: null;
 	let parsedOutput: unknown;
 	let isJsonOutput = false;
-	if (trimmedOutput.startsWith("{") || trimmedOutput.startsWith("[")) {
+	if (singleTextOutput?.startsWith("{") || singleTextOutput?.startsWith("[")) {
 		try {
 			parsedOutput = JSON.parse(trimmedOutput);
 			isJsonOutput = true;
@@ -129,7 +151,7 @@ export function renderMCPResult(
 			// Non-JSON text beginning with a bracket is still eligible for Markdown.
 		}
 	}
-	if (trimmedOutput && settings.get("mcp.renderMarkdownResults") && !isJsonOutput) {
+	if (singleTextOutput && settings.get("mcp.renderMarkdownResults") && !isJsonOutput) {
 		return renderMarkdownMCPResult(result, trimmedOutput, truncationWarning, options, theme, args);
 	}
 	return new WidthAwareText(
