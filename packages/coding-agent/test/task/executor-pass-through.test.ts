@@ -12,6 +12,7 @@ import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolPathWithSource } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools";
+import type { RequiredExtensionSpec } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -109,20 +110,30 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("forwards rules, preloadedExtensionPaths, and preloadedCustomToolPaths to createAgentSession", async () => {
+	it("forwards parent-discovered capabilities and resolved instruction context to createAgentSession", async () => {
 		const session = yieldEmittingSession();
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
 
+		const contextFiles = [{ path: "/tmp/AGENTS.md", content: "# Parent policy" }];
+		const appendSystemPrompt = "Parent outcome policy";
 		const rules: Rule[] = [{ name: "rule-a" } as unknown as Rule];
 		const preloadedExtensionPaths = ["/abs/parent/.omp/extensions/foo.ts"];
+		const requiredExtension: RequiredExtensionSpec = {
+			path: preloadedExtensionPaths[0]!,
+			extensionId: "extension-module:foo",
+			expectedSha256: "0".repeat(64),
+		};
 		const preloadedCustomToolPaths: ToolPathWithSource[] = [
 			{ path: "tools/x.ts", source: { provider: "config", providerName: "Config", level: "project" } },
 		];
 
 		const result = await runSubprocess({
 			...baseOptions,
+			contextFiles,
+			appendSystemPrompt,
 			rules,
 			preloadedExtensionPaths,
+			requiredExtension,
 			preloadedCustomToolPaths,
 		});
 
@@ -132,7 +143,10 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		// Identity, not equality: passing a clone would defeat the perf fix.
 		expect(forwarded?.rules).toBe(rules);
 		expect(forwarded?.preloadedExtensionPaths).toBe(preloadedExtensionPaths);
+		expect(forwarded?.requiredExtension).toBe(requiredExtension);
 		expect(forwarded?.preloadedCustomToolPaths).toBe(preloadedCustomToolPaths);
+		expect(forwarded?.contextFiles).toBe(contextFiles);
+		expect(forwarded?.appendSystemPrompt).toBe(appendSystemPrompt);
 	});
 
 	it("forwards undefined when the parent has not pre-discovered state", async () => {
@@ -145,6 +159,7 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		const forwarded = spy.mock.calls[0]?.[0];
 		expect(forwarded?.rules).toBeUndefined();
 		expect(forwarded?.preloadedExtensionPaths).toBeUndefined();
+		expect(forwarded?.requiredExtension).toBeUndefined();
 		expect(forwarded?.preloadedCustomToolPaths).toBeUndefined();
 	});
 
@@ -177,6 +192,11 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		});
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
 		const preloadedExtensionPaths = ["/hostile/extensions/read.ts"];
+		const requiredExtension: RequiredExtensionSpec = {
+			path: preloadedExtensionPaths[0]!,
+			extensionId: "extension-module:hostile",
+			expectedSha256: "0".repeat(64),
+		};
 		const preloadedCustomToolPaths: ToolPathWithSource[] = [
 			{ path: "/hostile/tools/read.ts", source: { provider: "test", providerName: "Test", level: "project" } },
 		];
@@ -189,6 +209,7 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 			restrictToolNames: true,
 			mcpManager,
 			preloadedExtensionPaths,
+			requiredExtension,
 			preloadedCustomToolPaths,
 			outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
 			outputSchemaMode: "strict",
@@ -201,6 +222,7 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(forwarded?.mcpManager).toBeUndefined();
 		expect(forwarded?.customTools).toBeUndefined();
 		expect(forwarded?.preloadedExtensionPaths).toEqual([]);
+		expect(forwarded?.requiredExtension).toBeUndefined();
 		expect(forwarded?.preloadedCustomToolPaths).toEqual([]);
 		expect(getTools).not.toHaveBeenCalled();
 		expect(forwarded?.outputSchemaMode).toBe("strict");

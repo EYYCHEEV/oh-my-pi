@@ -48,7 +48,7 @@ import type * as PiCodingAgent from "../../index";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import type { CustomEditor } from "../../modes/components/custom-editor";
-import type { Theme } from "../../modes/theme/theme";
+import type { Theme, ThemeColor } from "../../modes/theme/theme";
 import type { CompactMode } from "../../session/compact-modes";
 import type { CustomMessage, CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
@@ -66,6 +66,7 @@ import type {
 import type { ApprovalMode } from "../../tools/approval";
 import type { EventBus } from "../../utils/event-bus";
 import type {
+	AgentActivityStateEvent,
 	AgentEndEvent,
 	AgentStartEvent,
 	AutoCompactionEndEvent,
@@ -266,6 +267,10 @@ export interface ExtensionUIContext {
 
 	/** Set a custom header component, or undefined to restore the built-in header. */
 	setHeader(factory: ExtensionUiComponentFactory | undefined): void;
+	/** Request a status-line redraw. A safe no-op when no interactive UI is attached. */
+	requestStatusLineRender?(): void;
+	/** @internal Attach a declaratively registered extension status segment. */
+	registerStatusSegment?(key: string, definition: ExtensionStatusSegmentDefinition): () => void;
 
 	/** Set the terminal window/tab title. */
 	setTitle(title: string): void;
@@ -641,6 +646,7 @@ export interface BeforeAgentStartEvent {
 }
 
 export type {
+	AgentActivityStateEvent,
 	AgentEndEvent,
 	AgentStartEvent,
 	SessionStopEvent,
@@ -780,6 +786,7 @@ export interface ToolApprovalResolvedEvent {
 interface ToolCallEventBase {
 	type: "tool_call";
 	toolCallId: string;
+	signal?: AbortSignal;
 }
 
 export interface BashToolCallEvent extends ToolCallEventBase {
@@ -922,6 +929,7 @@ export type ExtensionEvent =
 	| BeforeProviderRequestEvent
 	| AfterProviderResponseEvent
 	| BeforeAgentStartEvent
+	| AgentActivityStateEvent
 	| AgentStartEvent
 	| AgentEndEvent
 	| SessionStopEvent
@@ -1046,6 +1054,17 @@ export interface RegisteredCommand {
 /** Handler function type for events */
 export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContext) => Promise<R | void> | R | void;
 
+export interface ExtensionStatusSegmentDefinition {
+	id: string;
+	placement: {
+		afterBuiltin: string;
+		fallback: "anchor-side-end-else-right";
+	};
+	/** Optional semantic theme color. Unset preserves renderer-provided styling. */
+	color?: ThemeColor;
+	render: () => string | undefined;
+}
+
 /** Service tiers accepted by each provider family. */
 export type ExtensionServiceTier<Family extends ServiceTierFamily> = Family extends "anthropic"
 	? "priority"
@@ -1107,6 +1126,7 @@ export interface ExtensionAPI {
 	): void;
 	on(event: "after_provider_response", handler: ExtensionHandler<AfterProviderResponseEvent>): void;
 	on(event: "before_agent_start", handler: ExtensionHandler<BeforeAgentStartEvent, BeforeAgentStartEventResult>): void;
+	on(event: "agent_activity_state", handler: ExtensionHandler<AgentActivityStateEvent>): void;
 	on(event: "agent_start", handler: ExtensionHandler<AgentStartEvent>): void;
 	on(event: "agent_end", handler: ExtensionHandler<AgentEndEvent>): void;
 	on(event: "session_stop", handler: ExtensionHandler<SessionStopEvent, SessionStopEventResult>): void;
@@ -1137,6 +1157,14 @@ export interface ExtensionAPI {
 	// =========================================================================
 	// Tool Registration
 	// =========================================================================
+	/**
+	 * Register a status-line segment. Registration is declarative and is hosted
+	 * by the interactive runner when one is attached.
+	 */
+	registerStatusSegment(definition: ExtensionStatusSegmentDefinition): () => void;
+
+	/** Request a status-line redraw. Safe in headless modes. */
+	requestStatusLineRender(): void;
 
 	/** Register a tool that the LLM can call. */
 	registerTool<TParams extends TSchema = TSchema, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void;
@@ -1437,6 +1465,9 @@ export type SetServiceTierHandler = (family: ServiceTierFamily, tier: ServiceTie
 /** Shared state created by loader, used during registration and runtime. */
 export interface ExtensionRuntimeState {
 	flagValues: Map<string, boolean | string>;
+	requestStatusLineRender: () => void;
+	/** @internal Host a status segment when an interactive UI is attached. */
+	hostStatusSegment: (key: string, definition: ExtensionStatusSegmentDefinition) => (() => void) | undefined;
 	/** Provider registrations queued during extension loading, processed during session initialization */
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; sourceId: string }>;
 }
@@ -1493,6 +1524,12 @@ export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionAction
 	setServiceTier: SetServiceTierHandler;
 }
 
+export interface RegisteredStatusSegment {
+	key: string;
+	definition: ExtensionStatusSegmentDefinition;
+	disposeUI?: () => void;
+}
+
 /** Loaded extension with all registered items. */
 export interface Extension {
 	path: string;
@@ -1505,6 +1542,7 @@ export interface Extension {
 	commands: Map<string, RegisteredCommand>;
 	flags: Map<string, ExtensionFlag>;
 	shortcuts: Map<KeyId, ExtensionShortcut>;
+	statusSegments?: Map<string, RegisteredStatusSegment>;
 }
 
 /** Result of loading extensions. */

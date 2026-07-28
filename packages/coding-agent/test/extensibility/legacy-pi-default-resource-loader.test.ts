@@ -2,6 +2,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	DefaultPackageManager,
@@ -11,6 +12,8 @@ import {
 import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 // Issue #4567: every published version of pi-schedule-prompt (and every pi
@@ -268,5 +271,95 @@ describe("createAgentSession({ resourceLoader }) (issue #4567)", () => {
 		// the running test's cwd rather than the temp dir the loader owns.
 		expect(forwarded.cwd).toBe(tmp);
 		expect(forwarded.agentDir).toBe(tmp);
+	});
+
+	it("loads and forwards the host-required extension when optional discovery is disabled", async () => {
+		const tmp = await mkTempCwd("omp-legacy-required-resource-loader-");
+		const content = `export default function (pi) { pi.on("tool_call", async () => {}); }`;
+		const extensionPath = path.join(tmp, "legacy-required.ts");
+		await fs.writeFile(extensionPath, content);
+		const requiredExtension = {
+			path: extensionPath,
+			extensionId: "extension-module:legacy-required",
+			expectedSha256: new Bun.SHA256().update(content).digest("hex"),
+		};
+		let captured: CreateAgentSessionOptions | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			captured = options;
+			return {
+				session: {} as never,
+				extensionsResult: { extensions: [], errors: [], runtime: undefined as never },
+			} as unknown as CreateAgentSessionResult;
+		});
+		const loader = new DefaultResourceLoader({
+			cwd: tmp,
+			agentDir: tmp,
+			settingsManager: Settings.isolated({
+				"requiredExtension.path": requiredExtension.path,
+				"requiredExtension.id": requiredExtension.extensionId,
+				"requiredExtension.sha256": requiredExtension.expectedSha256,
+			}),
+			noExtensions: true,
+			noSkills: true,
+			noPromptTemplates: true,
+			noThemes: true,
+			noContextFiles: true,
+		});
+
+		await legacyCreateAgentSession({ resourceLoader: loader });
+
+		expect(captured?.preloadedExtensions?.extensions.map(extension => extension.resolvedPath)).toEqual([
+			extensionPath,
+		]);
+		expect(captured?.requiredExtension).toEqual(requiredExtension);
+	});
+
+	it("preserves an explicit mismatched requirement so SDK re-attestation fails closed", async () => {
+		const tmp = await mkTempCwd("omp-legacy-required-mismatch-");
+		const content = `export default function (pi) { pi.on("tool_call", async () => {}); }`;
+		const extensionPath = path.join(tmp, "legacy-explicit-required.ts");
+		await fs.writeFile(extensionPath, content);
+		const settings = Settings.isolated({
+			"requiredExtension.path": extensionPath,
+			"requiredExtension.id": "extension-module:legacy-explicit-required",
+			"requiredExtension.sha256": new Bun.SHA256().update(content).digest("hex"),
+		});
+		const loader = new DefaultResourceLoader({
+			cwd: tmp,
+			agentDir: tmp,
+			settingsManager: settings,
+			noExtensions: true,
+			noSkills: true,
+			noPromptTemplates: true,
+			noThemes: true,
+			noContextFiles: true,
+		});
+		const authStorage = await AuthStorage.create(path.join(tmp, "auth.db"));
+		const modelRegistry = new ModelRegistry(authStorage);
+		try {
+			await expect(
+				legacyCreateAgentSession({
+					resourceLoader: loader,
+					requiredExtension: {
+						path: extensionPath,
+						extensionId: "extension-module:legacy-explicit-required",
+						expectedSha256: "0".repeat(64),
+					},
+					authStorage,
+					modelRegistry,
+					sessionManager: SessionManager.inMemory(),
+					enableLsp: false,
+					enableMCP: false,
+					skipPythonPreflight: true,
+					skills: [],
+					rules: [],
+					preloadedCustomToolPaths: [],
+					contextFiles: [],
+					promptTemplates: [],
+				}),
+			).rejects.toMatchObject({ code: "hash-mismatch" });
+		} finally {
+			authStorage.close();
+		}
 	});
 });

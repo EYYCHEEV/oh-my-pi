@@ -46,6 +46,26 @@ function wrapCause(reason: Error, wrapperCount: number): Error {
 	return current;
 }
 
+describe("postmortem fatal boundary", () => {
+	it("keeps uncaught read EINTR fatal outside its owner", async () => {
+		const result = await runPostmortemProbe(`
+			import "${postmortemModuleUrl}";
+			queueMicrotask(() => {
+				throw Object.assign(new Error("interrupted system call"), {
+					code: "EINTR",
+					syscall: "read",
+					fd: 25,
+					errno: -4,
+				});
+			});
+		`);
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("Uncaught Exception");
+		expect(result.stderr).toContain("interrupted system call");
+	});
+});
+
 describe("postmortem expected cleanup errors", () => {
 	it("marks errors with the well-known cleanup symbol and recognizes them", () => {
 		const reason = new Error("browser run ended");

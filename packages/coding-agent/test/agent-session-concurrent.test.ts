@@ -22,7 +22,7 @@ import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensi
 import { GoalRuntime } from "@oh-my-pi/pi-coding-agent/goals/runtime";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { convertToLlm, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
@@ -71,7 +71,10 @@ describe("AgentSession concurrent prompt guard", () => {
 		AsyncJobManager.resetForTests();
 	});
 
-	async function createSession(settingsOverrides?: Partial<Record<SettingPath, unknown>>) {
+	async function createSession(
+		settingsOverrides?: Partial<Record<SettingPath, unknown>>,
+		extensionRunner?: ExtensionRunner,
+	) {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		let abortSignal: AbortSignal | undefined;
 
@@ -114,6 +117,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
+			extensionRunner,
 		});
 
 		return session;
@@ -143,6 +147,81 @@ describe("AgentSession concurrent prompt guard", () => {
 		// Cleanup
 		await session.abort();
 		await firstPrompt.catch(() => {}); // Ignore abort error
+	});
+
+	it("settles an Esc-aborted root run as interrupted", async () => {
+		await createSession();
+		const activityEvents: Array<{
+			type: "agent_activity_state";
+			runId: string;
+			state: "running" | "waiting_for_human" | "settled";
+			outcome?: "completed" | "interrupted" | "error";
+		}> = [];
+		session.subscribe(event => {
+			if (event.type === "agent_activity_state") activityEvents.push(event);
+		});
+
+		const prompt = session.prompt("Interrupt me");
+		await waitFor(() => activityEvents.some(event => event.state === "running"));
+		await session.abort({ reason: USER_INTERRUPT_LABEL });
+		await prompt.catch(() => {});
+
+		expect(activityEvents).toEqual([
+			{ type: "agent_activity_state", runId: activityEvents[0]!.runId, state: "running" },
+			{
+				type: "agent_activity_state",
+				runId: activityEvents[0]!.runId,
+				state: "settled",
+				outcome: "interrupted",
+			},
+		]);
+	});
+	it("does not emit a settled-only lifecycle when pre-agent setup fails", async () => {
+		const extensionRunner = {
+			emit: vi.fn().mockResolvedValue(undefined),
+			emitBeforeAgentStart: vi.fn().mockRejectedValue(new Error("pre-agent failed")),
+			hasHandlers: vi.fn().mockReturnValue(false),
+		} as unknown as ExtensionRunner;
+		await createSession(undefined, extensionRunner);
+		const activityStates: string[] = [];
+		session.subscribe(event => {
+			if (event.type === "agent_activity_state") activityStates.push(event.state);
+		});
+
+		await expect(session.prompt("fail before start")).rejects.toThrow("pre-agent failed");
+		expect(activityStates).toEqual([]);
+	});
+
+	it("keeps an aborted pre-agent finalizer from settling the next prompt", async () => {
+		const firstSetup = Promise.withResolvers<void>();
+		let setupCount = 0;
+		const extensionRunner = {
+			emit: vi.fn().mockResolvedValue(undefined),
+			emitBeforeAgentStart: vi.fn(() => (++setupCount === 1 ? firstSetup.promise : Promise.resolve())),
+			hasHandlers: vi.fn().mockReturnValue(false),
+		} as unknown as ExtensionRunner;
+		await createSession(undefined, extensionRunner);
+		const events: Array<{ type: "agent_activity_state"; runId: string; state: string; outcome?: string }> = [];
+		session.subscribe(event => {
+			if (event.type === "agent_activity_state") events.push(event);
+		});
+
+		const oldPrompt = session.prompt("blocked setup");
+		await waitFor(() => setupCount === 1);
+		await session.abort({ reason: USER_INTERRUPT_LABEL });
+		firstSetup.resolve();
+		await oldPrompt.catch(() => {});
+
+		const nextPrompt = session.prompt("next run");
+		await waitFor(() => events.some(event => event.state === "running"));
+		const nextRunId = events.find(event => event.state === "running")!.runId;
+		await session.abort({ reason: USER_INTERRUPT_LABEL });
+		await nextPrompt.catch(() => {});
+
+		expect(events).toEqual([
+			{ type: "agent_activity_state", runId: nextRunId, state: "running" },
+			{ type: "agent_activity_state", runId: nextRunId, state: "settled", outcome: "interrupted" },
+		]);
 	});
 
 	it("should allow steer() while streaming", async () => {
@@ -354,28 +433,47 @@ describe("AgentSession concurrent prompt guard", () => {
 			last_assistant_message?: AgentMessage;
 		}> = [];
 		const eventOrder: string[] = [];
-		const extensionRunner = {
-			emit: vi.fn(event => {
-				eventOrder.push(event.type);
-				return Promise.resolve(undefined);
-			}),
-			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
-			hasHandlers: vi.fn((eventType: string) => eventType === "session_stop"),
-			emitSessionStop: vi.fn(event => {
-				eventOrder.push("session_stop");
-				stopEvents.push(event);
-				if (stopEvents.length === 1) {
-					return Promise.resolve({ continue: true, additionalContext: "Mission incomplete; continue." });
-				}
-				return Promise.resolve(undefined);
-			}),
-		} as unknown as ExtensionRunner;
+		const activityEvents: Array<{
+			type: "agent_activity_state";
+			runId: string;
+			state: "running" | "waiting_for_human" | "settled";
+			outcome?: "completed" | "interrupted" | "error";
+		}> = [];
+		const extensionRuntime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			pi => {
+				pi.on("agent_activity_state", event => {
+					activityEvents.push(event);
+				});
+				pi.on("agent_end", () => {
+					eventOrder.push("agent_end");
+				});
+				pi.on("session_stop", event => {
+					eventOrder.push("session_stop");
+					stopEvents.push(event);
+					if (stopEvents.length === 1) {
+						return { continue: true, additionalContext: "Mission incomplete; continue." };
+					}
+				});
+			},
+			tempDir,
+			new EventBus(),
+			extensionRuntime,
+			"activity-lifecycle-test",
+		);
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
 		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
 		authStorages.push(authStorage);
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const extensionRunner = new ExtensionRunner(
+			[extension],
+			extensionRuntime,
+			tempDir,
+			sessionManager,
+			modelRegistry,
+		);
 
 		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, extensionRunner });
 
@@ -393,6 +491,15 @@ describe("AgentSession concurrent prompt guard", () => {
 						),
 			),
 		).toBe(true);
+		expect(activityEvents).toEqual([
+			{ type: "agent_activity_state", runId: activityEvents[0]!.runId, state: "running" },
+			{
+				type: "agent_activity_state",
+				runId: activityEvents[0]!.runId,
+				state: "settled",
+				outcome: "completed",
+			},
+		]);
 		expect(eventOrder.filter(type => type === "session_stop" || type === "agent_end")).toEqual([
 			"session_stop",
 			"agent_end",
@@ -411,6 +518,80 @@ describe("AgentSession concurrent prompt guard", () => {
 					message.content.some(block => block.type === "text" && block.text === "First message"),
 			),
 		).toBe(true);
+	});
+
+	it("does not reuse a completed assistant when a continued raw loop errors before emitting its own terminal assistant", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let callCount = 0;
+		const mock = createMockModel({
+			handler: () => {
+				callCount++;
+				if (callCount === 1) return { content: ["Done"] };
+				throw new Error("continuation failed before assistant");
+			},
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+			convertToLlm,
+		});
+		const activityEvents: Array<{
+			type: "agent_activity_state";
+			runId: string;
+			state: "running" | "waiting_for_human" | "settled";
+			outcome?: "completed" | "interrupted" | "error";
+		}> = [];
+		let stopCount = 0;
+		const extensionRuntime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			pi => {
+				pi.on("agent_activity_state", event => {
+					activityEvents.push(event);
+				});
+				pi.on("session_stop", () => {
+					stopCount++;
+					if (stopCount === 1) {
+						return { continue: true, additionalContext: "Continue into failing loop." };
+					}
+				});
+			},
+			tempDir,
+			new EventBus(),
+			extensionRuntime,
+			"activity-current-loop-outcome-test",
+		);
+		const sessionManager = SessionManager.inMemory();
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "current-loop-auth.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "current-loop-models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const extensionRunner = new ExtensionRunner(
+			[extension],
+			extensionRuntime,
+			tempDir,
+			sessionManager,
+			modelRegistry,
+		);
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, extensionRunner });
+
+		await session.prompt("First message");
+		await session.waitForIdle();
+
+		expect(mock.calls).toHaveLength(2);
+		expect(agent.state.messages.some(message => message.role === "assistant" && message.stopReason === "stop")).toBe(
+			true,
+		);
+		expect(activityEvents).toEqual([
+			{ type: "agent_activity_state", runId: activityEvents[0]!.runId, state: "running" },
+			{
+				type: "agent_activity_state",
+				runId: activityEvents[0]!.runId,
+				state: "settled",
+				outcome: "error",
+			},
+		]);
 	});
 
 	it("uses non-empty session_stop reason when additional context is empty", async () => {
@@ -1327,6 +1508,14 @@ describe("AgentSession TTSR resume gate", () => {
 			ttsrManager,
 		});
 
+		const activityStates: string[] = [];
+		const activityRunIds: string[] = [];
+		session.subscribe(event => {
+			if (event.type !== "agent_activity_state") return;
+			activityStates.push(event.state);
+			activityRunIds.push(event.runId);
+		});
+
 		// prompt() must block until the TTSR continuation completes
 		await session.prompt("Write some Rust code");
 
@@ -1334,6 +1523,8 @@ describe("AgentSession TTSR resume gate", () => {
 		expect(continuationCompleted).toBe(true);
 		expect(streamCallCount).toBeGreaterThanOrEqual(2);
 		expect(session.isStreaming).toBe(false);
+		expect(activityStates).toEqual(["running", "settled"]);
+		expect(new Set(activityRunIds).size).toBe(1);
 	});
 
 	it("marks extension agent_end willContinue for TTSR abort and not ordinary abort", async () => {

@@ -118,6 +118,9 @@
 ### Fixed
 
 - Fixed an issue where Windows PTY callers were forced through shell command re-quoting by supporting direct executable and argument launching.
+### Added
+
+- Added an identity-pinned macOS supervised-process-group handle for bounded waits and TERM-to-KILL cleanup without falling back to direct-child tracking on unsupported platforms.
 
 ## [16.4.6] - 2026-07-12
 

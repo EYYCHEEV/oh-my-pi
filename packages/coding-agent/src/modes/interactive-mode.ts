@@ -152,7 +152,7 @@ import { CustomEditor } from "./components/custom-editor";
 import { DynamicBorder } from "./components/dynamic-border";
 import { ErrorBannerComponent } from "./components/error-banner";
 import type { EvalExecutionComponent } from "./components/eval-execution";
-import type { HookEditorComponent } from "./components/hook-editor";
+import type { HookEditorComponent, HookEditorOptions } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent, HookSelectorSlider } from "./components/hook-selector";
 import { type PlanReviewAnnotationState, PlanReviewOverlay } from "./components/plan-review-overlay";
@@ -552,6 +552,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	/** Extension-registered provider factories, applied in registration order (#4919). */
 	#autocompleteProviderFactories: AutocompleteProviderFactory[] = [];
 	#cleanupUnsubscribe?: () => void;
+	#promptAutocompleteProvider: AutocompleteProvider | undefined;
 	#signalTeardown?: SessionTeardown;
 	readonly #version: string;
 	readonly #changelogMarkdown: string | undefined;
@@ -1238,6 +1239,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			}
 		}
 		this.editor.setAutocompleteProvider(provider);
+		this.#promptAutocompleteProvider = provider;
 	}
 
 	/** Stack extension autocomplete behavior on top of the built-in editor provider (#4919). */
@@ -3425,7 +3427,11 @@ export class InteractiveMode implements InteractiveModeContext {
 				return;
 			}
 			const objective = (
-				await this.showHookEditor("Goal objective", undefined, undefined, { promptStyle: true })
+				await this.showHookEditor("Goal objective", undefined, undefined, {
+					promptStyle: true,
+					autocompleteProvider: this.#promptAutocompleteProvider,
+					autocompleteMaxVisible: this.settings.get("autocompleteMaxVisible"),
+				})
 			)?.trim();
 			if (!objective) return;
 			await this.#startGoalFromObjective(objective);
@@ -4918,7 +4924,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		title: string,
 		prefill?: string,
 		dialogOptions?: ExtensionUIDialogOptions,
-		editorOptions?: { promptStyle?: boolean },
+		editorOptions?: HookEditorOptions,
 	): Promise<string | undefined> {
 		return this.#extensionUiController.showHookEditor(title, prefill, dialogOptions, editorOptions);
 	}
