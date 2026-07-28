@@ -174,6 +174,7 @@ export class EventController {
 			requestRender: component => this.ctx.ui.requestComponentRender(component),
 		});
 		this.#handlers = {
+			agent_activity_state: async () => {},
 			agent_start: e => this.#handleAgentStart(e),
 			agent_end: e => this.#handleAgentEnd(e),
 			turn_start: async () => {},

@@ -518,6 +518,9 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	extensions: { type: "array", default: EMPTY_STRING_ARRAY },
+	"requiredExtension.path": { type: "string", default: undefined },
+	"requiredExtension.id": { type: "string", default: undefined },
+	"requiredExtension.sha256": { type: "string", default: undefined },
 
 	enabledModels: { type: "array", default: EMPTY_STRING_ARRAY },
 
@@ -4523,11 +4526,23 @@ export const SETTINGS_SCHEMA = {
 			tab: "tasks",
 			group: "Subagents",
 			label: "Prefer Task Delegation",
-			description: "How strongly to push delegating work to subagents",
+			description: "How strongly to prefer delegating work to subagents",
 			options: [
-				{ value: "default", label: "Default", description: "Model decides when to delegate" },
-				{ value: "preferred", label: "Preferred", description: "Adds delegation guidance to the system prompt" },
-				{ value: "always", label: "Always", description: "Prompt guidance plus a first-turn delegation reminder" },
+				{
+					value: "default",
+					label: "Default",
+					description: "Solo-first; model delegates only when coordination pays off",
+				},
+				{
+					value: "preferred",
+					label: "Preferred",
+					description: "Soft delegation nudge when value exceeds coordination cost",
+				},
+				{
+					value: "always",
+					label: "Always",
+					description: "Requires delegation for substantial work plus a first-turn reminder",
+				},
 			],
 		},
 	},
@@ -4540,7 +4555,19 @@ export const SETTINGS_SCHEMA = {
 			group: "Subagents",
 			label: "Batch Task Calls",
 			description:
-				"Switch the task tool to its batch shape: one call carries { context, tasks[] } — one subagent per item, with an optional per-item agent (defaulting to the session spawn-policy agent), per-item isolation, and a required shared context prepended to every assignment. With async.enabled=true, each spawn runs as an independent background agent with the normal idle/parked lifecycle; otherwise the call blocks for merged results. Disable to restore the flat single-spawn schema.",
+				"Switch the task tool to its batch shape: one call carries { context, tasks[] } — one subagent per item, with optional per-item agent, model, output schema, and isolation plus a required shared context prepended to every assignment. With async.enabled=true, each spawn normally runs as an independent background agent; task.batchBlocking can instead make multi-item calls wait for merged results. With async disabled, the call always blocks. Disable to restore the flat single-spawn schema.",
+		},
+	},
+
+	"task.batchBlocking": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Block Multi-Item Batches",
+			description:
+				"When task.batch and async.enabled are both on, batches with two or more items still run concurrently but the call waits for every item and returns merged results. One-item batches and flat calls retain their normal asynchronous behavior.",
 		},
 	},
 

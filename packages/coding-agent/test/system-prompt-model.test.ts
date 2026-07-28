@@ -10,7 +10,6 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { buildSystemPrompt } from "@oh-my-pi/pi-coding-agent/system-prompt";
-import { usesCodexTaskPrompt } from "@oh-my-pi/pi-coding-agent/task/prompt-policy";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 import { cleanupTempHome } from "./helpers/temp-home-cleanup";
 
@@ -167,26 +166,6 @@ describe("AgentSession model-change prompt refresh", () => {
 		return [first, second];
 	}
 
-	function pickTwoModelsWithSameTaskPolicy(): [Model, Model] {
-		const all = modelRegistry.getAll();
-		const first = all[0];
-		const second = all.find(
-			model =>
-				(model.provider !== first.provider || model.id !== first.id) &&
-				usesCodexTaskPrompt(model.id) === usesCodexTaskPrompt(first.id),
-		);
-		if (!first || !second) throw new Error("Expected two distinct models with the same task prompt policy");
-		return [first, second];
-	}
-
-	function pickModelsAcrossTaskPolicies(): [Model, Model] {
-		const all = modelRegistry.getAll();
-		const defaultPolicy = all.find(model => !usesCodexTaskPrompt(model.id));
-		const codexPolicy = all.find(model => usesCodexTaskPrompt(model.id));
-		if (!defaultPolicy || !codexPolicy) throw new Error("Expected default-policy and GPT-5.6 models");
-		return [defaultPolicy, codexPolicy];
-	}
-
 	function newSession(
 		model: Model,
 		settings: Settings,
@@ -228,8 +207,8 @@ describe("AgentSession model-change prompt refresh", () => {
 		expect(rebuildCount).toBe(1);
 	});
 
-	it("does not rebuild a hidden-model prompt when the task policy stays the same", async () => {
-		const [modelA, modelB] = pickTwoModelsWithSameTaskPolicy();
+	it("rebuilds model-dependent guidance when the model identifier is hidden", async () => {
+		const [modelA, modelB] = pickTwoModels();
 		authStorage.setRuntimeApiKey(modelA.provider, "key-a");
 		authStorage.setRuntimeApiKey(modelB.provider, "key-b");
 
@@ -239,32 +218,12 @@ describe("AgentSession model-change prompt refresh", () => {
 			Settings.isolated({ "compaction.enabled": false, includeModelInPrompt: false }),
 			async () => {
 				rebuildCount++;
-				return { systemPrompt: ["unchanged"] };
-			},
-		);
-
-		await session.setModel(modelB);
-		expect(rebuildCount).toBe(0);
-		expect(session.agent.state.systemPrompt).toEqual(["initial"]);
-	});
-
-	it("rebuilds a hidden-model prompt when the task policy changes", async () => {
-		const [modelA, modelB] = pickModelsAcrossTaskPolicies();
-		authStorage.setRuntimeApiKey(modelA.provider, "key-a");
-		authStorage.setRuntimeApiKey(modelB.provider, "key-b");
-
-		let rebuildCount = 0;
-		session = newSession(
-			modelA,
-			Settings.isolated({ "compaction.enabled": false, includeModelInPrompt: false }),
-			async () => {
-				rebuildCount++;
-				return { systemPrompt: ["policy changed"] };
+				return { systemPrompt: ["model-dependent guidance"] };
 			},
 		);
 
 		await session.setModel(modelB);
 		expect(rebuildCount).toBe(1);
-		expect(session.agent.state.systemPrompt).toEqual(["policy changed"]);
+		expect(session.agent.state.systemPrompt).toEqual(["model-dependent guidance"]);
 	});
 });
