@@ -6,7 +6,7 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 // Contract: subagent output ids are the requested name, used verbatim the first
 // time and suffixed (`-2`, `-3`, …) only when the same name recurs. A parent
 // prefix nests ids under it. On resume the manager scans existing output and
-// child-session files so it never reuses a name that would clobber prior state.
+// child-session/transcript artifacts so it never reuses a name from an interrupted run.
 
 describe("AgentOutputManager", () => {
 	it("uses the requested name verbatim and suffixes only on repeat", async () => {
@@ -37,20 +37,22 @@ describe("AgentOutputManager", () => {
 		expect(await mgr.allocate("Carol")).toBe("Anna.Carol");
 	});
 
-	it("scans existing output files so a resume never clobbers prior outputs", async () => {
+	it("scans existing artifacts so a resume never clobbers prior runs", async () => {
 		using tmp = TempDir.createSync("@omp-output-manager-");
 		const dir = tmp.path();
 		await Bun.write(path.join(dir, "Anna.md"), "prior");
 		await Bun.write(path.join(dir, "Anna-2.md"), "prior");
-		await Bun.write(path.join(dir, "Bob.jsonl"), "persisted child session");
+		// An interrupted run can persist its transcript before its output is written.
+		await Bun.write(path.join(dir, "Bob.jsonl"), '{"type":"session_init"}\n');
 		// Unrelated tool artifacts (numeric `.log` ids) must not be mistaken for names.
 		await Bun.write(path.join(dir, "7.bash.log"), "noise");
 
 		const mgr = new AgentOutputManager(() => dir);
 
 		expect(await mgr.allocate("Anna")).toBe("Anna-3");
-		// A child JSONL without a result markdown still reserves its worker id.
 		expect(await mgr.allocate("Bob")).toBe("Bob-2");
+		// A name with no artifact on disk is still pristine.
+		expect(await mgr.allocate("Carol")).toBe("Carol");
 	});
 
 	it("awaits one disk scan before concurrent allocations", async () => {
@@ -67,13 +69,14 @@ describe("AgentOutputManager", () => {
 		const dir = tmp.path();
 		await Bun.write(path.join(dir, "Anna.Bob.md"), "child");
 		await Bun.write(path.join(dir, "Anna.Bob.Carol.md"), "grandchild");
+		await Bun.write(path.join(dir, "Anna.Dave.jsonl"), '{"type":"session_init"}\n');
 		// A different parent's child must be ignored by Anna's manager.
 		await Bun.write(path.join(dir, "Other.Bob.md"), "elsewhere");
 
 		const mgr = new AgentOutputManager(() => dir, { parentPrefix: "Anna" });
 
 		expect(await mgr.allocate("Bob")).toBe("Anna.Bob-2");
-		expect(await mgr.allocate("Dave")).toBe("Anna.Dave");
+		expect(await mgr.allocate("Dave")).toBe("Anna.Dave-2");
 	});
 
 	it("reserves lifecycle-known ids that no longer have files on disk", async () => {

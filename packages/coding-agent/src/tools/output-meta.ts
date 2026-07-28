@@ -16,7 +16,14 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { getDefault, type Settings } from "../config/settings";
 import { formatGroupedDiagnosticMessages } from "../lsp/utils";
 import type { Theme } from "../modes/theme/theme";
-import { type OutputSummary, type TruncationResult, truncateMiddle, truncateTail } from "../session/streaming-output";
+import {
+	formatMiddleElisionMarker,
+	type OutputSummary,
+	type TruncationResult,
+	truncateHead,
+	truncateMiddle,
+	truncateTail,
+} from "../session/streaming-output";
 import { formatBytes, wrapBrackets } from "./render-utils";
 import { renderError } from "./tool-errors";
 
@@ -694,16 +701,20 @@ async function spillLargeResultToArtifact(
 		return result;
 	}
 
-	// Measure total text content
-	const textParts: string[] = [];
-	for (const block of result.content) {
-		if (block.type === "text" && block.text) {
-			textParts.push(block.text);
-		}
+	// Measure aggregate text content while retaining each block's location in
+	// that aggregate. The separators preserve the established artifact bytes.
+	const textEntries: Array<{ index: number; text: string; start: number; end: number }> = [];
+	let aggregateLength = 0;
+	for (const [index, block] of result.content.entries()) {
+		if (block.type !== "text" || !block.text) continue;
+		if (textEntries.length > 0) aggregateLength += 1;
+		const start = aggregateLength;
+		aggregateLength += block.text.length;
+		textEntries.push({ index, text: block.text, start, end: aggregateLength });
 	}
-	if (textParts.length === 0) return result;
+	if (textEntries.length === 0) return result;
 
-	const fullText = textParts.length === 1 ? textParts[0] : textParts.join("\n");
+	const fullText = textEntries.length === 1 ? textEntries[0].text : textEntries.map(entry => entry.text).join("\n");
 	const totalBytes = Buffer.byteLength(fullText, "utf-8");
 	if (totalBytes <= threshold) return result;
 
@@ -738,14 +749,63 @@ async function spillLargeResultToArtifact(
 				maxLines: tailLines,
 			});
 
-	// Replace text blocks with single truncated block, keep images
-	const newContent: (TextContent | ImageContent)[] = [];
-	for (const block of result.content) {
-		if (block.type !== "text") {
-			newContent.push(block);
+	// Project deterministic retained ranges back onto their original text
+	// blocks. Never infer a range from user-visible text: retained text may
+	// equal another range or contain the same bytes as the elision marker.
+	const retainedText = new Map<number, string>();
+	let head = "";
+	let tail = "";
+	let marker = "";
+	let markerEntryIndex: number | undefined;
+	let markerFollowsHeadInEntry = false;
+	if (truncated.truncatedBy === "middle") {
+		const headResult = truncateHead(fullText, { maxBytes: headBytes, maxLines: tailLines });
+		const tailResult = truncateTail(fullText, { maxBytes: tailBytes, maxLines: tailLines });
+		head = headResult.content;
+		tail = tailResult.content;
+		marker = formatMiddleElisionMarker(truncated.elidedLines ?? 0, truncated.elidedBytes ?? 0);
+		// An empty retained line still owns its following marker. When the
+		// retained head ends exactly at a block boundary, however, the marker
+		// belongs to the next text block so it cannot cross an intervening image.
+		for (const entry of textEntries) {
+			if (head.length >= entry.end) continue;
+			markerEntryIndex = entry.index;
+			markerFollowsHeadInEntry = entry.start <= head.length;
+			break;
+		}
+		markerEntryIndex ??= textEntries.at(-1)?.index;
+	} else if (!useMiddle) {
+		tail = truncated.content;
+	} else if (!truncated.truncated) {
+		head = fullText;
+	} else {
+		const headResult = truncateHead(fullText, { maxBytes: headBytes, maxLines: tailLines });
+		const headIsUnusable = (headResult.outputLines ?? 0) === 0 || headResult.firstLineExceedsLimit;
+		if (headIsUnusable) {
+			tail = truncated.content;
+		} else {
+			head = truncated.content;
 		}
 	}
-	newContent.push({ type: "text", text: truncated.content });
+
+	const tailStart = fullText.length - tail.length;
+	for (const entry of textEntries) {
+		const headEnd = Math.min(entry.end, head.length);
+		const headPart = headEnd > entry.start ? fullText.slice(entry.start, headEnd) : "";
+		const tailStartInEntry = Math.max(entry.start, tailStart);
+		const tailPart = entry.end > tailStartInEntry ? fullText.slice(tailStartInEntry, entry.end) : "";
+		if (entry.index === markerEntryIndex) {
+			const markerPrefix = markerFollowsHeadInEntry ? `${headPart}\n` : headPart;
+			const markerSuffix = tailPart ? `\n${tailPart}` : "";
+			retainedText.set(entry.index, `${markerPrefix}${marker}${markerSuffix}`);
+		} else {
+			retainedText.set(entry.index, headPart + tailPart);
+		}
+	}
+
+	const newContent: (TextContent | ImageContent)[] = result.content.map((block, index) =>
+		block.type === "text" && retainedText.has(index) ? { ...block, text: retainedText.get(index) ?? "" } : block,
+	);
 
 	// Build truncation meta
 	const outputLines = truncated.outputLines ?? truncated.totalLines;

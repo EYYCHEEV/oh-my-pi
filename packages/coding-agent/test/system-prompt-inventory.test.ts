@@ -655,32 +655,25 @@ describe("system prompt tool inventory", () => {
 		expect(text).toContain("- frontend-design: Frontend UI workflow");
 	});
 
-	it("omits the read-only scout delegation gate when scout is unavailable", async () => {
-		const opts = { toolNames: ["read", "bash", "task"], tools: TOOLS };
-		const withScout = (
-			await buildSystemPrompt({
-				...opts,
+	it("requires todo tool updates only when the tool is active", async () => {
+		const renderWithToolNames = async (toolNames: string[]): Promise<string> => {
+			const { systemPrompt } = await buildSystemPrompt({
 				cwd: tempDir,
 				contextFiles: [],
 				skills: [],
 				rules: [],
+				toolNames,
 				workspaceTree: { ...EMPTY_TREE, rootPath: tempDir },
-				scoutAvailable: true,
-			})
-		).systemPrompt.join("\n\n");
-		const withoutScout = (
-			await buildSystemPrompt({
-				...opts,
-				cwd: tempDir,
-				contextFiles: [],
-				skills: [],
-				rules: [],
-				workspaceTree: { ...EMPTY_TREE, rootPath: tempDir },
-				scoutAvailable: false,
-			})
-		).systemPrompt.join("\n\n");
+			});
+			return systemPrompt.join("\n\n");
+		};
 
-		expect(withScout).toContain("a single read-only scout while you keep working is fine");
-		expect(withoutScout).not.toContain("read-only scout");
+		const withTodo = await renderWithToolNames(["todo"]);
+		expect(withTodo).toContain("MUST call the `todo` TOOL");
+		expect(withTodo).toContain("whenever task state materially changes");
+		expect(withTodo).toContain("Do not merely describe todo changes in prose");
+
+		const withoutTodo = await renderWithToolNames([]);
+		expect(withoutTodo).not.toContain("MUST call the `todo` TOOL");
 	});
 });

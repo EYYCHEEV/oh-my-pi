@@ -115,6 +115,7 @@ Core methods:
 - `on(event, handler)`
 - `registerTool`, `registerCommand`, `registerShortcut`, `registerFlag`
 - `registerMessageRenderer`, `registerAssistantThinkingRenderer`
+- `registerStatusSegment({ id, placement, render })` (returns a disposer), `requestStatusLineRender`
 - `setLabel`, `getFlag`
 - `sendMessage`, `sendUserMessage`, `appendEntry`, `exec`
 - `getActiveTools`, `getAllTools`, `setActiveTools`
@@ -249,6 +250,7 @@ Cancelable pre-events:
 - `after_provider_response`
 - `context`
 - `agent_start` / `agent_end` — agent loop lifecycle notification; `agent_end` remains notification-only
+- `agent_activity_state` — continuation-safe root activity lifecycle. Each run has a stable string `runId` and emits `running`, optional `waiting_for_human` / `running` transitions around interactive dialogs, then one `settled` event with `outcome: "completed" | "interrupted" | "error"`. Raw `agent_start` / `agent_end` events remain unchanged.
 - `session_stop` — main-session stop hook, awaited before settle; may continue with `{ continue: true, additionalContext }` or `{ decision: "block", reason }`; capped at 8 consecutive continuations and never fires for task/subagent sessions
 - `turn_start` / `turn_end`
 - `message_start` / `message_update` / `message_end`
@@ -386,12 +388,9 @@ Supported:
 - theme listing/loading by name (`setTheme` supports string names)
 - tools expanded toggle
 
-Current no-op methods in this controller:
+Status-line segments registered with `pi.registerStatusSegment(...)` are hosted by the built-in status line and may be invalidated with `pi.requestStatusLineRender()`. A segment may set `color` to any semantic `ThemeColor`; the status renderer resolves that value through the active theme, while omitting it preserves renderer-provided styling. Public segment IDs are globally unique within the loaded extension runner: the first registration wins, and a duplicate or built-in ID is rejected synchronously without replacing or invalidating the first. Extension owner/path keys are internal hosting details, not public IDs. Registrations survive transcript switches. The disposer returned by a successful registration removes that hosted registration and invalidates the status line exactly once; repeated disposal is harmless.
 
-- `setFooter`
-- `setHeader`
-
-`setEditorComponent` is wired to the live editor (`ctx.setEditorComponent(factory)`). `setWidget` renders real widget components above or below the editor via `setHookWidget(...)` (`placement: "aboveEditor" | "belowEditor"`; string-array content capped at 10 lines).
+`setFooter` and `setHeader` remain no-ops in this controller. Extensions cannot currently replace the built-in footer/header; use a registered status segment or `setWidget` instead. `setEditorComponent` is wired to the live editor (`ctx.setEditorComponent(factory)`). `setWidget` renders real widget components above or below the editor via `setHookWidget(...)` (`placement: "aboveEditor" | "belowEditor"`; string-array content capped at 10 lines).
 
 ### RPC mode (`rpc-mode.ts`)
 
@@ -412,6 +411,7 @@ Unsupported/no-op in RPC implementation:
 ### Print/headless/subagent paths
 
 When no UI context is supplied to runner init, `ctx.hasUI` is `false` and methods are no-op/default-returning.
+Status-segment registration and render invalidation are safe no-ops in these modes.
 
 ### ACP mode
 

@@ -21,7 +21,7 @@ output:
   optionalProperties:
     findings:
       metadata:
-        description: "Populate via incremental yield sections under type: [\"findings\"]; don't repeat it in a final payload."
+        description: "Populate via incremental yield sections under type: [\"findings\"]. Include every explicitly requested, evidence-backed theoretical or optional observation as advisory_hardening even when overall_correctness is correct; an empty list is invalid for that input. Don't repeat findings in a final payload."
       elements:
         properties:
           title:
@@ -32,6 +32,10 @@ output:
             metadata:
               description: "One paragraph: bug, trigger, impact"
             type: string
+          classification:
+            metadata:
+              description: Finding authority relative to closed acceptance
+            enum: [blocking_existing_acceptance, material_new_risk, advisory_hardening, unrelated, evidence_insufficient]
           priority:
             metadata:
               description: "P0-P3: 0 blocks release, 1 fix next cycle, 2 fix eventually, 3 nice to have"
@@ -54,19 +58,21 @@ output:
             type: number
 ---
 
-Identify bugs the author would want fixed before merge.
+Review the change against the supplied acceptance contract and material safety boundaries.
 
 <procedure>
-1. Run `git diff`, `jj diff --git`, or `gh pr diff <number>` to view patch
-2. Read modified files for full context
-3. Record each issue with incremental `yield` using `type: ["findings"]`
-4. Record `overall_correctness`, `explanation`, and `confidence` with incremental `yield` sections, then stop so idle finalization assembles the result
+1. Run `git diff`, `jj diff --git`, or `gh pr diff <number>` to view the patch
+2. Read modified files, the supplied acceptance criteria, and direct integration paths needed for context
+3. Classify every candidate issue and every explicitly requested advisory observation under the authority rules below
+4. Record each reportable issue with incremental `yield` using `type: ["findings"]`
+5. Record `overall_correctness`, `explanation`, and `confidence` with incremental `yield` sections, then stop so idle finalization assembles the result
 
 Bash is read-only: `git diff`, `git log`, `git show`, `jj diff --git`, `gh pr diff`. You NEVER make file edits or trigger builds.
 </procedure>
 
 <criteria>
-Report issue only when ALL conditions hold:
+Report a blocking or material issue only when ALL conditions hold.
+An explicitly requested, evidence-backed advisory observation must still be reported even though it does not make the change incorrect:
 - **Provable impact**: Show specific affected code paths (no speculation)
 - **Actionable**: Discrete fix, not vague "consider improving X"
 - **Unintentional**: Clearly not deliberate design choice
@@ -75,6 +81,22 @@ Report issue only when ALL conditions hold:
 - **Proportionate rigor**: Fix doesn't demand rigor absent elsewhere in codebase
 </criteria>
 
+<authority>
+- Acceptance is closed by default.
+  Validate the supplied user or specification criteria; do not add deliverables or proof requirements.
+- Classify each candidate issue exactly once by the first matching rule:
+  1. `material_new_risk` for an evidenced realistic reachable path to material privacy, security, credential, data-loss, destructive-operation, irreversibility, or public-contract harm, even when the same issue also violates explicit acceptance.
+  2. `blocking_existing_acceptance` for an explicit unmet criterion, a reproduced supported-path failure, or an end-to-end blocker only when no material harm in rule 1 is evidenced.
+  3. `evidence_insufficient` only when supplied or safely discoverable proof cannot decide an existing acceptance criterion; request evidence or clarification, never a new deliverable.
+  4. `advisory_hardening` for an explicitly requested evidence-backed theoretical edge, optional proof gap, or optional rigor outside current acceptance.
+  5. Omit unrelated observations.
+- A supplied review focus is an explicit request to classify the observations it raises.
+  Do not omit a rule 4 finding merely because `overall_correctness` remains `correct`; an empty findings list is invalid when such an observation is evidenced.
+- Only `blocking_existing_acceptance` and `material_new_risk` make `overall_correctness` incorrect or authorize a `revise` recommendation.
+  Advisory and theoretical findings never restart implementation or review automatically.
+- If serious defects exist only in an optional unshipped proof mechanism, recommend deleting or abandoning that mechanism before hardening it.
+  Do not invalidate otherwise accepted source unless the mechanism is required or shipped.
+</authority>
 <cross-boundary>
 For every new type, variant, or value introduced by the patch that crosses a function or module boundary
 (event, message, command, frame, enum variant, queue item, IPC payload):
@@ -117,13 +139,15 @@ memcpy(buf, data.ptr, data.length);
 Each finding uses incremental `yield` with `type: ["findings"]` and `result.data` containing:
 - `title`: Imperative, ≤80 chars
 - `body`: One paragraph
+- `classification`: `blocking_existing_acceptance`, `material_new_risk`, `advisory_hardening`, `unrelated`, or `evidence_insufficient`
 - `priority`: 0-3
 - `confidence`: 0.0-1.0
 - `file_path`: Path to affected file
 - `line_start`, `line_end`: Range ≤10 lines, must overlap diff
 
 Verdict fields also use incremental `yield` sections:
-- `type: ["overall_correctness"]` with `"correct"` (no bugs/blockers) or `"incorrect"`
+- `type: ["overall_correctness"]` with `"correct"` unless a finding is `blocking_existing_acceptance` or `material_new_risk`; otherwise `"incorrect"`.
+  An otherwise-correct verdict still includes any required advisory findings.
 - `type: ["explanation"]` with a plain-text 1-3 sentence verdict summary
 - `type: ["confidence"]` with a 0.0-1.0 confidence value
 
@@ -131,9 +155,11 @@ Do not emit a separate submit tool call or duplicate `findings` in another paylo
 
 You NEVER output JSON or code blocks.
 
-Correctness ignores non-blocking issues (style, docs, nits).
+Correctness ignores advisory hardening, unrelated observations, evidence insufficiency that does not disprove an existing criterion, style, docs, and nits.
 </output>
 
 <critical>
-Every finding MUST be patch-anchored and evidence-backed.
+Every blocking or material finding MUST be patch-anchored and evidence-backed.
+An explicitly requested advisory finding may anchor to the reviewed change and supplied evidence without claiming the change is incorrect.
+A reviewer verdict is evidence for the parent, never authority to expand acceptance or start another loop.
 </critical>
