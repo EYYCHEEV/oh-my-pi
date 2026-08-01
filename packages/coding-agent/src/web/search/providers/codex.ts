@@ -22,6 +22,7 @@ import {
 	OPENAI_HEADERS,
 } from "@oh-my-pi/pi-catalog/wire/codex";
 import { $env, readSseJson, USER_AGENT } from "@oh-my-pi/pi-utils";
+import { type } from "arktype";
 import type { ModelRegistry } from "../../../config/model-registry";
 import type { SearchResponse, SearchSource } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
@@ -30,12 +31,15 @@ import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
 
+const CODEX_SEARCH_TIMEOUT_MS = 5 * 60_000;
 const FALLBACK_MODEL = "gpt-5.5";
-// Bundled non-Lite `gpt-5.5` leads: it accepts the forced hosted `web_search`
-// tool choice, so a search command always searches. The bundled Responses-Lite
-// candidates follow; under the Lite shape the forced choice is invalid (#5771),
-// so they run `tool_choice: "auto"` and may answer without searching (#6988).
+// Live GPT-5.6 Sol leads when model discovery advertises it: this matches the
+// Codex CLI's multi-step search path. Bundled non-Lite `gpt-5.5` remains the
+// first fallback because it accepts a forced hosted `web_search` tool choice.
+// Responses-Lite candidates run `tool_choice: "auto"` and may answer without
+// searching (#5771, #6988), so the response guard must remain fail-closed.
 const DEFAULT_MODEL_PREFERENCES = [
+	"gpt-5.6-sol",
 	"gpt-5.5",
 	"gpt-5.6-luna",
 	"gpt-5.6-terra",
@@ -49,6 +53,199 @@ const DEFAULT_MODEL_PREFERENCES = [
 ];
 const DEFAULT_INSTRUCTIONS =
 	"You are a helpful assistant with web search capabilities. Search the web to answer the user's question accurately and cite your sources.";
+const CODEX_STANDALONE_SEARCH_URL = `${CODEX_BASE_URL.replace(/\/$/, "")}/codex/alpha/search`;
+const CODEX_WEB_RUN_DESCRIPTION =
+	'Tool for accessing the internet.\n\n\n---\n\n## Examples of different commands available in this tool\n\nExamples of different commands available in this tool:\n* `search_query`: {"search_query": [{"q": "What is the capital of France?"}, {"q": "What is the capital of belgium?"}]}. Searches the internet for a given query (and optionally with a domain or recency filter)\n* `image_query`: {"image_query":[{"q": "waterfalls"}]}.\n* `open`: {"open": [{"ref_id": "turn0search0"}, {"ref_id": "https://www.openai.com", "lineno": 120}]}\n* `click`: {"click": [{"ref_id": "turn0fetch3", "id": 17}]}\n* `find`: {"find": [{"ref_id": "turn0fetch3", "pattern": "Annie Case"}]}\n* `screenshot`: {"screenshot": [{"ref_id": "turn1view0", "pageno": 0}, {"ref_id": "turn1view0", "pageno": 3}]}\n* `finance`: {"finance":[{"ticker":"AMD","type":"equity","market":"USA"}]}, {"finance":[{"ticker":"BTC","type":"crypto","market":""}]}\n* `weather`: {"weather":[{"location":"San Francisco, CA"}]}\n* `sports`: {"sports":[{"fn":"standings","league":"nfl"}, {"fn":"schedule","league":"nba","team":"GSW","date_from":"2025-02-24"}]}\n* `time`: {"time":[{"utc_offset":"+03:00"}]}\n\n---\n\n## Usage hints\nTo use this tool efficiently:\n* Use multiple commands and queries in one call to get more results faster; e.g. {"search_query": [{"q": "bitcoin news"}], "finance":[{"ticker":"BTC","type":"crypto","market":""}], "find": [{"ref_id": "turn0search0", "pattern": "Annie Case"}, {"ref_id": "turn0search1", "pattern": "John Smith"}]}\n* Use "response_length" to control the number of results returned by this tool, omit it if you intend to pass "short" in\n* Only write required parameters; do not write empty lists or nulls where they could be omitted.\n* `search_query` must have length at most 4 in each call. If it has length > 3, response_length must be medium or long\n* If you find yourself in a situation where you accidentally call the `web.run` tool, it\'s best just to send an empty query: {"search_query": [{"q": ""}]}.\n\n---\n\n## Decision boundary\n\nIf the user makes an explicit request to search the internet, find latest information, look up, etc (or to not do so), you must obey their request.\nWhen you make an assumption, always consider whether it is temporally stable; i.e. whether there\'s even a small (>10%) chance it has changed. If it is unstable, you must verify with browsing the internet for verification.\n\n<situations_where_you_must_browse_the_internet>\nBelow is a list of scenarios where browsing the internet MUST be used. PAY CLOSE ATTENTION: you MUST browse the internet in these cases. If you\'re unsure or on the fence, you MUST bias towards browsing the internet.\n- The information could have changed recently: for example news; prices; laws; schedules; product specs; sports scores; economic indicators; political/public/company figures (e.g. the question relates to \'the president of country A\' or \'the CEO of company B\', which might change over time); rules; regulations; standards; software libraries that could be updated; exchange rates; recommendations (i.e., recommendations about various topics or things might be informed by what currently exists / is popular / is safe / is unsafe / is in the zeitgeist / etc.); and many many many more categories -- again, if you\'re on the fence, you MUST browse the internet!\n  - For news queries, prioritize more recent events, ensuring you compare publish dates and the date that the event happened.\n- The user is seeking recommendations that could lead them to spend substantial time or money -- researching products, restaurants, travel plans, etc.\n- The user wants (or would benefit from) direct quotes, links, or precise source attribution.\n- A specific page, paper, dataset, PDF, or site is referenced and you haven\'t been given its contents.\n- You\'re unsure about a fact, the topic is niche or emerging, or you suspect there\'s at least a 10% chance you will incorrectly recall it\n- High-stakes accuracy matters (medical, legal, financial guidance). For these you generally should search by default because this information is highly temporally unstable\n- The user explicitly says to search, browse, verify, or look it up.\n</situations_where_you_must_browse_the_internet>\n\n---\n\n## Citations\n\nResults from `web.run` include internal reference IDs such as `turn2search5`. Use\nthose reference IDs only in calls to `web.run`; do not expose them in the final\nresponse.\n\nCite sources in the final response using Markdown links:\n\n- Cite a single source as `[descriptive source title](https://example.com/page)`.\n- Cite multiple sources with separate Markdown links, for example\n  `[first source](https://example.com/one), [second source](https://example.com/two)`.\n- Link directly to the page that supports the claim. Do not link to search result\n  pages or use bare URLs.\n\nFormatting of citations:\n\n- Place each citation as near as possible to the claim it supports, normally at\n  the end of the sentence or paragraph and after punctuation.\n- Do not place citations inside code fences.\n- Do not put citations on a line by themselves or collect all citations at the\n  end of the response.\n\nIf you browse the internet, cite statements supported by web sources. Each cited\nsource must directly support the associated claim. Prefer primary and\nauthoritative sources, and use sources from different domains when the response\nbenefits from multiple perspectives.\n\n---\n\n## Special cases\nIf these conflict with any other instructions, these should take precedence.\n\n<special_cases>\n- When the user asks for information about how to use OpenAI products, (ChatGPT, the OpenAI API, etc.), you should check the code in local env and only browse as fallback, when you browse restrict your sources to official OpenAI websites using the domains filter, unless otherwise requested.\n- When using search to answer technical questions, you must only rely on primary sources (research papers, official documentation, etc.)\n- Clearly indicate when you are making an inference from sources.\n</special_cases>\n\n---\n\n## Word limits\nResponses may not excessively quote or draw on a specific source. There are several limits here:\n- **Limit on verbatim quotes:**\n  - You may not quote more than 25 words verbatim from any single non-lyrical source, unless the source is reddit.\n  - For song lyrics, verbatim quotes must be limited to at most 10 words.\n  - Long quotes from reddit are allowed, as long as you indicate that those are direct quotes via a markdown blockquote starting with ">", copy verbatim, and link the source.\n- **Word limits:**\n  - Each webpage source in the sources has a word limit label formatted like "[wordlim N]", in which N is the maximum number of words in the whole response that are attributed to that source. If omitted, the word limit is 200 words.\n  - Non-contiguous words derived from a given source must be counted to the word limit.\n  - The summarization limit N is a maximum for each source.\n  - When using multiple sources, their summarization limits add together. However, each article used must be relevant to the response.\n- **Copyright compliance:**\n  - You must avoid providing full articles, long verbatim passages, or extensive direct quotes due to copyright concerns.\n  - If the user asked for a verbatim quote, the response should provide a short compliant excerpt and then answer with paraphrases and summaries.\n  - Again, this limit does not apply to reddit content, as long as it\'s appropriately indicated that those are direct quotes and you link to the source.\n';
+const CODEX_SEARCH_QUERY_SCHEMA = {
+	type: "object",
+	properties: {
+		domains: {
+			description: "Whether to filter by a specific list of domains.",
+			type: "array",
+			items: { type: "string" },
+		},
+		q: { description: "Search query.", type: "string" },
+		recency: {
+			description: "Whether to filter by recency, as a number of recent days.",
+			type: "integer",
+		},
+	},
+	required: ["q"],
+} as const;
+const CODEX_WEB_RUN_PARAMETERS = {
+	type: "object",
+	properties: {
+		click: {
+			description: "Open links from previously opened pages.",
+			type: "array",
+			items: {
+				type: "object",
+				properties: {
+					id: {
+						description: "Numbered link id to open.",
+						type: "integer",
+					},
+					ref_id: { description: "Reference id containing the numbered link.", type: "string" },
+				},
+				required: ["id", "ref_id"],
+			},
+		},
+		finance: {
+			description: "Look up prices for the given stock symbols.",
+			type: "array",
+			items: {
+				type: "object",
+				properties: {
+					market: {
+						description: 'ISO 3166-1 alpha-3 country code, "OTC", or "" for cryptocurrency.',
+						type: "string",
+					},
+					ticker: { description: "Ticker symbol to look up.", type: "string" },
+					type: {
+						description: "Asset type to look up.",
+						enum: ["equity", "fund", "crypto", "index"],
+						type: "string",
+					},
+				},
+				required: ["ticker", "type"],
+			},
+		},
+		find: {
+			description: "Find text patterns in pages.",
+			type: "array",
+			items: {
+				type: "object",
+				properties: {
+					pattern: { description: "Text pattern to find.", type: "string" },
+					ref_id: { description: "Reference id or URL to search within.", type: "string" },
+				},
+				required: ["pattern", "ref_id"],
+			},
+		},
+		image_query: {
+			description: "Query the image search engine for a given list of queries.",
+			type: "array",
+			items: CODEX_SEARCH_QUERY_SCHEMA,
+		},
+		open: {
+			description: "Open pages by reference id or URL.",
+			type: "array",
+			items: {
+				type: "object",
+				properties: {
+					lineno: {
+						description: "Line number to position the page at.",
+						type: "integer",
+					},
+					ref_id: { description: "Reference id or URL to open.", type: "string" },
+				},
+				required: ["ref_id"],
+			},
+		},
+		response_length: {
+			description: "Set the length of the response to be returned.",
+			enum: ["short", "medium", "long"],
+			type: "string",
+		},
+		screenshot: {
+			description: "Take screenshots of PDF pages.",
+			type: "array",
+			items: {
+				type: "object",
+				properties: {
+					pageno: {
+						description: "Zero-indexed PDF page number.",
+						type: "integer",
+					},
+					ref_id: { description: "Reference id or URL to screenshot.", type: "string" },
+				},
+				required: ["pageno", "ref_id"],
+			},
+		},
+		search_query: {
+			description: "Query the internet search engine for a given list of queries.",
+			type: "array",
+			items: CODEX_SEARCH_QUERY_SCHEMA,
+		},
+		sports: {
+			description: "Look up sports schedules and standings.",
+			type: "array",
+			items: {
+				type: "object",
+				properties: {
+					date_from: { description: "Start date in YYYY-MM-DD format.", type: "string" },
+					date_to: { description: "End date in YYYY-MM-DD format.", type: "string" },
+					fn: {
+						description: "Sports function to call.",
+						enum: ["schedule", "standings"],
+						type: "string",
+					},
+					league: {
+						description: "League to look up.",
+						enum: ["nba", "wnba", "nfl", "nhl", "mlb", "epl", "ncaamb", "ncaawb", "ipl"],
+						type: "string",
+					},
+					locale: { description: "Locale for the lookup.", type: "string" },
+					num_games: {
+						description: "Number of games to return.",
+						type: "integer",
+					},
+					opponent: {
+						description: "Opponent to use with `team` when narrowing the lookup.",
+						type: "string",
+					},
+					team: {
+						description: "Team to look up, using the common 3 or 4 letter alias used in broadcasts.",
+						type: "string",
+					},
+					tool: { description: "Tool name for sports requests.", enum: ["sports"], type: "string" },
+				},
+				required: ["fn", "league"],
+			},
+		},
+		time: {
+			description: "Get time for the given UTC offsets.",
+			type: "array",
+			items: {
+				type: "object",
+				properties: {
+					utc_offset: { description: 'UTC offset formatted like "+03:00".', type: "string" },
+				},
+				required: ["utc_offset"],
+			},
+		},
+		weather: {
+			description: "Look up weather forecasts.",
+			type: "array",
+			items: {
+				type: "object",
+				properties: {
+					duration: {
+						description: "Number of days to return. Defaults to 7.",
+						type: "integer",
+					},
+					location: { description: 'Location in "Country, Area, City" format.', type: "string" },
+					start: { description: "Start date in YYYY-MM-DD format. Defaults to today.", type: "string" },
+				},
+				required: ["location"],
+			},
+		},
+	},
+} as const;
+const CODEX_WEB_RUN_TOOL = {
+	type: "namespace",
+	name: "web",
+	description: "Tools in the web namespace.",
+	tools: [
+		{
+			type: "function",
+			name: "run",
+			strict: false,
+			description: CODEX_WEB_RUN_DESCRIPTION,
+			parameters: CODEX_WEB_RUN_PARAMETERS,
+		},
+	],
+} as const;
 
 type CodexSearchModel = Model<"openai-codex-responses">;
 
@@ -71,6 +268,11 @@ interface CodexSearchResult {
 	requestId: string;
 	usage?: { inputTokens: number; outputTokens: number; totalTokens: number };
 }
+const CodexStandaloneSearchResponseSchema = type({
+	output: "string",
+	"results?": "unknown[]",
+	"encrypted_output?": "string | null",
+});
 
 function getBundledCodexModels(): CodexSearchModel[] {
 	const models: CodexSearchModel[] = [];
@@ -82,6 +284,19 @@ function getBundledCodexModels(): CodexSearchModel[] {
 	return models;
 }
 
+function findCodexModelCandidate(
+	modelRegistry: ModelRegistry | undefined,
+	bundledModels: readonly CodexSearchModel[],
+	modelId: string,
+): CodexModelCandidate | undefined {
+	const registryModel = modelRegistry?.find("openai-codex", modelId);
+	if (registryModel?.api === "openai-codex-responses") {
+		return { modelId, catalogModel: registryModel as CodexSearchModel };
+	}
+	const bundledModel = bundledModels.find(model => model.id === modelId);
+	return bundledModel ? { modelId, catalogModel: bundledModel } : undefined;
+}
+
 function getConfiguredModel(modelRegistry: ModelRegistry | undefined): CodexModelCandidate | undefined {
 	const configuredModel = $env.PI_CODEX_WEB_SEARCH_MODEL?.trim();
 	if (!configuredModel) return undefined;
@@ -89,21 +304,19 @@ function getConfiguredModel(modelRegistry: ModelRegistry | undefined): CodexMode
 	// A live registry entry is fresher than bundled metadata (e.g. a discovered
 	// `useResponsesLite` flag), so it wins when it describes this exact model on
 	// the Codex Responses API. The configured id is sent verbatim either way.
-	const registryModel = modelRegistry?.find("openai-codex", configuredModel);
-	if (registryModel?.api === "openai-codex-responses") {
-		return { modelId: configuredModel, catalogModel: registryModel as CodexSearchModel };
-	}
-
-	const catalogModel = getBundledCodexModels().find(model => model.id === configuredModel);
-	return { modelId: configuredModel, ...(catalogModel ? { catalogModel } : {}) };
+	return (
+		findCodexModelCandidate(modelRegistry, getBundledCodexModels(), configuredModel) ?? {
+			modelId: configuredModel,
+		}
+	);
 }
 
-function getDefaultModelCandidates(): CodexModelCandidate[] {
+function getDefaultModelCandidates(modelRegistry: ModelRegistry | undefined): CodexModelCandidate[] {
 	const bundledModels = getBundledCodexModels();
 	const candidates: CodexModelCandidate[] = [];
 	for (const modelId of DEFAULT_MODEL_PREFERENCES) {
-		const catalogModel = bundledModels.find(model => model.id === modelId);
-		if (catalogModel) candidates.push({ modelId, catalogModel });
+		const candidate = findCodexModelCandidate(modelRegistry, bundledModels, modelId);
+		if (candidate) candidates.push(candidate);
 	}
 
 	if (candidates.length > 0) {
@@ -159,55 +372,68 @@ export interface CodexSearchParams {
 	search_context_size?: "low" | "medium" | "high";
 }
 
-/** Codex API response structure */
-interface CodexWebSearchSource {
-	url?: string;
-	source_website_url?: string;
-	title?: string;
-	caption?: string;
+/** Codex API response structures validated at the SSE boundary. */
+const CodexAnnotationSchema = type({
+	type: "string",
+	"url?": "string",
+	"title?": "string",
+	"start_index?": "number",
+	"end_index?": "number",
+});
+const CodexContentPartSchema = type({
+	type: "string",
+	"text?": "string",
+	"annotations?": CodexAnnotationSchema.array(),
+});
+const CodexFunctionOutputPartSchema = type({ type: "string", "text?": "string" });
+const CodexSummaryPartSchema = type({ type: "string", text: "string" });
+const CodexWebSearchSourceSchema = type({
+	"url?": "string",
+	"source_website_url?": "string",
+	"title?": "string",
+	"caption?": "string",
+});
+const CodexWebSearchActionSchema = type({
+	"sources?": CodexWebSearchSourceSchema.array(),
+});
+const CodexResponseItemSchema = type({
+	type: "string",
+	"id?": "string",
+	"role?": "string",
+	"name?": "string",
+	"namespace?": "string",
+	"call_id?": "string",
+	"status?": "string",
+	"arguments?": "string",
+	"output?": type("string").or(CodexFunctionOutputPartSchema.array()),
+	"content?": CodexContentPartSchema.array(),
+	"summary?": CodexSummaryPartSchema.array(),
+	"action?": CodexWebSearchActionSchema,
+	"sources?": CodexWebSearchSourceSchema.array(),
+	"results?": CodexWebSearchSourceSchema.array(),
+});
+type CodexResponseItem = typeof CodexResponseItemSchema.infer;
+
+const CodexResponseSchema = type({
+	"id?": "string",
+	"model?": "string",
+	"status?": "string",
+	"usage?": {
+		"input_tokens?": "number",
+		"output_tokens?": "number",
+		"total_tokens?": "number",
+		"input_tokens_details?": { "cached_tokens?": "number" },
+	},
+});
+
+function parseCodexResponseItem(value: unknown): CodexResponseItem | undefined {
+	const parsed = CodexResponseItemSchema(value);
+	return parsed instanceof type.errors ? undefined : parsed;
 }
 
-interface CodexResponseItem {
-	type: string;
-	id?: string;
-	role?: string;
-	name?: string;
-	call_id?: string;
-	status?: string;
-	arguments?: string;
-	content?: CodexContentPart[];
-	summary?: Array<{ type: string; text: string }>;
-	action?: { sources?: CodexWebSearchSource[] };
-	sources?: CodexWebSearchSource[];
-	results?: CodexWebSearchSource[];
-}
-
-interface CodexContentPart {
-	type: string;
-	text?: string;
-	annotations?: CodexAnnotation[];
-}
-
-interface CodexAnnotation {
-	type: string;
-	url?: string;
-	title?: string;
-	start_index?: number;
-	end_index?: number;
-}
-
-interface CodexUsage {
-	input_tokens?: number;
-	output_tokens?: number;
-	total_tokens?: number;
-	input_tokens_details?: { cached_tokens?: number };
-}
-
-interface CodexResponse {
-	id?: string;
-	model?: string;
-	status?: string;
-	usage?: CodexUsage;
+function parseCodexResponse(value: unknown): typeof CodexResponseSchema.infer | undefined {
+	const parsed = CodexResponseSchema(value);
+	return parsed instanceof type.errors ? undefined : parsed;
 }
 
 /**
@@ -362,6 +588,7 @@ function findMarkdownLinkUrlEnd(text: string, openParenIndex: number): number | 
  */
 function extractTextSources(text: string): SearchSource[] {
 	const sources: SearchSource[] = [];
+	const markdownUrlRanges: Array<[start: number, end: number]> = [];
 
 	for (let index = 0; index < text.length; index += 1) {
 		if (text[index] !== "[") {
@@ -380,10 +607,18 @@ function extractTextSources(text: string): SearchSource[] {
 		if (url) {
 			addSource(sources, { title: title || url, url });
 		}
+		markdownUrlRanges.push([titleEnd + 2, urlEnd]);
 		index = urlEnd;
 	}
 
 	for (const match of text.matchAll(/https?:\/\/\S+/g)) {
+		const matchIndex = match.index;
+		if (
+			matchIndex !== undefined &&
+			markdownUrlRanges.some(([start, end]) => matchIndex >= start && matchIndex < end)
+		) {
+			continue;
+		}
 		const url = normalizeExtractedUrl(match[0] ?? "");
 		if (!url) continue;
 		addSource(sources, { title: url, url });
@@ -464,18 +699,19 @@ function buildCodexHeaders(
  * discarding the backend diagnostic — e.g. a regional/model-snapshot rejection (#7200).
  */
 function extractCodexSseError(rawEvent: Record<string, unknown>): { code: string; message: string } {
-	const candidates: unknown[] = [
-		rawEvent,
-		rawEvent.error,
-		(rawEvent.response as { error?: unknown } | undefined)?.error,
-	];
+	const response = rawEvent.response;
+	const responseError = response && typeof response === "object" && "error" in response ? response.error : undefined;
+	const candidates: unknown[] = [rawEvent, rawEvent.error, responseError];
 	let code = "";
 	let message = "";
 	for (const candidate of candidates) {
 		if (!candidate || typeof candidate !== "object") continue;
-		const record = candidate as Record<string, unknown>;
-		if (!code && typeof record.code === "string" && record.code) code = record.code;
-		if (!message && typeof record.message === "string" && record.message) message = record.message;
+		if (!code && "code" in candidate && typeof candidate.code === "string" && candidate.code) {
+			code = candidate.code;
+		}
+		if (!message && "message" in candidate && typeof candidate.message === "string" && candidate.message) {
+			message = candidate.message;
+		}
 	}
 	return { code, message };
 }
@@ -487,6 +723,246 @@ function classifyCodexSseErrorStatus(code: string, message: string): number {
 	if (/forbidden|\b403\b/u.test(detail)) return 403;
 	if (/timeout|timed out/u.test(detail)) return 504;
 	return 500;
+}
+
+/**
+ * Runs GPT-5.6 Sol the same way Codex CLI does: the model calls a namespaced
+ * `web.run` function, OMP executes that call through Codex's standalone search
+ * endpoint, and the plain-text result is paired back into the Responses input.
+ */
+async function callCodexStandaloneSearch(
+	auth: { accessToken: string; accountId?: string },
+	query: string,
+	options: {
+		signal?: AbortSignal;
+		systemPrompt?: string;
+		searchContextSize?: "low" | "medium" | "high";
+		maxOutputTokens?: number;
+		model: CodexModelCandidate;
+		sessionId?: string;
+		fetch?: FetchImpl;
+		transport: CodexSearchTransport;
+	},
+): Promise<CodexSearchResult> {
+	const requestedModel = options.model.modelId;
+	const signal = withHardTimeout(options.signal, CODEX_SEARCH_TIMEOUT_MS);
+	const fetchImpl = options.fetch ?? fetch;
+	const searchSessionId = options.sessionId ?? crypto.randomUUID();
+	const compatibility = createOpenAICodexCompatibilityMetadata({
+		sessionId: searchSessionId,
+		requestKind: "turn",
+		startNewTurn: true,
+	});
+	const modelHeaders = buildCodexHeaders(auth.accessToken, auth.accountId, options.transport.headers);
+	const searchHeaders = buildCodexHeaders(auth.accessToken, auth.accountId, options.transport.headers);
+	for (const name in compatibility.headers) {
+		const value = compatibility.headers[name];
+		if (value === undefined) continue;
+		modelHeaders.set(name, value);
+		searchHeaders.set(name, value);
+	}
+	modelHeaders.set(OPENAI_HEADERS.RESPONSES_LITE, "true");
+	searchHeaders.set("Accept", "application/json");
+
+	const userMessage: CodexResponseItem = {
+		type: "message",
+		role: "user",
+		content: [{ type: "input_text", text: query }],
+	};
+	const history: CodexResponseItem[] = [userMessage];
+	let webRunCallCount = 0;
+	let model = requestedModel;
+	let requestId = "";
+	let inputTokens = 0;
+	let outputTokens = 0;
+	let totalTokens = 0;
+	let hasUsage = false;
+
+	for (;;) {
+		const body: Record<string, unknown> = {
+			model: requestedModel,
+			stream: true,
+			store: false,
+			input: history,
+			tools: [CODEX_WEB_RUN_TOOL],
+			tool_choice: webRunCallCount === 0 ? "required" : "auto",
+			instructions: options.systemPrompt ?? DEFAULT_INSTRUCTIONS,
+			client_metadata: compatibility.clientMetadata,
+			reasoning: { effort: "high", summary: "auto", context: "all_turns" },
+		};
+		applyCodexResponsesLiteShape(body);
+
+		const response = await fetchImpl(options.transport.url, {
+			method: "POST",
+			headers: modelHeaders,
+			body: JSON.stringify(body),
+			signal,
+		});
+		if (!response.ok) {
+			const errorText = await response.text();
+			const classified = classifyProviderHttpError("codex", response.status, errorText);
+			if (classified) throw classified;
+			throw new SearchProviderError("codex", `Codex API error (${response.status}): ${errorText}`, response.status);
+		}
+		if (!response.body) {
+			throw new SearchProviderError("codex", "Codex API returned no response body", 500);
+		}
+
+		const answerParts: string[] = [];
+		const streamedAnswerParts: string[] = [];
+		const turnItems: CodexResponseItem[] = [];
+		const functionCalls: CodexResponseItem[] = [];
+		const turnSources: SearchSource[] = [];
+		for await (const rawEvent of readSseJson<Record<string, unknown>>(response.body, signal)) {
+			const eventType = typeof rawEvent.type === "string" ? rawEvent.type : "";
+			if (!eventType) continue;
+
+			if (eventType === "response.output_text.delta") {
+				const delta = typeof rawEvent.delta === "string" ? rawEvent.delta : "";
+				if (delta) streamedAnswerParts.push(delta);
+			} else if (eventType === "response.output_item.done") {
+				const item = parseCodexResponseItem(rawEvent.item);
+				if (!item) continue;
+				turnItems.push(item);
+				if (
+					item.type === "function_call" &&
+					typeof item.call_id === "string" &&
+					typeof item.arguments === "string" &&
+					((item.namespace === "web" && item.name === "run") || item.name === "web.run")
+				) {
+					functionCalls.push(item);
+				}
+				if (item.type === "message" && item.content) {
+					for (const part of item.content) {
+						if (part.type !== "output_text" || !part.text) continue;
+						answerParts.push(part.text);
+						for (const annotation of part.annotations ?? []) {
+							if (annotation.type === "url_citation" && annotation.url) {
+								addSource(turnSources, { title: annotation.title ?? annotation.url, url: annotation.url });
+							}
+						}
+					}
+				}
+			} else if (eventType === "response.completed" || eventType === "response.done") {
+				const completed = parseCodexResponse(rawEvent.response);
+				if (!completed) continue;
+				if (completed.model) model = completed.model;
+				if (completed.id) requestId = completed.id;
+				if (completed.usage) {
+					const cachedTokens = completed.usage.input_tokens_details?.cached_tokens ?? 0;
+					inputTokens += (completed.usage.input_tokens ?? 0) - cachedTokens;
+					outputTokens += completed.usage.output_tokens ?? 0;
+					totalTokens += completed.usage.total_tokens ?? 0;
+					hasUsage = true;
+				}
+			} else if (eventType === "error") {
+				const { code, message } = extractCodexSseError(rawEvent);
+				throw new SearchProviderError("codex", `Codex error (${code}): ${message || "Unknown error"}`, 500);
+			} else if (eventType === "response.failed") {
+				const { code, message } = extractCodexSseError(rawEvent);
+				const detail = code
+					? `Codex request failed (${code}): ${message || "Request failed"}`
+					: `Codex request failed: ${message || "Request failed"}`;
+				throw new SearchProviderError("codex", detail, 500);
+			}
+		}
+
+		history.push(...turnItems);
+		if (functionCalls.length === 0) {
+			if (webRunCallCount === 0) throw new CodexNoWebSearchError();
+			const finalAnswer = answerParts.join("\n\n").trim();
+			const streamedAnswer = streamedAnswerParts.join("").trim();
+			const answer = finalAnswer || streamedAnswer;
+			if (!answer || isImagePlaceholderAnswer(answer)) {
+				throw new SearchProviderError("codex", "Codex standalone search returned no final answer", 502);
+			}
+			const sources = turnSources;
+			for (const source of extractTextSources(answer)) addSource(sources, source);
+			if (sources.length === 0) {
+				throw new SearchProviderError("codex", "Codex standalone search returned no source URLs", 502);
+			}
+			return {
+				answer,
+				sources,
+				model,
+				requestId,
+				usage: hasUsage ? { inputTokens, outputTokens, totalTokens } : undefined,
+			};
+		}
+
+		for (const call of functionCalls) {
+			webRunCallCount += 1;
+			const callId = call.call_id;
+			if (!callId) continue;
+
+			let commands: Record<string, unknown>;
+			try {
+				const parsed = JSON.parse(call.arguments ?? "");
+				if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+					throw new Error("expected a JSON object");
+				}
+				commands = parsed as Record<string, unknown>;
+			} catch (error) {
+				const message = error instanceof Error ? error.message : "invalid JSON";
+				history.push({
+					type: "function_call_output",
+					call_id: callId,
+					output: `Invalid web.run arguments: ${message}`,
+				});
+				continue;
+			}
+
+			const searchBody: Record<string, unknown> = {
+				id: searchSessionId,
+				model: requestedModel,
+				input: [userMessage],
+				commands,
+				settings: {
+					search_context_size: options.searchContextSize ?? "high",
+					allowed_callers: ["direct"],
+					external_web_access: true,
+				},
+			};
+			if (options.maxOutputTokens !== undefined) searchBody.max_output_tokens = options.maxOutputTokens;
+			const searchResponse = await fetchImpl(CODEX_STANDALONE_SEARCH_URL, {
+				method: "POST",
+				headers: searchHeaders,
+				body: JSON.stringify(searchBody),
+				signal,
+			});
+			if (!searchResponse.ok) {
+				const errorText = await searchResponse.text();
+				const classified = classifyProviderHttpError("codex", searchResponse.status, errorText);
+				if (classified) throw classified;
+				throw new SearchProviderError(
+					"codex",
+					`Codex standalone search error (${searchResponse.status}): ${errorText}`,
+					searchResponse.status,
+				);
+			}
+
+			let rawStandalone: unknown;
+			try {
+				rawStandalone = await searchResponse.json();
+			} catch (error) {
+				const message = error instanceof Error ? error.message : "invalid JSON";
+				throw new SearchProviderError("codex", `Codex standalone search returned invalid JSON: ${message}`, 502);
+			}
+			const standalone = CodexStandaloneSearchResponseSchema(rawStandalone);
+			if (standalone instanceof type.errors) {
+				throw new SearchProviderError(
+					"codex",
+					`Codex standalone search response failed validation: ${standalone.summary}`,
+					502,
+				);
+			}
+			history.push({
+				type: "function_call_output",
+				call_id: callId,
+				output: [{ type: "input_text", text: standalone.output }],
+			});
+		}
+	}
 }
 
 /**
@@ -574,7 +1050,7 @@ async function callCodexSearch(
 		}
 
 		if (eventType === "response.created") {
-			const resp = (rawEvent as { response?: CodexResponse }).response;
+			const resp = parseCodexResponse(rawEvent.response);
 			if (resp?.id) requestId = resp.id;
 			if (resp?.model) model = resp.model;
 		} else if (eventType === "response.output_text.delta") {
@@ -583,7 +1059,7 @@ async function callCodexSearch(
 				streamedAnswerParts.push(delta);
 			}
 		} else if (eventType === "response.output_item.done") {
-			const item = rawEvent.item as CodexResponseItem | undefined;
+			const item = parseCodexResponseItem(rawEvent.item);
 			if (!item) continue;
 			if (item.type === "web_search_call") {
 				webSearchInvoked = true;
@@ -631,7 +1107,7 @@ async function callCodexSearch(
 				}
 			}
 		} else if (eventType === "response.completed" || eventType === "response.done") {
-			const resp = (rawEvent as { response?: CodexResponse }).response;
+			const resp = parseCodexResponse(rawEvent.response);
 			if (resp) {
 				if (resp.model) model = resp.model;
 				if (resp.id) requestId = resp.id;
@@ -710,15 +1186,19 @@ async function runCodexSearchCandidates(options: {
 		if (!candidate) continue;
 
 		try {
-			return await callCodexSearch(options.auth, options.query, {
+			const callOptions = {
 				signal: options.params.signal,
 				timeoutMs: options.params.timeoutMs,
 				systemPrompt: options.params.systemPrompt,
-				searchContextSize: "high",
+				searchContextSize: "high" as const,
+				maxOutputTokens: options.params.maxOutputTokens,
 				model: candidate,
 				fetch: options.params.fetch,
 				transport: options.transport,
-			});
+			};
+			return await (candidate.modelId === "gpt-5.6-sol" && !options.transport.customEndpoint
+				? callCodexStandaloneSearch(options.auth, options.query, callOptions)
+				: callCodexSearch(options.auth, options.query, callOptions));
 		} catch (error) {
 			lastError = error;
 			const isLastCandidate = index === options.modelCandidates.length - 1;
@@ -736,16 +1216,15 @@ async function runCodexSearchCandidates(options: {
  * Default-model behavior:
  * - If `PI_CODEX_WEB_SEARCH_MODEL` is set, use it exactly once and surface any
  *   upstream error verbatim.
- * - Otherwise start with the bundled non-Lite default (`gpt-5.5`), which
- *   accepts the forced hosted `web_search` tool choice, then advance through
- *   the bundled Responses-Lite candidates (GPT-5.6 Luna, Terra) only when
- *   Codex returns the known 400 "model is not supported" family or a Lite
- *   model answers without running web search. This avoids selecting
- *   `gpt-5-codex-mini` first on ChatGPT accounts, which OpenAI rejects.
+ * - Otherwise prefer live-registry GPT-5.6 Sol and run its namespaced
+ *   `web.run` calls through Codex's standalone search endpoint. Unsupported
+ *   Sol attempts may advance through the bundled hosted-search fallbacks.
+ *   Non-Sol Responses-Lite candidates remain protected by the existing
+ *   `web_search_call` evidence guard.
  */
 export async function searchCodex(params: SearchParams): Promise<SearchResponse> {
 	const configuredModel = getConfiguredModel(params.modelRegistry);
-	const modelCandidates = configuredModel ? [configuredModel] : getDefaultModelCandidates();
+	const modelCandidates = configuredModel ? [configuredModel] : getDefaultModelCandidates(params.modelRegistry);
 	const firstCandidate = modelCandidates[0];
 	if (!firstCandidate) {
 		throw new SearchProviderError("codex", "No Codex web search model is configured.");
