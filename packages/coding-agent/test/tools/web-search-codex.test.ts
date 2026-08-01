@@ -101,7 +101,7 @@ function makeMarkdownLinkSseResponse(model: string): string {
 				content: [
 					{
 						type: "output_text",
-						text: "See **[Example Article](https://example.com/article)** for details.",
+						text: 'See **[Example Article](https://example.com/article "Reference")** for details.',
 						annotations: [],
 					},
 				],
@@ -194,7 +194,11 @@ function makePlainUrlPunctuationSseResponse(model: string): string {
 	].join("\n");
 }
 
-function makeWebRunCallSse(model: string): string {
+function makeWebRunCallSse(
+	model: string,
+	argumentsText = JSON.stringify({ search_query: [{ q: "official DeepSeek API terms" }] }),
+	callId = "web_call_1",
+): string {
 	return [
 		`data: ${JSON.stringify({
 			type: "response.output_item.done",
@@ -223,8 +227,8 @@ function makeWebRunCallSse(model: string): string {
 				type: "function_call",
 				namespace: "web",
 				name: "run",
-				call_id: "web_call_1",
-				arguments: JSON.stringify({ search_query: [{ q: "official DeepSeek API terms" }] }),
+				call_id: callId,
+				arguments: argumentsText,
 			},
 		})}`,
 		"",
@@ -258,6 +262,30 @@ function makeStandaloneFinalSse(model: string): string {
 				model,
 				usage: { input_tokens: 20, output_tokens: 8, total_tokens: 28 },
 			},
+		})}`,
+		"",
+	].join("\n");
+}
+
+function makeIncompleteFinalSse(model: string): string {
+	return [
+		`data: ${JSON.stringify({
+			type: "response.output_item.done",
+			item: {
+				type: "message",
+				content: [
+					{
+						type: "output_text",
+						text: "Partial answer",
+						annotations: [{ type: "url_citation", title: "Partial source", url: "https://example.com/partial" }],
+					},
+				],
+			},
+		})}`,
+		"",
+		`data: ${JSON.stringify({
+			type: "response.incomplete",
+			response: { id: "resp_sol_incomplete", model, status: "incomplete" },
 		})}`,
 		"",
 	].join("\n");
@@ -480,6 +508,84 @@ describe("searchCodex model selection", () => {
 		);
 	});
 
+	it("feeds invalid commands back, then accepts blank commands and null results", async () => {
+		delete process.env.PI_CODEX_WEB_SEARCH_MODEL;
+		const requests: CapturedRequest[] = [];
+		let modelCalls = 0;
+		const fetchMock: FetchImpl = (url, init) => {
+			const request = {
+				url: typeof url === "string" ? url : url.toString(),
+				headers: init?.headers,
+				body: init?.body ? (JSON.parse(init.body as string) as Record<string, unknown>) : null,
+			};
+			requests.push(request);
+			if (request.url.endsWith("/codex/alpha/search")) {
+				return Promise.resolve(
+					Response.json({ output: "Search result: https://example.com/terms", results: null }),
+				);
+			}
+			modelCalls += 1;
+			const responseBody =
+				modelCalls === 1
+					? makeWebRunCallSse("gpt-5.6-sol", JSON.stringify({ search_query: [{ q: 42 }] }), "bad_call")
+					: modelCalls === 2
+						? makeWebRunCallSse("gpt-5.6-sol", "  ", "blank_call")
+						: makeStandaloneFinalSse("gpt-5.6-sol");
+			return Promise.resolve(
+				new Response(responseBody, { status: 200, headers: { "Content-Type": "text/event-stream" } }),
+			);
+		};
+
+		const result = await searchCodex({
+			...makeSearchParams("Correct invalid Sol command", fetchMock),
+			modelRegistry: liveSolModelRegistry,
+		});
+
+		expect(requests.map(request => request.url)).toEqual([
+			"https://chatgpt.com/backend-api/codex/responses",
+			"https://chatgpt.com/backend-api/codex/responses",
+			"https://chatgpt.com/backend-api/codex/alpha/search",
+			"https://chatgpt.com/backend-api/codex/responses",
+		]);
+		expect(requests[1]?.body?.tool_choice).toBe("required");
+		expect(requests[1]?.body?.input).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					type: "function_call_output",
+					call_id: "bad_call",
+					output: expect.stringContaining("Invalid web.run arguments"),
+				}),
+			]),
+		);
+		expect(requests[2]?.body?.commands).toEqual({});
+		expect(result.sources).toEqual([{ title: "DeepSeek Terms", url: "https://example.com/terms" }]);
+	});
+
+	it("rejects an incomplete standalone continuation", async () => {
+		delete process.env.PI_CODEX_WEB_SEARCH_MODEL;
+		let modelCalls = 0;
+		const fetchMock: FetchImpl = url => {
+			const requestUrl = typeof url === "string" ? url : url.toString();
+			if (requestUrl.endsWith("/codex/alpha/search")) {
+				return Promise.resolve(Response.json({ output: "Search result", results: [] }));
+			}
+			modelCalls += 1;
+			return Promise.resolve(
+				new Response(modelCalls === 1 ? makeWebRunCallSse("gpt-5.6-sol") : makeIncompleteFinalSse("gpt-5.6-sol"), {
+					status: 200,
+					headers: { "Content-Type": "text/event-stream" },
+				}),
+			);
+		};
+
+		await expect(
+			searchCodex({
+				...makeSearchParams("Incomplete Sol answer", fetchMock),
+				modelRegistry: liveSolModelRegistry,
+			}),
+		).rejects.toThrow("Codex response was incomplete");
+	});
+
 	it("does not fall back when explicitly configured Sol standalone search is rejected", async () => {
 		process.env.PI_CODEX_WEB_SEARCH_MODEL = "gpt-5.6-sol";
 		let calls = 0;
@@ -543,6 +649,35 @@ describe("searchCodex model selection", () => {
 
 		expect(calls).toBe(2);
 		expect(result.model).toBe("gpt-5.5");
+	});
+
+	it("does not add live-only models to the bundled fallback chain", async () => {
+		delete process.env.PI_CODEX_WEB_SEARCH_MODEL;
+		const attemptedModels: unknown[] = [];
+		const allLiveModelRegistry = {
+			...liveSolModelRegistry,
+			find(provider: string, modelId: string) {
+				return { provider, id: modelId, api: "openai-codex-responses", useResponsesLite: modelId.includes("5.6") };
+			},
+		} as unknown as ModelRegistry;
+		const fetchMock: FetchImpl = (_url, init) => {
+			const body = init?.body ? (JSON.parse(init.body as string) as Record<string, unknown>) : null;
+			attemptedModels.push(body?.model);
+			return Promise.resolve(
+				Response.json(
+					{ detail: "The requested model is not supported when using Codex with a ChatGPT account." },
+					{ status: 400 },
+				),
+			);
+		};
+
+		await expect(
+			searchCodex({
+				...makeSearchParams("Bounded fallback chain", fetchMock),
+				modelRegistry: allLiveModelRegistry,
+			}),
+		).rejects.toThrow("not supported");
+		expect(attemptedModels).toEqual(["gpt-5.6-sol", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra"]);
 	});
 
 	function sentUserText(): string | undefined {
