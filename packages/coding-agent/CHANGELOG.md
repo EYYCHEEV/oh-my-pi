@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Codex web search spending default attempts on Responses-Lite models that can skip hosted search by preferring non-Lite GPT-5.5 and honoring live registry request-shape metadata for explicit models.
+
 ## [17.2.3] - 2026-08-01
 
 ### Changed
