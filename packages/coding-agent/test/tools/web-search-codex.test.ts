@@ -677,7 +677,7 @@ describe("searchCodex model selection", () => {
 				modelRegistry: allLiveModelRegistry,
 			}),
 		).rejects.toThrow("not supported");
-		expect(attemptedModels).toEqual(["gpt-5.6-sol", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra"]);
+		expect(attemptedModels).toEqual(["gpt-5.6-sol", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.4"]);
 	});
 
 	function sentUserText(): string | undefined {
