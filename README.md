@@ -124,6 +124,7 @@ An upgrade fails before build or installation if the block is stale, any declare
 - `outcome-first-scope-control`: Outcome-first reviewer and Todo scope control
 - `kimi-usage-account-identity`: Per-account Kimi usage report identity
 - `archive-read-crash-containment`: Crash-safe tar and tar.gz reads
+- `codex-web-search-reliability`: Reliable forced Codex web search
 <!-- stronk-omp:fork-contracts:end -->
 
 ## Upstream alignment
