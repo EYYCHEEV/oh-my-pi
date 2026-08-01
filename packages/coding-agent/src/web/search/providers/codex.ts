@@ -37,11 +37,14 @@ import { SearchProvider } from "./base";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
 
 const FALLBACK_MODEL = "gpt-5.5";
+// Bundled non-Lite `gpt-5.5` leads: it accepts the forced hosted `web_search`
+// tool choice, so a search command always searches. The bundled Responses-Lite
+// candidates follow; under the Lite shape the forced choice is invalid (#5771),
+// so they run `tool_choice: "auto"` and may answer without searching (#6988).
 const DEFAULT_MODEL_PREFERENCES = [
+	"gpt-5.5",
 	"gpt-5.6-luna",
 	"gpt-5.6-terra",
-	"gpt-5.6-sol",
-	"gpt-5.5",
 	"gpt-5.4",
 	"gpt-5-codex",
 	"gpt-5",
@@ -85,9 +88,17 @@ function getBundledCodexModels(): CodexSearchModel[] {
 	return models;
 }
 
-function getConfiguredModel(): CodexModelCandidate | undefined {
+function getConfiguredModel(modelRegistry: ModelRegistry | undefined): CodexModelCandidate | undefined {
 	const configuredModel = $env.PI_CODEX_WEB_SEARCH_MODEL?.trim();
 	if (!configuredModel) return undefined;
+
+	// A live registry entry is fresher than bundled metadata (e.g. a discovered
+	// `useResponsesLite` flag), so it wins when it describes this exact model on
+	// the Codex Responses API. The configured id is sent verbatim either way.
+	const registryModel = modelRegistry?.find("openai-codex", configuredModel);
+	if (registryModel?.api === "openai-codex-responses") {
+		return { modelId: configuredModel, catalogModel: registryModel as CodexSearchModel };
+	}
 
 	const catalogModel = getBundledCodexModels().find(model => model.id === configuredModel);
 	return { modelId: configuredModel, ...(catalogModel ? { catalogModel } : {}) };
@@ -669,14 +680,15 @@ async function runCodexSearchCandidates(options: {
  * Default-model behavior:
  * - If `PI_CODEX_WEB_SEARCH_MODEL` is set, use it exactly once and surface any
  *   upstream error verbatim.
- * - Otherwise prefer ChatGPT-account-safe bundled defaults (GPT-5.6 Luna,
- *   Terra, Sol, GPT-5.5, …) and retry the next candidate only when Codex
- *   returns the known 400 "model is not supported" family. This avoids
- *   selecting `gpt-5-codex-mini` first on ChatGPT accounts, which OpenAI
- *   rejects.
+ * - Otherwise start with the bundled non-Lite default (`gpt-5.5`), which
+ *   accepts the forced hosted `web_search` tool choice, then advance through
+ *   the bundled Responses-Lite candidates (GPT-5.6 Luna, Terra) only when
+ *   Codex returns the known 400 "model is not supported" family or a Lite
+ *   model answers without running web search. This avoids selecting
+ *   `gpt-5-codex-mini` first on ChatGPT accounts, which OpenAI rejects.
  */
 export async function searchCodex(params: SearchParams): Promise<SearchResponse> {
-	const configuredModel = getConfiguredModel();
+	const configuredModel = getConfiguredModel(params.modelRegistry);
 	const modelCandidates = configuredModel ? [configuredModel] : getDefaultModelCandidates();
 	const firstCandidate = modelCandidates[0];
 	if (!firstCandidate) {
