@@ -320,7 +320,14 @@ function getDefaultModelCandidates(modelRegistry: ModelRegistry | undefined): Co
 	const bundledModels = getBundledCodexModels();
 	const candidates: CodexModelCandidate[] = [];
 	for (const modelId of DEFAULT_MODEL_PREFERENCES) {
-		if (modelId !== "gpt-5.6-sol" && !bundledModels.some(model => model.id === modelId)) continue;
+		if (modelId === "gpt-5.6-sol") {
+			const liveModel = modelRegistry?.find("openai-codex", modelId);
+			if (liveModel?.api === "openai-codex-responses") {
+				candidates.push({ modelId, catalogModel: liveModel as CodexSearchModel });
+			}
+			continue;
+		}
+		if (!bundledModels.some(model => model.id === modelId)) continue;
 		const candidate = findCodexModelCandidate(modelRegistry, bundledModels, modelId);
 		if (candidate) candidates.push(candidate);
 	}
