@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed Codex web search spending default attempts on Responses-Lite models that can skip hosted search by preferring non-Lite GPT-5.5 and honoring live registry request-shape metadata for explicit models.
+- Improved Codex web search parity by preferring live-registry GPT-5.6 Sol, executing its standalone `web.run` search and page-opening loop for up to five minutes, returning only final-answer citations, and retaining bundled hosted-search fallbacks.
 
 ## [17.2.3] - 2026-08-01
 

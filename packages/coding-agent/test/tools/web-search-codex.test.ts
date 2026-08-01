@@ -101,7 +101,7 @@ function makeMarkdownLinkSseResponse(model: string): string {
 				content: [
 					{
 						type: "output_text",
-						text: "See [Example Article](https://example.com/article) for details.",
+						text: "See **[Example Article](https://example.com/article)** for details.",
 						annotations: [],
 					},
 				],
@@ -194,6 +194,75 @@ function makePlainUrlPunctuationSseResponse(model: string): string {
 	].join("\n");
 }
 
+function makeWebRunCallSse(model: string): string {
+	return [
+		`data: ${JSON.stringify({
+			type: "response.output_item.done",
+			item: {
+				type: "message",
+				role: "assistant",
+				content: [
+					{
+						type: "output_text",
+						text: "Searching an initial result.",
+						annotations: [
+							{
+								type: "url_citation",
+								title: "Intermediate result",
+								url: "https://irrelevant.example/intermediate",
+							},
+						],
+					},
+				],
+			},
+		})}`,
+		"",
+		`data: ${JSON.stringify({
+			type: "response.output_item.done",
+			item: {
+				type: "function_call",
+				namespace: "web",
+				name: "run",
+				call_id: "web_call_1",
+				arguments: JSON.stringify({ search_query: [{ q: "official DeepSeek API terms" }] }),
+			},
+		})}`,
+		"",
+		`data: ${JSON.stringify({
+			type: "response.completed",
+			response: { id: "resp_sol_search", model },
+		})}`,
+		"",
+	].join("\n");
+}
+
+function makeStandaloneFinalSse(model: string): string {
+	return [
+		`data: ${JSON.stringify({
+			type: "response.output_item.done",
+			item: {
+				type: "message",
+				content: [
+					{
+						type: "output_text",
+						text: "DeepSeek may use API inputs and outputs. [DeepSeek Terms](https://example.com/terms)",
+					},
+				],
+			},
+		})}`,
+		"",
+		`data: ${JSON.stringify({
+			type: "response.completed",
+			response: {
+				id: "resp_sol_final",
+				model,
+				usage: { input_tokens: 20, output_tokens: 8, total_tokens: 28 },
+			},
+		})}`,
+		"",
+	].join("\n");
+}
+
 describe("searchCodex model selection", () => {
 	const fakeAuthStorage = {
 		async getOAuthAccess() {
@@ -246,6 +315,23 @@ describe("searchCodex model selection", () => {
 			return async () => "test-proxy-key";
 		},
 	} as unknown as ModelRegistry;
+	const liveSolModelRegistry = {
+		find(provider: string, modelId: string) {
+			if (provider !== "openai-codex" || modelId !== "gpt-5.6-sol") return undefined;
+			return {
+				provider,
+				id: modelId,
+				api: "openai-codex-responses",
+				useResponsesLite: true,
+			};
+		},
+		getProviderBaseUrl() {
+			return undefined;
+		},
+		getProviderHeaders() {
+			return {};
+		},
+	} as unknown as ModelRegistry;
 	let capturedRequest: CapturedRequest | null = null;
 
 	function makeSearchParams(query: string, fetch?: FetchImpl): SearchParams {
@@ -284,7 +370,7 @@ describe("searchCodex model selection", () => {
 		}
 	});
 
-	it("uses gpt-5.5 as the first bundled default with a forced web_search tool choice", async () => {
+	it("uses gpt-5.5 as the first bundled fallback when live Sol is unavailable", async () => {
 		delete process.env.PI_CODEX_WEB_SEARCH_MODEL;
 		const result = await searchCodex(makeSearchParams("default codex model", mockCodexFetch("gpt-5.5")));
 
@@ -297,6 +383,166 @@ describe("searchCodex model selection", () => {
 		expect(capturedRequest?.body?.tool_choice).toEqual({ type: "web_search" });
 		expect(result.model).toBe("gpt-5.5");
 		expect(result.sources).toEqual([{ title: "Example Article", url: "https://example.com/article" }]);
+	});
+
+	it("runs live gpt-5.6-sol through the standalone web.run loop", async () => {
+		delete process.env.PI_CODEX_WEB_SEARCH_MODEL;
+		const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(new AbortController().signal);
+		const requests: CapturedRequest[] = [];
+		let modelCalls = 0;
+		const fetchMock: FetchImpl = (url, init) => {
+			const request = {
+				url: typeof url === "string" ? url : url.toString(),
+				headers: init?.headers,
+				body: init?.body ? (JSON.parse(init.body as string) as Record<string, unknown>) : null,
+			};
+			requests.push(request);
+			if (request.url.endsWith("/codex/alpha/search")) {
+				return Promise.resolve(
+					Response.json({
+						output: "Search result: https://irrelevant.example/page",
+						results: [{ title: "Consulted result", url: "https://irrelevant.example/page" }],
+					}),
+				);
+			}
+			modelCalls += 1;
+			return Promise.resolve(
+				new Response(modelCalls === 1 ? makeWebRunCallSse("gpt-5.6-sol") : makeStandaloneFinalSse("gpt-5.6-sol"), {
+					status: 200,
+					headers: { "Content-Type": "text/event-stream" },
+				}),
+			);
+		};
+
+		const result = await searchCodex({
+			...makeSearchParams("Sol web search", fetchMock),
+			modelRegistry: liveSolModelRegistry,
+			maxOutputTokens: 1_234,
+		});
+
+		expect(requests).toHaveLength(3);
+		const [initial, standalone, continuation] = requests;
+		expect(initial?.url).toBe("https://chatgpt.com/backend-api/codex/responses");
+		expect(initial?.body).toEqual(
+			expect.objectContaining({
+				model: "gpt-5.6-sol",
+				tool_choice: "required",
+				input: expect.arrayContaining([
+					expect.objectContaining({
+						type: "additional_tools",
+						tools: [expect.objectContaining({ type: "namespace", name: "web" })],
+					}),
+				]),
+			}),
+		);
+		expect(new Headers(initial?.headers).get("x-openai-internal-codex-responses-lite")).toBe("true");
+		expect(standalone?.url).toBe("https://chatgpt.com/backend-api/codex/alpha/search");
+		expect(standalone?.body).toEqual(
+			expect.objectContaining({
+				model: "gpt-5.6-sol",
+				input: [
+					{
+						type: "message",
+						role: "user",
+						content: [{ type: "input_text", text: "Sol web search" }],
+					},
+				],
+				commands: { search_query: [{ q: "official DeepSeek API terms" }] },
+				settings: {
+					search_context_size: "high",
+					allowed_callers: ["direct"],
+					external_web_access: true,
+				},
+				max_output_tokens: 1_234,
+			}),
+		);
+		const standaloneHeaders = new Headers(standalone?.headers);
+		expect(standaloneHeaders.get("authorization")).toBe("Bearer test-access-token");
+		expect(standaloneHeaders.get("chatgpt-account-id")).toBe("acct-test");
+		expect(standaloneHeaders.get("accept")).toBe("application/json");
+		expect(continuation?.body?.input).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					type: "function_call_output",
+					call_id: "web_call_1",
+					output: [{ type: "input_text", text: "Search result: https://irrelevant.example/page" }],
+				}),
+			]),
+		);
+		expect(timeoutSpy).toHaveBeenCalledWith(300_000);
+		expect(result).toEqual(
+			expect.objectContaining({
+				provider: "codex",
+				model: "gpt-5.6-sol",
+				answer: "DeepSeek may use API inputs and outputs. [DeepSeek Terms](https://example.com/terms)",
+				sources: [{ title: "DeepSeek Terms", url: "https://example.com/terms" }],
+			}),
+		);
+	});
+
+	it("does not fall back when explicitly configured Sol standalone search is rejected", async () => {
+		process.env.PI_CODEX_WEB_SEARCH_MODEL = "gpt-5.6-sol";
+		let calls = 0;
+		const fetchMock: FetchImpl = (url, init) => {
+			calls += 1;
+			if ((typeof url === "string" ? url : url.toString()).endsWith("/codex/alpha/search")) {
+				return Promise.resolve(Response.json({ detail: "The model is not supported" }, { status: 400 }));
+			}
+			const body = init?.body ? (JSON.parse(init.body as string) as Record<string, unknown>) : null;
+			expect(body?.model).toBe("gpt-5.6-sol");
+			return Promise.resolve(
+				new Response(makeWebRunCallSse("gpt-5.6-sol"), {
+					status: 200,
+					headers: { "Content-Type": "text/event-stream" },
+				}),
+			);
+		};
+
+		await expect(
+			searchCodex({
+				...makeSearchParams("Explicit Sol search", fetchMock),
+				modelRegistry: liveSolModelRegistry,
+			}),
+		).rejects.toThrow("not supported");
+		expect(calls).toBe(2);
+	});
+
+	it("falls back to bundled gpt-5.5 when live Sol skips web search", async () => {
+		delete process.env.PI_CODEX_WEB_SEARCH_MODEL;
+		let calls = 0;
+		const noSearchSse = [
+			`data: ${JSON.stringify({
+				type: "response.output_item.done",
+				item: { type: "message", content: [{ type: "output_text", text: "answer without search" }] },
+			})}`,
+			`data: ${JSON.stringify({ type: "response.completed", response: { id: "resp_sol_skip", model: "gpt-5.6-sol" } })}`,
+			"",
+		].join("\n");
+		const fetchMock: FetchImpl = (_url, init) => {
+			calls += 1;
+			const body = init?.body ? (JSON.parse(init.body as string) as Record<string, unknown>) : null;
+			if (calls === 1) {
+				expect(body?.model).toBe("gpt-5.6-sol");
+				return Promise.resolve(
+					new Response(noSearchSse, { status: 200, headers: { "Content-Type": "text/event-stream" } }),
+				);
+			}
+			expect(body?.model).toBe("gpt-5.5");
+			return Promise.resolve(
+				new Response(makeSseResponse("gpt-5.5"), {
+					status: 200,
+					headers: { "Content-Type": "text/event-stream" },
+				}),
+			);
+		};
+
+		const result = await searchCodex({
+			...makeSearchParams("Sol fallback", fetchMock),
+			modelRegistry: liveSolModelRegistry,
+		});
+
+		expect(calls).toBe(2);
+		expect(result.model).toBe("gpt-5.5");
 	});
 
 	function sentUserText(): string | undefined {
