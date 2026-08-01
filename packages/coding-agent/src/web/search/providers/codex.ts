@@ -18,6 +18,7 @@ import {
 	createOpenAICodexCompatibilityMetadata,
 	resolveCodexResponsesUrl,
 } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import { validateJsonSchemaValue } from "@oh-my-pi/pi-ai/utils/schema";
 import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import {
 	CODEX_BASE_URL,
@@ -276,7 +277,7 @@ interface CodexSearchResult {
 }
 const CodexStandaloneSearchResponseSchema = type({
 	output: "string",
-	"results?": "unknown[]",
+	"results?": "unknown[] | null",
 	"encrypted_output?": "string | null",
 });
 
@@ -321,6 +322,7 @@ function getDefaultModelCandidates(modelRegistry: ModelRegistry | undefined): Co
 	const bundledModels = getBundledCodexModels();
 	const candidates: CodexModelCandidate[] = [];
 	for (const modelId of DEFAULT_MODEL_PREFERENCES) {
+		if (modelId !== "gpt-5.6-sol" && !bundledModels.some(model => model.id === modelId)) continue;
 		const candidate = findCodexModelCandidate(modelRegistry, bundledModels, modelId);
 		if (candidate) candidates.push(candidate);
 	}
@@ -564,11 +566,13 @@ function extractTextSources(text: string): SearchSource[] {
 			continue;
 		}
 		const title = text.slice(index + 1, titleEnd).trim();
-		const url = normalizeExtractedUrl(text.slice(titleEnd + 2, urlEnd));
+		const destination = text.slice(titleEnd + 2, urlEnd).trim();
+		const titleStart = destination.search(/\s/);
+		const url = normalizeExtractedUrl(titleStart === -1 ? destination : destination.slice(0, titleStart));
 		if (url) {
 			addSource(sources, { title: title || url, url });
+			markdownUrlRanges.push([titleEnd + 2, urlEnd]);
 		}
-		markdownUrlRanges.push([titleEnd + 2, urlEnd]);
 		index = urlEnd;
 	}
 
@@ -799,6 +803,9 @@ async function callCodexStandaloneSearch(
 				const completed = parseCodexResponse(rawEvent.response);
 				if (!completed) continue;
 				if (completed.model) model = completed.model;
+				if (completed.status && completed.status !== "completed") {
+					throw new SearchProviderError("codex", `Codex response ended with status ${completed.status}`, 502);
+				}
 				if (completed.id) requestId = completed.id;
 				if (completed.usage) {
 					const cachedTokens = completed.usage.input_tokens_details?.cached_tokens ?? 0;
@@ -816,6 +823,8 @@ async function callCodexStandaloneSearch(
 					? `Codex request failed (${code}): ${message || "Request failed"}`
 					: `Codex request failed: ${message || "Request failed"}`;
 				throw new SearchProviderError("codex", detail, 500);
+			} else if (eventType === "response.incomplete") {
+				throw new SearchProviderError("codex", "Codex response was incomplete", 502);
 			}
 		}
 
@@ -843,15 +852,19 @@ async function callCodexStandaloneSearch(
 		}
 
 		for (const call of functionCalls) {
-			webRunCallCount += 1;
 			const callId = call.call_id;
 			if (!callId) continue;
 
 			let commands: Record<string, unknown>;
 			try {
-				const parsed = JSON.parse(call.arguments ?? "");
+				const argumentsText = call.arguments?.trim() ?? "";
+				const parsed = argumentsText ? JSON.parse(argumentsText) : {};
 				if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 					throw new Error("expected a JSON object");
+				}
+				const validation = validateJsonSchemaValue(CODEX_WEB_RUN_PARAMETERS, parsed);
+				if (!validation.success) {
+					throw new Error(validation.issues.map(issue => issue.message).join("; "));
 				}
 				commands = parsed as Record<string, unknown>;
 			} catch (error) {
@@ -908,6 +921,7 @@ async function callCodexStandaloneSearch(
 					502,
 				);
 			}
+			webRunCallCount += 1;
 			history.push({
 				type: "function_call_output",
 				call_id: callId,
