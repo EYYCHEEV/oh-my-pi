@@ -612,6 +612,8 @@ describe("searchCodex model selection", () => {
 	});
 
 	it("routes a namespaced web.run call without starting the private Sol loop", async () => {
+		const searchOutput =
+			"Investors cool on red-hot chip stocks (https://www.axios.com/2026/07/29/chips-stocks-ai-china)\nciteturn0news12";
 		const requests: CapturedRequest[] = [];
 		const fetchMock: FetchImpl = (url, init) => {
 			requests.push({
@@ -619,7 +621,7 @@ describe("searchCodex model selection", () => {
 				headers: init?.headers,
 				body: init?.body ? (JSON.parse(init.body as string) as Record<string, unknown>) : null,
 			});
-			return Promise.resolve(Response.json({ output: "One-layer result", results: [] }));
+			return Promise.resolve(Response.json({ output: searchOutput, results: [] }));
 		};
 		const storedMessage = { role: "custom", customType: "bashExecution", content: "hidden shape" } as AgentMessage;
 		const modelMessage = { role: "user", content: "current question", timestamp: 1 } as Message;
@@ -663,7 +665,13 @@ describe("searchCodex model selection", () => {
 		expect(requests[0]?.body?.commands).toEqual({ search_query: [{ q: "latest SK hynix earnings" }] });
 		expect(requests[0]?.body?.id).toBe("provider-session-native-route");
 		expect(requests[0]?.body?.input).toEqual(buildCodexWebRunInput([modelMessage]));
-		expect(result.content).toEqual([{ type: "text", text: "One-layer result" }]);
+		expect(result.content).toEqual([{ type: "text", text: searchOutput }]);
+		expect(result.details?.response.sources).toEqual([
+			{
+				title: "https://www.axios.com/2026/07/29/chips-stocks-ai-china",
+				url: "https://www.axios.com/2026/07/29/chips-stocks-ai-china",
+			},
+		]);
 	});
 
 	it("feeds invalid commands back, then accepts blank commands and null results", async () => {
