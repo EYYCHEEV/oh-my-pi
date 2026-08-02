@@ -1074,6 +1074,83 @@ describe("openai-codex streaming", () => {
 		expect(toolcallEnds.find(e => e.name === "other")?.contentIndex).toBe(1);
 	});
 
+	it("maps namespaced web.run calls back to the registered tool", async () => {
+		const token = createCodexTestToken();
+		const context: Context = {
+			...createCodexTestContext(),
+			tools: [
+				{
+					name: "web_search",
+					description: "Generic web search",
+					parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+					native: {
+						type: "namespace",
+						namespace: "web",
+						name: "run",
+						description: "Run web commands",
+						parameters: { type: "object", properties: { search_query: { type: "array" } } },
+						modelIds: ["gpt-5.6-sol"],
+					},
+				},
+			],
+		};
+		const args = { search_query: [{ q: "latest SK hynix earnings" }] };
+		const item = {
+			type: "function_call",
+			id: "fc_web_run",
+			call_id: "call_web_run",
+			namespace: "web",
+			name: "run",
+			arguments: JSON.stringify(args),
+		};
+		const events = [
+			{ type: "response.output_item.added", output_index: 0, item: { ...item, arguments: "" } },
+			{ type: "response.output_item.done", output_index: 0, item },
+			{
+				type: "response.completed",
+				response: {
+					id: "resp_web_run",
+					status: "completed",
+					usage: {
+						input_tokens: 5,
+						output_tokens: 3,
+						total_tokens: 8,
+						input_tokens_details: { cached_tokens: 0 },
+					},
+				},
+			},
+		];
+		const sse = `${events.map(event => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\n`;
+		const fetchMock: FetchImpl = (async () =>
+			new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } })) as FetchImpl;
+		const model = {
+			...createCodexTestModel("https://chatgpt.com/backend-api"),
+			id: "gpt-5.6-sol",
+			useResponsesLite: true,
+			preferWebsockets: false,
+		};
+
+		const stream = streamOpenAICodexResponses(model, context, { apiKey: token, fetch: fetchMock });
+		const streamed = [];
+		for await (const event of stream) streamed.push(event);
+		const result = await stream.result();
+		const call = result.content.find(content => content.type === "toolCall");
+		const completedCall = streamed.find(event => event.type === "toolcall_end");
+
+		expect(call).toMatchObject({
+			type: "toolCall",
+			name: "web_search",
+			arguments: args,
+			providerMetadata: { type: "namespace", namespace: "web", name: "run" },
+		});
+		expect(completedCall?.type === "toolcall_end" ? completedCall.toolCall : undefined).toMatchObject({
+			type: "toolCall",
+			name: "web_search",
+			arguments: args,
+			providerMetadata: { type: "namespace", namespace: "web", name: "run" },
+		});
+	});
+
 	it("uses output_index to finalize idless function and custom tool calls", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());

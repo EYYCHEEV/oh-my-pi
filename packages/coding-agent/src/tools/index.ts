@@ -1,6 +1,6 @@
 import type { Clipboard, InMemorySnapshotStore } from "@oh-my-pi/hashline";
-import type { AgentOptions, AgentTelemetryConfig, AgentTool } from "@oh-my-pi/pi-agent-core";
-import type { FetchImpl, ImageContent, Model, ServiceTierByFamily, ToolChoice } from "@oh-my-pi/pi-ai";
+import type { AgentMessage, AgentOptions, AgentTelemetryConfig, AgentTool } from "@oh-my-pi/pi-agent-core";
+import type { FetchImpl, ImageContent, Message, Model, ServiceTierByFamily, ToolChoice } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AsyncJobManager } from "../async/job-manager";
 import type { Rule } from "../capability/rule";
@@ -235,6 +235,8 @@ export interface ToolSession {
 	getSessionFile: () => string | null;
 	/** Parent session journal used by tools that persist runtime lifecycle state. */
 	sessionManager?: Pick<SessionManager, "appendCustomEntry" | "ensureOnDisk" | "flush" | "getBranch" | "getEntries">;
+	/** Project session messages through the same model-visible boundary as the active turn. */
+	convertMessagesToLlm?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<Message[]>;
 	/** Get eval kernel owner ID for session-scoped retained-kernel cleanup. */
 	getEvalKernelOwnerId?: () => string | null;
 	/** Reject new eval work once session disposal has started. */
@@ -243,6 +245,8 @@ export interface ToolSession {
 	trackEvalExecution?<T>(execution: Promise<T>, abortController: AbortController): Promise<T>;
 	/** Get session ID */
 	getSessionId?: () => string | null;
+	/** Get the provider-facing request lineage ID, including explicit overrides and live rotation. */
+	getProviderSessionId?: () => string | null;
 	/** Get Hindsight runtime state for this agent session. */
 	getHindsightSessionState?: () => HindsightSessionState | undefined;
 	/** Get Mnemopi runtime state for this agent session. */

@@ -3189,13 +3189,19 @@ describe("ExtensionRunner", () => {
 	describe("invokeTool same-tool delegation", () => {
 		// Records what the native tool actually received, so the inherited abort/progress channels and
 		// the caller context are observable.
-		function nativeProbe(seen: { signal?: AbortSignal; onUpdate?: unknown; params?: unknown }): AgentTool {
+		function nativeProbe(seen: {
+			id?: string;
+			signal?: AbortSignal;
+			onUpdate?: unknown;
+			params?: unknown;
+		}): AgentTool {
 			return {
 				name: "bash",
 				label: "Bash",
 				description: "native bash",
 				parameters: Type.Object({ command: Type.String() }),
-				execute: async (_id: string, params: unknown, signal?: AbortSignal, onUpdate?: unknown) => {
+				execute: async (id: string, params: unknown, signal?: AbortSignal, onUpdate?: unknown) => {
+					seen.id = id;
 					seen.params = params;
 					seen.signal = signal;
 					seen.onUpdate = onUpdate;
@@ -3220,13 +3226,14 @@ describe("ExtensionRunner", () => {
 		};
 
 		it("inherits the wrapper call's signal and onUpdate for a bare invokeTool", async () => {
-			const seen: { signal?: AbortSignal; onUpdate?: unknown; params?: unknown } = {};
+			const seen: { id?: string; signal?: AbortSignal; onUpdate?: unknown; params?: unknown } = {};
 			const runner = await runnerWithNative(nativeProbe(seen));
 			const controller = new AbortController();
 			const onUpdate = () => {};
 
 			const ctx = runner.createContext(undefined, {
 				toolName: "bash",
+				toolCallId: "call-invoke-outer",
 				signal: controller.signal,
 				onUpdate,
 			});
@@ -3236,6 +3243,7 @@ describe("ExtensionRunner", () => {
 			expect(seen.signal).toBe(controller.signal);
 			expect(seen.onUpdate).toBe(onUpdate);
 			expect(seen.params).toEqual({ command: "echo hi" });
+			expect(seen.id).toBe("call-invoke-outer");
 		});
 
 		it("lets explicit invokeTool options override the inherited channels", async () => {

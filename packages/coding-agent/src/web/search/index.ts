@@ -5,7 +5,7 @@
  * providers with provider-specific parameters exposed conditionally.
  */
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import type { AuthStorage } from "@oh-my-pi/pi-ai";
+import type { AuthStorage, FetchImpl, Message, NativeToolMarker } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import { ModelRegistry } from "../../config/model-registry";
@@ -15,6 +15,7 @@ import type { Theme } from "../../modes/theme/theme";
 import webSearchSystemPrompt from "../../prompts/system/web-search.md" with { type: "text" };
 import webSearchDescription from "../../prompts/tools/web-search.md" with { type: "text" };
 import { discoverAuthStorage } from "../../sdk";
+import { convertToLlm } from "../../session/messages";
 import type { ToolSession } from "../../tools";
 import { formatAge } from "../../tools/render-utils";
 import { throwIfAborted } from "../../tools/tool-errors";
@@ -27,6 +28,7 @@ import {
 	type SearchProvider,
 	type SearchProviderCandidate,
 } from "./provider";
+import { CODEX_WEB_RUN_DESCRIPTION, CODEX_WEB_RUN_PARAMETERS, executeCodexWebRun } from "./providers/codex";
 import { applyQueryConstraints, parseSearchQuery } from "./query";
 import { renderSearchCall, renderSearchResult, type SearchRenderDetails } from "./render";
 import type { SearchProviderId, SearchResponse } from "./types";
@@ -41,6 +43,15 @@ export const webSearchSchema = type({
 	temperature: "number?",
 	num_search_results: "number?",
 });
+
+const CODEX_WEB_RUN_NATIVE_TOOL = {
+	type: "namespace",
+	namespace: "web",
+	name: "run",
+	description: CODEX_WEB_RUN_DESCRIPTION,
+	parameters: CODEX_WEB_RUN_PARAMETERS,
+	modelIds: ["gpt-5.6-sol"],
+} as const satisfies NativeToolMarker;
 
 export type SearchToolParams = typeof webSearchSchema.infer;
 
@@ -126,6 +137,39 @@ interface ExecuteSearchOptions {
 	modelRegistry?: ModelRegistry;
 	sessionId?: string;
 	signal?: AbortSignal;
+}
+
+function isCodexWebRunCall(context: AgentToolContext | undefined): boolean {
+	const metadata = context?.toolCall?.providerMetadata;
+	return metadata?.type === "namespace" && metadata.namespace === "web" && metadata.name === "run";
+}
+
+async function executeCodexWebRunTool(
+	commands: Record<string, unknown>,
+	options: {
+		authStorage: AuthStorage;
+		messages: readonly Message[];
+		modelId: string | undefined;
+		sessionId: string | undefined;
+		signal?: AbortSignal;
+		fetch?: FetchImpl;
+	},
+): Promise<AgentToolResult<SearchRenderDetails>> {
+	if (!options.modelId) throw new Error("Codex web.run requires an active model");
+	const result = await executeCodexWebRun({
+		authStorage: options.authStorage,
+		commands,
+		messages: options.messages,
+		modelId: options.modelId,
+		sessionId: options.sessionId,
+		signal: options.signal,
+		fetch: options.fetch,
+	});
+	const response: SearchResponse = { provider: "codex", answer: result.output, sources: [] };
+	return {
+		content: [{ type: "text", text: result.output }],
+		details: { response },
+	};
 }
 
 /** Execute web search */
@@ -305,6 +349,7 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 	readonly description: string;
 	readonly parameters = webSearchSchema;
 	readonly strict = true;
+	readonly native = CODEX_WEB_RUN_NATIVE_TOOL;
 	readonly loadMode = "discoverable";
 	readonly summary = "Search the web for up-to-date information";
 
@@ -322,6 +367,24 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 		_onUpdate?: AgentToolUpdateCallback<SearchRenderDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<SearchRenderDetails>> {
+		if (isCodexWebRunCall(_context)) {
+			const authStorage = this.#session.authStorage ?? (await discoverAuthStorage());
+			const sessionMessages =
+				this.#session.sessionManager
+					?.getBranch()
+					.flatMap(entry => (entry.type === "message" ? [entry.message] : [])) ?? [];
+			const messages = this.#session.convertMessagesToLlm
+				? await this.#session.convertMessagesToLlm(sessionMessages, signal)
+				: convertToLlm(sessionMessages);
+			return executeCodexWebRunTool(params as unknown as Record<string, unknown>, {
+				authStorage,
+				messages,
+				modelId: _context?.model?.id ?? this.#session.getActiveModel?.()?.id,
+				sessionId: this.#session.getProviderSessionId?.() ?? this.#session.getSessionId?.() ?? undefined,
+				signal,
+				fetch: this.#session.fetch,
+			});
+		}
 		const authStorage = this.#session.authStorage ?? (await discoverAuthStorage());
 		const sessionId = this.#session.getSessionId?.() ?? undefined;
 		return executeSearch(_toolCallId, params, {
@@ -340,6 +403,7 @@ export const webSearchCustomTool: CustomTool<typeof webSearchSchema, SearchRende
 	description: prompt.render(webSearchDescription),
 	parameters: webSearchSchema,
 
+	native: CODEX_WEB_RUN_NATIVE_TOOL,
 	approval: "read",
 	async execute(
 		toolCallId: string,
@@ -348,6 +412,9 @@ export const webSearchCustomTool: CustomTool<typeof webSearchSchema, SearchRende
 		ctx: CustomToolContext,
 		signal?: AbortSignal,
 	) {
+		if (ctx.invokeTool) {
+			return ctx.invokeTool(params as unknown as Record<string, unknown>, { signal, onUpdate: _onUpdate });
+		}
 		const authStorage = ctx.modelRegistry?.authStorage ?? (await discoverAuthStorage());
 		const sessionId = ctx.sessionManager.getSessionId();
 		return executeSearch(toolCallId, params, {

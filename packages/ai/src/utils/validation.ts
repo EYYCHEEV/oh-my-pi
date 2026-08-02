@@ -1572,14 +1572,28 @@ type ValidationContext =
  * to recompute-on-call instead of throwing on assignment.
  */
 const kValidationContext = Symbol("ai.validationContext");
-function getValidationContext(tool: Tool): ValidationContext {
-	return stamp(tool.parameters as object, kValidationContext, params =>
+function getValidationContext(parameters: Tool["parameters"]): ValidationContext {
+	return stamp(parameters as object, kValidationContext, params =>
 		isArkSchema(params)
 			? { kind: "arktype", ark: params, json: arkToWireSchema(params) }
 			: isZodSchema(params)
 				? { kind: "zod", zod: params, json: zodToWireSchema(params) }
 				: { kind: "json", json: upgradeJsonSchemaTo202012(params) as Record<string, unknown> },
 	);
+}
+
+function validationParameters(tool: Tool, toolCall: ToolCall): Tool["parameters"] {
+	const metadata = toolCall.providerMetadata;
+	const native = tool.native;
+	if (
+		metadata?.type === "namespace" &&
+		native?.type === "namespace" &&
+		metadata.namespace === native.namespace &&
+		metadata.name === native.name
+	) {
+		return native.parameters;
+	}
+	return tool.parameters;
 }
 
 type ContextValidationResult =
@@ -1870,7 +1884,7 @@ export function validateToolArguments(tool: Tool, toolCall: ToolCall): ToolCall[
 			`Validation failed for tool "${toolCall.name}": Tool call arguments are not valid JSON.\nParse Error: ${parseError}\nRaw JSON:\n${truncatedRawJson}`,
 		);
 	}
-	const ctx = getValidationContext(tool);
+	const ctx = getValidationContext(validationParameters(tool, toolCall));
 	const { json } = ctx;
 
 	// Always normalize first — strip null/string "null" from optional fields,

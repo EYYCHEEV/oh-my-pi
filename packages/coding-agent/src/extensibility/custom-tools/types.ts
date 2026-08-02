@@ -13,7 +13,7 @@ import type {
 	ToolTier,
 } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
-import type { FetchImpl, Model, Static, TSchema } from "@oh-my-pi/pi-ai";
+import type { FetchImpl, Model, NativeToolMarker, Static, TSchema } from "@oh-my-pi/pi-ai";
 import type { Component } from "@oh-my-pi/pi-tui";
 import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
 import type { type as ArkType } from "arktype";
@@ -102,6 +102,11 @@ export interface CustomToolContext {
 	localProtocolOptions?: LocalProtocolOptions;
 	/** Whether to auto-approve all destructive tool operations (--auto-approve CLI flag) */
 	autoApprove?: boolean;
+	/** Delegate a re-registered built-in to its native implementation. */
+	invokeTool?<TDetails = unknown>(
+		params: Record<string, unknown>,
+		options?: { signal?: AbortSignal; onUpdate?: AgentToolUpdateCallback<TDetails> },
+	): Promise<AgentToolResult<TDetails>>;
 }
 
 /** Session event passed to onSession callback */
@@ -207,6 +212,8 @@ export interface CustomTool<TParams extends TSchema = TSchema, TDetails = any> {
 	description: string;
 	/** Parameter schema (arktype, TypeBox, or legacy formats). */
 	parameters: TParams;
+	/** Provider-native wire representation and validation schema. */
+	native?: NativeToolMarker;
 	/** If true, tool is excluded unless explicitly listed in --tools or agent's tools field */
 	hidden?: boolean;
 	/** How this tool is presented when enabled. See {@link ToolLoadMode}. Custom tools default to `"discoverable"`; set `"essential"` to stay top-level. */

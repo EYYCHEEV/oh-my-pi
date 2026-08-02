@@ -24,6 +24,7 @@ import type {
 	ImageContent,
 	Model,
 	ModelSpec,
+	NativeToolMarker,
 	ProviderResponseMetadata,
 	ServiceTier,
 	ServiceTierByFamily,
@@ -557,6 +558,8 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	description: string;
 	/** Parameter schema (Zod, or TypeBox for legacy/extension compat). */
 	parameters: TParams;
+	/** Provider-native wire representation and validation schema. */
+	native?: NativeToolMarker;
 	/** If true, tool is excluded unless explicitly listed in --tools or agent's tools field */
 	hidden?: boolean;
 	/** If true, tool is registered but not auto-included in the initial active set.
