@@ -796,16 +796,20 @@ class CodexStreamRuntime {
 	whitespaceToolCallArgumentsDelta?: CodexWhitespaceToolCallArgumentsDeltaState;
 	whitespaceLoopRetries = 0;
 
+	readonly namespacedToolNames: ReadonlyMap<string, string>;
+
 	constructor(initial: {
 		eventStream: AsyncGenerator<Record<string, unknown>>;
 		requestBodyForState: RequestBody;
 		transport: CodexTransport;
 		websocketState?: CodexWebSocketSessionState;
+		namespacedToolNames: ReadonlyMap<string, string>;
 	}) {
 		this.eventStream = initial.eventStream;
 		this.requestBodyForState = initial.requestBodyForState;
 		this.transport = initial.transport;
 		this.websocketState = initial.websocketState;
+		this.namespacedToolNames = initial.namespacedToolNames;
 	}
 
 	/**
@@ -1183,13 +1187,21 @@ export function normalizeCodexToolChoice(
 	if (!choice) return undefined;
 	if (typeof choice === "string") return choice;
 	const allowFreeform = model ? model.applyPatchToolType === "freeform" : false;
-	const mapName = (name: string): Record<string, string> | undefined => {
+	const mapName = (name: string): string | Record<string, string> | undefined => {
 		const directTool = tools.find(tool => tool.name === name);
 		const customTool = allowFreeform
 			? tools.find(tool => tool.customFormat && (tool.name === name || tool.customWireName === name))
 			: undefined;
 		const offeredTool = customTool ?? directTool;
 		if (!offeredTool) return undefined;
+		if (
+			offeredTool.native?.type === "namespace" &&
+			model &&
+			(!offeredTool.native.modelIds || offeredTool.native.modelIds.includes(model.id))
+		) {
+			// Codex's request contract accepts only string choices for namespaced tools.
+			return "required";
+		}
 		if (offeredTool.native?.type === "computer" && model?.supportsComputerUse === true) {
 			return { type: "computer" };
 		}
@@ -1511,12 +1523,22 @@ export async function buildTransformedCodexRequestBody(
 	// (#3117 — codex-rs sends none of these either.)
 	applyOpenAIServiceTier(params, options?.serviceTier, model);
 	if (context.tools && context.tools.length > 0) {
-		params.tools = convertOpenAICodexResponsesTools(context.tools, model);
-		if (options?.toolChoice) {
-			const toolChoice = normalizeCodexToolChoice(options.toolChoice, context.tools, model);
-			if (toolChoice) {
-				params.tool_choice = toolChoice;
+		let requestTools = context.tools;
+		const requestedChoice = options?.toolChoice;
+		if (requestedChoice && typeof requestedChoice !== "string" && requestedChoice.type !== "computer") {
+			const requestedName = "function" in requestedChoice ? requestedChoice.function.name : requestedChoice.name;
+			const requestedTool = context.tools.find(tool => tool.name === requestedName);
+			if (
+				requestedTool?.native?.type === "namespace" &&
+				(!requestedTool.native.modelIds || requestedTool.native.modelIds.includes(model.id))
+			) {
+				requestTools = [requestedTool];
 			}
+		}
+		params.tools = convertOpenAICodexResponsesTools(requestTools, model);
+		if (requestedChoice) {
+			const toolChoice = normalizeCodexToolChoice(requestedChoice, context.tools, model);
+			if (toolChoice) params.tool_choice = toolChoice;
 		}
 	}
 
@@ -1888,7 +1910,10 @@ function isJsonWhitespaceOnly(value: string): boolean {
 	return true;
 }
 
-function createOutputBlockForItem(item: CodexEventItem): CodexOutputBlock | null {
+function createOutputBlockForItem(
+	item: CodexEventItem,
+	namespacedToolNames: ReadonlyMap<string, string>,
+): CodexOutputBlock | null {
 	if (item.type === "reasoning") {
 		return { type: "thinking", thinking: "" };
 	}
@@ -1897,11 +1922,15 @@ function createOutputBlockForItem(item: CodexEventItem): CodexOutputBlock | null
 		return { type: "text", text: "", textSignature: encodeTextSignatureV1(item.id, phase) };
 	}
 	if (item.type === "function_call") {
+		const namespace = item.namespace;
 		return {
 			type: "toolCall",
 			id: encodeResponsesToolCallId(item.call_id, item.id),
-			name: item.name,
+			name: namespace
+				? (namespacedToolNames.get(`${namespace}\0${item.name}`) ?? `${namespace}.${item.name}`)
+				: item.name,
 			arguments: {},
+			...(namespace ? { providerMetadata: { type: "namespace" as const, namespace, name: item.name } } : {}),
 			[kStreamingPartialJson]: item.arguments || "",
 		};
 	}
@@ -2070,7 +2099,7 @@ class CodexStreamProcessor {
 			if (!firstTokenTime) firstTokenTime = performance.now();
 			const item = rawEvent.item as CodexEventItem;
 			this.runtime.currentItem = item;
-			this.runtime.currentBlock = createOutputBlockForItem(item);
+			this.runtime.currentBlock = createOutputBlockForItem(item, this.runtime.namespacedToolNames);
 			let contentIndex = -1;
 			if (this.runtime.currentBlock) {
 				output.content.push(this.runtime.currentBlock);
@@ -2344,16 +2373,24 @@ class CodexStreamProcessor {
 		}
 
 		if (item.type === "function_call") {
+			const id = encodeResponsesToolCallId(item.call_id, item.id);
+			const args = parseStreamingJson(item.arguments || "{}");
+			const started =
+				block?.type === "toolCall" ? block : createOutputBlockForItem(item, runtime.namespacedToolNames);
 			const toolCall: ToolCall = {
 				type: "toolCall",
-				id: encodeResponsesToolCallId(item.call_id, item.id),
-				name: item.name,
-				arguments: parseStreamingJson(item.arguments || "{}"),
+				id,
+				name: started?.type === "toolCall" ? started.name : item.name,
+				arguments: args,
+				...(started?.type === "toolCall" && started.providerMetadata
+					? { providerMetadata: started.providerMetadata }
+					: {}),
 			};
 			if (block?.type === "toolCall") {
-				// Persist the authoritative final args on the stored block; the throttled
-				// delta parser may have left block.arguments stale (often `{}`).
-				block.arguments = toolCall.arguments;
+				// Persist the authoritative final id and args on the stored block; the
+				// throttled delta parser may have left block.arguments stale (often `{}`).
+				block.id = id;
+				block.arguments = args;
 				clearStreamingPartialJson(block);
 			}
 			// Detach so a late/duplicate arguments.delta cannot append to the
@@ -2874,6 +2911,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			const runtime = new CodexStreamRuntime({
 				...initialTransport,
 				websocketState: requestContext.websocketState,
+				namespacedToolNames: collectNamespacedToolNames(context.tools ?? [], model),
 			});
 			if (requestContext.websocketState) {
 				requestContext.websocketState.lastTransport = initialTransport.transport;
@@ -4516,7 +4554,32 @@ type CodexToolPayload =
 			name: string;
 			description: string;
 			format: { type: "grammar"; syntax: "lark" | "regex"; definition: string };
+	  }
+	| {
+			type: "namespace";
+			name: string;
+			description: string;
+			tools: Array<{
+				type: "function";
+				name: string;
+				description: string;
+				parameters: Record<string, unknown>;
+				strict: false;
+			}>;
 	  };
+
+function collectNamespacedToolNames(
+	tools: readonly Tool[],
+	model: Model<"openai-codex-responses">,
+): ReadonlyMap<string, string> {
+	const names = new Map<string, string>();
+	for (const tool of tools) {
+		const native = tool.native;
+		if (native?.type !== "namespace" || (native.modelIds && !native.modelIds.includes(model.id))) continue;
+		names.set(`${native.namespace}\0${native.name}`, tool.name);
+	}
+	return names;
+}
 
 /** @internal Exported for tests. */
 export function convertOpenAICodexResponsesTools(
@@ -4526,6 +4589,24 @@ export function convertOpenAICodexResponsesTools(
 	const allowFreeform = model.applyPatchToolType === "freeform";
 	const payloads: CodexToolPayload[] = [];
 	for (const tool of tools) {
+		const native = tool.native;
+		if (native?.type === "namespace" && (!native.modelIds || native.modelIds.includes(model.id))) {
+			payloads.push({
+				type: "namespace",
+				name: native.namespace,
+				description: `Tools in the ${native.namespace} namespace.`,
+				tools: [
+					{
+						type: "function",
+						name: native.name,
+						description: native.description,
+						parameters: sanitizeSchemaForOpenAIResponses(native.parameters),
+						strict: false,
+					},
+				],
+			});
+			continue;
+		}
 		// Subscription models default to the function fallback. Explicit metadata
 		// remains authoritative for future Codex endpoints that implement GA computer use.
 		if (tool.native?.type === "computer" && model.supportsComputerUse === true) {
