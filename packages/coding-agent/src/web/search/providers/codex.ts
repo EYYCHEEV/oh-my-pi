@@ -849,14 +849,14 @@ export async function executeCodexWebRun(options: {
 	sessionId?: string;
 	signal?: AbortSignal;
 	fetch?: FetchImpl;
-}): Promise<typeof CodexStandaloneSearchResponseSchema.infer> {
+}): Promise<typeof CodexStandaloneSearchResponseSchema.infer & { sources: SearchSource[] }> {
 	const signal = withHardTimeout(options.signal, CODEX_SEARCH_TIMEOUT_MS);
 	const sessionId = options.sessionId ?? crypto.randomUUID();
 	const seed = await findCodexAuth(options.authStorage, sessionId, signal);
 	if (!seed) {
 		throw new Error("No Codex OAuth credentials found. Login with 'omp /login openai-codex' to enable web search.");
 	}
-	return withOAuthAccess(
+	const result = await withOAuthAccess(
 		options.authStorage,
 		"openai-codex",
 		access => {
@@ -874,6 +874,7 @@ export async function executeCodexWebRun(options: {
 		},
 		{ sessionId, signal, seed: seed.access },
 	);
+	return { ...result, sources: extractTextSources(result.output) };
 }
 
 /**
