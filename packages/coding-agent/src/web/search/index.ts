@@ -165,7 +165,7 @@ async function executeCodexWebRunTool(
 		signal: options.signal,
 		fetch: options.fetch,
 	});
-	const response: SearchResponse = { provider: "codex", answer: result.output, sources: [] };
+	const response: SearchResponse = { provider: "codex", answer: result.output, sources: result.sources };
 	return {
 		content: [{ type: "text", text: result.output }],
 		details: { response },
