@@ -452,6 +452,7 @@ export class ExtensionRunner {
 		options?: {
 			signal?: AbortSignal;
 			onUpdate?: AgentToolUpdateCallback<TDetails>;
+			toolCallId?: string;
 			depth?: number;
 			/**
 			 * The caller tool's own context. Reused for the native call so metadata the native tool
@@ -468,7 +469,7 @@ export class ExtensionRunner {
 		if (depth >= 8) {
 			throw new Error(`invokeTool: delegation depth exceeded 8 (recursive invokeTool for "${name}"?)`);
 		}
-		const toolCallId = `invoke-${name}-${Date.now().toString(36)}-${depth}`;
+		const toolCallId = options?.toolCallId ?? `invoke-${name}-${Date.now().toString(36)}-${depth}`;
 		return (await resolved.tool.execute(
 			toolCallId,
 			params as never,
@@ -857,6 +858,7 @@ export class ExtensionRunner {
 		delegation?: {
 			toolName: string;
 			depth?: number;
+			toolCallId?: string;
 			context?: AgentToolContext;
 			signal?: AbortSignal;
 			onUpdate?: AgentToolUpdateCallback;
@@ -893,6 +895,7 @@ export class ExtensionRunner {
 								// Inherit the wrapper's own channels so a bare `ctx.invokeTool(params)` aborts
 								// and streams with the outer call. Explicit options win.
 								signal: options?.signal ?? delegation.signal,
+								toolCallId: delegation.toolCallId,
 								onUpdate: options?.onUpdate ?? delegation.onUpdate,
 								depth: (delegation.depth ?? 0) + 1,
 								callerContext: delegation.context,

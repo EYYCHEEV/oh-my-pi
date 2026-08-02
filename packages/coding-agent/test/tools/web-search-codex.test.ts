@@ -1,8 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import type { AuthStorage, FetchImpl } from "@oh-my-pi/pi-ai";
+import type { AgentMessage, AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import type { AuthStorage, FetchImpl, Message } from "@oh-my-pi/pi-ai";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { customToolToDefinition } from "@oh-my-pi/pi-coding-agent/sdk";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { WebSearchTool, webSearchCustomTool } from "@oh-my-pi/pi-coding-agent/web/search";
 import type { SearchParams } from "@oh-my-pi/pi-coding-agent/web/search/providers/base";
-import { hasCodexSearch, searchCodex } from "@oh-my-pi/pi-coding-agent/web/search/providers/codex";
+import {
+	buildCodexWebRunInput,
+	executeCodexWebRun,
+	hasCodexSearch,
+	searchCodex,
+} from "@oh-my-pi/pi-coding-agent/web/search/providers/codex";
 
 type CapturedRequest = {
 	url: string;
@@ -412,7 +421,38 @@ describe("searchCodex model selection", () => {
 		expect(capturedRequest?.body?.tools).toEqual([{ type: "web_search", search_context_size: "high" }]);
 		expect(capturedRequest?.body?.tool_choice).toEqual({ type: "web_search" });
 		expect(result.model).toBe("gpt-5.5");
+
 		expect(result.sources).toEqual([{ title: "Example Article", url: "https://example.com/article" }]);
+	});
+	it("preserves the native web.run contract through custom tool registration", () => {
+		expect(customToolToDefinition(webSearchCustomTool).native).toMatchObject({
+			type: "namespace",
+			namespace: "web",
+			name: "run",
+			modelIds: ["gpt-5.6-sol"],
+		});
+	});
+
+	it("preserves native delegation through the custom tool context", async () => {
+		const params = { search_query: [{ q: "latest SK hynix earnings" }] };
+		const expected = {
+			content: [{ type: "text" as const, text: "search evidence" }],
+			details: { response: { provider: "codex" as const, answer: "search evidence", sources: [] } },
+		};
+		const invokeTool = vi.fn(async () => expected);
+		const definition = customToolToDefinition(webSearchCustomTool);
+		const result = await definition.execute("call-web-run", params as never, undefined, undefined, {
+			sessionManager: {},
+			modelRegistry: {},
+			model: { id: "gpt-5.6-sol" },
+			isIdle: () => false,
+			hasPendingMessages: () => false,
+			abort: () => {},
+			invokeTool,
+		} as never);
+
+		expect(invokeTool).toHaveBeenCalledWith(params, { signal: undefined, onUpdate: undefined });
+		expect(result).toEqual(expected);
 	});
 
 	it("applies the configured request timeout to Codex search", async () => {
@@ -521,6 +561,109 @@ describe("searchCodex model selection", () => {
 				sources: [{ title: "DeepSeek Terms", url: "https://example.com/terms" }],
 			}),
 		);
+	});
+
+	it("executes main-loop web.run directly with bounded recent conversation context", async () => {
+		const requests: CapturedRequest[] = [];
+		const fetchMock: FetchImpl = (url, init) => {
+			requests.push({
+				url: typeof url === "string" ? url : url.toString(),
+				headers: init?.headers,
+				body: init?.body ? (JSON.parse(init.body as string) as Record<string, unknown>) : null,
+			});
+			return Promise.resolve(
+				Response.json({
+					output: "Fresh search evidence",
+					results: [{ title: "Ignored", url: "https://example.com" }],
+				}),
+			);
+		};
+		const messages = [
+			{ role: "user", content: "old user", timestamp: 1 },
+			{ role: "assistant", content: [{ type: "text", text: "old assistant" }], timestamp: 2 },
+			{ role: "user", content: "previous user", timestamp: 3 },
+			{ role: "assistant", content: [{ type: "text", text: "previous assistant" }], timestamp: 4 },
+			{ role: "user", content: "current user", timestamp: 5 },
+			{ role: "assistant", content: [{ type: "text", text: "planning search" }], timestamp: 6 },
+		] as unknown as Message[];
+
+		expect(buildCodexWebRunInput(messages)).toEqual([
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "previous user" }] },
+			{ type: "message", role: "assistant", content: [{ type: "output_text", text: "previous assistant" }] },
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "current user" }] },
+		]);
+		const result = await executeCodexWebRun({
+			authStorage: fakeAuthStorage,
+			commands: { search_query: [{ q: "latest SK hynix earnings" }] },
+			messages,
+			modelId: "gpt-5.6-sol",
+			sessionId: "session-main-loop",
+			fetch: fetchMock,
+		});
+
+		expect(requests).toHaveLength(1);
+		expect(requests[0]?.url).toBe("https://chatgpt.com/backend-api/codex/alpha/search");
+		expect(requests[0]?.body).toMatchObject({
+			model: "gpt-5.6-sol",
+			commands: { search_query: [{ q: "latest SK hynix earnings" }] },
+			input: buildCodexWebRunInput(messages),
+		});
+		expect(result.output).toBe("Fresh search evidence");
+	});
+
+	it("routes a namespaced web.run call without starting the private Sol loop", async () => {
+		const requests: CapturedRequest[] = [];
+		const fetchMock: FetchImpl = (url, init) => {
+			requests.push({
+				url: typeof url === "string" ? url : url.toString(),
+				headers: init?.headers,
+				body: init?.body ? (JSON.parse(init.body as string) as Record<string, unknown>) : null,
+			});
+			return Promise.resolve(Response.json({ output: "One-layer result", results: [] }));
+		};
+		const storedMessage = { role: "custom", customType: "bashExecution", content: "hidden shape" } as AgentMessage;
+		const modelMessage = { role: "user", content: "current question", timestamp: 1 } as Message;
+		let projectedMessages: AgentMessage[] | undefined;
+		const tool = new WebSearchTool({
+			authStorage: fakeAuthStorage,
+			fetch: fetchMock,
+			getActiveModel: () => ({ id: "gpt-5.6-sol" }),
+			getSessionId: () => "session-native-route",
+			getProviderSessionId: () => "provider-session-native-route",
+			sessionManager: {
+				getBranch: () => [{ type: "message", message: storedMessage }],
+			},
+			convertMessagesToLlm: async (messages: AgentMessage[]) => {
+				projectedMessages = messages;
+				return [modelMessage];
+			},
+		} as unknown as ToolSession);
+		const context = {
+			model: { id: "gpt-5.6-sol" },
+			toolCall: {
+				type: "toolCall",
+				id: "call_web_run",
+				name: "web_search",
+				arguments: { search_query: [{ q: "latest SK hynix earnings" }] },
+				providerMetadata: { type: "namespace", namespace: "web", name: "run" },
+			},
+		} as unknown as AgentToolContext;
+
+		const result = await tool.execute(
+			"call_web_run",
+			{ search_query: [{ q: "latest SK hynix earnings" }] } as never,
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(projectedMessages).toEqual([storedMessage]);
+		expect(requests).toHaveLength(1);
+		expect(requests[0]?.url).toBe("https://chatgpt.com/backend-api/codex/alpha/search");
+		expect(requests[0]?.body?.commands).toEqual({ search_query: [{ q: "latest SK hynix earnings" }] });
+		expect(requests[0]?.body?.id).toBe("provider-session-native-route");
+		expect(requests[0]?.body?.input).toEqual(buildCodexWebRunInput([modelMessage]));
+		expect(result.content).toEqual([{ type: "text", text: "One-layer result" }]);
 	});
 
 	it("feeds invalid commands back, then accepts blank commands and null results", async () => {

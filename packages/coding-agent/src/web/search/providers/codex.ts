@@ -5,9 +5,11 @@
  * the official ChatGPT backend for OAuth logins.
  */
 import * as os from "node:os";
+import { countTokens } from "@oh-my-pi/pi-agent-core";
 import {
 	type AuthStorage,
 	type FetchImpl,
+	type Message,
 	type Model,
 	type OAuthAccess,
 	withAuth,
@@ -61,7 +63,7 @@ const DEFAULT_MODEL_PREFERENCES = [
 const DEFAULT_INSTRUCTIONS =
 	"You are a helpful assistant with web search capabilities. Search the web to answer the user's question accurately and cite your sources.";
 const CODEX_STANDALONE_SEARCH_URL = `${CODEX_BASE_URL.replace(/\/$/, "")}/codex/alpha/search`;
-const CODEX_WEB_RUN_DESCRIPTION =
+export const CODEX_WEB_RUN_DESCRIPTION =
 	'Tool for accessing the internet.\n\n\n---\n\n## Examples of different commands available in this tool\n\nExamples of different commands available in this tool:\n* `search_query`: {"search_query": [{"q": "What is the capital of France?"}, {"q": "What is the capital of belgium?"}]}. Searches the internet for a given query (and optionally with a domain or recency filter)\n* `image_query`: {"image_query":[{"q": "waterfalls"}]}.\n* `open`: {"open": [{"ref_id": "turn0search0"}, {"ref_id": "https://www.openai.com", "lineno": 120}]}\n* `click`: {"click": [{"ref_id": "turn0fetch3", "id": 17}]}\n* `find`: {"find": [{"ref_id": "turn0fetch3", "pattern": "Annie Case"}]}\n* `screenshot`: {"screenshot": [{"ref_id": "turn1view0", "pageno": 0}, {"ref_id": "turn1view0", "pageno": 3}]}\n* `finance`: {"finance":[{"ticker":"AMD","type":"equity","market":"USA"}]}, {"finance":[{"ticker":"BTC","type":"crypto","market":""}]}\n* `weather`: {"weather":[{"location":"San Francisco, CA"}]}\n* `sports`: {"sports":[{"fn":"standings","league":"nfl"}, {"fn":"schedule","league":"nba","team":"GSW","date_from":"2025-02-24"}]}\n* `time`: {"time":[{"utc_offset":"+03:00"}]}\n\n---\n\n## Usage hints\nTo use this tool efficiently:\n* Use multiple commands and queries in one call to get more results faster; e.g. {"search_query": [{"q": "bitcoin news"}], "finance":[{"ticker":"BTC","type":"crypto","market":""}], "find": [{"ref_id": "turn0search0", "pattern": "Annie Case"}, {"ref_id": "turn0search1", "pattern": "John Smith"}]}\n* Use "response_length" to control the number of results returned by this tool, omit it if you intend to pass "short" in\n* Only write required parameters; do not write empty lists or nulls where they could be omitted.\n* `search_query` must have length at most 4 in each call. If it has length > 3, response_length must be medium or long\n* If you find yourself in a situation where you accidentally call the `web.run` tool, it\'s best just to send an empty query: {"search_query": [{"q": ""}]}.\n\n---\n\n## Decision boundary\n\nIf the user makes an explicit request to search the internet, find latest information, look up, etc (or to not do so), you must obey their request.\nWhen you make an assumption, always consider whether it is temporally stable; i.e. whether there\'s even a small (>10%) chance it has changed. If it is unstable, you must verify with browsing the internet for verification.\n\n<situations_where_you_must_browse_the_internet>\nBelow is a list of scenarios where browsing the internet MUST be used. PAY CLOSE ATTENTION: you MUST browse the internet in these cases. If you\'re unsure or on the fence, you MUST bias towards browsing the internet.\n- The information could have changed recently: for example news; prices; laws; schedules; product specs; sports scores; economic indicators; political/public/company figures (e.g. the question relates to \'the president of country A\' or \'the CEO of company B\', which might change over time); rules; regulations; standards; software libraries that could be updated; exchange rates; recommendations (i.e., recommendations about various topics or things might be informed by what currently exists / is popular / is safe / is unsafe / is in the zeitgeist / etc.); and many many many more categories -- again, if you\'re on the fence, you MUST browse the internet!\n  - For news queries, prioritize more recent events, ensuring you compare publish dates and the date that the event happened.\n- The user is seeking recommendations that could lead them to spend substantial time or money -- researching products, restaurants, travel plans, etc.\n- The user wants (or would benefit from) direct quotes, links, or precise source attribution.\n- A specific page, paper, dataset, PDF, or site is referenced and you haven\'t been given its contents.\n- You\'re unsure about a fact, the topic is niche or emerging, or you suspect there\'s at least a 10% chance you will incorrectly recall it\n- High-stakes accuracy matters (medical, legal, financial guidance). For these you generally should search by default because this information is highly temporally unstable\n- The user explicitly says to search, browse, verify, or look it up.\n</situations_where_you_must_browse_the_internet>\n\n---\n\n## Citations\n\nResults from `web.run` include internal reference IDs such as `turn2search5`. Use\nthose reference IDs only in calls to `web.run`; do not expose them in the final\nresponse.\n\nCite sources in the final response using Markdown links:\n\n- Cite a single source as `[descriptive source title](https://example.com/page)`.\n- Cite multiple sources with separate Markdown links, for example\n  `[first source](https://example.com/one), [second source](https://example.com/two)`.\n- Link directly to the page that supports the claim. Do not link to search result\n  pages or use bare URLs.\n\nFormatting of citations:\n\n- Place each citation as near as possible to the claim it supports, normally at\n  the end of the sentence or paragraph and after punctuation.\n- Do not place citations inside code fences.\n- Do not put citations on a line by themselves or collect all citations at the\n  end of the response.\n\nIf you browse the internet, cite statements supported by web sources. Each cited\nsource must directly support the associated claim. Prefer primary and\nauthoritative sources, and use sources from different domains when the response\nbenefits from multiple perspectives.\n\n---\n\n## Special cases\nIf these conflict with any other instructions, these should take precedence.\n\n<special_cases>\n- When the user asks for information about how to use OpenAI products, (ChatGPT, the OpenAI API, etc.), you should check the code in local env and only browse as fallback, when you browse restrict your sources to official OpenAI websites using the domains filter, unless otherwise requested.\n- When using search to answer technical questions, you must only rely on primary sources (research papers, official documentation, etc.)\n- Clearly indicate when you are making an inference from sources.\n</special_cases>\n\n---\n\n## Word limits\nResponses may not excessively quote or draw on a specific source. There are several limits here:\n- **Limit on verbatim quotes:**\n  - You may not quote more than 25 words verbatim from any single non-lyrical source, unless the source is reddit.\n  - For song lyrics, verbatim quotes must be limited to at most 10 words.\n  - Long quotes from reddit are allowed, as long as you indicate that those are direct quotes via a markdown blockquote starting with ">", copy verbatim, and link the source.\n- **Word limits:**\n  - Each webpage source in the sources has a word limit label formatted like "[wordlim N]", in which N is the maximum number of words in the whole response that are attributed to that source. If omitted, the word limit is 200 words.\n  - Non-contiguous words derived from a given source must be counted to the word limit.\n  - The summarization limit N is a maximum for each source.\n  - When using multiple sources, their summarization limits add together. However, each article used must be relevant to the response.\n- **Copyright compliance:**\n  - You must avoid providing full articles, long verbatim passages, or extensive direct quotes due to copyright concerns.\n  - If the user asked for a verbatim quote, the response should provide a short compliant excerpt and then answer with paraphrases and summaries.\n  - Again, this limit does not apply to reddit content, as long as it\'s appropriately indicated that those are direct quotes and you link to the source.\n';
 const CODEX_SEARCH_QUERY_SCHEMA = {
 	type: "object",
@@ -79,7 +81,7 @@ const CODEX_SEARCH_QUERY_SCHEMA = {
 	},
 	required: ["q"],
 } as const;
-const CODEX_WEB_RUN_PARAMETERS = {
+export const CODEX_WEB_RUN_PARAMETERS = {
 	type: "object",
 	properties: {
 		click: {
@@ -663,6 +665,174 @@ function buildCodexHeaders(
 	return headers;
 }
 
+const ASSISTANT_SEARCH_CONTEXT_TOKEN_LIMIT = 1_000;
+
+type CodexWebRunInputMessage = {
+	type: "message";
+	role: "user" | "assistant";
+	content: Array<{ type: "input_text" | "output_text"; text: string }>;
+};
+
+function visibleMessageText(message: Message): string {
+	if (message.role !== "user" && message.role !== "assistant") return "";
+	if (typeof message.content === "string") return message.content;
+	return message.content
+		.flatMap(part => ("text" in part && typeof part.text === "string" ? [part.text] : []))
+		.join("\n");
+}
+
+function truncateToTokenBudget(text: string, budget: number): string {
+	if (budget <= 0) return "";
+	if (countTokens(text) <= budget) return text;
+	let low = 0;
+	let high = text.length;
+	while (low < high) {
+		const midpoint = Math.ceil((low + high) / 2);
+		if (countTokens(text.slice(0, midpoint)) <= budget) low = midpoint;
+		else high = midpoint - 1;
+	}
+	return text.slice(0, low);
+}
+
+/** Mirrors Codex's standalone-search history tail: previous user turn, bounded assistant text, current user turn. */
+export function buildCodexWebRunInput(messages: readonly Message[]): CodexWebRunInputMessage[] {
+	const visible: CodexWebRunInputMessage[] = [];
+	for (const message of messages) {
+		if (message.role !== "user" && message.role !== "assistant") continue;
+		const text = visibleMessageText(message);
+		if (!text.trim()) continue;
+		visible.push({
+			type: "message",
+			role: message.role,
+			content: [{ type: message.role === "user" ? "input_text" : "output_text", text }],
+		});
+	}
+
+	const userIndexes = visible.flatMap((message, index) => (message.role === "user" ? [index] : []));
+	const currentUserIndex = userIndexes.at(-1);
+	if (currentUserIndex === undefined) return [];
+	const startIndex = userIndexes.at(-2) ?? currentUserIndex;
+	const tail = visible.slice(startIndex, currentUserIndex + 1);
+	let assistantBudget = ASSISTANT_SEARCH_CONTEXT_TOKEN_LIMIT;
+	for (const message of tail) {
+		if (message.role !== "assistant") continue;
+		const part = message.content[0];
+		if (!part) continue;
+		part.text = truncateToTokenBudget(part.text, assistantBudget);
+		assistantBudget = Math.max(0, assistantBudget - countTokens(part.text));
+	}
+	return tail.filter(message => message.content[0]?.text);
+}
+
+interface CodexWebRunRequestOptions {
+	auth: { accessToken: string; accountId?: string };
+	commands: Record<string, unknown>;
+	input: CodexWebRunInputMessage[] | CodexResponseItem[];
+	modelId: string;
+	sessionId: string;
+	signal: AbortSignal;
+	fetch: FetchImpl;
+	searchContextSize?: "low" | "medium" | "high";
+	maxOutputTokens?: number;
+	headers?: Record<string, string>;
+}
+
+async function requestCodexWebRun(
+	options: CodexWebRunRequestOptions,
+): Promise<typeof CodexStandaloneSearchResponseSchema.infer> {
+	const compatibility = createOpenAICodexCompatibilityMetadata({
+		sessionId: options.sessionId,
+		requestKind: "turn",
+		startNewTurn: true,
+	});
+	const headers = buildCodexHeaders(options.auth.accessToken, options.auth.accountId, options.headers ?? {});
+	for (const name in compatibility.headers) {
+		const value = compatibility.headers[name];
+		if (value !== undefined) headers.set(name, value);
+	}
+	headers.set("Accept", "application/json");
+	const body: Record<string, unknown> = {
+		id: options.sessionId,
+		model: options.modelId,
+		input: options.input,
+		commands: options.commands,
+		settings: {
+			search_context_size: options.searchContextSize ?? "high",
+			allowed_callers: ["direct"],
+			external_web_access: true,
+		},
+	};
+	if (options.maxOutputTokens !== undefined) body.max_output_tokens = options.maxOutputTokens;
+	const response = await options.fetch(CODEX_STANDALONE_SEARCH_URL, {
+		method: "POST",
+		headers,
+		body: JSON.stringify(body),
+		signal: options.signal,
+	});
+	if (!response.ok) {
+		const errorText = await response.text();
+		const classified = classifyProviderHttpError("codex", response.status, errorText);
+		if (classified) throw classified;
+		throw new SearchProviderError(
+			"codex",
+			`Codex standalone search error (${response.status}): ${errorText}`,
+			response.status,
+		);
+	}
+
+	let rawStandalone: unknown;
+	try {
+		rawStandalone = await response.json();
+	} catch (error) {
+		const message = error instanceof Error ? error.message : "invalid JSON";
+		throw new SearchProviderError("codex", `Codex standalone search returned invalid JSON: ${message}`, 502);
+	}
+	const standalone = CodexStandaloneSearchResponseSchema(rawStandalone);
+	if (standalone instanceof type.errors) {
+		throw new SearchProviderError(
+			"codex",
+			`Codex standalone search response failed validation: ${standalone.summary}`,
+			502,
+		);
+	}
+	return standalone;
+}
+
+export async function executeCodexWebRun(options: {
+	authStorage: AuthStorage;
+	commands: Record<string, unknown>;
+	messages: readonly Message[];
+	modelId: string;
+	sessionId?: string;
+	signal?: AbortSignal;
+	fetch?: FetchImpl;
+}): Promise<typeof CodexStandaloneSearchResponseSchema.infer> {
+	const signal = withHardTimeout(options.signal, CODEX_SEARCH_TIMEOUT_MS);
+	const sessionId = options.sessionId ?? crypto.randomUUID();
+	const seed = await findCodexAuth(options.authStorage, sessionId, signal);
+	if (!seed) {
+		throw new Error("No Codex OAuth credentials found. Login with 'omp /login openai-codex' to enable web search.");
+	}
+	return withOAuthAccess(
+		options.authStorage,
+		"openai-codex",
+		access => {
+			const accountId = access.accountId ?? getCodexAccountId(access.accessToken);
+			if (!accountId) throw new Error("Codex OAuth credential is missing a ChatGPT account id");
+			return requestCodexWebRun({
+				auth: { accessToken: access.accessToken, accountId },
+				commands: options.commands,
+				input: buildCodexWebRunInput(options.messages),
+				modelId: options.modelId,
+				sessionId,
+				signal,
+				fetch: options.fetch ?? fetch,
+			});
+		},
+		{ sessionId, signal, seed: seed.access },
+	);
+}
+
 /**
  * Extracts a backend error `{code, message}` from a Codex SSE event, tolerating
  * the envelope shapes the ChatGPT Codex backend emits: top-level `{code,message}`,
@@ -717,15 +887,12 @@ async function callCodexStandaloneSearch(
 		startNewTurn: true,
 	});
 	const modelHeaders = buildCodexHeaders(auth.accessToken, auth.accountId, options.transport.headers);
-	const searchHeaders = buildCodexHeaders(auth.accessToken, auth.accountId, options.transport.headers);
 	for (const name in compatibility.headers) {
 		const value = compatibility.headers[name];
 		if (value === undefined) continue;
 		modelHeaders.set(name, value);
-		searchHeaders.set(name, value);
 	}
 	modelHeaders.set(OPENAI_HEADERS.RESPONSES_LITE, "true");
-	searchHeaders.set("Accept", "application/json");
 
 	const userMessage: CodexResponseItem = {
 		type: "message",
@@ -884,50 +1051,18 @@ async function callCodexStandaloneSearch(
 				continue;
 			}
 
-			const searchBody: Record<string, unknown> = {
-				id: searchSessionId,
-				model: requestedModel,
-				input: [userMessage],
+			const standalone = await requestCodexWebRun({
+				auth,
 				commands,
-				settings: {
-					search_context_size: options.searchContextSize ?? "high",
-					allowed_callers: ["direct"],
-					external_web_access: true,
-				},
-			};
-			if (options.maxOutputTokens !== undefined) searchBody.max_output_tokens = options.maxOutputTokens;
-			const searchResponse = await fetchImpl(CODEX_STANDALONE_SEARCH_URL, {
-				method: "POST",
-				headers: searchHeaders,
-				body: JSON.stringify(searchBody),
+				input: [userMessage],
+				modelId: requestedModel,
+				sessionId: searchSessionId,
 				signal,
+				fetch: fetchImpl,
+				searchContextSize: options.searchContextSize,
+				maxOutputTokens: options.maxOutputTokens,
+				headers: options.transport.headers,
 			});
-			if (!searchResponse.ok) {
-				const errorText = await searchResponse.text();
-				const classified = classifyProviderHttpError("codex", searchResponse.status, errorText);
-				if (classified) throw classified;
-				throw new SearchProviderError(
-					"codex",
-					`Codex standalone search error (${searchResponse.status}): ${errorText}`,
-					searchResponse.status,
-				);
-			}
-
-			let rawStandalone: unknown;
-			try {
-				rawStandalone = await searchResponse.json();
-			} catch (error) {
-				const message = error instanceof Error ? error.message : "invalid JSON";
-				throw new SearchProviderError("codex", `Codex standalone search returned invalid JSON: ${message}`, 502);
-			}
-			const standalone = CodexStandaloneSearchResponseSchema(rawStandalone);
-			if (standalone instanceof type.errors) {
-				throw new SearchProviderError(
-					"codex",
-					`Codex standalone search response failed validation: ${standalone.summary}`,
-					502,
-				);
-			}
 			webRunCallCount += 1;
 			history.push({
 				type: "function_call_output",
