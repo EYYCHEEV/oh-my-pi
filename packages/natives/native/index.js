@@ -29,7 +29,7 @@ export const SupervisedProcessTree = nativeBindings.SupervisedProcessTree;
 
 // functions
 export const __ompInstallTokioRuntime = nativeBindings.__ompInstallTokioRuntime;
-export const __piNativesV17_2_3 = nativeBindings.__piNativesV17_2_3;
+export const __piNativesV17_2_4 = nativeBindings.__piNativesV17_2_4;
 export const astEdit = nativeBindings.astEdit;
 export const astGrep = nativeBindings.astGrep;
 export const astMatch = nativeBindings.astMatch;
