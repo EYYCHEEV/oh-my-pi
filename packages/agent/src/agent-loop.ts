@@ -291,6 +291,16 @@ function snapshotToolCallProviderMetadata(value: unknown): ToolCallProviderMetad
 	if (value === undefined) return undefined;
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const metadata = value as Record<string, unknown>;
+	if (metadata.type === "namespace") {
+		if (
+			typeof metadata.namespace !== "string" ||
+			metadata.namespace.length === 0 ||
+			typeof metadata.name !== "string" ||
+			metadata.name.length === 0
+		)
+			return undefined;
+		return { type: "namespace", namespace: metadata.namespace, name: metadata.name };
+	}
 	if (
 		metadata.type !== "computer" ||
 		typeof metadata.providerItemId !== "string" ||

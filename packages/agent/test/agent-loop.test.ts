@@ -4207,6 +4207,87 @@ describe("agentLoopContinue with AgentMessage", () => {
 		expect(toolEnd?.type === "tool_execution_end" && toolEnd.isError).toBe(true);
 	});
 
+	it("preserves namespaced tool metadata through validation and dispatch", async () => {
+		const toolSchema = type({ query: "string" });
+		const nativeArgs = { search_query: [{ q: "latest official results" }] };
+		const executed: unknown[] = [];
+		const tool: AgentTool<any> = {
+			name: "web_search",
+			label: "Web Search",
+			description: "Search the web",
+			parameters: toolSchema,
+			native: {
+				type: "namespace",
+				namespace: "web",
+				name: "run",
+				description: "Run web commands",
+				parameters: {
+					type: "object",
+					properties: {
+						search_query: {
+							type: "array",
+							items: {
+								type: "object",
+								properties: { q: { type: "string" } },
+								required: ["q"],
+							},
+						},
+					},
+					required: ["search_query"],
+				},
+			},
+			async execute(_toolCallId, params) {
+				executed.push(params);
+				return { content: [{ type: "text", text: "search evidence" }], details: {} };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const nativeCall = {
+			type: "toolCall" as const,
+			id: "tool-web-run",
+			name: "web_search",
+			arguments: nativeArgs,
+			providerMetadata: { type: "namespace" as const, namespace: "web", name: "run" },
+		};
+		const mock = createMockModel();
+		let turn = 0;
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				if (turn++ === 0) {
+					const partial = createAssistantMessage([nativeCall], "toolUse");
+					stream.push({ type: "start", partial });
+					stream.push({ type: "toolcall_start", contentIndex: 0, partial });
+					stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: nativeCall, partial });
+					stream.push({ type: "done", reason: "toolUse", message: partial });
+					return;
+				}
+				const final = createAssistantMessage([{ type: "text", text: "done" }], "stop");
+				stream.push({ type: "start", partial: final });
+				stream.push({ type: "done", reason: "stop", message: final });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		for await (const _event of agentLoop(
+			[createUserMessage("search")],
+			context,
+			{ model: mock.model, convertToLlm: identityConverter },
+			undefined,
+			streamFn,
+		)) {
+			events.push(_event);
+		}
+
+		const toolEnd = events.find(event => event.type === "tool_execution_end");
+		expect(toolEnd?.type === "tool_execution_end" ? toolEnd.result.content : undefined).toEqual([
+			{ type: "text", text: "search evidence" },
+		]);
+		expect(toolEnd?.type === "tool_execution_end" && toolEnd.isError).toBe(false);
+		expect(executed).toEqual([nativeArgs]);
+	});
+
 	it("afterToolCall overrides content and isError on the emitted tool result", async () => {
 		const toolSchema = type({ value: "string" });
 		const tool: AgentTool<typeof toolSchema, { value: string }> = {

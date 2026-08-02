@@ -394,7 +394,7 @@ function buildParams(
 				}
 				// Fall through: unsupported models get the computer tool as a
 				// plain function tool so function-calling models can drive it.
-			} else if (tool.native !== undefined) continue;
+			}
 			serializedTools.push({
 				type: "function",
 				name: tool.name,

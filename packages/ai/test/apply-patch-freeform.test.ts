@@ -230,6 +230,29 @@ describe("tool choice mapping: freeform emission", () => {
 			name: "apply_patch",
 		});
 	});
+
+	test("codex backend forces an advertised namespace with required", () => {
+		const webSearchTool: Tool = {
+			name: "web_search",
+			description: "search",
+			parameters: type({ query: "string" }),
+			native: {
+				type: "namespace",
+				namespace: "web",
+				name: "run",
+				description: "run web commands",
+				parameters: { type: "object", properties: {} },
+				modelIds: ["gpt-5.6-sol"],
+			},
+		};
+		expect(
+			normalizeCodexToolChoice(
+				{ type: "tool", name: "web_search" },
+				[webSearchTool],
+				makeCodexModel({ id: "gpt-5.6-sol" }),
+			),
+		).toBe("required");
+	});
 });
 
 describe("request params: freeform custom tools", () => {
