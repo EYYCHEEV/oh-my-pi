@@ -5,8 +5,12 @@ import {
 } from "@oh-my-pi/pi-ai/oauth/openai-codex";
 import { type RequestBody, transformRequestBody } from "@oh-my-pi/pi-ai/providers/openai-codex/request-transformer";
 import { CodexApiError, parseCodexError } from "@oh-my-pi/pi-ai/providers/openai-codex/response-handler";
-import { convertOpenAICodexResponsesTools } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import {
+	buildTransformedCodexRequestBody,
+	convertOpenAICodexResponsesTools,
+} from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import type { Tool } from "@oh-my-pi/pi-ai/types";
+import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
 import { OPENAI_HEADER_VALUES } from "@oh-my-pi/pi-catalog/wire/codex";
 import { createCodexModel } from "./helpers";
 
@@ -174,6 +178,88 @@ describe("openai-codex tool schemas", () => {
 		// Codex responses only enforces strict when the tool opts in; leaving
 		// `strict` unset MUST NOT synthesize the field either way.
 		expect(payload.strict).toBeUndefined();
+	});
+
+	it("serializes, exclusively selects, and validates Sol's namespaced web.run tool", async () => {
+		const tools: Tool[] = [
+			{
+				name: "web_search",
+				description: "Generic search",
+				parameters: {
+					type: "object",
+					properties: { query: { type: "string" } },
+					required: ["query"],
+				},
+				native: {
+					type: "namespace",
+					namespace: "web",
+					name: "run",
+					description: "Run web commands",
+					parameters: {
+						type: "object",
+						properties: {
+							search_query: {
+								type: "array",
+								items: {
+									type: "object",
+									properties: { q: { type: "string" } },
+									required: ["q"],
+								},
+							},
+						},
+					},
+					modelIds: ["gpt-5.6-sol"],
+				},
+			},
+		];
+
+		expect(convertOpenAICodexResponsesTools(tools, createCodexModel("gpt-5.6-sol"))).toEqual([
+			{
+				type: "namespace",
+				name: "web",
+				description: "Tools in the web namespace.",
+				tools: [
+					{
+						type: "function",
+						name: "run",
+						description: "Run web commands",
+						parameters: expect.objectContaining({ type: "object" }),
+						strict: false,
+					},
+				],
+			},
+		]);
+		expect(convertOpenAICodexResponsesTools(tools, createCodexModel("gpt-5.5"))[0]).toMatchObject({
+			type: "function",
+			name: "web_search",
+		});
+		const args = { search_query: [{ q: "latest SK hynix earnings" }] };
+		expect(
+			validateToolArguments(tools[0]!, {
+				type: "toolCall",
+				id: "call_web_run",
+				name: "web_search",
+				arguments: args,
+				providerMetadata: { type: "namespace", namespace: "web", name: "run" },
+			}),
+		).toEqual(args);
+		const body = await buildTransformedCodexRequestBody(
+			createCodexModel("gpt-5.6-sol"),
+			{
+				messages: [{ role: "user", content: "Search", timestamp: 0 }],
+				tools: [
+					...tools,
+					{
+						name: "read",
+						description: "Read files",
+						parameters: { type: "object", properties: { path: { type: "string" } } },
+					},
+				],
+			},
+			{ toolChoice: { type: "function", name: "web_search" } },
+		);
+		expect(body.tool_choice).toBe("required");
+		expect(body.tools).toEqual([expect.objectContaining({ type: "namespace", name: "web" })]);
 	});
 });
 

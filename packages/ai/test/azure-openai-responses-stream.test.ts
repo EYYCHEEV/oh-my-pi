@@ -208,6 +208,28 @@ describe("azure openai responses streaming", () => {
 		expect(Array.isArray(tools[0].parameters.properties.item.anyOf)).toBe(true);
 	});
 
+	it("serializes an unsupported namespace tool as its generic function fallback", async () => {
+		const webSearch: Tool = {
+			name: "web_search",
+			description: "Search the web",
+			parameters: { type: "object", properties: { query: { type: "string" } } },
+			native: {
+				type: "namespace",
+				namespace: "web",
+				name: "run",
+				description: "Run web commands",
+				parameters: { type: "object", properties: { search_query: { type: "array" } } },
+				modelIds: ["gpt-5.6-sol"],
+			},
+		};
+		const payload = await captureAzurePayload({
+			messages: [{ role: "user", content: "Search", timestamp: Date.now() }],
+			tools: [webSearch],
+		});
+
+		expect(payload.tools).toEqual([expect.objectContaining({ type: "function", name: "web_search" })]);
+	});
+
 	it("serializes computer and its forced choice as a function on unsupported models", async () => {
 		const computer: Tool = {
 			name: "computer",

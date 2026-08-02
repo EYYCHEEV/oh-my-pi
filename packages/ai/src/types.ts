@@ -106,7 +106,16 @@ export interface TokenTaskBudget {
 
 export type MessageAttribution = "user" | "agent";
 
-export type NativeToolMarker = { type: "computer" };
+export type NativeToolMarker =
+	| { type: "computer" }
+	| {
+			type: "namespace";
+			namespace: string;
+			name: string;
+			description: string;
+			parameters: Record<string, unknown>;
+			modelIds?: readonly string[];
+	  };
 
 export type ToolChoice =
 	| "auto"
@@ -755,8 +764,13 @@ export interface ComputerToolCallMetadata {
 	actions: ComputerAction[];
 	pendingSafetyChecks: ComputerSafetyCheck[];
 }
+export interface NamespacedToolCallMetadata {
+	type: "namespace";
+	namespace: string;
+	name: string;
+}
 
-export type ToolCallProviderMetadata = ComputerToolCallMetadata;
+export type ToolCallProviderMetadata = ComputerToolCallMetadata | NamespacedToolCallMetadata;
 
 export type ComputerScreenshotRef =
 	| { type: "computer_screenshot"; image_url: string; file_id?: never }

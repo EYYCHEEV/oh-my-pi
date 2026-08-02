@@ -926,6 +926,7 @@ function createCustomToolContext(ctx: ExtensionContext): CustomToolContext {
 		hasQueuedMessages: ctx.hasPendingMessages,
 		abort: ctx.abort,
 		localProtocolOptions: ctx.localProtocolOptions,
+		invokeTool: ctx.invokeTool,
 	};
 }
 
@@ -976,6 +977,7 @@ export function customToolToDefinition(tool: CustomTool): ToolDefinition {
 		label: tool.label,
 		description: tool.description,
 		parameters: tool.parameters,
+		native: tool.native,
 		hidden: tool.hidden,
 		loadMode: defaultLoadModeForToolName(tool.name, tool.loadMode),
 		deferrable: tool.deferrable,
@@ -1800,6 +1802,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			taskDepth: options.taskDepth ?? 0,
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
 			sessionManager,
+			convertMessagesToLlm: (messages, signal) => session.convertMessagesToLlm(messages, signal),
 			getEvalKernelOwnerId: () => evalKernelOwnerId,
 			getEvalSessionId: () =>
 				session?.getEvalSessionId() ?? options.parentEvalSessionId ?? defaultEvalSessionId(toolSession),
@@ -1808,6 +1811,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				session ? session.trackEvalExecution(execution, abortController) : execution,
 			getSessionId: () => sessionManager.getSessionId?.() ?? null,
 			isDisposed: () => session?.isDisposed ?? false,
+			getProviderSessionId: () => session.sessionId,
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			getMnemopiSessionState: () => session?.getMnemopiSessionState(),
 			getAgentId: () => resolvedAgentId,
