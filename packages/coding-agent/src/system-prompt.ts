@@ -596,7 +596,6 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		taskMaxConcurrency = 0,
 		secretsEnabled = false,
 		workspaceTree: providedWorkspaceTree,
-		scoutAvailable = true,
 		memoryRootEnabled = false,
 		securityEnabled = false,
 		model,
