@@ -1186,11 +1186,11 @@ export class AgentSession {
 			injectIdle: async messages => {
 				const first = messages[0];
 				if (!first) return;
-				this.#beginInFlight();
+				const inFlightGeneration = this.#beginInFlight();
 				try {
 					await this.agent.prompt(messages.length === 1 ? first : messages);
 				} finally {
-					this.#endInFlight();
+					this.#endInFlight(inFlightGeneration);
 				}
 			},
 			scheduleIdleFlush: run => {
