@@ -166,7 +166,7 @@ function canonicalizeExtensionPath(extensionPath: string, cwd: string): string {
 }
 
 export class RequiredExtensionStartupError extends Error {
-	readonly name = "RequiredExtensionStartupError";
+	override readonly name = "RequiredExtensionStartupError";
 
 	constructor(
 		readonly code: RequiredExtensionStartupFailure,
