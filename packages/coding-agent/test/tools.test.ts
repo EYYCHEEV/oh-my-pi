@@ -1178,6 +1178,7 @@ describe("Coding Agent Tools", () => {
 					{ path: "dup/file.txt", content: "" },
 				]),
 			);
+			const entries = await readArchiveEntries(archivePath);
 
 			const empty = entries.get("dup/file.txt");
 			expect(empty).toBeInstanceOf(File);

@@ -522,6 +522,8 @@ export interface BuildSystemPromptOptions {
 	taskBatch?: boolean;
 	/** Effective task concurrency limit displayed in centralized delegation guidance. Zero means unlimited. */
 	taskMaxConcurrency?: number;
+	/** Whether the current spawn policy exposes the read-only scout agent. Default: true. */
+	scoutAvailable?: boolean;
 
 	/** Rules with alwaysApply=true — their full content is injected into the prompt. */
 	alwaysApplyRules?: AlwaysApplyRule[];
@@ -870,6 +872,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		eagerTasksAlways,
 		taskBatch,
 		MAX_CONCURRENCY: normalizeConcurrencyLimit(taskMaxConcurrency),
+		scoutAvailable: options.scoutAvailable ?? true,
 
 		secretsEnabled,
 		hasMemoryRoot: memoryRootEnabled,

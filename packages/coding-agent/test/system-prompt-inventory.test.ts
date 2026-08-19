@@ -751,12 +751,11 @@ describe("system prompt tool inventory", () => {
 			inlineToolDescriptors: false,
 		};
 		const withoutTodo = (await buildSystemPrompt({ ...opts, toolNames: ["read", "bash"] })).systemPrompt.join("\n\n");
-		expect(withoutTodo).not.toContain("Todo calls NEVER alone");
-		expect(withoutTodo).not.toContain("batch each with turn's real calls");
+		expect(withoutTodo).not.toContain("Todo calls NEVER travel alone");
 
 		const withTodo = (await buildSystemPrompt({ ...opts, toolNames: ["read", "bash", "todo"] })).systemPrompt.join(
 			"\n\n",
 		);
-		expect(withTodo).toContain("Todo calls NEVER alone");
+		expect(withTodo).toContain("Todo calls NEVER travel alone");
 	});
 });
