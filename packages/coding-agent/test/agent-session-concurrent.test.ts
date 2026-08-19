@@ -564,10 +564,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		);
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
-		const authStorage = await AuthStorage.create(path.join(tempDir, "current-loop-auth.db"));
-		authStorages.push(authStorage);
-		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "current-loop-models.yml"));
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = sharedModelRegistry;
 		const extensionRunner = new ExtensionRunner(
 			[extension],
 			extensionRuntime,

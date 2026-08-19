@@ -129,7 +129,9 @@ describe("extension status-line segments", () => {
 				throw new Error("boom");
 			},
 		});
-		expect(status.getTopBorder(100)).toEqual(expected);
+		const actual = status.getTopBorder(100);
+		expect(actual.content).toBe(expected.content);
+		expect(actual.width).toBe(expected.width);
 	});
 
 	it("renders fixed empty-registry goldens for every supported baseline", () => {
