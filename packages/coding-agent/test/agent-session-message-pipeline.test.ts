@@ -1007,7 +1007,7 @@ describe("AgentSession message pipeline", () => {
 			authStorage.close();
 		}
 	});
-	it("applies a tool_call input revision at arg-prep time across events, execution, and history", async () => {
+	it("forwards the caller signal and input revision through the primary tool-call path", async () => {
 		// End-to-end wiring for the loop-level tool_call emission (session
 		// #beforeToolCall): the handler fires once per dispatch (the wrapper's
 		// own emission is suppressed via the runner marker), the revision is what
@@ -1053,9 +1053,11 @@ describe("AgentSession message pipeline", () => {
 			maxTokens: 1024,
 		} as ModelSpec<Api>) as Model<Api>;
 		let handlerCalls = 0;
+		let handlerSignal: AbortSignal | undefined;
 		const reviseBash: ExtensionFactory = pi => {
 			pi.on("tool_call", async event => {
 				if (event.toolName !== "bash") return undefined;
+				handlerSignal = event.signal;
 				handlerCalls++;
 				return { input: { command: "echo revised" } };
 			});
@@ -1094,6 +1096,8 @@ describe("AgentSession message pipeline", () => {
 			await session.sendUserMessage("run it");
 
 			expect(handlerCalls).toBe(1);
+			expect(handlerSignal).toBeInstanceOf(AbortSignal);
+			expect(handlerSignal?.aborted).toBe(false);
 			expect(startArgs).toEqual([{ command: "echo revised" }]);
 			const messages = session.agent.state.messages;
 			const toolCallBlock = messages

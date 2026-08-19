@@ -38,10 +38,10 @@ export * from "./modes/components";
 export * from "./modes/theme/theme";
 export type {
 	AgentKind,
-	AgentRef,
-	AgentRegistryListener,
+	AgentRegistryObservationEvent,
+	AgentRegistryObservationListener,
+	AgentRegistrySnapshot,
 	AgentStatus,
-	RegistryEvent,
 } from "./registry/agent-registry";
 export { listRegisteredAgents, onAgentRegistryChange } from "./registry/agent-registry";
 // SDK for programmatic usage

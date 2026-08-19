@@ -95,6 +95,27 @@ export type RegistryEvent =
 	| { type: "removed"; ref: AgentRef };
 
 export type AgentRegistryListener = (event: RegistryEvent) => void;
+export interface AgentRegistrySnapshot {
+	readonly id: string;
+	readonly displayName: string;
+	readonly kind: AgentKind;
+	readonly parentId?: string;
+	readonly status: AgentStatus;
+	readonly sessionFile: string | null;
+	readonly createdAt: number;
+	readonly lastActivity: number;
+	readonly activity?: string;
+	readonly history?: Readonly<
+		Omit<AgentHistorySummary, "metrics"> & { readonly metrics?: Readonly<AgentMetricsSummary> }
+	>;
+}
+
+export interface AgentRegistryObservationEvent {
+	readonly type: RegistryEvent["type"];
+	readonly ref: AgentRegistrySnapshot;
+}
+
+export type AgentRegistryObservationListener = (event: AgentRegistryObservationEvent) => void;
 
 export interface RegisterInput {
 	id: string;
@@ -311,10 +332,33 @@ export class AgentRegistry {
 	}
 }
 
-export function listRegisteredAgents(): AgentRef[] {
-	return AgentRegistry.global().list();
+function snapshotAgentRef(ref: AgentRef): AgentRegistrySnapshot {
+	const history = ref.history;
+	return {
+		id: ref.id,
+		displayName: ref.displayName,
+		kind: ref.kind,
+		parentId: ref.parentId,
+		status: ref.status,
+		sessionFile: ref.sessionFile,
+		createdAt: ref.createdAt,
+		lastActivity: ref.lastActivity,
+		activity: ref.activity,
+		history: history
+			? {
+					...history,
+					metrics: history.metrics ? { ...history.metrics } : undefined,
+				}
+			: undefined,
+	};
 }
 
-export function onAgentRegistryChange(listener: AgentRegistryListener): () => void {
-	return AgentRegistry.global().onChange(listener);
+export function listRegisteredAgents(): AgentRegistrySnapshot[] {
+	return AgentRegistry.global().list().map(snapshotAgentRef);
+}
+
+export function onAgentRegistryChange(listener: AgentRegistryObservationListener): () => void {
+	return AgentRegistry.global().onChange(event => {
+		listener({ type: event.type, ref: snapshotAgentRef(event.ref) });
+	});
 }
