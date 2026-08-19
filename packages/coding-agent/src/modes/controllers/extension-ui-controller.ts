@@ -1066,6 +1066,7 @@ export class ExtensionUiController {
 	): Promise<T> {
 		const savedText = this.ctx.editor.getText();
 		const keybindings = KeybindingsManager.inMemory();
+		const previousFocus = this.ctx.ui.getFocused?.() ?? this.ctx.editor;
 
 		const { promise, resolve, reject } = Promise.withResolvers<T>();
 		let component: (Component & { dispose?(): void }) | undefined;
@@ -1082,7 +1083,7 @@ export class ExtensionUiController {
 				this.ctx.editorContainer.addChild(this.ctx.editor);
 				this.ctx.editor.setText(savedText);
 			}
-			this.ctx.ui.setFocus(this.ctx.editor);
+			this.ctx.ui.setFocus(previousFocus);
 			this.ctx.ui.requestRender();
 		};
 		const finish = (settle: () => void) => {
