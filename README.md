@@ -123,9 +123,10 @@ An upgrade fails before build or installation if the block is stale, any declare
 - `agent-registry-observation`: Read-only global agent-registry observation
 - `outcome-first-scope-control`: Outcome-first reviewer and Todo scope control
 - `kimi-usage-account-identity`: Per-account Kimi usage report identity
-- `archive-read-crash-containment`: Crash-safe tar and tar.gz reads
+- `archive-read-crash-containment`: Crash-safe archive I/O
 - `codex-web-search-reliability`: Native Codex web search orchestration
 - `context-overflow-recovery`: Mid-turn context overflow prevention and recovery
+- `terminal-resize-test-harness`: Terminal resize regression harness
 <!-- stronk-omp:fork-contracts:end -->
 
 ## Upstream alignment
