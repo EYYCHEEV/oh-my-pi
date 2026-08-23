@@ -91,6 +91,31 @@ describe("generated model policies", () => {
 		expect(models[3]?.priority).toBe(1);
 	});
 
+	it("preserves OpenRouter's mandatory provider-authored effort ladder", () => {
+		const models: ModelSpec<Api>[] = [
+			createSpec({
+				id: "mandatory-model",
+				api: "openrouter",
+				provider: "openrouter",
+				thinking: {
+					mode: "effort",
+					efforts: [Effort.Low, Effort.High, Effort.Max],
+					defaultLevel: Effort.Max,
+					requiresEffort: true,
+				},
+			}),
+		];
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]?.thinking).toEqual({
+			mode: "effort",
+			efforts: [Effort.Low, Effort.High, Effort.Max],
+			defaultLevel: Effort.Max,
+			requiresEffort: true,
+		});
+	});
+
 	it("applies GPT-5.6 off and long-context pricing through request-model aliases", () => {
 		const models: ModelSpec<Api>[] = [
 			createSpec({ id: "gpt-5.6", api: "openai-responses", provider: "openai" }),
@@ -160,6 +185,21 @@ describe("generated model policies", () => {
 		expect(models[2]?.contextWindow).toBe(1_000_000);
 		expect(models[3]?.contextWindow).toBe(1050000);
 		expect(models[4]?.contextWindow).toBe(272000);
+	});
+
+	it("applies GPT-5.6 long-context pricing to Codex-transport SKUs (openai/codex#32486)", () => {
+		const models: ModelSpec<Api>[] = [
+			createSpec({ id: "gpt-5.6-sol", api: "openai-codex-responses", provider: "openai-codex" }),
+			createSpec({ id: "gpt-5.6-luna", api: "openai-codex-responses", provider: "openai-codex" }),
+			// Third-party carriers of the same id must not inherit the tier.
+			createSpec({ id: "gpt-5.6-sol", api: "openai-completions", provider: "openrouter" }),
+		];
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]?.cost.longContext).toMatchObject({ inputThreshold: 272_000, input: 10, output: 45 });
+		expect(models[1]?.cost.longContext).toMatchObject({ inputThreshold: 272_000, input: 0.4, output: 1.8 });
+		expect(models[2]?.cost.longContext).toBeUndefined();
 	});
 
 	it("pins Claude Mythos 5 first-party Anthropic catalog metadata", () => {

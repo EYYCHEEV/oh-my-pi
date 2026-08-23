@@ -439,6 +439,7 @@ export class VirtualTerminal implements Terminal {
 
 	#engineWrite(data: string): void {
 		const wasBottom = this.#atBottom();
+		const reportsCursor = data.includes("\x1b[6n");
 		const clearScrollbackAfterFullClear = "\x1b[2J\x1b[H\x1b[3J";
 		// Destructive full paints emit home + ED3 without ED2 (TUI#emitFullPaint
 		// rewrites every visible row with self-clearing lines).
@@ -473,6 +474,10 @@ export class VirtualTerminal implements Terminal {
 		data = stripCombiningMarksForGhostty(data);
 		this.#writeToGhostty(data);
 		this.#refollowBottom(wasBottom);
+		if (reportsCursor) {
+			const { row, col } = this.getCursor();
+			queueMicrotask(() => this.#inputHandler?.(`\x1b[${row + 1};${col + 1}R`));
+		}
 	}
 
 	#stripSynchronizedOutput(data: string): string {

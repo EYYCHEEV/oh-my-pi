@@ -23,6 +23,7 @@ import type {
 } from "../../extensibility/extensions";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
 import { AskDialogComponent, boundPromptTitle } from "../../modes/components/ask-dialog";
+import { installExtensionComposerShape } from "../../modes/components/composer-shape-registry";
 import type { HookEditorOptions } from "../../modes/components/hook-editor";
 import { HookEditorComponent } from "../../modes/components/hook-editor";
 import { HookInputComponent } from "../../modes/components/hook-input";
@@ -73,6 +74,7 @@ function toWireSelectOptions(options: ExtensionUISelectItem[]): CollabUiSelectIt
 
 export class ExtensionUiController {
 	#extensionTerminalInputUnsubscribers = new Set<() => void>();
+	#composerShapeDisposers: Array<() => void> = [];
 	#hookWidgetsAbove = new Map<string, ExtensionUiComponent>();
 	#hookWidgetsBelow = new Map<string, ExtensionUiComponent>();
 	// Single-file dialog surface (`editorContainer` + focus) is shared by the
@@ -88,6 +90,19 @@ export class ExtensionUiController {
 	 */
 	#toolUIContext: ExtensionUIContext | undefined;
 	constructor(private ctx: InteractiveModeContext) {}
+
+	#syncExtensionComposerShapes(): void {
+		this.disposeComposerShapes();
+		for (const definition of this.ctx.session.extensionRunner?.getComposerShapes() ?? []) {
+			this.#composerShapeDisposers.push(installExtensionComposerShape(definition));
+		}
+		this.ctx.syncComposerShape();
+	}
+
+	/** Remove extension-owned composer styles from the process registries. */
+	disposeComposerShapes(): void {
+		for (const dispose of this.#composerShapeDisposers.splice(0)) dispose();
+	}
 
 	/**
 	 * Initialize the hook system with TUI-based UI context.
@@ -156,6 +171,7 @@ export class ExtensionUiController {
 		});
 
 		const extensionRunner = this.ctx.session.extensionRunner;
+		this.#syncExtensionComposerShapes();
 		if (!extensionRunner) {
 			return; // No hooks loaded
 		}
@@ -527,6 +543,7 @@ export class ExtensionUiController {
 		};
 
 		extensionRunner.initialize(actions, contextActions, commandActions, uiContext, "tui");
+		this.#syncExtensionComposerShapes();
 	}
 
 	/**

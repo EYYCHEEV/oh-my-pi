@@ -1043,10 +1043,7 @@ function readTarEntries(rawBytes: Uint8Array, preserveRawPaths = false): Archive
 	const entries = new Map<string, ArchiveIndexEntry>();
 	const rawEntries: ArchiveIndexEntry[] | undefined = preserveRawPaths ? [] : undefined;
 	const pendingLinks = new Map<ArchiveIndexEntry, PendingTarLink>();
-	const addEntry = (
-		entry: ArchiveIndexEntry,
-		pendingLink?: PendingTarLink,
-	): ArchiveIndexEntry | undefined => {
+	const addEntry = (entry: ArchiveIndexEntry, pendingLink?: PendingTarLink): ArchiveIndexEntry | undefined => {
 		const existing = entries.get(entry.path);
 		const indexed = upsertArchiveEntry(entries, entry);
 		if (!indexed) return undefined;
@@ -1083,7 +1080,7 @@ function readTarEntries(rawBytes: Uint8Array, preserveRawPaths = false): Archive
 			typeFlag === "X" ||
 			typeFlag === "g";
 		const pendingPaxSize = isMetadataHeader ? undefined : paxAttribute(globalPax, localPax, "size");
-		let size =
+		const size =
 			pendingPaxSize === undefined
 				? readTarSize(buffer, headerOffset + TAR_SIZE_OFFSET)
 				: parsePaxSize(pendingPaxSize, "member size");
@@ -1693,12 +1690,7 @@ export async function readArchiveEntries(source: ArchiveSource): Promise<Map<str
 	}
 	for (const entry of readTarEntries(bytes, true)) {
 		const rawPath = (entry.rawPath ?? entry.path).replace(/\\/g, "/");
-		if (entry.isDirectory) {
-			if (entry.storage?.type === "tar-link") {
-				throwUnreadableTarLink(entry.storage, rawPath);
-			}
-			continue;
-		}
+		if (entry.isDirectory) continue;
 		if (!entry.storage) {
 			throw new ToolError(`Archive file '${rawPath}' has no readable storage`);
 		}
@@ -1714,10 +1706,138 @@ export async function readArchiveEntries(source: ArchiveSource): Promise<Map<str
 	return entries;
 }
 
+function writeTarField(target: Uint8Array, offset: number, length: number, value: Uint8Array): void {
+	if (value.byteLength > length) throw new ToolError("Tar header field is too long");
+	target.set(value, offset);
+}
+
+function writeTarOctal(target: Uint8Array, offset: number, length: number, value: number): void {
+	if (!Number.isSafeInteger(value) || value < 0) throw new ToolError("Invalid tar numeric value");
+	const digits = value.toString(8);
+	if (digits.length > length - 1) throw new ToolError("Tar numeric value does not fit its header field");
+	target.fill(0x30, offset, offset + length - 1 - digits.length);
+	for (let index = 0; index < digits.length; index++) {
+		target[offset + length - 1 - digits.length + index] = digits.charCodeAt(index);
+	}
+	target[offset + length - 1] = 0;
+}
+
+function splitTarWritePath(pathBytes: Uint8Array): readonly [Uint8Array, Uint8Array] | undefined {
+	if (pathBytes.byteLength <= TAR_NAME_LENGTH) return [pathBytes, new Uint8Array(0)];
+	for (let index = pathBytes.byteLength - 1; index > 0; index--) {
+		if (pathBytes[index] !== 0x2f) continue;
+		const prefix = pathBytes.subarray(0, index);
+		const name = pathBytes.subarray(index + 1);
+		if (prefix.byteLength <= TAR_PREFIX_LENGTH && name.byteLength > 0 && name.byteLength <= TAR_NAME_LENGTH) {
+			return [name, prefix];
+		}
+	}
+	return undefined;
+}
+
+function tarPaxPathRecord(memberPath: string): Uint8Array {
+	const body = ENCODER.encode(`path=${memberPath}\n`);
+	let length = body.byteLength + 2;
+	for (;;) {
+		const next = String(length).length + 1 + body.byteLength;
+		if (next === length) break;
+		length = next;
+	}
+	const prefix = ENCODER.encode(`${length} `);
+	const record = new Uint8Array(length);
+	record.set(prefix);
+	record.set(body, prefix.byteLength);
+	return record;
+}
+
+function createTarWriteHeader(name: Uint8Array, prefix: Uint8Array, size: number, typeFlag: number): Uint8Array {
+	const header = new Uint8Array(TAR_BLOCK_SIZE);
+	writeTarField(header, TAR_NAME_OFFSET, TAR_NAME_LENGTH, name);
+	writeTarOctal(header, 100, 8, 0o644);
+	writeTarOctal(header, 108, 8, 0);
+	writeTarOctal(header, 116, 8, 0);
+	writeTarOctal(header, TAR_SIZE_OFFSET, TAR_SIZE_LENGTH, size);
+	writeTarOctal(header, TAR_MTIME_OFFSET, TAR_MTIME_LENGTH, 0);
+	header.fill(0x20, TAR_CHECKSUM_OFFSET, TAR_CHECKSUM_OFFSET + TAR_CHECKSUM_LENGTH);
+	header[TAR_TYPEFLAG_OFFSET] = typeFlag;
+	writeTarField(header, TAR_MAGIC_OFFSET, TAR_MAGIC.length, ENCODER.encode(TAR_MAGIC));
+	writeTarField(header, TAR_VERSION_OFFSET, TAR_VERSION.length, ENCODER.encode(TAR_VERSION));
+	writeTarField(header, TAR_PREFIX_OFFSET, TAR_PREFIX_LENGTH, prefix);
+	let checksum = 0;
+	for (const byte of header) checksum += byte;
+	const digits = checksum.toString(8).padStart(6, "0");
+	for (let index = 0; index < digits.length; index++) {
+		header[TAR_CHECKSUM_OFFSET + index] = digits.charCodeAt(index);
+	}
+	header[TAR_CHECKSUM_OFFSET + 6] = 0;
+	header[TAR_CHECKSUM_OFFSET + 7] = 0x20;
+	return header;
+}
+
+function appendTarWritePayload(parts: Uint8Array[], payload: Uint8Array): void {
+	parts.push(payload);
+	const padding = tarPaddedSize(payload.byteLength) - payload.byteLength;
+	if (padding > 0) parts.push(new Uint8Array(padding));
+}
+
+function concatTarWriteParts(parts: readonly Uint8Array[]): Uint8Array {
+	let length = 0;
+	for (const part of parts) {
+		length += part.byteLength;
+		if (!Number.isSafeInteger(length) || length > MAX_TAR_ARCHIVE_BYTES) {
+			throw new ToolError("Tar archive is too large to write safely");
+		}
+	}
+	const output = new Uint8Array(length);
+	let offset = 0;
+	for (const part of parts) {
+		output.set(part, offset);
+		offset += part.byteLength;
+	}
+	return output;
+}
+
+async function encodeTarEntries(entries: Iterable<readonly [string, ArchiveMemberContent]>): Promise<Uint8Array> {
+	const parts: Uint8Array[] = [];
+	let sequence = 0;
+	for (const [rawName, content] of entries) {
+		const name = rawName.replace(/\\/g, "/");
+		if (!name || name.includes("\0")) throw new ToolError("Tar member path is empty or contains NUL");
+		const nameBytes = ENCODER.encode(name);
+		if (nameBytes.byteLength > TAR_MAX_PATH_BYTES) {
+			throw new ToolError(`Tar member path exceeds ${TAR_MAX_PATH_BYTES} bytes`);
+		}
+		const payload = await memberToBytes(content);
+		assertArchiveMemberSize(payload.byteLength, name);
+		const split = splitTarWritePath(nameBytes);
+		if (!split) {
+			const paxPayload = tarPaxPathRecord(name);
+			parts.push(
+				createTarWriteHeader(
+					ENCODER.encode(`PaxHeaders/${String(sequence).padStart(8, "0")}`),
+					new Uint8Array(0),
+					paxPayload.byteLength,
+					0x78,
+				),
+			);
+			appendTarWritePayload(parts, paxPayload);
+		}
+		const effectiveSplit = split ?? [
+			ENCODER.encode(`PaxFile/${String(sequence).padStart(8, "0")}`),
+			new Uint8Array(0),
+		];
+		parts.push(createTarWriteHeader(effectiveSplit[0], effectiveSplit[1], payload.byteLength, 0x30));
+		appendTarWritePayload(parts, payload);
+		sequence++;
+	}
+	parts.push(new Uint8Array(TAR_BLOCK_SIZE * 2));
+	return concatTarWriteParts(parts);
+}
+
 /**
  * Serialize `entries` into an archive of `format` and write it to `destPath`.
- * ZIP is framed in memory, tar / tar.gz via `Bun.Archive` (gzip for tar.gz).
- * String members are encoded as UTF-8.
+ * ZIP and tar framing stay in-process so raw member names survive rewrites;
+ * tar.gz adds gzip compression after framing.
  */
 export async function writeArchive(
 	destPath: string,
@@ -1733,11 +1853,8 @@ export async function writeArchive(
 		return;
 	}
 
-	const record: Record<string, ArchiveMemberContent> = {};
-	for (const [name, content] of entries) {
-		record[name.replace(/\\/g, "/")] = content;
-	}
-	await Bun.Archive.write(destPath, record, format === "tar.gz" ? { compress: "gzip" } : undefined);
+	const tarBytes = await encodeTarEntries(entries);
+	await Bun.write(destPath, format === "tar.gz" ? zlib.gzipSync(tarBytes) : tarBytes);
 }
 
 /**

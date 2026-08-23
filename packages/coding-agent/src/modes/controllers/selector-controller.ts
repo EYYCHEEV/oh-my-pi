@@ -1,9 +1,9 @@
-import { type AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { type AgentMessage, type AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
 import { PASTE_CODE_LOGIN_PROVIDERS } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
-import type { Component, OverlayHandle } from "@oh-my-pi/pi-tui";
+import type { Component, OverlayHandle, ResizeScrollbackMode } from "@oh-my-pi/pi-tui";
 import { Loader, Spacer, setTuiTight, Text } from "@oh-my-pi/pi-tui";
 import { getAgentDbPath, getAgentDir, getProjectDir, normalizePathForComparison } from "@oh-my-pi/pi-utils";
 import {
@@ -50,8 +50,10 @@ import {
 	persistForeignSession,
 } from "../../session/foreign-session-import";
 import type { ForeignSessionInfo, ForeignSessionSource } from "../../session/foreign-session-store";
+import type { SessionEntry } from "../../session/session-entries";
 import type { SessionInfo } from "../../session/session-listing";
 import { SessionManager } from "../../session/session-manager";
+import { loadPinnedSessionIds } from "../../session/session-pins";
 import { FileSessionStorage } from "../../session/session-storage";
 import { type LogoutAccount, toLogoutAccounts } from "../../slash-commands/helpers/logout";
 import {
@@ -202,6 +204,7 @@ export class SelectorController {
 					model: this.ctx.session.model,
 					imageBudget: this.ctx.ui.imageBudget,
 					requestRender: () => this.ctx.ui.requestRender(),
+					composerPreviewStatus: this.ctx.statusLine,
 				},
 				{
 					onChange: (id, value) => this.handleSettingChange(id, value),
@@ -224,14 +227,16 @@ export class SelectorController {
 							sessionAccent: settings.get("statusLine.sessionAccent"),
 							transparent: settings.get("statusLine.transparent"),
 							compactThinkingLevel: settings.get("statusLine.compactThinkingLevel"),
+							contextLine: settings.get("statusLine.contextLine"),
 							...previewSettings,
 						});
 						this.ctx.ui.requestRender();
 					},
 					getStatusLinePreview: () => {
-						// Return the rendered status line for inline preview
+						// The bar exactly as the active composer shape renders it (box top
+						// border, claude rule + chip, or the plain standalone bottom bar).
 						const availableWidth = this.ctx.editor.getTopBorderAvailableWidth(this.ctx.ui.terminal.columns);
-						return this.ctx.statusLine.getTopBorder(availableWidth).content;
+						return this.ctx.statusLine.getPreviewLines(availableWidth).join("\n");
 					},
 					onPluginsChanged: async () => {
 						const projectPath = await resolveActiveProjectRegistryPath(this.ctx.sessionManager.getCwd());
@@ -253,6 +258,7 @@ export class SelectorController {
 							sessionAccent: settings.get("statusLine.sessionAccent"),
 							transparent: settings.get("statusLine.transparent"),
 							compactThinkingLevel: settings.get("statusLine.compactThinkingLevel"),
+							contextLine: settings.get("statusLine.contextLine"),
 						});
 						this.ctx.ui.requestRender();
 					},
@@ -443,6 +449,9 @@ export class SelectorController {
 				this.ctx.session.setAutoCompactionEnabled(value as boolean);
 				this.ctx.statusLine.setAutoCompactEnabled(value as boolean);
 				break;
+			case "composer.shape":
+				this.ctx.syncComposerShape();
+				break;
 			case "advisor.enabled":
 				this.ctx.session.setAdvisorEnabled(value as boolean);
 				this.ctx.statusLine.invalidate();
@@ -492,6 +501,12 @@ export class SelectorController {
 			case "autocompleteMaxVisible":
 				this.ctx.editor.setAutocompleteMaxVisible(typeof value === "number" ? value : Number(value));
 				break;
+			case "spelling.typoDetection":
+			case "spelling.autocomplete":
+			case "spelling.autocorrect":
+				this.ctx.syncEditorSpelling();
+				this.ctx.ui.requestRender();
+				break;
 
 			// Settings with UI side effects
 			case "display.hideToolActivity": {
@@ -507,7 +522,7 @@ export class SelectorController {
 				}
 				this.ctx.chatContainer.setToolActivityVisible(!hidden);
 				if (hidden) this.ctx.ui.clearInlineImages();
-				this.ctx.ui.resetDisplay();
+				this.ctx.ui.requestRender(true);
 				break;
 			}
 			case "terminal.showImages":
@@ -521,7 +536,7 @@ export class SelectorController {
 					}
 				}
 				if (!visible) this.ctx.ui.clearInlineImages();
-				this.ctx.ui.resetDisplay();
+				this.ctx.ui.requestRender(true);
 				break;
 			}
 			case "hideThinkingBlock":
@@ -531,10 +546,7 @@ export class SelectorController {
 						child.setHideThinkingBlock(this.ctx.effectiveHideThinkingBlock);
 					}
 				}
-				// Full clear + replay so blocks frozen in committed scrollback on
-				// ED3-risk terminals retire their stale snapshots too (see
-				// InputController.toggleThinkingBlockVisibility).
-				this.ctx.ui.resetDisplay();
+				this.ctx.ui.requestRender(true);
 				break;
 			case "proseOnlyThinking":
 				this.ctx.proseOnlyThinking = value as boolean;
@@ -543,7 +555,7 @@ export class SelectorController {
 						child.setProseOnlyThinking(value as boolean);
 					}
 				}
-				this.ctx.ui.resetDisplay();
+				this.ctx.ui.requestRender(true);
 				break;
 			case "omitThinking":
 				this.ctx.session.agent.hideThinkingSummary = value as boolean;
@@ -573,9 +585,8 @@ export class SelectorController {
 				this.ctx.ui.invalidate();
 				this.ctx.ui.requestRender();
 				break;
-
-			case "tui.scrollbackRebuild":
-				this.ctx.ui.setScrollbackRebuild(value as boolean);
+			case "tui.resizeScrollback":
+				this.ctx.ui.setResizeScrollback(value as ResizeScrollbackMode);
 				break;
 
 			case "tui.renderMermaid":
@@ -842,17 +853,16 @@ export class SelectorController {
 					const releaseDefaultMutation = role === "default" ? await this.#acquireDefaultRoleMutation() : undefined;
 					const configuredStorage = this.ctx.settings.get("modelRoleStorage");
 					const targetScope = configuredStorage === "project" ? (scope ?? "project") : "global";
-					// `auto` is session-global: never baked into a per-role model value
-					// (it can't round-trip through `model:<level>`). Apply it to the session
-					// separately and persist via `defaultThinkingLevel`.
-					const isAuto = thinkingLevel === AUTO_THINKING;
-					const concreteThinking = isAuto || thinkingLevel === undefined ? undefined : thinkingLevel;
 					const selectorValue = selector ?? `${model.provider}/${model.id}`;
 					const scopeLabel =
 						configuredStorage === "project" ? `${targetScope === "project" ? "Project" : "Global"} ` : "";
 					const defaultStatusLabel = configuredStorage === "project" ? `${scopeLabel}default` : "Default";
 					try {
 						if (role === "default") {
+							// `auto` on the default role configures the active session. Other roles
+							// persist an explicit `:auto` suffix and must not mutate the current model.
+							const isAuto = thinkingLevel === AUTO_THINKING;
+							const concreteThinking = isAuto || thinkingLevel === undefined ? undefined : thinkingLevel;
 							const effectiveProvenance = this.ctx.settings.getModelRoleProvenance("default");
 							const shadowedGlobal =
 								configuredStorage === "project" &&
@@ -905,14 +915,11 @@ export class SelectorController {
 							this.ctx.showStatus(`${defaultStatusLabel} model: ${selector ?? model.id}`);
 						} else {
 							// Other roles (smol, slow, custom): update settings, not the current model.
-							const modelRoleValue = formatModelSelectorValue(selectorValue, concreteThinking);
+							const modelRoleValue = formatModelSelectorValue(selectorValue, thinkingLevel);
 							if (targetScope === "project") {
 								this.ctx.settings.setProjectModelRole(role, modelRoleValue);
 							} else {
 								this.ctx.settings.setModelRole(role, modelRoleValue);
-							}
-							if (isAuto) {
-								this.ctx.session.setThinkingLevel(AUTO_THINKING, true);
 							}
 							const roleInfo = getRoleInfo(role, settings);
 							this.ctx.showStatus(
@@ -1155,6 +1162,15 @@ export class SelectorController {
 			const selector = new UserMessageSelectorComponent(
 				userMessages.map(m => ({ id: m.entryId, text: m.text })),
 				async entryId => {
+					// Branching rewinds to a strict prefix of the rendered transcript:
+					// the selected user message and everything after it are dropped.
+					// Capture the boundary before branch() so the tail can be dropped
+					// in place when it never reached native scrollback.
+					const branchEntry = this.ctx.sessionManager.getEntry(entryId);
+					const branchMessage =
+						branchEntry?.type === "message" && branchEntry.message.role === "user"
+							? branchEntry.message
+							: undefined;
 					const result = await this.ctx.session.branch(entryId);
 					if (result.cancelled) {
 						// Hook cancelled the branch
@@ -1163,7 +1179,18 @@ export class SelectorController {
 						return;
 					}
 
-					await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
+					// A leaf that moved past the branch point (e.g. a session_branch
+					// hook persisted entries) invalidates the prefix assumption.
+					// Root branches (parentId null) start a fresh session file and may
+					// leave pre-message components stale — always replay those.
+					const fastRewind =
+						branchMessage !== undefined &&
+						branchEntry?.parentId != null &&
+						this.ctx.sessionManager.getLeafId() === branchEntry.parentId &&
+						this.ctx.truncateTranscriptFromMessage(branchMessage);
+					if (!fastRewind) {
+						await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
+					}
 					this.ctx.editor.setDraft(result.selectedText, result.selectedImages);
 					done();
 					this.ctx.showStatus("Branched to new session");
@@ -1243,6 +1270,12 @@ export class SelectorController {
 
 					// Ask about summarization
 					done(); // Close selector first
+
+					// Pure-rewind probe (before navigation mutates the leaf): when the
+					// target sits on the current leaf's path and no summary is added,
+					// the post-navigation transcript is a strict prefix of the rendered
+					// one and the tail can be dropped in place.
+					const treeRewind = this.#treeRewindBoundary(entryId, realLeafId);
 
 					// Loop until user makes a complete choice or cancels to tree.
 					// Shift+Enter in the tree selector pre-answers "Summarize" and
@@ -1336,7 +1369,16 @@ export class SelectorController {
 
 						// Update UI — rebuild the display transcript for the new leaf (the
 						// context from navigateTree is the LLM context, not the transcript).
-						await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
+						const fastRewind =
+							treeRewind !== undefined &&
+							!wantsSummary &&
+							!result.summaryEntry &&
+							!result.askReanswerCommitted &&
+							this.ctx.sessionManager.getLeafId() === treeRewind.expectedLeafId &&
+							this.ctx.truncateTranscriptFromMessage(treeRewind.message);
+						if (!fastRewind) {
+							await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
+						}
 						await this.ctx.reloadTodos();
 						if (result.editorText && !this.ctx.editor.getText().trim()) {
 							this.ctx.editor.setDraft(result.editorText, result.editorImages);
@@ -1373,6 +1415,47 @@ export class SelectorController {
 			);
 			return { component: selector, focus: selector };
 		});
+	}
+
+	/**
+	 * First rendered message a pure tree rewind drops, plus the leaf id the
+	 * navigation is expected to land on. `targetId` must sit on the current
+	 * leaf's path; a user-message target rewinds PAST itself (navigateTree
+	 * moves the leaf to its parent and hands the text back as an editor
+	 * draft), every other target keeps the target as the new leaf. Returns
+	 * undefined when the navigation is not a pure rewind or the boundary entry
+	 * cannot anchor an in-place truncation (non-message boundary; custom
+	 * messages render unkeyed components).
+	 */
+	#treeRewindBoundary(
+		targetId: string,
+		leafId: string | null,
+	): { message: AgentMessage; expectedLeafId: string } | undefined {
+		if (!leafId) return undefined;
+		const target = this.ctx.sessionManager.getEntry(targetId);
+		if (!target) return undefined;
+		const rewindsPastTarget = target.type === "message" && target.message.role === "user";
+		if (!rewindsPastTarget && target.type === "custom_message") return undefined;
+		// Walk leaf → root: proves the target is on the current path and finds
+		// the first entry the rewind drops.
+		let firstDropped: SessionEntry | undefined;
+		let cursor = this.ctx.sessionManager.getEntry(leafId);
+		while (cursor && cursor.id !== targetId) {
+			firstDropped = cursor;
+			cursor = cursor.parentId ? this.ctx.sessionManager.getEntry(cursor.parentId) : undefined;
+		}
+		if (!cursor) return undefined;
+		const boundary = rewindsPastTarget ? target : firstDropped;
+		if (boundary?.type !== "message") return undefined;
+		// A root rewind (expected leaf null) empties the transcript but may leave
+		// components rendered before the first message stale — take the
+		// destructive replay instead.
+		const expectedLeafId = rewindsPastTarget ? target.parentId : targetId;
+		if (expectedLeafId === null) return undefined;
+		return {
+			message: boundary.message,
+			expectedLeafId,
+		};
 	}
 
 	/**
@@ -1469,10 +1552,11 @@ export class SelectorController {
 				showCwd: true,
 			};
 		} else {
-			sessions = await SessionManager.list(
-				this.ctx.sessionManager.getCwd(),
-				this.ctx.sessionManager.getSessionDir(),
-			);
+			const [loadedSessions, pinnedIds] = await Promise.all([
+				SessionManager.list(this.ctx.sessionManager.getCwd(), this.ctx.sessionManager.getSessionDir()),
+				loadPinnedSessionIds(),
+			]);
+			sessions = loadedSessions;
 			const historyStorage = this.ctx.historyStorage;
 			const historyMatcher = historyStorage
 				? (query: string) => historyStorage.matchingSessionIds(query)
@@ -1496,6 +1580,7 @@ export class SelectorController {
 				},
 				historyMatcher,
 				loadAllSessions: () => SessionManager.listAll(),
+				pinnedIds,
 			};
 		}
 

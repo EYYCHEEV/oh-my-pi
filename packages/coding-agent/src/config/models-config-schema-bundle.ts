@@ -50,6 +50,7 @@ export const getModelsConfigSchemaBundle = once(() => {
 		"supportsStrictMode?": "boolean",
 		"toolStrictMode?": '"all_strict" | "none"',
 		"streamIdleTimeoutMs?": "number >= 0",
+		"streamMarkupHealingPattern?": '"kimi" | "dsml" | "qwen" | "thinking"',
 		"supportsLongPromptCacheRetention?": "boolean",
 		"supportsReasoningParams?": "boolean",
 		"alwaysSendMaxTokens?": "boolean",
@@ -132,6 +133,10 @@ export const getModelsConfigSchemaBundle = once(() => {
 			};
 		});
 
+	const ModelTokenizerSchema = type(
+		'"claude-v3" | "claude-v47" | "claude-v5" | "claude-v5-sonnet" | "qwen3" | "deepseek-v3" | "kimi-k2" | "glm5"',
+	);
+
 	const RemoteCompactionSchema = type({
 		"enabled?": "boolean",
 		"api?": ApiSchema,
@@ -169,6 +174,7 @@ export const getModelsConfigSchemaBundle = once(() => {
 		"thinking?": ModelThinkingSchema,
 		"input?": '("text" | "image")[]',
 		"imageInputDecoder?": '"stb"',
+		"tokenizer?": ModelTokenizerSchema,
 		"supportsTools?": "boolean",
 		"cost?": {
 			input: "number",
@@ -219,6 +225,7 @@ export const getModelsConfigSchemaBundle = once(() => {
 		"thinking?": ModelThinkingSchema,
 		"input?": '("text" | "image")[]',
 		"imageInputDecoder?": '"stb"',
+		"tokenizer?": ModelTokenizerSchema,
 		"supportsTools?": "boolean",
 		"cost?": {
 			"input?": "number",
@@ -284,6 +291,16 @@ export const getModelsConfigSchemaBundle = once(() => {
 		"models?": ModelDefinitionSchema.array(),
 		"modelOverrides?": { "[string]": ModelOverrideSchema },
 		"disableStrictTools?": "boolean",
+		/**
+		 * Amazon Bedrock Guardrail id or ARN attached to every Converse request under
+		 * this provider. Required by accounts that gate `bedrock:InvokeModel*` on the
+		 * `bedrock:GuardrailIdentifier` condition key.
+		 */
+		"guardrailIdentifier?": "string",
+		/** Bedrock guardrail version (defaults to `"DRAFT"` when a guardrail is set). */
+		"guardrailVersion?": "string",
+		/** Bedrock guardrail trace verbosity. */
+		"guardrailTrace?": '"enabled" | "disabled" | "enabled_full"',
 		/**
 		 * Streaming transport override. When set to `"pi-native"`, omp dispatches
 		 * every model under this provider via the auth-gateway's

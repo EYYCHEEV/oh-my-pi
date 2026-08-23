@@ -4,7 +4,7 @@
  * Uses the configured Codex Responses transport for proxy/API-key setups and
  * the official ChatGPT backend for OAuth logins.
  */
-import { countTokens } from "@oh-my-pi/pi-agent-core";
+import { Tokenizer } from "@oh-my-pi/pi-agent-core";
 import {
 	type AuthStorage,
 	type FetchImpl,
@@ -22,6 +22,7 @@ import {
 import { validateJsonSchemaValue } from "@oh-my-pi/pi-ai/utils/schema";
 import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import {
+	applyCodexResidencyHeader,
 	CODEX_BASE_URL,
 	CODEX_CLIENT_VERSION,
 	getCodexAccountId,
@@ -39,6 +40,7 @@ import { SearchProvider } from "./base";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
 
 const CODEX_SEARCH_TIMEOUT_MS = 5 * 60_000;
+const CODEX_SEARCH_TOKENIZER = new Tokenizer();
 const FALLBACK_MODEL = "gpt-5.5";
 // Live GPT-5.6 Sol leads when model discovery advertises it: this matches the
 // Codex CLI's multi-step search path. Bundled non-Lite `gpt-5.5` remains the
@@ -699,6 +701,7 @@ function buildCodexHeaders(
 	} else {
 		headers.delete(OPENAI_HEADERS.ACCOUNT_ID);
 	}
+	applyCodexResidencyHeader(headers, accessToken);
 	headers.set(OPENAI_HEADERS.BETA, OPENAI_HEADER_VALUES.BETA_RESPONSES);
 	headers.set(OPENAI_HEADERS.ORIGINATOR, OPENAI_HEADER_VALUES.ORIGINATOR_CODEX);
 	headers.set(OPENAI_HEADERS.VERSION, CODEX_CLIENT_VERSION);
@@ -726,12 +729,12 @@ function visibleMessageText(message: Message): string {
 
 function truncateToTokenBudget(text: string, budget: number): string {
 	if (budget <= 0) return "";
-	if (countTokens(text) <= budget) return text;
+	if (CODEX_SEARCH_TOKENIZER.countTokens(text) <= budget) return text;
 	let low = 0;
 	let high = text.length;
 	while (low < high) {
 		const midpoint = Math.ceil((low + high) / 2);
-		if (countTokens(text.slice(0, midpoint)) <= budget) low = midpoint;
+		if (CODEX_SEARCH_TOKENIZER.countTokens(text.slice(0, midpoint)) <= budget) low = midpoint;
 		else high = midpoint - 1;
 	}
 	return text.slice(0, low);
@@ -762,7 +765,7 @@ export function buildCodexWebRunInput(messages: readonly Message[]): CodexWebRun
 		const part = message.content[0];
 		if (!part) continue;
 		part.text = truncateToTokenBudget(part.text, assistantBudget);
-		assistantBudget = Math.max(0, assistantBudget - countTokens(part.text));
+		assistantBudget = Math.max(0, assistantBudget - CODEX_SEARCH_TOKENIZER.countTokens(part.text));
 	}
 	return tail.filter(message => message.content[0]?.text);
 }

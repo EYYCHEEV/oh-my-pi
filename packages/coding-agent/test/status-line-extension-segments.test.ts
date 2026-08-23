@@ -93,7 +93,7 @@ describe("extension status-line segments", () => {
 				render: () => "42s",
 			});
 			const raw = status.getTopBorder(80).content;
-			expect(plain(raw)).toContain("$0.74 (sub) | 42s");
+			expect(plain(raw)).toContain("S0.74 | 42s");
 			expect(raw).toContain(`${theme.getFgAnsi("statusLineOutput")}42s`);
 		}
 	});
@@ -134,29 +134,23 @@ describe("extension status-line segments", () => {
 		expect(actual.width).toBe(expected.width);
 	});
 
-	it("renders fixed empty-registry goldens for every supported baseline", () => {
-		const goldens = {
-			default: " π  > 📁 …y-pi ▶",
-			compact: " ⬢ test ▶",
-			full: " π  ▶ 📁 …y-pi ▶",
-			ascii: " ⬢ test > 📁 …y-pi ",
-			custom: " π  ─────── session ",
-		};
-		for (const preset of ["default", "compact", "full", "ascii", "custom"] as const) {
-			const status = new StatusLineComponent(session());
-			const settings =
-				preset === "custom"
-					? {
-							preset,
-							leftSegments: ["pi"],
-							rightSegments: ["session_name"],
-							separator: "pipe",
-							sessionAccent: false,
-						}
-					: { preset };
-			status.updateSettings(settings as never);
-			expect(plain(status.getTopBorder(20).content)).toBe(goldens[preset]);
-		}
+	it("keeps extension segments on their configured composer side", () => {
+		const status = component(["pi"], ["session_name"]);
+		status.registerExtensionSegment("left-only", {
+			id: "left-only",
+			placement: { afterBuiltin: "pi", fallback: "anchor-side-end-else-right" },
+			render: () => "LEFT",
+		});
+		status.registerExtensionSegment("right-only", {
+			id: "right-only",
+			placement: { afterBuiltin: "session_name", fallback: "anchor-side-end-else-right" },
+			render: () => "RIGHT",
+		});
+
+		expect(plain(status.renderBottomBar(100, "left"))).toContain("LEFT");
+		expect(plain(status.renderBottomBar(100, "left"))).not.toContain("RIGHT");
+		expect(plain(status.getStandaloneTopBorder(100).content)).toContain("RIGHT");
+		expect(plain(status.getStandaloneTopBorder(100).content)).not.toContain("LEFT");
 	});
 
 	it("invalidates on registration and idempotent disposal", () => {

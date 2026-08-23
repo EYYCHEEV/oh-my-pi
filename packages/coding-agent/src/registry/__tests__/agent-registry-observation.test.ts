@@ -3,9 +3,9 @@ import { afterEach, describe, expect, it } from "bun:test";
 import type { AgentSession } from "../../session/agent-session";
 import {
 	AgentRegistry,
+	type AgentRegistryObservationEvent,
 	listRegisteredAgents,
 	onAgentRegistryChange,
-	type AgentRegistryObservationEvent,
 } from "../agent-registry";
 
 afterEach(() => {

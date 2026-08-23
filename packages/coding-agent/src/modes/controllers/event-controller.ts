@@ -116,6 +116,7 @@ export class EventController {
 	// those calls arrive so the normal no-pending path cannot recreate the
 	// retracted card below the rewind's fresh blocks (#6879).
 	#retractedToolCallIds = new Set<string>();
+	#executionStartedCallIds = new Set<string>();
 	// Cards settled by a synthetic aborted/error `tool_execution_end` (agent-loop
 	// emits one per never-run call on a terminal error/abort). They stay visible
 	// for a genuinely terminal failure, but if an auto-retry then supersedes the
@@ -280,7 +281,7 @@ export class EventController {
 					this.ctx.streamingComponent.setHideThinkingBlock(hideThinking);
 					this.#streamingReveal.resyncVisibility();
 				}
-				this.ctx.ui.resetDisplay();
+				this.ctx.ui.requestRender(true);
 			},
 			goal_updated: async () => {},
 		} satisfies AgentSessionEventHandlers;
@@ -408,6 +409,9 @@ export class EventController {
 		// The reveal controller is id-keyed; drop the stale target so the loop's
 		// setTarget/bind under the new id owns the paced reveal.
 		this.#toolArgsReveal.finish(oldId);
+		if (this.#executionStartedCallIds.delete(oldId)) {
+			this.#executionStartedCallIds.add(newId);
+		}
 		const readArgs = this.#readToolCallArgs.get(oldId);
 		if (readArgs !== undefined) {
 			this.#readToolCallArgs.delete(oldId);
@@ -456,7 +460,7 @@ export class EventController {
 		const children = this.ctx.chatContainer.children;
 		const anchorIndex = anchor ? children.indexOf(anchor) : -1;
 		if (anchorIndex < 0) return false;
-		if (children.slice(anchorIndex + 1).some(child => !this.ctx.chatContainer.isBlockUncommitted(child))) {
+		if (children.slice(anchorIndex + 1).some(child => !this.ctx.chatContainer.canRemoveBlock(child))) {
 			return false;
 		}
 		this.ctx.chatContainer.addChild(component);
@@ -625,6 +629,12 @@ export class EventController {
 		this.#pendingMessageUpdate = undefined;
 		await this.handleEvent(event);
 	}
+
+	/** Whether `#handleToolExecutionStart` has fired for this call id this turn. */
+	hasToolExecutionStarted(toolCallId: string): boolean {
+		return this.#executionStartedCallIds.has(toolCallId);
+	}
+
 	/**
 	 * Clear every transcript-anchored/turn-scoped piece of state. Used by the
 	 * session focus proxy when re-pointing the transcript at another session:
@@ -644,6 +654,7 @@ export class EventController {
 		this.#toolTimelineComponents.clear();
 		this.#streamedToolCallIdByIndex.clear();
 		this.#retractedToolCallIds.clear();
+		this.#executionStartedCallIds.clear();
 		this.#syntheticFailureCards.clear();
 		this.#orphanedToolCompletions.clear();
 		this.#postToolAssistantComponents.clear();
@@ -739,6 +750,7 @@ export class EventController {
 		this.#toolTimelineComponents.clear();
 		this.#streamedToolCallIdByIndex.clear();
 		this.#retractedToolCallIds.clear();
+		this.#executionStartedCallIds.clear();
 		this.#syntheticFailureCards.clear();
 		this.#orphanedToolCompletions.clear();
 		this.#postToolAssistantComponents.clear();
@@ -845,7 +857,7 @@ export class EventController {
 				}
 				this.ctx.updatePendingMessagesDisplay();
 			}
-			this.ctx.ui.requestRender();
+			this.ctx.ui.requestRender(true);
 		} else if (event.message.role === "fileMention") {
 			this.#resetReadGroup();
 			this.ctx.addMessageToChat(event.message);
@@ -889,13 +901,9 @@ export class EventController {
 	}
 
 	/**
-	 * Remove an expired/evicted IRC card — but only while it still sits below a
-	 * live block, where its rows cannot have entered native scrollback. Once
-	 * everything above it has finalized, its rows may already be committed;
-	 * removing them then is an interior deletion of the committed prefix, which
-	 * the engine can only repair by recommitting every row below the gap —
-	 * exactly the duplicated-block artifact this guard exists to prevent. Such
-	 * a card simply stays: it is final history, and the window scrolls past it.
+	 * Remove an expired/evicted IRC card only while its transcript entry remains
+	 * active. Pending or committed entries already belong to an immutable
+	 * ordered history batch and remain as final history.
 	 */
 	#retireIrcCard(signature: string): void {
 		const components = this.#liveIrcCards.get(signature);
@@ -903,7 +911,7 @@ export class EventController {
 		if (!components) return;
 		let removed = false;
 		for (const component of components) {
-			if (!this.ctx.chatContainer.isBlockUncommitted(component)) continue;
+			if (!this.ctx.chatContainer.canRemoveBlock(component)) continue;
 			this.ctx.chatContainer.removeChild(component);
 			removed = true;
 		}
@@ -937,11 +945,7 @@ export class EventController {
 		const previous = this.#displaceablePollComponent;
 		if (!previous) return;
 		this.#displaceablePollComponent = undefined;
-		if (
-			nextToolName === "hub" &&
-			previous.isDisplaceableBlock() &&
-			this.ctx.chatContainer.isBlockUncommitted(previous)
-		) {
+		if (nextToolName === "hub" && previous.isDisplaceableBlock() && this.ctx.chatContainer.canRemoveBlock(previous)) {
 			this.ctx.chatContainer.removeChild(previous);
 		}
 		// Sealing stops the waiting-poll spinner and freezes the block (for a
@@ -959,7 +963,7 @@ export class EventController {
 		}
 		if (previous.canBeDisplacedBy(nextToolName)) {
 			this.#displaceableTodoComponent = undefined;
-			if (this.ctx.chatContainer.isBlockUncommitted(previous)) {
+			if (this.ctx.chatContainer.canRemoveBlock(previous)) {
 				this.ctx.chatContainer.removeChild(previous);
 			}
 			previous.seal();
@@ -1279,7 +1283,7 @@ export class EventController {
 						) {
 							continue;
 						}
-						if (this.ctx.chatContainer.isBlockUncommitted(component)) {
+						if (this.ctx.chatContainer.canRemoveBlock(component)) {
 							this.#retractToolCardEntry(toolCallId, component);
 							this.#retractedToolCallIds.add(toolCallId);
 						} else {
@@ -1395,9 +1399,6 @@ export class EventController {
 					snapshots: getFileSnapshotStore(this.ctx.viewSession),
 					clipboard: getEditClipboard(this.ctx.viewSession),
 					showImages: settings.get("terminal.showImages"),
-					editFuzzyThreshold: settings.get("edit.fuzzyThreshold"),
-					editAllowFuzzy: settings.get("edit.fuzzyMatch"),
-					liveRegion: this.ctx.chatContainer,
 				},
 				tool,
 				this.ctx.ui,
@@ -1405,6 +1406,8 @@ export class EventController {
 				event.toolCallId,
 			);
 			component.setArgsComplete(event.toolCallId);
+			component.setExecutionStarted(event.toolCallId);
+			this.#executionStartedCallIds.add(event.toolCallId);
 			component.setExpanded(this.ctx.toolOutputExpanded);
 			this.ctx.chatContainer.addChild(component);
 			this.ctx.pendingTools.set(event.toolCallId, component);
@@ -1428,6 +1431,10 @@ export class EventController {
 				if (typeof component.setArgsComplete === "function") {
 					component.setArgsComplete(event.toolCallId);
 				}
+				if (typeof component.setExecutionStarted === "function") {
+					component.setExecutionStarted(event.toolCallId);
+				}
+				this.#executionStartedCallIds.add(event.toolCallId);
 				this.ctx.ui.requestRender();
 			}
 		}
@@ -1506,7 +1513,7 @@ export class EventController {
 			const previous = this.#displaceableTodoComponent;
 			if (previous && previous !== component && previous.isDisplaceableBlock()) {
 				this.#displaceableTodoComponent = undefined;
-				if (this.ctx.chatContainer.isBlockUncommitted(previous)) {
+				if (this.ctx.chatContainer.canRemoveBlock(previous)) {
 					this.ctx.chatContainer.removeChild(previous);
 				}
 				previous.seal();
@@ -1521,6 +1528,7 @@ export class EventController {
 		// assistant message. The matching card was deliberately retracted at
 		// message_end; consume the completion instead of recreating/updating UI.
 		if (this.#retractedToolCallIds.delete(event.toolCallId)) return;
+		this.#executionStartedCallIds.delete(event.toolCallId);
 		// A synthetic aborted/error completion (agent-loop's placeholder for a
 		// never-run call on a terminal error/abort) settles the card in place so a
 		// terminal failure stays visible. Remember it so `#handleAutoRetryStart`
@@ -1595,6 +1603,7 @@ export class EventController {
 				const isBackgroundTask = event.toolName === "task" && asyncState === "running";
 				component.updateResult({ ...event.result, isError: event.isError }, isBackgroundTask, event.toolCallId);
 				if (isBackgroundTask) {
+					component.parkAsBackground();
 					this.#backgroundTaskCallIds.add(event.toolCallId);
 				} else {
 					this.ctx.pendingTools.delete(event.toolCallId);
@@ -1611,7 +1620,7 @@ export class EventController {
 						const previous = this.#displaceableTodoComponent;
 						if (previous && previous !== component && previous.isDisplaceableBlock()) {
 							this.#displaceableTodoComponent = undefined;
-							if (this.ctx.chatContainer.isBlockUncommitted(previous)) {
+							if (this.ctx.chatContainer.canRemoveBlock(previous)) {
 								this.ctx.chatContainer.removeChild(previous);
 							}
 							previous.seal();
@@ -1779,6 +1788,7 @@ export class EventController {
 		this.#toolTimelineComponents.clear();
 		this.#streamedToolCallIdByIndex.clear();
 		this.#retractedToolCallIds.clear();
+		this.#executionStartedCallIds.clear();
 		this.#syntheticFailureCards.clear();
 		this.#orphanedToolCompletions.clear();
 		this.#postToolAssistantComponents.clear();
@@ -1851,13 +1861,15 @@ export class EventController {
 						? "Idle "
 						: "";
 		const actionLabel =
-			event.action === "handoff"
-				? "Auto-handoff"
-				: event.action === "shake"
-					? "Auto-shake"
-					: event.action === "snapcompact"
-						? "Auto-snapcompact"
-						: "Auto context-full maintenance";
+			event.action === "remote"
+				? "Auto server compaction"
+				: event.action === "handoff"
+					? "Auto-handoff"
+					: event.action === "shake"
+						? "Auto-shake"
+						: event.action === "snapcompact"
+							? "Auto-snapcompact"
+							: "Auto context-full maintenance";
 		this.ctx.autoCompactionLoader = new Loader(
 			this.ctx.ui,
 			spinner => theme.fg("accent", spinner),
@@ -1879,17 +1891,20 @@ export class EventController {
 			this.ctx.statusContainer.disposeChildren();
 		}
 		const isHandoffAction = event.action === "handoff";
+		const isRemoteAction = event.action === "remote";
 		const isShakeAction = event.action === "shake";
 		const isSnapcompactAction = event.action === "snapcompact";
 		if (event.aborted) {
 			this.ctx.showStatus(
 				isHandoffAction
 					? "Auto-handoff cancelled"
-					: isShakeAction
-						? "Auto-shake cancelled"
-						: isSnapcompactAction
-							? "Auto-snapcompact cancelled"
-							: "Auto context-full maintenance cancelled",
+					: isRemoteAction
+						? "Auto server compaction cancelled"
+						: isShakeAction
+							? "Auto-shake cancelled"
+							: isSnapcompactAction
+								? "Auto-snapcompact cancelled"
+								: "Auto context-full maintenance cancelled",
 			);
 		} else if (isShakeAction) {
 			// Shake produces no CompactionResult; rebuild on success, suppress benign skips.
@@ -1942,6 +1957,8 @@ export class EventController {
 			// to compact yet. Not a failure — suppress the warning.
 		} else if (isSnapcompactAction) {
 			this.ctx.showWarning("Auto-snapcompact maintenance failed; continuing without maintenance");
+		} else if (isRemoteAction) {
+			this.ctx.showWarning("Auto server compaction failed; continuing without maintenance");
 		} else {
 			this.ctx.showWarning("Auto context-full maintenance failed; continuing without maintenance");
 		}
@@ -1959,7 +1976,7 @@ export class EventController {
 		// fresh cards don't render the same call twice (#6879). Only uncommitted
 		// cards are removable; one already on the scrollback tape stays as history.
 		for (const [toolCallId, component] of this.#syntheticFailureCards) {
-			if (this.ctx.chatContainer.isBlockUncommitted(component)) {
+			if (this.ctx.chatContainer.canRemoveBlock(component)) {
 				this.#retractToolCardEntry(toolCallId, component);
 			}
 		}
@@ -2066,7 +2083,7 @@ export class EventController {
 		if (
 			previous &&
 			this.ctx.chatContainer.children.at(-1) === previous &&
-			this.ctx.chatContainer.isBlockUncommitted(previous)
+			this.ctx.chatContainer.canRemoveBlock(previous)
 		) {
 			previous.addRules(event.rules);
 			this.ctx.ui.requestRender();

@@ -13,8 +13,8 @@ import type { GoalModeState } from "@oh-my-pi/pi-coding-agent/goals/state";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
-import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { SessionMaintenance } from "@oh-my-pi/pi-coding-agent/session/session-maintenance";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -112,7 +112,8 @@ describe("AgentSession mid-run threshold compaction", () => {
 		const modelRegistry = sharedModelRegistry;
 		const settings = Settings.isolated({
 			"compaction.enabled": true,
-			"compaction.strategy": "context-full",
+			"compaction.methodOrder": ["soft"],
+			"compaction.asyncEnabled": false,
 			"compaction.autoContinue": true,
 			"compaction.midTurnEnabled": true,
 			"compaction.thresholdTokens": 1000,
@@ -224,7 +225,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 		const runAutoSpy = vi.spyOn(SessionMaintenance.prototype, "runAutoCompaction");
 		const toolOutput = "large tool result ".repeat(500);
 		const { session, observedContexts } = await createHarness(
-			{ "compaction.thresholdTokens": 51_000 },
+			{ "compaction.asyncEnabled": true, "compaction.thresholdTokens": 51_000 },
 			{
 				firstTurnUsageInput: 50_000,
 				onProviderCall,
@@ -241,7 +242,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 		expect(onProviderCall.mock.invocationCallOrder[0]).toBeLessThan(onToolExecute.mock.invocationCallOrder[0]);
 		expect(onToolExecute.mock.invocationCallOrder[0]).toBeLessThan(runAutoSpy.mock.invocationCallOrder[0]);
 		expect(runAutoSpy.mock.invocationCallOrder[0]).toBeLessThan(onProviderCall.mock.invocationCallOrder[1]);
-		expect((await runAutoSpy.mock.results[0]?.value)?.historyRewritten).toBe(true);
+		expect(await runAutoSpy.mock.results[0]?.value).toMatchObject({ historyRewritten: true });
 		expect(observedContexts[1].join("\n")).not.toContain(toolOutput);
 	});
 
@@ -255,20 +256,6 @@ describe("AgentSession mid-run threshold compaction", () => {
 		expect(compactSpy).toHaveBeenCalledTimes(1);
 		expect(observedContexts.length).toBeGreaterThanOrEqual(2);
 		expect(observedContexts[1].join("\n")).toContain("ACTIVE-GOAL-MID-RUN-COMPACTED");
-	});
-
-	it("falls back to in-place compaction for mid-run handoff strategy", async () => {
-		const { session, observedContexts } = await createHarness({ "compaction.strategy": "handoff" });
-		const handoffSpy = vi.spyOn(session, "handoff").mockImplementation(async () => {
-			throw new Error("mid-run compaction must not reset the session through handoff");
-		});
-		const compactSpy = mockCompaction("HANDOFF-MID-RUN-COMPACTED-IN-PLACE");
-
-		await session.prompt("work on the release");
-
-		expect(handoffSpy).not.toHaveBeenCalled();
-		expect(compactSpy).toHaveBeenCalledTimes(1);
-		expect(observedContexts[1].join("\n")).toContain("HANDOFF-MID-RUN-COMPACTED-IN-PLACE");
 	});
 
 	it("does not wait for message persistence below the mid-run threshold", async () => {
@@ -534,11 +521,11 @@ describe("AgentSession mid-run threshold compaction", () => {
 	});
 
 	it.each([
-		["auto_compaction_end", "context-full"],
-		["session_compact", "context-full"],
-		["auto_compaction_end", "shake"],
-		["session_compact", "shake"],
-	] as const)("hung %s handlers do not pin the mid-run %s loop", async (handlerType, strategy) => {
+		["auto_compaction_end", "context-full", ["soft"]],
+		["session_compact", "context-full", ["soft"]],
+		["auto_compaction_end", "shake", ["shake", "soft"]],
+		["session_compact", "shake", ["shake", "soft"]],
+	] as const)("hung %s handlers do not pin the mid-run %s loop", async (handlerType, action, methodOrder) => {
 		const releaseHandler = Promise.withResolvers<void>();
 		const handlerEntered = Promise.withResolvers<void>();
 		const nextProviderCall = Promise.withResolvers<void>();
@@ -553,7 +540,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 			}),
 		} as unknown as ExtensionRunner;
 		const { session, observedContexts } = await createHarness(
-			{ "compaction.strategy": strategy },
+			{ "compaction.methodOrder": methodOrder },
 			{
 				extensionRunner,
 				onProviderCall: index => {
@@ -562,7 +549,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 			},
 		);
 		const shakeSpy =
-			strategy === "shake"
+			action === "shake"
 				? vi
 						.spyOn(session, "shake")
 						.mockResolvedValue({ mode: "elide", toolResultsDropped: 0, blocksDropped: 0, tokensFreed: 0 })
