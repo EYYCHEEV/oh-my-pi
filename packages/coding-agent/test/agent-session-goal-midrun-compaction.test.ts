@@ -14,6 +14,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { SessionMaintenance } from "@oh-my-pi/pi-coding-agent/session/session-maintenance";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -92,8 +93,11 @@ describe("AgentSession mid-run threshold compaction", () => {
 		settingsOverride: Record<string, unknown> = {},
 		options: {
 			extensionRunner?: ExtensionRunner;
+			firstTurnUsageInput?: number;
 			onProviderCall?: (index: number) => void;
+			onToolExecute?: () => void;
 			configureAgent?: (agent: Agent) => void;
+			toolOutput?: string;
 			toolResultDetails?: unknown;
 		} = {},
 	): Promise<{
@@ -125,10 +129,13 @@ describe("AgentSession mid-run threshold compaction", () => {
 			label: "Bash",
 			description: "Mock bash tool",
 			parameters: type({}),
-			execute: async () => ({
-				content: [{ type: "text" as const, text: "tool output" }],
-				...(options.toolResultDetails === undefined ? {} : { details: options.toolResultDetails }),
-			}),
+			execute: async () => {
+				options.onToolExecute?.();
+				return {
+					content: [{ type: "text" as const, text: options.toolOutput ?? "tool output" }],
+					...(options.toolResultDetails === undefined ? {} : { details: options.toolResultDetails }),
+				};
+			},
 		};
 
 		let call = 0;
@@ -151,7 +158,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 							api: "anthropic-messages" as const,
 							provider: "anthropic" as const,
 							model: "claude-sonnet-4-5",
-							usage: highUsage(50_000),
+							usage: highUsage(options.firstTurnUsageInput ?? 50_000),
 							stopReason: "toolUse" as const,
 							timestamp: Date.now(),
 						}
@@ -187,14 +194,17 @@ describe("AgentSession mid-run threshold compaction", () => {
 		return { session, sessionManager, observedContexts };
 	}
 
-	function mockCompaction(summary: string) {
-		return vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
-			summary,
-			shortSummary: undefined,
-			firstKeptEntryId: preparation.firstKeptEntryId,
-			tokensBefore: preparation.tokensBefore,
-			details: {},
-		}));
+	function mockCompaction(summary: string, onCompact?: () => void) {
+		return vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => {
+			onCompact?.();
+			return {
+				summary,
+				shortSummary: undefined,
+				firstKeptEntryId: preparation.firstKeptEntryId,
+				tokensBefore: preparation.tokensBefore,
+				details: {},
+			};
+		});
 	}
 
 	it("compacts in place between tool-call turns outside goal mode", async () => {
@@ -206,6 +216,33 @@ describe("AgentSession mid-run threshold compaction", () => {
 		expect(compactSpy).toHaveBeenCalledTimes(1);
 		expect(observedContexts.length).toBeGreaterThanOrEqual(2);
 		expect(observedContexts[1].join("\n")).toContain("MID-RUN-COMPACTED");
+	});
+
+	it("runs overflow maintenance for a trailing tool result before the next provider request", async () => {
+		const onProviderCall = vi.fn();
+		const onToolExecute = vi.fn();
+		const runAutoSpy = vi.spyOn(SessionMaintenance.prototype, "runAutoCompaction");
+		const toolOutput = "large tool result ".repeat(500);
+		const { session, observedContexts } = await createHarness(
+			{ "compaction.thresholdTokens": 51_000 },
+			{
+				firstTurnUsageInput: 50_000,
+				onProviderCall,
+				onToolExecute,
+				toolOutput,
+			},
+		);
+
+		await session.prompt("process the large tool result");
+
+		expect(onProviderCall).toHaveBeenNthCalledWith(1, 0);
+		expect(onProviderCall).toHaveBeenNthCalledWith(2, 1);
+		expect(runAutoSpy).toHaveBeenCalledTimes(1);
+		expect(onProviderCall.mock.invocationCallOrder[0]).toBeLessThan(onToolExecute.mock.invocationCallOrder[0]);
+		expect(onToolExecute.mock.invocationCallOrder[0]).toBeLessThan(runAutoSpy.mock.invocationCallOrder[0]);
+		expect(runAutoSpy.mock.invocationCallOrder[0]).toBeLessThan(onProviderCall.mock.invocationCallOrder[1]);
+		expect((await runAutoSpy.mock.results[0]?.value)?.historyRewritten).toBe(true);
+		expect(observedContexts[1].join("\n")).not.toContain(toolOutput);
 	});
 
 	it("compacts in place between tool-call turns during an active goal run", async () => {

@@ -1103,19 +1103,31 @@ export class SessionMaintenance {
 			return;
 		}
 
-		const lastAssistant = [...activeMessages]
-			.reverse()
-			.find((message): message is AssistantMessage => message.role === "assistant");
-		if (!lastAssistant || lastAssistant.stopReason === "aborted" || lastAssistant.stopReason === "error") return;
+		const lastAssistantIndex = activeMessages.findLastIndex(message => message.role === "assistant");
+		const lastAssistant = activeMessages[lastAssistantIndex];
+		if (
+			!lastAssistant ||
+			lastAssistant.role !== "assistant" ||
+			lastAssistant.stopReason === "aborted" ||
+			lastAssistant.stopReason === "error"
+		) {
+			return;
+		}
 
 		// Decide from the live agent context before waiting for the asynchronous
 		// session journal. The persistence barrier is required only when maintenance
 		// will actually rewrite history; awaiting it on every ordinary tool turn lets
 		// a slow message_end listener leave the TUI "generating" with no provider
 		// request or tool running.
-		const billedContextTokens = calculateContextTokens(lastAssistant.usage);
+		let providerContextTokens = 0;
+		if (hasContextTokenUsage(lastAssistant.usage)) {
+			providerContextTokens = calculateContextTokens(lastAssistant.usage);
+			for (let index = lastAssistantIndex + 1; index < activeMessages.length; index++) {
+				providerContextTokens += estimateTokens(activeMessages[index]);
+			}
+		}
 		const storedContextTokens = this.#estimateStoredContextTokens();
-		const contextTokens = compactionContextTokens(billedContextTokens, storedContextTokens);
+		const contextTokens = compactionContextTokens(providerContextTokens, storedContextTokens);
 		if (!shouldCompact(contextTokens, contextWindow, compactionSettings)) return;
 
 		if (!(await this.#host.persistTurnMessagesForMidRunCompaction(context))) return;

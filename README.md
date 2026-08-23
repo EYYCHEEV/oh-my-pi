@@ -125,6 +125,7 @@ An upgrade fails before build or installation if the block is stale, any declare
 - `kimi-usage-account-identity`: Per-account Kimi usage report identity
 - `archive-read-crash-containment`: Crash-safe tar and tar.gz reads
 - `codex-web-search-reliability`: Native Codex web search orchestration
+- `context-overflow-recovery`: Mid-turn context overflow prevention and recovery
 <!-- stronk-omp:fork-contracts:end -->
 
 ## Upstream alignment

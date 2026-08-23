@@ -84,6 +84,7 @@ const OVERFLOW_PATTERNS = [
 	/exceeds the available context size/i, // llama.cpp server
 	/requested tokens?.*exceed.*context (window|length|size)/i, // llama.cpp / OpenAI-compatible local servers
 	/context (window|length|size).*(exceeded|overflow|too small)/i, // Generic local server variants
+	/rendered input and requested output exceed configured context/i, // OpenAI-compatible local hard context gate
 	/(prompt|input).*(too long|too large).*(context|n_ctx)/i, // llama.cpp phrasing variants
 	/requested tokens?.*(exceeds?|greater than).*(n_ctx|context)/i, // llama.cpp n_ctx variants
 	/greater than the context length/i, // LM Studio

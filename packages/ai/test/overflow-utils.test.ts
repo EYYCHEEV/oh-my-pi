@@ -41,6 +41,15 @@ describe("isContextOverflow - model_context_window_exceeded", () => {
 	});
 });
 
+describe("isContextOverflow - configured local context", () => {
+	it("detects rendered input plus requested output exceeding configured context", () => {
+		const message = createErrorMessage(
+			"400 status code: rendered input and requested output exceed configured context [local-ai-context-v1: rendered=213464 max_input=208384]",
+		);
+		expect(isContextOverflow(message)).toBe(true);
+	});
+});
+
 describe("isContextOverflow - HTTP 413 variants", () => {
 	it("detects generic 413 payload-too-large errors", () => {
 		const message = createErrorMessage("413 Request Entity Too Large: payload too large for request body");
