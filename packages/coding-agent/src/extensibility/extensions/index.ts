@@ -11,6 +11,7 @@ export type {
 	RequiredExtensionStartupFailure,
 } from "./loader";
 export {
+	bindPreparedExtensions,
 	discoverAndLoadExtensions,
 	discoverExtensionPaths,
 	disposeLoadedExtensions,

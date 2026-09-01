@@ -588,6 +588,17 @@ function isPrivateModeSupported(status: string): boolean {
 	return status !== "0" && status !== "4";
 }
 
+/** Construction-time overrides for {@link ProcessTerminal}. */
+export interface ProcessTerminalOptions {
+	/**
+	 * Force ConPTY-hosted behavior on or off. Defaults to live detection via
+	 * {@link isConPTYHosted}. Tests set this so the kitty-flag and write-chunking
+	 * paths stay hermetic regardless of the ambient WSL env (`WSL_DISTRO_NAME` /
+	 * `WSL_INTEROP`) — the suite must behave identically on WSL and on CI.
+	 */
+	conpty?: boolean;
+}
+
 /**
  * Real terminal using process.stdin/stdout
  */
@@ -629,6 +640,11 @@ export class ProcessTerminal implements Terminal {
 	// terminal side effect (writes, probes, raw mode, SIGWINCH, timers) is
 	// suppressed. Defaults on under `bun test` — see isTerminalHeadless().
 	#headless = isTerminalHeadless();
+	// Captured once at construction: whether stdout flows through a ConPTY
+	// pseudo-console. Gates the kitty-flag choice (#1216) and large-write
+	// chunking (#safeWrite). Live-detected by default; tests inject a fixed
+	// value so WSL env does not change behavior. See {@link ProcessTerminalOptions}.
+	readonly #conpty: boolean;
 	#writeLogPath = $env.PI_TUI_WRITE_LOG || "";
 	#stdoutErrorCleanup?: () => void;
 	#stdoutErrorHandler = (err: Error) => {
@@ -685,11 +701,12 @@ export class ProcessTerminal implements Terminal {
 	#progressTimer?: Timer;
 
 	constructor(
-		options: {
+		options: ProcessTerminalOptions & {
 			stdin?: NodeJS.ReadStream;
 			reopenStdin?: () => NodeJS.ReadStream;
 		} = {},
 	) {
+		this.#conpty = options.conpty ?? isConPTYHosted();
 		this.#stdin = options.stdin ?? process.stdin;
 		this.#reopenStdin = options.reopenStdin ?? (() => new TtyReadStream(process.stdin.fd));
 	}
@@ -1226,7 +1243,7 @@ export class ProcessTerminal implements Terminal {
 				const reportedFlags = parseInt(match[1]!, 10);
 				this.#kittyProtocolActive = true;
 				setKittyProtocolActive(true);
-				if (isConPTYHosted()) {
+				if (this.#conpty) {
 					// ConPTY (native Windows and WSL) drops Shift+letter keypresses
 					// entirely when flag 4 (report alternate keys) is set. Use flag 1
 					// (disambiguate only), preserving flag 2 if already active.
@@ -1915,7 +1932,7 @@ export class ProcessTerminal implements Terminal {
 			// threshold. See #2034 and #2095.
 			const bytes = Buffer.byteLength(data, "utf8");
 			let accepted: boolean;
-			if (isConPTYHosted() && bytes > MAX_CONPTY_WRITE_CHUNK_BYTES) {
+			if (this.#conpty && bytes > MAX_CONPTY_WRITE_CHUNK_BYTES) {
 				accepted = true;
 				for (const chunk of chunkForConPTY(data, MAX_CONPTY_WRITE_CHUNK_BYTES)) {
 					if (this.#dead) break;

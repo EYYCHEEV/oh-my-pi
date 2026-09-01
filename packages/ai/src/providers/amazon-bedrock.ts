@@ -799,6 +799,8 @@ function resolvePromptCachePolicy(
 	}
 
 	return {
+		// This emitter has only two placement sites (final user and system); the
+		// provider's wire-level maximum remains authoritative in catalog compat.
 		remainingCheckpoints: Math.min(configuredMaximum, 2),
 		...(cacheRetention === "long" && model.compat.supportsLongPromptCacheRetention ? { ttl: "1h" } : {}),
 	};
@@ -1087,6 +1089,15 @@ function buildAdditionalModelRequestFields(
 			thinking: adaptive,
 			output_config: { effort },
 		};
+	}
+
+	if (mode === "effort") {
+		// OpenAI-schema models on Bedrock (the GPT-5.x SKUs) reject the
+		// Anthropic budget block with `unknown_parameter: 'thinking'` and take
+		// `reasoning.effort` instead — same effort vocabulary the catalog
+		// already bakes (low/medium/high/xhigh/max).
+		const level = requireSupportedEffort(model, reasoning);
+		return { reasoning: { effort: model.thinking?.effortMap?.[level] ?? level } };
 	}
 
 	const level = requireSupportedEffort(model, reasoning);

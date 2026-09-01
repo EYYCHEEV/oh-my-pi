@@ -172,6 +172,8 @@ long as that extension registration is active. `pi.unregisterProvider(name)` (an
 extension source cleanup) removes only that runtime override, restoring the built-in
 or configured usage resolver.
 
+Extension-registered providers (`registerProvider`) can supply `fetchDynamicModels` for runtime model discovery; these fetches are hard-bounded to a 15-second timeout (`RUNTIME_DYNAMIC_MODEL_FETCH_TIMEOUT_MS` in `model-provider-discovery.ts`) so a hung endpoint cannot stall discovery.
+
 In interactive mode, `input` handlers run before the built-in first-message auto-title check. Extensions that call `await pi.setSessionName(...)` from `input` can set the persisted session name and prevent the default auto-generated title from running for that session.
 
 Also exposed:
@@ -192,6 +194,8 @@ Also exposed:
 - `triggerTurn: true` — starts a turn when idle (also honored with `deliverAs: "nextTurn"`: idle prompts immediately; while streaming the queued message schedules an internal continuation)
 
 `pi.sendUserMessage(content, { deliverAs })` always goes through prompt flow. Omit `deliverAs` to start a normal prompt when idle; while streaming, omitted `deliverAs` queues the message as a steer. Set `deliverAs: "followUp"` to wait until the current run finishes.
+
+Payloads passed to `pi.sendMessage` are normalized before delivery (`normalizeCustomMessagePayload` in `session/messages.ts`): non-object payloads are coerced to string content under the default custom type, missing `customType`/`attribution` fields are defaulted, and invalid content collapses to an empty string — malformed payloads no longer persist entries that crash later session resumes.
 
 ## 2) Handler context (`ExtensionContext`)
 
@@ -295,7 +299,7 @@ Cancelable pre-events:
 - `context`
 - `agent_start` / `agent_end` — agent loop lifecycle notification; `agent_end` remains notification-only
 - `agent_activity_state` — continuation-safe root activity lifecycle. Each run has a stable string `runId` and emits `running`, optional `waiting_for_human` / `running` transitions around interactive dialogs, then one `settled` event with `outcome: "completed" | "interrupted" | "error"`. Raw `agent_start` / `agent_end` events remain unchanged.
-- `session_stop` — main-session stop hook, awaited before settle; may continue with `{ continue: true, additionalContext }` or `{ decision: "block", reason }`; capped at 8 consecutive continuations and never fires for task/subagent sessions
+- `session_stop` — main-session stop hook, awaited before settle; may continue with `{ continue: true, additionalContext }` or `{ decision: "block", reason }`; capped at 8 consecutive continuations, never fires for task/subagent sessions, and defers until agent-owned background jobs are fully idle (`#hasPendingAsyncWake` in `session/agent-session.ts`)
 - `turn_start` / `turn_end`
 - `message_start` / `message_update` / `message_end` — lifecycle notifications; `message_end` receives a detached message snapshot, so use `tool_result` or `context` when an extension needs to change provider context
 
@@ -565,7 +569,7 @@ Supported:
 
 Status-line segments registered with `pi.registerStatusSegment(...)` are hosted by the built-in status line and may be invalidated with `pi.requestStatusLineRender()`. A segment may set `color` to any semantic `ThemeColor`; the status renderer resolves that value through the active theme, while omitting it preserves renderer-provided styling. Public segment IDs are globally unique within the loaded extension runner: the first registration wins, and a duplicate or built-in ID is rejected synchronously without replacing or invalidating the first. Extension owner/path keys are internal hosting details, not public IDs. Registrations survive transcript switches. The disposer returned by a successful registration removes that hosted registration and invalidates the status line exactly once; repeated disposal is harmless.
 
-`setFooter` and `setHeader` remain no-ops in this controller. Extensions cannot currently replace the built-in footer/header; use a registered status segment or `setWidget` instead. `setEditorComponent` is wired to the live editor (`ctx.setEditorComponent(factory)`). `setWidget` renders real widget components above or below the editor via `setHookWidget(...)` (`placement: "aboveEditor" | "belowEditor"`; string-array content capped at 10 lines).
+`setFooter` and `setHeader` remain no-ops in this controller. Extensions cannot currently replace the built-in footer/header; use a registered status segment or `setWidget` instead. `setEditorComponent` is wired to the live editor (`ctx.setEditorComponent(factory)`). `setWidget` renders real widget components above or below the editor via `setHookWidget(...)` (`placement: "aboveEditor" | "belowEditor"`; string-array content capped at 10 lines). `setEditorText` and `pasteToEditor` schedule a repaint after mutating the editor, so prompt changes don't leave stale content on screen.
 
 ### RPC mode (`rpc-mode.ts`)
 

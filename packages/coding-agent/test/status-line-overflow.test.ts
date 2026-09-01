@@ -79,6 +79,7 @@ function createCtx(overrides?: {
 		speculationBlinkOn: true,
 		subagentCount: 0,
 		activeMs: 0,
+		turnElapsedMs: null,
 		activeRepo: null,
 		worktree: null,
 		git: {
@@ -149,9 +150,7 @@ describe("status line session accent", () => {
 
 	// Computed lazily: `theme` is assigned by initTheme() in beforeAll, after module evaluation.
 	const accentAnsi = (): string => {
-		const ansi = getSessionAccentAnsi(
-			getSessionAccentHex("Named session", theme.getMajorThemeColorHexes(), theme.accentSurfaceLuminance),
-		);
+		const ansi = getSessionAccentAnsi(getSessionAccentHex("Named session", theme.sessionAccentInputs));
 		if (!ansi) throw new Error("expected a session accent ANSI sequence for the test theme");
 		return ansi;
 	};
@@ -562,8 +561,8 @@ describe("extension segment overflow integrity", () => {
 				sessionAccent: false,
 				transparent: true,
 			});
-			const piGlyph = theme.icon.pi.trim();
-			const piContent = theme.fg("accent", theme.icon.pi ? `${theme.icon.pi} ` : "");
+			const piGlyph = theme.icon.omp.trim();
+			const piContent = theme.fg("accent", theme.icon.omp ? `${theme.icon.omp} ` : "");
 			component.registerExtensionSegment("same-as-pi", {
 				id: "same_as_pi",
 				placement: { afterBuiltin: "path", fallback: "anchor-side-end-else-right" },

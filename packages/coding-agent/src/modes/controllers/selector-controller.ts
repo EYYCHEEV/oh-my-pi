@@ -3,6 +3,7 @@ import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
 import { PASTE_CODE_LOGIN_PROVIDERS } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import type { Component, OverlayHandle, ResizeScrollbackMode } from "@oh-my-pi/pi-tui";
 import { Loader, Spacer, setTuiTight, Text } from "@oh-my-pi/pi-tui";
 import { getAgentDbPath, getAgentDir, getProjectDir, normalizePathForComparison } from "@oh-my-pi/pi-utils";
@@ -14,6 +15,7 @@ import {
 	saveWatchdogConfigFile,
 } from "../../advisor";
 import { reset as resetCapabilities } from "../../capability";
+import { showGitOverlay } from "../../cli/git-tui";
 import {
 	formatModelSelectorValue,
 	resolveAdvisorRoleSelection,
@@ -50,7 +52,7 @@ import {
 	persistForeignSession,
 } from "../../session/foreign-session-import";
 import type { ForeignSessionInfo, ForeignSessionSource } from "../../session/foreign-session-store";
-import type { SessionEntry } from "../../session/session-entries";
+import type { SessionEntry, SessionMessageEntry, SessionTreeNode } from "../../session/session-entries";
 import type { SessionInfo } from "../../session/session-listing";
 import { SessionManager } from "../../session/session-manager";
 import { loadPinnedSessionIds } from "../../session/session-pins";
@@ -78,8 +80,8 @@ import {
 import { AskTool, type AskToolDetails, type AskToolInput } from "../../tools/ask";
 import { shortenPath } from "../../tools/render-utils";
 import { ToolAbortError } from "../../tools/tool-errors";
+import { applyHyperlinkSetting } from "../../tui/hyperlink";
 import { copyToClipboard } from "../../utils/clipboard";
-import { repo } from "../../utils/git";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { type AdvisorConfigDeps, AdvisorConfigOverlayComponent } from "../components/advisor-config";
 import { AgentHubOverlayComponent } from "../components/agent-hub";
@@ -87,6 +89,7 @@ import { AgentsHubComponent } from "../components/agents-hub";
 import { AssistantMessageComponent } from "../components/assistant-message";
 import { CopySelectorComponent } from "../components/copy-selector";
 import { ExtensionDashboard } from "../components/extensions";
+import { listLiveToolRecords, liveToolRecordFromSession } from "../components/extensions/live-tool-session";
 import { HistorySearchComponent } from "../components/history-search";
 import { LoginDialogComponent } from "../components/login-dialog";
 import { LogoutAccountSelectorComponent } from "../components/logout-account-selector";
@@ -96,6 +99,7 @@ import { OAuthSelectorComponent } from "../components/oauth-selector";
 import { PluginSelectorComponent } from "../components/plugin-selector";
 import { ReadToolGroupComponent } from "../components/read-tool-group";
 import { ResetUsageSelectorComponent } from "../components/reset-usage-selector";
+import { type BranchVariantPath, RewindSelectorComponent } from "../components/rewind-selector";
 import { renderSegmentTrack } from "../components/segment-track";
 import { SessionAccountSelectorComponent } from "../components/session-account-selector";
 import { SessionSelectorComponent, type SessionSelectorOptions } from "../components/session-selector";
@@ -103,9 +107,7 @@ import { SettingsSelectorComponent } from "../components/settings-selector";
 import { ToolExecutionComponent } from "../components/tool-execution";
 import { TranscriptBlock } from "../components/transcript-container";
 import { TreeSelectorComponent } from "../components/tree-selector";
-import { UserMessageSelectorComponent } from "../components/user-message-selector";
 import type { SessionObserverRegistry } from "../session-observer-registry";
-import { buildCopyTargets } from "../utils/copy-targets";
 
 const MANUAL_LOGIN_PROMPT = "Paste the authorization code (or full redirect URL), then press Enter:";
 
@@ -277,7 +279,7 @@ export class SelectorController {
 			// discovery walks), not the launch subdir — `getProjectDir()` is only cwd.
 			let projectDir = cwd;
 			try {
-				projectDir = (await repo.root(cwd)) ?? cwd;
+				projectDir = vcs.repo(cwd)?.root() ?? cwd;
 			} catch {
 				projectDir = cwd;
 			}
@@ -372,7 +374,18 @@ export class SelectorController {
 	 * Replaces /status with a unified view of all providers and extensions.
 	 */
 	async showExtensionsDashboard(): Promise<void> {
-		const dashboard = await ExtensionDashboard.create(getProjectDir(), this.ctx.settings, this.ctx.ui.terminal.rows);
+		const dashboard = await ExtensionDashboard.create({
+			cwd: getProjectDir(),
+			settings: this.ctx.settings,
+			terminalHeight: this.ctx.ui.terminal.rows,
+			mcpManager: this.ctx.mcpManager,
+			eventBus: this.ctx.eventBus,
+			toolSource: {
+				getLiveTool: name => liveToolRecordFromSession(this.ctx.session, name),
+				listLiveTools: () => listLiveToolRecords(this.ctx.session),
+			},
+			onMcpToolsChanged: tools => this.ctx.session.refreshMCPTools(tools),
+		});
 		// Fullscreen dashboard on the alternate screen (the /settings idiom): the
 		// overlay borrows the terminal's alt buffer and enables mouse tracking for
 		// its lifetime, leaving the transcript untouched underneath.
@@ -384,6 +397,7 @@ export class SelectorController {
 			fullscreen: true,
 		});
 		dashboard.onClose = () => {
+			dashboard.dispose();
 			overlay.hide();
 			this.focusActiveEditorArea();
 			this.ctx.ui.requestRender();
@@ -391,6 +405,21 @@ export class SelectorController {
 		dashboard.onRequestRender = () => {
 			this.ctx.ui.requestRender();
 		};
+	}
+
+	/**
+	 * Fullscreen git UI on the alternate screen (the /models idiom): split
+	 * diff viewer, staging sidebar, and commit composer. Resolves focus back
+	 * to the editor when the user closes it.
+	 */
+	async showGitTui(revision?: string): Promise<void> {
+		try {
+			await showGitOverlay(this.ctx.ui, { cwd: getProjectDir(), revision });
+		} catch (error) {
+			this.ctx.showStatus(error instanceof Error ? error.message : String(error));
+		}
+		this.focusActiveEditorArea();
+		this.ctx.ui.requestRender();
 	}
 
 	/**
@@ -420,6 +449,7 @@ export class SelectorController {
 				modelRegistry: this.ctx.session.modelRegistry,
 				activeModelPattern,
 				defaultModelPattern,
+				extensionRoots: () => this.ctx.session.effectiveExtensionRoots,
 			},
 			{ onCancel: () => done() },
 		);
@@ -580,8 +610,20 @@ export class SelectorController {
 				this.ctx.rebuildChatFromMessages();
 				this.ctx.ui.resetDisplay();
 				break;
+			case "display.showTurnTime":
+				// Same as showTokenUsage: the prompt→yield delta lives in the same
+				// usage row, so toggling it must rebuild and retire committed rows.
+				this.ctx.rebuildChatFromMessages();
+				this.ctx.ui.resetDisplay();
+				break;
 			case "tui.tight":
 				setTuiTight(value as boolean);
+				this.ctx.ui.invalidate();
+				this.ctx.ui.requestRender();
+				break;
+			case "tui.hyperlinks":
+				applyHyperlinkSetting();
+				this.ctx.statusLine.invalidate();
 				this.ctx.ui.invalidate();
 				this.ctx.ui.requestRender();
 				break;
@@ -735,6 +777,11 @@ export class SelectorController {
 		const current = this.ctx.session.model;
 		const quickRoleOrder = this.ctx.settings.get("cycleOrder");
 		const quickRoleCycle = this.ctx.session.getRoleModelCycle(quickRoleOrder);
+		const currentSelector = current ? `${current.provider}/${current.id}` : undefined;
+		// Preselect the effective Task model in task mode: the configured override,
+		// else the session model (the bundled task agent inherits it by default).
+		const taskOverride = this.ctx.settings.get("task.agentModelOverrides").task;
+		const taskSelector = (Array.isArray(taskOverride) ? taskOverride[0] : taskOverride) ?? currentSelector;
 		let overlayHandle: OverlayHandle | undefined;
 		let closed = false;
 		const done = () => {
@@ -803,11 +850,24 @@ export class SelectorController {
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
 					}
 				},
+				onPickTask: (_model, selector) => {
+					// Session-only: layer the Task override onto the runtime settings
+					// layer so it is never persisted, mirroring the session-model pick.
+					this.ctx.settings.override("task.agentModelOverrides", {
+						...this.ctx.settings.get("task.agentModelOverrides"),
+						task: selector,
+					});
+					this.ctx.showStatus(`Task subagent model (session-only): ${selector}. Use /agents to persist.`);
+					done();
+				},
 				onCancel: done,
 			},
 			{
 				currentContextTokens,
-				currentSelector: current ? `${current.provider}/${current.id}` : undefined,
+				currentSelector,
+				taskModeKeys: this.ctx.keybindings.getKeys("app.model.selectTemporary"),
+				taskModeKeyLabel: this.ctx.keybindings.getDisplayString("app.model.selectTemporary") || "alt+p",
+				taskSelector,
 				quickRoles: quickRoleCycle?.models,
 				quickRoleOrder,
 				currentQuickRole: quickRoleCycle?.models[quickRoleCycle.currentIndex]?.role,
@@ -1151,86 +1211,212 @@ export class SelectorController {
 	}
 
 	showUserMessageSelector(): void {
-		const userMessages = this.ctx.session.getUserMessagesForBranching();
-
-		if (userMessages.length === 0) {
+		const entries = this.ctx.sessionManager
+			.getBranch()
+			.filter((entry): entry is SessionMessageEntry => entry.type === "message");
+		if (entries.length === 0) {
 			this.ctx.showStatus("No messages to branch from");
 			return;
 		}
 
-		this.showSelector(done => {
-			const selector = new UserMessageSelectorComponent(
-				userMessages.map(m => ({ id: m.entryId, text: m.text })),
-				async entryId => {
-					// Branching rewinds to a strict prefix of the rendered transcript:
-					// the selected user message and everything after it are dropped.
-					// Capture the boundary before branch() so the tail can be dropped
-					// in place when it never reached native scrollback.
-					const branchEntry = this.ctx.sessionManager.getEntry(entryId);
-					const branchMessage =
-						branchEntry?.type === "message" && branchEntry.message.role === "user"
-							? branchEntry.message
-							: undefined;
-					const result = await this.ctx.session.branch(entryId);
-					if (result.cancelled) {
-						// Hook cancelled the branch
-						done();
-						this.ctx.ui.requestRender();
-						return;
-					}
-
-					// A leaf that moved past the branch point (e.g. a session_branch
-					// hook persisted entries) invalidates the prefix assumption.
-					// Root branches (parentId null) start a fresh session file and may
-					// leave pre-message components stale — always replay those.
-					const fastRewind =
-						branchMessage !== undefined &&
-						branchEntry?.parentId != null &&
-						this.ctx.sessionManager.getLeafId() === branchEntry.parentId &&
-						this.ctx.truncateTranscriptFromMessage(branchMessage);
-					if (!fastRewind) {
-						await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
-					}
-					this.ctx.editor.setDraft(result.selectedText, result.selectedImages);
-					done();
-					this.ctx.showStatus("Branched to new session");
-				},
-				() => {
-					done();
-					this.ctx.ui.requestRender();
-				},
-			);
-			return { component: selector, focus: selector.getMessageList() };
-		});
-	}
-
-	showCopySelector(): void {
-		const targets = buildCopyTargets(this.ctx.session);
-		if (targets.length === 0) {
-			this.ctx.showStatus("Nothing to copy yet.");
-			return;
-		}
-
 		let overlayHandle: OverlayHandle | undefined;
+		let selector: RewindSelectorComponent | undefined;
 		const done = () => {
 			overlayHandle?.hide();
+			selector?.dispose();
+			this.focusActiveEditorArea();
 			this.ctx.ui.requestRender();
 		};
-		const selector = new CopySelectorComponent(targets, {
-			onPick: target => {
-				done();
-				if (target.content === undefined) return;
-				void copyToClipboard(target.content);
-				this.ctx.showStatus(target.copyMessage ?? "Copied to clipboard");
-			},
+		selector = new RewindSelectorComponent(entries, {
+			ui: this.ctx.ui,
+			getTool: name => this.ctx.session.getToolByName(name),
+			isBuiltInTool: name => this.ctx.session.hasBuiltInTool(name),
+			getMessageRenderer: type => this.ctx.session.extensionRunner?.getMessageRenderer(type),
+			cwd: this.ctx.sessionManager.getCwd(),
+			hideThinkingBlock: () => this.ctx.effectiveHideThinkingBlock,
+			proseOnlyThinking: () => this.ctx.proseOnlyThinking,
+			requestRender: () => this.ctx.ui.requestRender(),
+			siblingPaths: entryId => this.#siblingBranchPaths(entryId),
+			onSelect: entryId => void this.#rewindFromTranscript(entryId, done),
 			onCancel: done,
 		});
-
+		if (selector.targetCount === 0) {
+			selector.dispose();
+			this.ctx.showStatus("No messages to branch from");
+			return;
+		}
+		// Fullscreen alternate-screen overlay: the transcript replica draws over
+		// the live one, and the normal screen stays untouched until the rewind
+		// itself rewrites it.
 		overlayHandle = this.ctx.ui.showOverlay(selector, {
 			anchor: "bottom-center",
 			width: "100%",
 			maxHeight: "100%",
 			margin: 0,
+			fullscreen: true,
+		});
+		this.ctx.ui.setFocus(selector);
+		this.ctx.ui.requestRender();
+	}
+
+	/**
+	 * Alternate branches of `entryId`'s turn for the rewind selector's strip:
+	 * every other child of its parent, each unrolled along its most-recent
+	 * descendants (children are timestamp-ordered, so the last child chain is
+	 * the branch's latest continuation) and filtered to message entries.
+	 */
+	#siblingBranchPaths(entryId: string): BranchVariantPath[] {
+		const entry = this.ctx.sessionManager.getEntry(entryId);
+		if (!entry) return [];
+		const forest = this.ctx.sessionManager.getTree();
+		const byId = new Map<string, SessionTreeNode>();
+		const stack = [...forest];
+		while (stack.length > 0) {
+			const node = stack.pop()!;
+			byId.set(node.entry.id, node);
+			stack.push(...node.children);
+		}
+		const siblings =
+			entry.parentId === null
+				? forest.filter(node => node.entry.id !== entryId)
+				: (byId.get(entry.parentId)?.children ?? []).filter(node => node.entry.id !== entryId);
+		const paths: BranchVariantPath[] = [];
+		for (const sibling of siblings) {
+			const entries: SessionMessageEntry[] = [];
+			let node: SessionTreeNode | undefined = sibling;
+			while (node) {
+				if (node.entry.type === "message") entries.push(node.entry);
+				node = node.children.at(-1);
+			}
+			if (entries.length > 0) paths.push({ rootId: sibling.entry.id, entries });
+		}
+		return paths;
+	}
+
+	/**
+	 * Complete an esc-esc rewind: user-message targets take the branch flow
+	 * (rewind past the prompt, hand its text back as an editor draft); every
+	 * other target lands the leaf on the entry via `navigateTree`. `done`
+	 * closes the fullscreen selector after the transcript is rebuilt so the
+	 * alternate screen never flashes a stale transcript.
+	 */
+	async #rewindFromTranscript(entryId: string, done: () => void): Promise<void> {
+		const entry = this.ctx.sessionManager.getEntry(entryId);
+		if (entry?.type !== "message") {
+			done();
+			return;
+		}
+
+		if (entry.message.role === "user") {
+			// Branching rewinds to a strict prefix of the rendered transcript:
+			// the selected user message and everything after it are dropped.
+			// Capture the boundary before branch() so the tail can be dropped
+			// in place when it never reached native scrollback.
+			const branchMessage = entry.message;
+			const result = await this.ctx.session.branch(entryId);
+			if (result.cancelled) {
+				// Hook cancelled the branch
+				done();
+				return;
+			}
+			// A leaf that moved past the branch point (e.g. a session_branch
+			// hook persisted entries) invalidates the prefix assumption.
+			// Root branches (parentId null) start a fresh session file and may
+			// leave pre-message components stale — always replay those.
+			const fastRewind =
+				entry.parentId != null &&
+				this.ctx.sessionManager.getLeafId() === entry.parentId &&
+				this.ctx.truncateTranscriptFromMessage(branchMessage);
+			if (!fastRewind) {
+				await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
+			}
+			this.ctx.editor.setDraft(result.selectedText, result.selectedImages);
+			done();
+			this.ctx.showStatus("Branched to new session");
+			return;
+		}
+
+		const realLeafId = this.ctx.sessionManager.getLeafId();
+		if (entryId === realLeafId) {
+			done();
+			this.ctx.showStatus("Already at this point");
+			return;
+		}
+		const treeRewind = this.#treeRewindBoundary(entryId, realLeafId);
+		try {
+			const result = await this.ctx.session.navigateTree(entryId, { summarize: false });
+			if (result.cancelled) {
+				done();
+				this.ctx.showStatus("Navigation cancelled");
+				return;
+			}
+			const fastRewind =
+				treeRewind !== undefined &&
+				this.ctx.sessionManager.getLeafId() === treeRewind.expectedLeafId &&
+				this.ctx.truncateTranscriptFromMessage(treeRewind.message);
+			if (!fastRewind) {
+				await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
+			}
+			await this.ctx.reloadTodos();
+			if (result.editorText && !this.ctx.editor.getText().trim()) {
+				this.ctx.editor.setDraft(result.editorText, result.editorImages);
+			}
+			done();
+			this.ctx.showStatus("Rewound to selected point");
+		} catch (error) {
+			done();
+			this.ctx.showError(error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	showCopySelector(): void {
+		const entries = this.ctx.sessionManager
+			.getBranch()
+			.filter((entry): entry is SessionMessageEntry => entry.type === "message");
+		if (entries.length === 0) {
+			this.ctx.showStatus("Nothing to copy yet.");
+			return;
+		}
+
+		let overlayHandle: OverlayHandle | undefined;
+		let selector: CopySelectorComponent | undefined;
+		const done = () => {
+			overlayHandle?.hide();
+			selector?.dispose();
+			this.focusActiveEditorArea();
+			this.ctx.ui.requestRender();
+		};
+		selector = new CopySelectorComponent(entries, {
+			ui: this.ctx.ui,
+			getTool: name => this.ctx.session.getToolByName(name),
+			isBuiltInTool: name => this.ctx.session.hasBuiltInTool(name),
+			getMessageRenderer: type => this.ctx.session.extensionRunner?.getMessageRenderer(type),
+			cwd: this.ctx.sessionManager.getCwd(),
+			hideThinkingBlock: () => this.ctx.effectiveHideThinkingBlock,
+			proseOnlyThinking: () => this.ctx.proseOnlyThinking,
+			requestRender: () => this.ctx.ui.requestRender(),
+			onPick: (content, label) => {
+				done();
+				if (!content.trim()) {
+					this.ctx.showStatus("Nothing to copy in that item");
+					return;
+				}
+				void copyToClipboard(content);
+				this.ctx.showStatus(`Copied ${label} to clipboard`);
+			},
+			onCancel: done,
+		});
+		if (selector.targetCount === 0) {
+			selector.dispose();
+			this.ctx.showStatus("Nothing to copy yet.");
+			return;
+		}
+		overlayHandle = this.ctx.ui.showOverlay(selector, {
+			anchor: "bottom-center",
+			width: "100%",
+			maxHeight: "100%",
+			margin: 0,
+			fullscreen: true,
 		});
 		this.ctx.ui.setFocus(selector);
 		this.ctx.ui.requestRender();
@@ -1671,7 +1857,7 @@ export class SelectorController {
 		const previousCwd = this.ctx.sessionManager.getCwd();
 		// Flush pending settings writes before switching sessions so a save
 		// failure leaves the session, process project dir, and Settings in the
-		// source scope — the switch below mutates the SessionManager cwd.
+		// source scope.
 		if (!options?.settingsFlushed) {
 			try {
 				await this.ctx.settings.flush();
@@ -1680,17 +1866,21 @@ export class SelectorController {
 				return false;
 			}
 		}
-		// Switch session via AgentSession (emits hook and tool session events). The
-		// SessionManager adopts the resumed session's own cwd when it differs.
-		await this.ctx.session.switchSession(sessionPath);
+		// AgentSession owns the transaction. It restores the complete source state
+		// if applying the target project's cwd fails, including in-memory sessions.
+		if (
+			(await this.ctx.session.switchSession(sessionPath, {
+				onCwdChange: async (newCwd, sourceCwd) => {
+					if (normalizePathForComparison(newCwd) === normalizePathForComparison(sourceCwd)) return true;
+					return this.ctx.applyCwdChange(newCwd);
+				},
+			})) === false
+		) {
+			return false;
+		}
 		this.ctx.clearTransientSessionUi();
 		const newCwd = this.ctx.sessionManager.getCwd();
 		const movedProject = normalizePathForComparison(newCwd) !== normalizePathForComparison(previousCwd);
-		if (movedProject) {
-			// Resumed a session from another project: re-point the process and every
-			// cwd-derived cache at it before rendering.
-			await this.ctx.applyCwdChange(newCwd);
-		}
 		this.#refreshSessionTerminalTitle();
 		this.ctx.updateEditorBorderColor();
 

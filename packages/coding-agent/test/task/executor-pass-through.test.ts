@@ -11,9 +11,10 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { parseAgentFields } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import type { ToolPathWithSource } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools";
 import type { RequiredExtensionSpec } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
-import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { LoadExtensionsResult, PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
@@ -47,6 +48,8 @@ function createMockSession(onPrompt: (params: { emit: (event: AgentSessionEvent)
 			onPrompt({ emit });
 		},
 		waitForIdle: async () => {},
+		prepareForHeadlessAdvisorDrain: () => {},
+		waitForAdvisorCatchup: async () => true,
 		getLastAssistantMessage: () => undefined,
 		abort: async () => {},
 		dispose: async () => {},
@@ -125,17 +128,33 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 			extensionId: "extension-module:foo",
 			expectedSha256: "0".repeat(64),
 		};
+		const preloadedPreparedExtensions: PreparedExtension[] = [
+			{
+				path: preloadedExtensionPaths[0]!,
+				resolvedPath: preloadedExtensionPaths[0]!,
+				factory: () => {},
+				error: null,
+			},
+		];
 		const preloadedCustomToolPaths: ToolPathWithSource[] = [
 			{ path: "tools/x.ts", source: { provider: "config", providerName: "Config", level: "project" } },
 		];
+		const extensionRoots = () => ({
+			explicit: ["/abs/parent/explicit-extension"],
+			mode: "explicit-only" as const,
+			configured: ["/abs/parent/configured-extension"],
+			configuredLevel: "project" as const,
+		});
 
 		const result = await runSubprocess({
 			...baseOptions,
 			contextFiles,
 			appendSystemPrompt,
 			rules,
+			extensionRoots,
 			preloadedExtensionPaths,
 			requiredExtension,
+			preloadedPreparedExtensions,
 			preloadedCustomToolPaths,
 		});
 
@@ -144,8 +163,10 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		const forwarded = spy.mock.calls[0]?.[0];
 		// Identity, not equality: passing a clone would defeat the perf fix.
 		expect(forwarded?.rules).toBe(rules);
+		expect(forwarded?.extensionRoots).toBe(extensionRoots);
 		expect(forwarded?.preloadedExtensionPaths).toBe(preloadedExtensionPaths);
 		expect(forwarded?.requiredExtension).toBe(requiredExtension);
+		expect(forwarded?.preloadedPreparedExtensions).toBe(preloadedPreparedExtensions);
 		expect(forwarded?.preloadedCustomToolPaths).toBe(preloadedCustomToolPaths);
 		expect(forwarded?.contextFiles).toBe(contextFiles);
 		expect(forwarded?.appendSystemPrompt).toBe(appendSystemPrompt);
@@ -174,6 +195,29 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(forwarded?.preloadedExtensionPaths).toBeUndefined();
 		expect(forwarded?.requiredExtension).toBeUndefined();
 		expect(forwarded?.preloadedCustomToolPaths).toBeUndefined();
+	});
+	it("preserves empty and absent agent tool declarations through session creation", async () => {
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const emptyFields = parseAgentFields({ name: "quiet", description: "desc", tools: [] });
+		const absentFields = parseAgentFields({ name: "default", description: "desc" });
+		if (!emptyFields || !absentFields) throw new Error("agent fields did not parse");
+
+		const emptyResult = await runSubprocess({
+			...baseOptions,
+			id: "empty-tools-child",
+			agent: { ...baseAgent, ...emptyFields },
+		});
+		const absentResult = await runSubprocess({
+			...baseOptions,
+			id: "default-tools-child",
+			agent: { ...baseAgent, ...absentFields },
+		});
+
+		expect(emptyResult.exitCode).toBe(0);
+		expect(absentResult.exitCode).toBe(0);
+		expect(spy.mock.calls[0]?.[0]?.toolNames).toEqual(["yield", "hub"]);
+		expect(spy.mock.calls[1]?.[0]?.toolNames).toBeUndefined();
 	});
 
 	it("records the spawning agent as parentAgentId, distinct from the child's own id and prefix", async () => {
@@ -210,6 +254,14 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 			extensionId: "extension-module:hostile",
 			expectedSha256: "0".repeat(64),
 		};
+		const preloadedPreparedExtensions: PreparedExtension[] = [
+			{
+				path: preloadedExtensionPaths[0]!,
+				resolvedPath: preloadedExtensionPaths[0]!,
+				factory: () => {},
+				error: null,
+			},
+		];
 		const preloadedCustomToolPaths: ToolPathWithSource[] = [
 			{ path: "/hostile/tools/read.ts", source: { provider: "test", providerName: "Test", level: "project" } },
 		];
@@ -223,6 +275,7 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 			mcpManager,
 			preloadedExtensionPaths,
 			requiredExtension,
+			preloadedPreparedExtensions,
 			preloadedCustomToolPaths,
 			outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
 			outputSchemaMode: "strict",
@@ -236,6 +289,7 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(forwarded?.customTools).toBeUndefined();
 		expect(forwarded?.preloadedExtensionPaths).toEqual([]);
 		expect(forwarded?.requiredExtension).toBeUndefined();
+		expect(forwarded?.preloadedPreparedExtensions).toEqual([]);
 		expect(forwarded?.preloadedCustomToolPaths).toEqual([]);
 		expect(getTools).not.toHaveBeenCalled();
 		expect(forwarded?.outputSchemaMode).toBe("strict");
@@ -254,6 +308,38 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 
 		expect(result.exitCode).toBe(0);
 		expect(appendSessionInit).toHaveBeenCalledWith(expect.objectContaining({ tools: ["eval", "read", "yield"] }));
+	});
+
+	it("omits transport-only write from the persisted cold-revival contract", async () => {
+		const session = yieldEmittingSession();
+		vi.spyOn(session, "getEnabledToolNames").mockReturnValue(["read", "write", "yield"]);
+		const appendSessionInit = vi.spyOn(session.sessionManager, "appendSessionInit");
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "transport-only-child",
+			agent: { ...baseAgent, tools: ["read"] },
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(appendSessionInit).toHaveBeenCalledWith(expect.objectContaining({ tools: ["read", "yield"] }));
+	});
+
+	it("persists write when the original subagent contract grants it", async () => {
+		const session = yieldEmittingSession();
+		vi.spyOn(session, "getEnabledToolNames").mockReturnValue(["read", "write", "yield"]);
+		const appendSessionInit = vi.spyOn(session.sessionManager, "appendSessionInit");
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "writable-child",
+			agent: { ...baseAgent, tools: ["read", "write"] },
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(appendSessionInit).toHaveBeenCalledWith(expect.objectContaining({ tools: ["read", "write", "yield"] }));
 	});
 
 	it("retains inherited MCP proxy tools for normal children", async () => {
