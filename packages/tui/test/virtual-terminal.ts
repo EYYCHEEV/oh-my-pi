@@ -472,12 +472,33 @@ export class VirtualTerminal implements Terminal {
 		}
 		data = this.#stripSynchronizedOutput(data);
 		data = stripCombiningMarksForGhostty(data);
-		this.#writeToGhostty(data);
-		this.#refollowBottom(wasBottom);
 		if (reportsCursor) {
-			const { row, col } = this.getCursor();
-			queueMicrotask(() => this.#inputHandler?.(`\x1b[${row + 1};${col + 1}R`));
+			// ghostty-web never emits DSR replies, so answer CSI 6n here at the
+			// point the engine processes it: the resize anchor probe writes
+			// `\x1b[<tag>G\x1b[6n\x1b[1G` in one batch, and reading the cursor
+			// after the whole batch would report column 1, making the reply
+			// unattributable and forcing the probe to its timeout.
+			let rest = data;
+			let reply: string | undefined;
+			for (;;) {
+				const query = rest.indexOf("\x1b[6n");
+				if (query < 0) break;
+				this.#writeToGhostty(rest.slice(0, query + 4));
+				if (reply === undefined) {
+					const { row, col } = this.getCursor();
+					reply = `\x1b[${row + 1};${col + 1}R`;
+				}
+				rest = rest.slice(query + 4);
+			}
+			this.#writeToGhostty(rest);
+			if (reply !== undefined) {
+				const replyText = reply;
+				queueMicrotask(() => this.#inputHandler?.(replyText));
+			}
+		} else {
+			this.#writeToGhostty(data);
 		}
+		this.#refollowBottom(wasBottom);
 	}
 
 	#stripSynchronizedOutput(data: string): string {
