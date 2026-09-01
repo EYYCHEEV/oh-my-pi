@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { AssistantMessage, Model, ToolCall, Usage } from "@oh-my-pi/pi-ai";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import {
 	createHarmonyAuditEvent,
 	detectHarmonyLeak,
@@ -85,6 +86,12 @@ describe("isHarmonyLeakMitigationTarget", () => {
 	it("does not target models without the compatibility policy", () => {
 		expect(anthropicModel.compat).not.toMatchObject({ harmonyLeakMitigation: true });
 		expect(isHarmonyLeakMitigationTarget(anthropicModel)).toBe(false);
+	});
+
+	it("does not infer policy from the provider when compatibility is absent", () => {
+		const model = createMockModel({ provider: "openai-codex" });
+		expect(model.compat).toBeUndefined();
+		expect(isHarmonyLeakMitigationTarget(model)).toBe(false);
 	});
 });
 

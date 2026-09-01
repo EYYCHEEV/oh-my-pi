@@ -20,6 +20,8 @@ import { ASIDE_MESSAGE_COMMIT, ASIDE_MESSAGE_DISCARD } from "@oh-my-pi/pi-agent-
 import type { AssistantMessage, AssistantMessageEvent, Context, Message, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import { createAssistantMessage, createUserMessage } from "./helpers";
 
@@ -40,6 +42,8 @@ declare module "@oh-my-pi/pi-agent-core/types" {
 function identityConverter(messages: AgentMessage[]): Message[] {
 	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
 }
+
+const codexModel = buildModel({ ...getBundledModel("openai-codex", "gpt-5.4") });
 
 describe("agentLoop with AgentMessage", () => {
 	it("should emit events with AgentMessage types", async () => {
@@ -185,7 +189,7 @@ describe("agentLoop with AgentMessage", () => {
 			provider: "openai-codex",
 			responses: [{ content: [leak] }, { content: ["clean retry response"] }],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: codexModel, convertToLlm: identityConverter };
 
 		const events: AgentEvent[] = [];
 		const stream = agentLoop([createUserMessage("Hello")], context, config, undefined, mock.stream);
@@ -230,7 +234,7 @@ describe("agentLoop with AgentMessage", () => {
 				{ content: ["done"] },
 			],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: codexModel, convertToLlm: identityConverter };
 		const stream = agentLoop([createUserMessage("edit a fixture")], context, config, undefined, mock.stream);
 		for await (const _event of stream) {
 			// drain
@@ -3777,13 +3781,13 @@ describe("agentLoop pre-model-call gate", () => {
 			provider: "openai-codex",
 			responses: [{ content: ["Some prose. analysis to=functions.edit code"] }],
 		});
-		const retryModel = { ...mock.model, id: "retry-model" };
+		const retryModel = { ...codexModel, id: "retry-model" };
 		let gateCalls = 0;
 		let turnEndCalls = 0;
 		let rejectedToolChoices = 0;
 		const config: AgentLoopConfig = {
-			model: mock.model,
-			getModel: () => (gateCalls === 0 ? mock.model : retryModel),
+			model: codexModel,
+			getModel: () => (gateCalls === 0 ? codexModel : retryModel),
 			convertToLlm: identityConverter,
 			beforeModelCall: () => (++gateCalls > 1 ? { stop: true, reason: "over budget" } : undefined),
 			onTurnEnd: () => {
@@ -3824,7 +3828,7 @@ describe("agentLoop pre-model-call gate", () => {
 		const controller = new AbortController();
 		let gateCalls = 0;
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: codexModel,
 			convertToLlm: identityConverter,
 			beforeModelCall: async (_context, signal) => {
 				if (++gateCalls === 1) return undefined;

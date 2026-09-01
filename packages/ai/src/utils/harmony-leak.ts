@@ -154,10 +154,7 @@ export interface HarmonyRecoveredToolCall {
  */
 export function isHarmonyLeakMitigationTarget(model: Model): boolean {
 	const compat = model.compat;
-	if (compat !== undefined) return "harmonyLeakMitigation" in compat && compat.harmonyLeakMitigation === true;
-	// Models without a resolved compat record (mock/test models) fall back to the
-	// provider check the KDL axis replaced; real models always carry compat.
-	return model.provider === "openai-codex";
+	return compat !== undefined && "harmonyLeakMitigation" in compat && compat.harmonyLeakMitigation === true;
 }
 
 export function signalListLabel(signals: readonly HarmonySignal[]): string {
