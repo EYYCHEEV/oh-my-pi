@@ -128,6 +128,7 @@ An upgrade fails before build or installation if the block is stale, any declare
 - `context-overflow-recovery`: Mid-turn context overflow prevention and recovery
 - `terminal-resize-test-harness`: Terminal resize regression harness
 - `socket-close-tool-call-recovery`: Completed tool-call recovery after socket closure
+- `harmony-mitigation-compat-fallback`: Harmony mitigation fallback for compat-less models
 <!-- stronk-omp:fork-contracts:end -->
 
 ## Upstream alignment
