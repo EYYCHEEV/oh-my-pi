@@ -4,25 +4,58 @@
 
 ### Added
 
-- Added `injectV1: false` option to `openai-models-list` discovery to fetch the model list from `{baseUrl}/models` without injecting `/v1`, for gateways that root their OpenAI-compatible surface at a versioned URL (e.g. `https://api.opper.ai/v3/compat`) where the `/v1`-injected endpoint returns only a small subset.
-- Added provider-reported credits and concrete routed-model counts to `/session` statistics ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
-- Added `CLINE_API_KEY` to the CLI environment help for native ClinePass subscription inference ([#7863](https://github.com/can1357/oh-my-pi/pull/7863) by [@will-bogusz](https://github.com/will-bogusz)).
-- Devin model selectors now accept the native CLI's short aliases (`devin/opus`, `devin/swe`), dotted upstream spellings (`devin/gemini-3.7-flash`), and raw effort-route wire uids for dynamically collapsed families ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
-- Added provider-supplied model metadata to the `/models` detail line: `new`, `beta`, and `recommended` badges beside the model name, and the upstream description after the context, cost, and perf facts ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
-- Standalone `CLAUDE.md` files in the project root (and ancestor directories) are now loaded as context, mirroring `AGENTS.md` discovery; config-directory context files still take precedence per scope.
+- Added the `/trace` slash command to display session trace URLs in the stats dashboard.
+- Added support for OpenAI-compatible gateways whose model-list endpoint is rooted at a versioned URL, with an `injectV1: false` discovery option to request `{baseUrl}/models` directly.
+- Added provider-reported credits and concrete routed-model counts to `/session` statistics.
+- Added `CLINE_API_KEY` to CLI environment help for native ClinePass subscription inference.
+- Expanded Devin model selection to support native CLI aliases, dotted upstream model names, and raw effort-route identifiers.
+- Added provider-supplied model metadata to `/models`, including new, beta, and recommended badges plus model descriptions.
+- Standalone `CLAUDE.md` files in project and ancestor directories are now loaded as context alongside `AGENTS.md`, while preserving config-directory precedence.
+- Added an Activity view to Agent Hub with searchable and filterable timelines spanning live progress and persisted transcripts; `/hub` is now the live-operations entry point while `/agents` retains Control Center behavior.
+- Added an `icon.advisorClosed` symbol-theme token: the advisor eye in the status line now closes once the advisor has finished reviewing and will not add further comments.
 
 ### Changed
 
-- Disabled `hashline` edit mode for Kimi, Mimo, DeepSeek Flash, and Stepfun models for stability
-- Double-Escape now opens a fullscreen transcript rewind selector that outlines the target item with a dotted border — ↑/↓ step through rendered items, ←/→ jump between user turns, Enter rewinds (branching on user prompts, in-place leaf moves elsewhere); it replaces both the previous user-message list and the tree route (`doubleEscapeAction` is now `rewind` or `none`)
-- The rewind selector shows alternate session-tree branches at a fork as side-by-side half-width transcript columns; ←/→ slide between them with an animated camera, a dot rail with edge ellipses tracks position when branches overflow the window, and Enter rewinds into the chosen branch
-- `/copy` now uses the same fullscreen transcript selector as esc-esc: step the dotted outline over rendered items and Enter copies the turn's text, or press → to descend into its inner blocks (fenced code, quotes, bash/eval commands, tool output) and copy one verbatim
+- Disabled hashline editing for Kimi, Mimo, DeepSeek Flash, and Stepfun models for improved stability.
+- Reworked transcript navigation with a fullscreen rewind selector opened by double-Escape, supporting rendered-item navigation, user-turn jumps, branching rewinds, and alternate session-tree branch selection.
+- Updated `/copy` to use the fullscreen transcript selector, allowing users to copy a turn or navigate into nested content such as code, quotes, commands, and tool output.
 
 ### Fixed
 
-- Fixed an issue where custom model overrides were lost during configuration updates
-- Fixed "Please use nerdfont" notification incorrectly persisting after theme configuration
-- Fixed sampling parameter errors for newer Anthropic models (Opus 4.7+, Sonnet 5+)
+- Fixed online auto-thinking classifier usage being omitted from session token and cost totals.
+- Fixed image generation with custom provider endpoints when using `openai-codex` credentials and a non-OpenAI chat model.
+- Fixed custom hook UI factories not receiving the documented `keybindings` argument.
+- Fixed MCP OAuth token exchange for authorization endpoints that use a different resource indicator.
+- Fixed custom extension `web_search` tools being shadowed by the built-in search tool.
+- Fixed Agent Hub task boards collapsing to summary rows after returning from a focused session.
+- Improved Linux ARM64 browser startup messaging when managed Chrome for Testing builds are unavailable, with guidance for using system Chromium or `PUPPETEER_EXECUTABLE_PATH`.
+- Fixed resuming image-heavy sessions that previously terminated while replaying transcripts.
+- Fixed custom agents declaring `hub` being incorrectly treated as read-only.
+- Restored compatibility for legacy Pi extensions that import `calculateContextTokens` or use the synchronous `SettingsManager.create()` API.
+- Fixed custom model overrides being lost during configuration updates.
+- Clarified that the default task-delegation setting follows the selected model's policy.
+- Fixed `/rename` without a title interrupting active session activity.
+- Fixed the Nerd Font notification persisting incorrectly after theme configuration.
+- Fixed sampling parameter errors with newer Anthropic models.
+- Long OpenCode Go usage-limit waits now switch replay-safe turns to a configured alternate provider when the delay exceeds `retry.maxDelayMs`.
+- Fixed OpenAI Codex Responses tool results being lost when composite and plain tool-call identifiers did not match.
+- Fixed `/tan` background agents failing to resolve credentials for providers supplied by extensions.
+- Fixed Mnemopi saving session transcripts on exit when automatic retention is disabled.
+- Fixed configuration writes through chained symlinks so the final target and intermediate links are preserved.
+- Fixed direct tool calls using full `xd://` device URLs.
+- Fixed command-backed headers in custom discovery providers being resolved for discovered models.
+- Fixed Windows drive paths pasted under WSL being resolved through their `/mnt/<drive>` mounts for images and file reads.
+- Improved sloppy/SPARSE edit no-match guidance so low-confidence matches are clearly presented without unsafe copy-ready operations.
+- Fixed agents in Hub wait loops failing to respond to user steering messages.
+- Fixed `/tan` sessions inheriting parent costs and overstating subagent totals.
+- Fixed prompt action labels being truncated.
+- Fixed assistant text being truncated when a tool call begins during streaming.
+- Fixed the advisor dropping concerns when catching up on multiple turns and improved review context with bounded tool-result excerpts plus complete `ask` exchanges.
+- Fixed bash command timeouts being delayed by child processes holding output pipes open, while improving timeout reporting and cleanup.
+- Fixed retry countdowns and capped-wait errors displaying floating-point noise in millisecond durations.
+- Prevented browser `app.path` from terminating existing same-executable applications when no reusable CDP endpoint is available.
+- Fixed top-level errors overwriting the active composer before terminal restoration.
+- Fixed Enter being ignored during the first turn when omp starts with an initial prompt.
 
 ## [18.0.11] - 2026-08-29
 
@@ -114,6 +147,7 @@
 - Transcript usage rows now show the total prompt-to-yield time (Δ + clock, including tool calls) after the turn timestamp, opt-in via `display.showTurnTime` (off by default).
 - `omp usage` now shows Z.AI GLM Coding Plan credit quotas (5h + weekly) with the subscribed plan tier.
 - The usage status line now labels untiered quota windows with the report's plan tier, surfacing Z.AI Coding Plan (`pro`) and Codex plan names next to the 5h/7d percentages.
+
 ### Fixed
 
 - Fixed corrupt session headers silently overwriting recoverable transcripts during resume ([#9915](https://github.com/can1357/oh-my-pi/issues/9915)).
@@ -15977,3 +16011,4 @@ Initial public release.
 Previous releases did not maintain a changelog.
 Older entries are archived in [packages/coding-agent/CHANGELOG.md@c821261d1018](https://github.com/can1357/oh-my-pi/blob/c821261d10180d60bd96c1b7334227691c9e14f6/packages/coding-agent/CHANGELOG.md).
 Older entries are archived in [packages/coding-agent/CHANGELOG.md@9f06f7133fbe](https://github.com/can1357/oh-my-pi/blob/9f06f7133fbe877f89fc04cb4843472dc06988e9/packages/coding-agent/CHANGELOG.md).
+Older entries are archived in [packages/coding-agent/CHANGELOG.md@0045e59216f5](https://github.com/can1357/oh-my-pi/blob/0045e59216f5911ea4ebeb960c3bc0b96f254f8c/packages/coding-agent/CHANGELOG.md).

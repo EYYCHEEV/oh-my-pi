@@ -678,8 +678,8 @@ function resolveCodexSearchTransport(modelRegistry: ModelRegistry | undefined, m
 		baseUrl,
 		url,
 		headers: {
-			...(modelRegistry?.getProviderHeaders("openai-codex") ?? {}),
-			...(registryModel?.headers ?? {}),
+			...modelRegistry?.getProviderHeaders("openai-codex"),
+			...registryModel?.headers,
 		},
 		customEndpoint: url !== resolveCodexResponsesUrl(CODEX_BASE_URL),
 	};

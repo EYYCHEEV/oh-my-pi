@@ -229,7 +229,7 @@ function mergeLlmCompactionPreserveData(
 	hookPreserveData: Record<string, unknown> | undefined,
 	resultPreserveData: Record<string, unknown> | undefined,
 ): Record<string, unknown> | undefined {
-	const preserveData = { ...(hookPreserveData ?? {}), ...(resultPreserveData ?? {}) };
+	const preserveData = { ...hookPreserveData, ...resultPreserveData };
 	return snapcompact.stripPreservedArchive(Object.keys(preserveData).length > 0 ? preserveData : undefined);
 }
 
@@ -984,7 +984,7 @@ export class SessionMaintenance {
 				firstKeptEntryId = snapcompactResult.firstKeptEntryId;
 				tokensBefore = snapcompactResult.tokensBefore;
 				details = snapcompactResult.details;
-				preserveData = { ...(compactionPrep.preserveData ?? {}), ...(snapcompactResult.preserveData ?? {}) };
+				preserveData = { ...compactionPrep.preserveData, ...snapcompactResult.preserveData };
 			} else {
 				codexCompaction = createCodexCompactionContext({
 					trigger: "manual",
@@ -3469,7 +3469,7 @@ export class SessionMaintenance {
 				firstKeptEntryId = snapcompactResult.firstKeptEntryId;
 				tokensBefore = snapcompactResult.tokensBefore;
 				details = snapcompactResult.details;
-				preserveData = { ...(compactionPrep.preserveData ?? {}), ...(snapcompactResult.preserveData ?? {}) };
+				preserveData = { ...compactionPrep.preserveData, ...snapcompactResult.preserveData };
 			} else {
 				const candidates = this.#getCompactionModelCandidates(
 					availableModels,
