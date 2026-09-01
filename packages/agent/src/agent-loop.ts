@@ -1970,6 +1970,7 @@ function recoverTransientErrorToolTurn(
 	if (
 		!AIError.isStreamReadErrorText(errorText) &&
 		!AIError.isStreamEnvelopeErrorText(errorText) &&
+		!AIError.isUnexpectedSocketCloseMessage(errorText) &&
 		!AIError.isTransientStreamParseError(message.errorMessage) &&
 		!AIError.isTransientStreamParseError(message.stopDetails?.explanation)
 	)

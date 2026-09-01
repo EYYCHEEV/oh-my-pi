@@ -127,6 +127,7 @@ An upgrade fails before build or installation if the block is stale, any declare
 - `codex-web-search-reliability`: Native Codex web search orchestration
 - `context-overflow-recovery`: Mid-turn context overflow prevention and recovery
 - `terminal-resize-test-harness`: Terminal resize regression harness
+- `socket-close-tool-call-recovery`: Completed tool-call recovery after socket closure
 <!-- stronk-omp:fork-contracts:end -->
 
 ## Upstream alignment

@@ -16,6 +16,10 @@ import {
 	parseRateLimitReason,
 } from "./rate-limit";
 
+/** Persisted-text form of Bun's fetch socket-drop diagnostic, re-exported so
+ *  loop-level salvage can recognize it the same way the classifiers do. */
+export { isUnexpectedSocketCloseMessage };
+
 export const Flag = {
 	Class: 0x1000,
 	ThinkingLoop: 0x0001_0000,
