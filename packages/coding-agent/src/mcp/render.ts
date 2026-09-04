@@ -135,7 +135,7 @@ export function renderMCPResult(
 		}
 		return [];
 	});
-	const trimmedOutput = displayBlocks.join("\n");
+	const trimmedOutput = displayBlocks.join("\n\n");
 	const singleTextOutput =
 		result.content.length === 1 && result.content[0]?.type === "text" ? trimmedOutput : undefined;
 	const truncationWarning = result.details?.meta?.truncation

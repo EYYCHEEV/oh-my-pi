@@ -17,6 +17,7 @@ import { deduplicateMCPToolsByName } from "../mcp/tool-bridge";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
 import { MEMORY_BACKEND_TOOL_NAMES } from "../memory-backend/tool-names";
 import type { MemoryBackendStartOptions } from "../memory-backend/types";
+import toolRosterNoticePrompt from "../prompts/system/tool-roster-notice.md" with { type: "text" };
 import xdevMountNoticePrompt from "../prompts/system/xdev-mount-notice.md" with { type: "text" };
 import { isMCPToolName, normalizeToolNames } from "../tools/builtin-names";
 import { computerExposureMode } from "../tools/computer/exposure";
@@ -176,6 +177,7 @@ export function projectMountedMCPXdevGuidance(routes: Iterable<MountedMCPToolRou
 	return { mappings, hasOmittedMappings };
 }
 
+const TOOL_ROSTER_NOTICE_MESSAGE_TYPE = "tool-roster-notice";
 const XDEV_MOUNT_NOTICE_MESSAGE_TYPE = "xdev-mount-notice";
 
 /**
@@ -205,6 +207,7 @@ export class SessionTools {
 	#mcpManagerToolNames = new Set<string>();
 	#extensionMcpTools = new Map<string, AgentTool>();
 	#xdev: XdevState | undefined;
+	#pendingToolRosterDelta: { added: Set<string>; removed: Set<string> } | undefined;
 	#pendingXdevMountDelta: { added: Set<string>; removed: Set<string> } | undefined;
 	/**
 	 * Dynamic (`xd://`) devices the model has already been told are mounted.
@@ -246,6 +249,14 @@ export class SessionTools {
 	#toolRegistryMutationScope = new AsyncLocalStorage<boolean>();
 	#toolRegistryMutationTail: Promise<void> = Promise.resolve();
 	#promptModelKey: string | undefined;
+	/**
+	 * Model identity (`formatModelString`) last named by an inspect_image
+	 * status notice. Consulted by {@link reconcileInspectImageAfterModelChange}
+	 * to refresh the hint when consecutive switches keep the tool hidden but
+	 * change the active model — otherwise the notice keeps naming the previous
+	 * model (issue #10729).
+	 */
+	#lastInspectImageNoticeModel: string | undefined;
 	#rebuildSystemPrompt: SessionToolsOptions["rebuildSystemPrompt"];
 	#getMcpServerInstructions: SessionToolsOptions["getMcpServerInstructions"];
 	#setActiveToolNames: SessionToolsOptions["setActiveToolNames"];
@@ -1008,6 +1019,7 @@ export class SessionTools {
 
 		let rebuiltSystemPrompt: string[] | undefined;
 		let rebuiltSignature: string | undefined;
+		let frozenSignature: string | undefined;
 		let rebuiltXdevCatalogNames: readonly string[] | undefined;
 		try {
 			if (restrictDeviceOnlyWrite) this.#setDeviceOnlyWrite?.(true);
@@ -1027,7 +1039,15 @@ export class SessionTools {
 					: appliedTools;
 				const directToolNames = codeMode.active ? appliedNames : undefined;
 				const signature = this.#computeAppliedToolSignature(promptToolNames, promptTools, directToolNames);
-				if (forcePromptRefresh || signature !== this.#lastAppliedToolSignature) {
+				const freezeImplicitPromptRefresh =
+					!forcePromptRefresh &&
+					signature !== this.#lastAppliedToolSignature &&
+					this.#lastAppliedToolSignature !== undefined &&
+					this.#host.model()?.thinking?.prefixBinding === true &&
+					this.#host.agent.state.messages.some(message => message.role === "assistant");
+				if (freezeImplicitPromptRefresh) {
+					frozenSignature = signature;
+				} else if (forcePromptRefresh || signature !== this.#lastAppliedToolSignature) {
 					const built = await untilAborted(
 						signal,
 						this.#rebuildSystemPrompt(promptToolNames, this.#toolRegistry, { directToolNames }),
@@ -1075,6 +1095,9 @@ export class SessionTools {
 				this.#lastAppliedToolSignature = rebuiltSignature;
 				this.#promptModelKey = this.#currentPromptModelKey();
 				this.#basePromptXdevNames = new Set(rebuiltXdevCatalogNames);
+			} else if (frozenSignature) {
+				this.#notifyToolRosterDelta(previousActiveToolNames, appliedNames);
+				this.#lastAppliedToolSignature = frozenSignature;
 			}
 			if (restoreDormantDeviceOnlyWrite) {
 				this.#setDeviceOnlyWrite?.(true);
@@ -1091,6 +1114,22 @@ export class SessionTools {
 		if (!mountedNames) return;
 		mountedNames.clear();
 		for (const name of names) mountedNames.add(name);
+	}
+
+	#notifyToolRosterDelta(previousActiveToolNames: readonly string[], appliedNames: readonly string[]): void {
+		const previous = new Set(previousActiveToolNames);
+		const current = new Set(appliedNames);
+		const addedNames = appliedNames.filter(name => !previous.has(name));
+		const removedNames = previousActiveToolNames.filter(name => !current.has(name));
+		if (addedNames.length === 0 && removedNames.length === 0) return;
+		const pending = this.#pendingToolRosterDelta ?? { added: new Set<string>(), removed: new Set<string>() };
+		for (const name of addedNames) {
+			if (!pending.removed.delete(name)) pending.added.add(name);
+		}
+		for (const name of removedNames) {
+			if (!pending.added.delete(name)) pending.removed.add(name);
+		}
+		this.#pendingToolRosterDelta = pending.added.size > 0 || pending.removed.size > 0 ? pending : undefined;
 	}
 
 	/**
@@ -1196,6 +1235,27 @@ export class SessionTools {
 				else this.#announcedMounts.delete(name);
 			}
 		}
+	}
+
+	/** Consumes the hidden notice for provider-visible tool-roster changes. */
+	takePendingToolRosterNotice(): CustomMessage<{ added: string[]; removed: string[] }> | undefined {
+		const pending = this.#pendingToolRosterDelta;
+		if (!pending) return undefined;
+		this.#pendingToolRosterDelta = undefined;
+		const added = [...pending.added];
+		const removed = [...pending.removed];
+		return {
+			role: "custom",
+			customType: TOOL_ROSTER_NOTICE_MESSAGE_TYPE,
+			content: prompt.render(toolRosterNoticePrompt, {
+				added: added.length > 0 ? added.join(", ") : undefined,
+				removed: removed.length > 0 ? removed.join(", ") : undefined,
+			}),
+			details: { added, removed },
+			attribution: "agent",
+			display: false,
+			timestamp: Date.now(),
+		};
 	}
 
 	/** Consumes the hidden notice for unannounced `xd://` mount changes. */
@@ -1321,6 +1381,18 @@ export class SessionTools {
 				signal,
 			);
 		}, signal);
+	}
+
+	/** Restores a non-MCP presentation snapshot while retaining the current MCP selection. */
+	restoreNonMCPToolPresentation(nonMCPToolNames: string[], nonMCPMountedToolNames: string[]): Promise<void> {
+		return this.runToolRegistryMutation(async () => {
+			const currentMCPToolNames = this.getSelectedMCPToolNames();
+			const currentMountedMCPToolNames = this.getMountedXdevToolNames().filter(isMCPToolName);
+			await this.setActiveToolPresentation(
+				[...nonMCPToolNames, ...currentMCPToolNames],
+				[...nonMCPMountedToolNames, ...currentMountedMCPToolNames],
+			);
+		});
 	}
 
 	/**
@@ -1535,23 +1607,32 @@ export class SessionTools {
 
 	/**
 	 * Reconciles inspect_image after a model change and surfaces a notice when
-	 * the visible tool set actually flipped. Called from every model-change
-	 * path — including retry-fallback switches that bypass
-	 * {@link syncAfterModelChange}.
+	 * the visible tool set flips, or when consecutive switches keep the tool
+	 * hidden for image capability but change the active model (the hint names
+	 * the model, so it would otherwise keep naming the previous one — issue
+	 * #10729). Called from every model-change path — including retry-fallback
+	 * switches that bypass {@link syncAfterModelChange}.
 	 */
 	reconcileInspectImageAfterModelChange(): Promise<void> {
 		return this.runToolRegistryMutation(async () => {
 			const before = this.getEnabledToolNames().includes("inspect_image");
 			const reconciled = await this.reconcileInspectImageTool();
+			if (!reconciled) return;
 			const after = this.getEnabledToolNames().includes("inspect_image");
-			if (!reconciled || before === after) return;
 			const model = this.#host.model();
 			const modelName = model ? formatModelString(model) : "the current model";
+			const flipped = before !== after;
+			// The hidden-state hint names the active model to explain why
+			// inspect_image vanished; refresh it when the model changed while the
+			// tool stays hidden, otherwise the prior hint keeps naming the old model.
+			const staleHiddenModel = !after && !flipped && modelName !== this.#lastInspectImageNoticeModel;
+			if (!flipped && !staleHiddenModel) return;
+			this.#lastInspectImageNoticeModel = modelName;
 			this.#host.emitNotice(
 				"info",
 				after
 					? `inspect_image is now available: ${modelName} has no native image input.`
-					: `inspect_image is now hidden: ${modelName} supports image input natively. Override with /vision on.`,
+					: `inspect_image ${flipped ? "is now hidden" : "stays hidden"}: ${modelName} supports image input natively. Override with /vision on.`,
 				"vision",
 			);
 		});
