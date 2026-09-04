@@ -119,6 +119,7 @@ An upgrade fails before build or installation if the block is stale, any require
 - `tool-call-abort-signal`: Tool-call abort signal propagation
 - `mcp-image-forwarding`: MCP image render and spill preservation
 - `task-delegation-gate`: Policy-gated task delegation
+- `task-batch-shape`: Batch task shape and shared context
 - `agent-registry-observation`: Copied read-only agent-registry observation
 - `outcome-first-scope-control`: Outcome-first reviewer and Todo scope control
 - `kimi-usage-account-identity`: Per-account Kimi usage report identity
