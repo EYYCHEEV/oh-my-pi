@@ -8,16 +8,18 @@ import {
 	assertEntryCount,
 	assertIndexSize,
 	assertInMemorySize,
+	DEFAULT_ARCHIVE_LIMITS,
 } from "./limits";
 import {
 	assertArchivePathBytes,
 	assertArchivePathString,
 	formatArchivePathForError,
+	isUnsafeArchiveEntryPath,
 	normalizeArchiveEntryPath,
 	normalizeArchiveLookupPath,
 } from "./paths";
 import { readAllBytes } from "./source";
-import type { ArchiveIndexEntry, FormatReader, FormatReadOptions, MemberSource } from "./types";
+import type { ArchiveIndexEntry, ArchiveWriteOptions, FormatReader, FormatReadOptions, MemberSource } from "./types";
 
 const BLOCK_SIZE = 512;
 const NAME_OFFSET = 0;
@@ -151,6 +153,14 @@ function parsePaxSize(value: string, field: string): number {
 	return size;
 }
 
+function parsePaxMtime(value: string): number {
+	const mtimeMs = Number(value) * 1000;
+	if (!Number.isFinite(mtimeMs) || !Number.isSafeInteger(Math.trunc(mtimeMs))) {
+		throw new ArchiveError("Invalid tar PAX mtime");
+	}
+	return mtimeMs;
+}
+
 function isZeroBlock(buffer: Uint8Array, offset: number): boolean {
 	for (let index = 0; index < BLOCK_SIZE; index++) {
 		if (buffer[offset + index] !== 0) return false;
@@ -212,6 +222,9 @@ function parsePaxRecords(data: Uint8Array, limits: ArchiveLimits): Map<string, s
 			} else if (bytesEqualAscii(key, "size")) {
 				if (value.byteLength > MAX_PAX_NUMERIC_BYTES) throw new ArchiveError("Invalid tar member size");
 				attrs.set("size", TEXT_DECODER.decode(value));
+			} else if (bytesEqualAscii(key, "mtime")) {
+				if (value.byteLength > MAX_PAX_NUMERIC_BYTES) throw new ArchiveError("Invalid tar PAX mtime");
+				attrs.set("mtime", TEXT_DECODER.decode(value));
 			}
 		}
 		pos += length;
@@ -231,7 +244,10 @@ function paxAttribute(
 	localPax: ReadonlyMap<string, string> | undefined,
 	key: string,
 ): string | undefined {
-	if (localPax?.has(key)) return localPax.get(key);
+	if (localPax?.has(key)) {
+		const value = localPax.get(key);
+		return value === "" ? undefined : value;
+	}
 	return globalPax.get(key);
 }
 
@@ -417,6 +433,7 @@ export function readTarEntriesFromBuffer(buffer: Uint8Array, options: FormatRead
 	const { limits } = options;
 	assertInMemorySize(buffer.byteLength, limits);
 	const entries = new Map<string, ArchiveIndexEntry>();
+	const rawEntries: ArchiveIndexEntry[] | undefined = options.preservePaths ? [] : undefined;
 	const pendingLinks = new Map<ArchiveIndexEntry, PendingTarLink>();
 	const addEntry = (entry: ArchiveIndexEntry, pendingLink?: PendingTarLink): void => {
 		const existing = entries.get(entry.path);
@@ -424,7 +441,12 @@ export function readTarEntriesFromBuffer(buffer: Uint8Array, options: FormatRead
 		if (!indexed) return;
 		if (existing) pendingLinks.delete(existing);
 		if (pendingLink) pendingLinks.set(indexed, pendingLink);
-		assertEntryCount(entries.size, limits);
+		if (rawEntries) {
+			rawEntries.push(indexed);
+			assertEntryCount(rawEntries.length, limits);
+		} else {
+			assertEntryCount(entries.size, limits);
+		}
 	};
 	let offset = 0;
 	let longName: string | undefined;
@@ -441,14 +463,24 @@ export function readTarEntriesFromBuffer(buffer: Uint8Array, options: FormatRead
 		if (!checksumMatches(buffer, offset)) throw new ArchiveError("Invalid or corrupt tar archive header");
 		const headerOffset = offset;
 		const typeFlag = String.fromCharCode(buffer[headerOffset + TYPEFLAG_OFFSET] || 0x30);
-		let size = readTarSize(buffer, headerOffset + SIZE_OFFSET);
+		const isMetadataHeader =
+			typeFlag === "L" ||
+			typeFlag === "K" ||
+			typeFlag === "N" ||
+			typeFlag === "x" ||
+			typeFlag === "X" ||
+			typeFlag === "g";
+		const pendingPaxSize = isMetadataHeader ? undefined : paxAttribute(globalPax, localPax, "size");
+		const size =
+			pendingPaxSize === undefined
+				? readTarSize(buffer, headerOffset + SIZE_OFFSET)
+				: parsePaxSize(pendingPaxSize, "member size");
 		let name = readTarString(buffer, headerOffset + NAME_OFFSET, NAME_LENGTH);
 		if (isUstarHeader(buffer, headerOffset)) {
 			const prefix = readTarString(buffer, headerOffset + PREFIX_OFFSET, PREFIX_LENGTH);
 			if (prefix) name = `${prefix}/${name}`;
 		}
 		let linkName = readTarString(buffer, headerOffset + LINKNAME_OFFSET, LINKNAME_LENGTH);
-		const mtime = readTarNumeric(buffer, headerOffset + MTIME_OFFSET, MTIME_LENGTH);
 		const rawMode = readTarNumeric(buffer, headerOffset + MODE_OFFSET, MODE_LENGTH);
 		const mode = Number.isSafeInteger(rawMode) && rawMode >= 0 ? rawMode : undefined;
 		offset += BLOCK_SIZE;
@@ -491,14 +523,13 @@ export function readTarEntriesFromBuffer(buffer: Uint8Array, options: FormatRead
 		if (paxPath !== undefined) name = paxPath;
 		const paxLinkPath = paxAttribute(globalPax, localPax, "linkpath");
 		if (paxLinkPath !== undefined) linkName = paxLinkPath;
-		const paxSize = paxAttribute(globalPax, localPax, "size");
-		if (paxSize !== undefined) size = parsePaxSize(paxSize, "member size");
 		const paxSparseName = paxAttribute(globalPax, localPax, "GNU.sparse.name");
 		if (paxSparseName !== undefined) name = paxSparseName;
 		let displaySize = size;
 		const paxSparseRealSize = paxAttribute(globalPax, localPax, "GNU.sparse.realsize");
 		if (paxSparseRealSize !== undefined) displaySize = parsePaxSize(paxSparseRealSize, "sparse real size");
 		const sparse = typeFlag === "S" || paxDeclaresSparse(globalPax, localPax);
+		const paxMtime = paxAttribute(globalPax, localPax, "mtime");
 		if (typeFlag === "S" && buffer[headerOffset + GNU_SPARSE_ISEXTENDED_OFFSET] === 1) {
 			let extended = true;
 			while (extended) {
@@ -519,17 +550,35 @@ export function readTarEntriesFromBuffer(buffer: Uint8Array, options: FormatRead
 		longLink = undefined;
 		localPax = undefined;
 
-		const isDirectory = typeFlag === "5" || name.endsWith("/");
-		const normalizedPath = normalizeArchiveEntryPath(name);
-		if (!normalizedPath) continue;
-		assertArchivePathString(normalizedPath, "member path", limits.maxPathBytes);
-		const scaledMtime = mtime * 1000;
-		const mtimeMs = mtime !== 0 && Number.isSafeInteger(scaledMtime) ? scaledMtime : undefined;
+		if (!name) continue;
+		const rawPath = name;
+		assertArchivePathString(rawPath, "member path", limits.maxPathBytes);
+		if (options.rejectUnsafePaths && isUnsafeArchiveEntryPath(rawPath)) {
+			throw new ArchiveError(`Archive entry escapes extraction dir: ${formatArchivePathForError(rawPath)}`);
+		}
+		const isDirectory = typeFlag === "5" || rawPath.endsWith("/");
+		const normalizedPath = normalizeArchiveEntryPath(rawPath);
+		if (!normalizedPath && !rawEntries) continue;
+		if (normalizedPath) assertArchivePathString(normalizedPath, "member path", limits.maxPathBytes);
+		const headerMtime =
+			paxMtime === undefined ? readTarNumeric(buffer, headerOffset + MTIME_OFFSET, MTIME_LENGTH) : undefined;
+		const scaledMtime = headerMtime === undefined ? undefined : headerMtime * 1000;
+		const mtimeMs =
+			paxMtime !== undefined
+				? parsePaxMtime(paxMtime)
+				: headerMtime !== 0 &&
+					  headerMtime !== undefined &&
+					  Number.isSafeInteger(headerMtime) &&
+					  Number.isSafeInteger(scaledMtime)
+					? scaledMtime
+					: undefined;
 		if (isDirectory) {
-			addEntry({ path: normalizedPath, isDirectory: true, size: 0, mtimeMs, mode });
+			if (!normalizedPath) continue;
+			addEntry({ path: normalizedPath, rawPath, isDirectory: true, size: 0, mtimeMs, mode });
 			continue;
 		}
 		if (typeFlag === "1" || typeFlag === "2") {
+			if (!normalizedPath) continue;
 			const kind = typeFlag === "1" ? "hard link" : "symlink";
 			const portableLinkName = linkName.replace(/\\/g, "/");
 			assertArchivePathString(portableLinkName, "link target", limits.maxPathBytes);
@@ -541,6 +590,7 @@ export function readTarEntriesFromBuffer(buffer: Uint8Array, options: FormatRead
 						: normalizeArchiveLookupPath(path.posix.join(path.posix.dirname(normalizedPath), portableLinkName));
 			const entry: ArchiveIndexEntry = {
 				path: normalizedPath,
+				rawPath,
 				isDirectory: false,
 				size: 0,
 				mtimeMs,
@@ -560,19 +610,34 @@ export function readTarEntriesFromBuffer(buffer: Uint8Array, options: FormatRead
 			continue;
 		}
 		if (typeFlag !== "0" && typeFlag !== "\0" && typeFlag !== "7" && typeFlag !== "S") continue;
-		assertArchiveMemberSize(displaySize, normalizedPath, limits);
-		addEntry({
-			path: normalizedPath,
+		const memberPath = normalizedPath ?? rawPath;
+		assertArchiveMemberSize(displaySize, memberPath, limits);
+		const entry: ArchiveIndexEntry = {
+			path: memberPath,
+			rawPath,
 			isDirectory: false,
 			size: displaySize,
 			mtimeMs,
 			mode,
 			storage: { type: "member", source: new TarMemberSource(buffer, dataOffset, sparse) },
-		});
+		};
+		if (normalizedPath) {
+			addEntry(entry);
+		} else if (rawEntries) {
+			rawEntries.push(entry);
+			assertEntryCount(rawEntries.length, limits);
+		}
 	}
 	if (!sawTerminator) throw new ArchiveError("Not a valid tar archive: missing terminating zero block");
 	resolvePendingLinks(entries, pendingLinks, limits);
-	return [...entries.values()];
+	if (!rawEntries) return [...entries.values()];
+	const entriesByRawPath = new Map<string, ArchiveIndexEntry>();
+	for (const entry of rawEntries) {
+		const rawPath = entry.rawPath ?? entry.path;
+		entriesByRawPath.delete(rawPath);
+		entriesByRawPath.set(rawPath, entry);
+	}
+	return [...entriesByRawPath.values()];
 }
 
 /** Read and index a tar source after one bounded whole-stream read. */
@@ -735,13 +800,32 @@ function appendTarEntry(
 }
 
 /** Encode files as a deterministic ustar archive, using PAX records for overflow paths. */
-export async function encodeTar(members: Iterable<readonly [string, Uint8Array]>): Promise<Uint8Array> {
+export async function encodeTar(
+	members: Iterable<readonly [string, Uint8Array]>,
+	options: ArchiveWriteOptions = {},
+): Promise<Uint8Array> {
 	const parts: Uint8Array[] = [];
 	const kinds = new Map<string, "directory" | "file">();
 	let sequence = 0;
 	for (const [rawPath, bytes] of members) {
-		const directory = rawPath.endsWith("/") || rawPath.endsWith("\\");
-		const normalized = normalizeArchiveEntryPath(rawPath);
+		const portablePath = rawPath.replace(/\\/g, "/");
+		const directory = portablePath.endsWith("/");
+		const normalized = normalizeArchiveEntryPath(portablePath);
+		if (options.preservePaths) {
+			if (!portablePath || portablePath.includes("\0")) {
+				throw new ArchiveError(`Invalid tar member path '${formatArchivePathForError(rawPath)}'`);
+			}
+			assertArchivePathString(portablePath, "member path", DEFAULT_ARCHIVE_LIMITS.maxPathBytes);
+			const archivePath = directory ? portablePath.slice(0, -1) : portablePath;
+			if (!archivePath) throw new ArchiveError("Invalid empty tar member path");
+			if (directory && bytes.byteLength !== 0) {
+				throw new ArchiveError(
+					`Tar directory '${formatArchivePathForError(portablePath)}' cannot contain file data`,
+				);
+			}
+			appendTarEntry(parts, archivePath, bytes, directory, sequence++);
+			continue;
+		}
 		if (!normalized) throw new ArchiveError(`Invalid tar member path '${formatArchivePathForError(rawPath)}'`);
 		const pathBytes = TEXT_ENCODER.encode(normalized);
 		if (pathBytes.byteLength === 0) throw new ArchiveError("Invalid empty tar member path");

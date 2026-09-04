@@ -106,28 +106,29 @@ Flake consumers can use `packages.<system>.omp`, `overlays.default`, `nixosModul
 ## Exact active fork contract map
 
 This block is generated from the same manifest that gates every `upgrade-omp` run.
-An upgrade fails before build or installation if the block is stale, any declared fork path disappears, a required contract disappears, or any fork-relative path is unclassified.
+An upgrade fails before build or installation if the block is stale, any required semantic anchor disappears or is deletion-only, a required contract disappears, or any fork-relative path is unclassified.
 
 <!-- stronk-omp:fork-contracts:start -->
 - `required-extension-enforcement`: Required safety extension enforcement
-- `terminal-eintr-worker-ownership`: Terminal EINTR recovery and shared-worker ownership
+- `terminal-eintr-recovery`: Terminal EINTR recovery
+- `shared-worker-ownership`: Process-global worker ownership
 - `subagent-policy-inheritance`: Resolved parent policy inheritance for subagents
-- `turn-status-lifecycle`: Root and subagent turn-status lifecycle
+- `turn-status-lifecycle`: Root and subagent activity lifecycle
+- `status-line-extension-state`: Extension status-line rendering and disposal
 - `goal-objective-skill-picker`: Goal objective skill-picker routing
 - `tool-call-abort-signal`: Tool-call abort signal propagation
-- `mcp-image-forwarding`: Ordered MCP image forwarding
-- `bounded-process-tree-cleanup`: Identity-safe bounded process-tree cleanup
+- `mcp-image-forwarding`: MCP image render and spill preservation
 - `task-delegation-gate`: Policy-gated task delegation
-- `blocking-task-batches`: Blocking task-batch execution
-- `interrupted-transcript-artifact-ids`: Collision-free interrupted transcript artifact IDs
-- `agent-registry-observation`: Read-only global agent-registry observation
+- `agent-registry-observation`: Copied read-only agent-registry observation
 - `outcome-first-scope-control`: Outcome-first reviewer and Todo scope control
 - `kimi-usage-account-identity`: Per-account Kimi usage report identity
 - `archive-read-crash-containment`: Crash-safe archive I/O
-- `codex-web-search-reliability`: Native Codex web search orchestration
-- `context-overflow-recovery`: Mid-turn context overflow prevention and recovery
-- `terminal-resize-test-harness`: Terminal resize regression harness
-- `socket-close-tool-call-recovery`: Completed tool-call recovery after socket closure
+- `codex-native-web-run`: Native Codex web.run orchestration
+- `codex-web-search-cli-fallback`: Reliable model-less Codex web-search fallback
+- `context-occupancy-projection`: Mid-turn context occupancy projection
+- `local-context-overflow-classification`: Local hard-context overflow classification
+- `terminal-resize-test-harness`: Exact Kitty terminal harness dependency pin
+- `socket-close-tool-call-recovery`: Bun socket-close tool-call recovery
 - `harmony-mitigation-resolved-model-tests`: Harmony mitigation resolved-model regressions
 <!-- stronk-omp:fork-contracts:end -->
 

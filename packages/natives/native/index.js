@@ -31,7 +31,6 @@ export const PowerAssertion = nativeBindings.PowerAssertion;
 export const Process = nativeBindings.Process;
 export const PtySession = nativeBindings.PtySession;
 export const Shell = nativeBindings.Shell;
-export const SupervisedProcessTree = nativeBindings.SupervisedProcessTree;
 export const TtyWriter = nativeBindings.TtyWriter;
 export const VcsGitRepo = nativeBindings.VcsGitRepo;
 export const VcsJjWorkspace = nativeBindings.VcsJjWorkspace;

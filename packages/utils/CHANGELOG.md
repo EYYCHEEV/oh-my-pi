@@ -340,9 +340,6 @@
 ### Fixed
 
 - Prevented the global postmortem handler from terminating OMP sessions when Bun surfaces a transient POSIX `read` interruption (`EINTR`) as an uncaught exception.
-### Added
-
-- Added `spawnBounded` for binary-safe capped stdout/stderr capture and awaited macOS parent-plus-descendant cleanup through one retained supervised process group.
 
 ## [16.4.6] - 2026-07-12
 

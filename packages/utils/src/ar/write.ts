@@ -3,7 +3,7 @@ import { gzipCompress } from "./codecs/gzip";
 import { zstdCompress } from "./codecs/zstd";
 import { memberContentToBytes } from "./open";
 import { encodeTar } from "./tar";
-import type { ArchiveFormat, ArchiveMemberContent, WritableArchiveFormat } from "./types";
+import type { ArchiveFormat, ArchiveMemberContent, ArchiveWriteOptions, WritableArchiveFormat } from "./types";
 import { encodeZip } from "./zip";
 
 const WRITABLE_FORMATS: Record<WritableArchiveFormat, true> = {
@@ -26,6 +26,7 @@ export function isWritableArchiveFormat(format: ArchiveFormat): format is Writab
 export async function encodeArchive(
 	format: WritableArchiveFormat,
 	entries: Iterable<readonly [string, ArchiveMemberContent]>,
+	options: ArchiveWriteOptions = {},
 ): Promise<Uint8Array> {
 	const members: (readonly [string, Uint8Array])[] = [];
 	for (const [name, content] of entries) {
@@ -33,15 +34,15 @@ export async function encodeArchive(
 	}
 	switch (format) {
 		case "zip":
-			return encodeZip(members);
+			return encodeZip(members, options);
 		case "asar":
 			return encodeAsar(members);
 		case "tar":
-			return encodeTar(members);
+			return encodeTar(members, options);
 		case "tar.gz":
-			return gzipCompress(await encodeTar(members));
+			return gzipCompress(await encodeTar(members, options));
 		case "tar.zst":
-			return zstdCompress(await encodeTar(members));
+			return zstdCompress(await encodeTar(members, options));
 	}
 }
 
@@ -50,6 +51,7 @@ export async function writeArchive(
 	destPath: string,
 	format: WritableArchiveFormat,
 	entries: Iterable<readonly [string, ArchiveMemberContent]>,
+	options: ArchiveWriteOptions = {},
 ): Promise<void> {
-	await Bun.write(destPath, await encodeArchive(format, entries));
+	await Bun.write(destPath, await encodeArchive(format, entries, options));
 }

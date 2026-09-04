@@ -129,7 +129,6 @@ interface TaskDescriptionOptions {
 	applyIsolatedChanges: boolean;
 	disabledAgents: string[];
 	batchEnabled: boolean;
-	batchBlocking: boolean;
 	effortEnabled: boolean;
 	evalToolsEnabled: boolean;
 	asyncEnabled: boolean;
@@ -166,7 +165,6 @@ function renderDescription(options: TaskDescriptionOptions): string {
 		isolationEnabled: options.isolationEnabled,
 		applyIsolatedChanges: options.applyIsolatedChanges,
 		batchEnabled: options.batchEnabled,
-		batchBlocking: options.batchBlocking,
 		effortEnabled: options.effortEnabled,
 		evalToolsEnabled: options.evalToolsEnabled,
 		asyncEnabled: options.asyncEnabled,
@@ -496,8 +494,8 @@ export async function refreshAgentDiscovery(cwd: string, extensionRoots?: Effect
  * Task tool - Delegate tasks to specialized agents.
  *
  * Each call spawns one subagent — or, with `task.batch`, one per `tasks[]`
- * item. Non-blocking spawns normally use AsyncJobManager when async execution
- * is enabled; `task.batchBlocking` keeps multi-item fan-out inline and merged.
+ * item. Non-blocking spawns use AsyncJobManager when async execution is
+ * enabled; agent definitions marked `blocking` run inline.
  */
 export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetails, Theme> {
 	readonly name = "task";
@@ -612,7 +610,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			applyIsolatedChanges: this.session.settings.get("task.isolation.apply"),
 			disabledAgents,
 			batchEnabled: this.#isBatchEnabled(),
-			batchBlocking: this.session.settings.get("task.batchBlocking"),
 			effortEnabled: this.session.settings.get("task.enableEffort"),
 			evalToolsEnabled: evalToolsEnabled(this.session),
 			asyncEnabled: this.session.settings.get("async.enabled"),
@@ -711,8 +708,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 		const normalizedSpawnParams = spawnItems.map(item => spawnParamsFor(params, item, defaultAgent));
 		const resolvedAgents = normalizedSpawnParams.map(spawn => spawn.agent ?? defaultAgent);
-		const blockingBatch =
-			Array.isArray(params.tasks) && spawnItems.length > 1 && this.session.settings.get("task.batchBlocking");
 		// Resolve every item before choosing an execution path. No executor or
 		// job manager may observe a batch unless every effective policy is valid.
 		const preflights = await Promise.all(
@@ -749,7 +744,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		// execution is available.
 		const asyncEnabled = this.session.settings.get("async.enabled");
 		const manager = asyncEnabled ? this.session.asyncJobManager : undefined;
-		const asyncItems = manager && !blockingBatch ? spawnItems.filter((_, index) => !itemBlocking[index]) : [];
+		const asyncItems = manager ? spawnItems.filter((_, index) => !itemBlocking[index]) : [];
 		const depthCapacity = canSpawnAtDepth(
 			this.session.settings.get("task.maxRecursionDepth") ?? 2,
 			this.session.taskDepth ?? 0,

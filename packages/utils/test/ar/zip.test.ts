@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { ArchiveError } from "../../src/ar/error";
 import { DEFAULT_ARCHIVE_LIMITS } from "../../src/ar/limits";
+import { readArchiveEntries } from "../../src/ar/open";
 import { ArchiveReader } from "../../src/ar/reader";
 import { type ByteSource, memoryByteSource } from "../../src/ar/source";
 import type { ArchiveIndexEntry } from "../../src/ar/types";
@@ -126,6 +127,24 @@ test("encodeZip round-trips lazily and through the eager document-converter API"
 	const eager = await readZipEager(encoded);
 	expect(DECODER.decode(eager.get("nested/repeated.txt"))).toBe("highly compressible ".repeat(30));
 	await expect(encodeZip([["../escape", new Uint8Array()]] as const)).rejects.toBeInstanceOf(ArchiveError);
+});
+
+test("encodeZip preserves raw file names only for explicit whole-archive rewrites", async () => {
+	const bytes = await encodeZip(
+		[
+			["same.txt", ENCODER.encode("first")],
+			["./same.txt", ENCODER.encode("dot")],
+			["a//b.txt", ENCODER.encode("double")],
+			["/rooted.txt", ENCODER.encode("rooted")],
+			["a/../drop.txt", ENCODER.encode("traversal")],
+			["same.txt", ENCODER.encode("last")],
+		],
+		{ preservePaths: true },
+	);
+	const entries = await readArchiveEntries({ bytes, format: "zip" }, { preservePaths: true });
+
+	expect([...entries.keys()]).toEqual(["./same.txt", "a//b.txt", "/rooted.txt", "a/../drop.txt", "same.txt"]);
+	expect(DECODER.decode(entries.get("same.txt"))).toBe("last");
 });
 
 test("encodeZip emits interoperable ZIP64 end records at the 16-bit entry-count boundary", async () => {

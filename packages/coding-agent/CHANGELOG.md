@@ -2330,9 +2330,6 @@
 ### Removed
 
 - Removed the unreliable Bing and Yahoo HTML-scraping web search providers
-### Added
-
-- Added `task.batchBlocking` to keep multi-item task batches concurrent while returning one merged result only after every child finishes.
 
 ### Changed
 

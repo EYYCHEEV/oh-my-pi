@@ -48,6 +48,11 @@ export type ArchiveSource =
 /** Content for a member when packing or extracting an archive. */
 export type ArchiveMemberContent = string | Uint8Array | Blob;
 
+/** Controls whether whole-archive rewrites retain caller-supplied member spellings. */
+export interface ArchiveWriteOptions {
+	preservePaths?: boolean;
+}
+
 /** One `archive.ext:inner/path` split candidate (see `parseArchivePathCandidates`). */
 export interface ArchivePathCandidate {
 	archivePath: string;
@@ -106,12 +111,18 @@ export type EntryStorage =
 
 /** One indexed entry as produced by a format reader, before core resolution. */
 export interface ArchiveIndexEntry extends ArchiveNode {
+	/** Original container spelling, retained only for whole-archive rewrites. */
+	rawPath?: string;
 	storage?: EntryStorage;
 }
 
 /** Context passed to every format reader. */
 export interface FormatReadOptions {
 	limits: ArchiveLimits;
+	/** Keep raw member spellings for whole-archive rewrites; normal browsing omits this. */
+	preservePaths?: boolean;
+	/** Reject unsafe member metadata instead of dropping or normalizing it. */
+	rejectUnsafePaths?: boolean;
 	/**
 	 * Filesystem path of the archive when file-backed. Formats that reference
 	 * sibling files use it (ASAR `.unpacked` payloads, multi-volume RAR).

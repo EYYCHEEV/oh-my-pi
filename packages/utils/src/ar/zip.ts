@@ -18,11 +18,12 @@ import {
 	assertArchivePathBytes,
 	assertArchivePathString,
 	isArchiveDirectoryName,
+	isUnsafeArchiveEntryPath,
 	normalizeArchiveEntryPath,
 	normalizeArchiveLookupPath,
 } from "./paths";
 import { type ByteSource, memoryByteSource } from "./source";
-import type { ArchiveIndexEntry, FormatReader, FormatReadOptions, MemberSource } from "./types";
+import type { ArchiveIndexEntry, ArchiveWriteOptions, FormatReader, FormatReadOptions, MemberSource } from "./types";
 
 const LOCAL_HEADER_SIGNATURE = 0x04034b50;
 const CENTRAL_HEADER_SIGNATURE = 0x02014b50;
@@ -503,20 +504,24 @@ function parseCentralDirectory(
 			throw new ArchiveError(`Encrypted ZIP member '${rawPath}' is not supported`);
 		}
 		const normalizedPath = normalizeArchiveEntryPath(rawPath);
-		if (normalizedPath) {
-			assertArchiveMemberSize(
-				Math.max(values.uncompressedSize, values.compressedSize),
-				normalizedPath,
-				options.limits,
-			);
+		if (options.rejectUnsafePaths && isUnsafeArchiveEntryPath(rawPath)) {
+			throw new ArchiveError(`Archive entry escapes extraction dir: ${rawPath}`);
+		}
+		const memberPath = options.preservePaths
+			? rawPath.includes("\0")
+				? undefined
+				: rawPath.replace(/\\/g, "/")
+			: normalizedPath;
+		if (memberPath) {
+			assertArchiveMemberSize(Math.max(values.uncompressedSize, values.compressedSize), memberPath, options.limits);
 			const host = versionMadeBy >>> 8;
 			const mode = host === UNIX_HOST || host === OSX_HOST ? externalAttributes >>> 16 : undefined;
 			const fileType = mode === undefined ? 0 : mode & FILE_TYPE_MASK;
 			const isDirectory =
 				isArchiveDirectoryName(rawPath) || fileType === DIRECTORY_TYPE || (externalAttributes & 0x10) !== 0;
-			const isSymlink = fileType === SYMLINK_TYPE && !isDirectory;
+			const isSymlink = !options.preservePaths && fileType === SYMLINK_TYPE && !isDirectory;
 			const localHeaderOffset = values.localHeaderOffset + info.archiveOffset;
-			checkedEnd(localHeaderOffset, 30, source.size, `local header for '${normalizedPath}'`);
+			checkedEnd(localHeaderOffset, 30, source.size, `local header for '${memberPath}'`);
 			const member = new ZipMemberSource(
 				source,
 				values.compressedSize,
@@ -527,7 +532,7 @@ function parseCentralDirectory(
 				options.limits,
 			);
 			const entry: ArchiveIndexEntry = {
-				path: normalizedPath,
+				path: memberPath,
 				isDirectory,
 				size: isDirectory ? 0 : values.uncompressedSize,
 				mtimeMs: extra.mtimeMs ?? parseDosMtime(dosTime, dosDate),
@@ -607,7 +612,10 @@ export async function readZipEager(
 }
 
 /** Encode deterministic stored/deflated ZIP bytes, emitting ZIP64 end records when the entry count requires them. */
-export async function encodeZip(members: Iterable<readonly [string, Uint8Array]>): Promise<Uint8Array> {
+export async function encodeZip(
+	members: Iterable<readonly [string, Uint8Array]>,
+	options: ArchiveWriteOptions = {},
+): Promise<Uint8Array> {
 	try {
 		const localParts: Uint8Array[] = [];
 		const centralParts: Uint8Array[] = [];
@@ -616,17 +624,24 @@ export async function encodeZip(members: Iterable<readonly [string, Uint8Array]>
 		let count = 0;
 		for (const [inputName, data] of members) {
 			const portableName = inputName.replace(/\\/g, "/");
-			const normalizedName = normalizeArchiveEntryPath(portableName);
-			if (
-				!normalizedName ||
-				normalizedName !== portableName.replace(/^\.\//, "") ||
-				portableName.startsWith("/") ||
-				/^[A-Za-z]:/.test(portableName) ||
-				portableName.includes("\0")
-			) {
-				throw new ArchiveError(`Cannot write unsafe ZIP member path '${inputName}'`);
+			let name = portableName;
+			if (options.preservePaths) {
+				if (!portableName || portableName.includes("\0")) {
+					throw new ArchiveError(`Cannot write invalid ZIP member path '${inputName}'`);
+				}
+			} else {
+				const normalizedName = normalizeArchiveEntryPath(portableName);
+				if (
+					!normalizedName ||
+					normalizedName !== portableName.replace(/^\.\//, "") ||
+					portableName.startsWith("/") ||
+					/^[A-Za-z]:/.test(portableName) ||
+					portableName.includes("\0")
+				) {
+					throw new ArchiveError(`Cannot write unsafe ZIP member path '${inputName}'`);
+				}
+				name = normalizedName;
 			}
-			const name = normalizedName;
 			const nameBytes = TEXT_ENCODER.encode(name);
 			if (nameBytes.byteLength > U16_MAX) throw new ArchiveError(`ZIP member path '${name}' is too long to write`);
 			if (data.byteLength >= U32_MAX) throw new ArchiveError(`ZIP member '${name}' is too large to write`);

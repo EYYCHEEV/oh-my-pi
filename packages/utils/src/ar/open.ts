@@ -23,6 +23,14 @@ const ENCODER = new TextEncoder();
 export interface OpenArchiveOptions {
 	/** Override individual resource ceilings; unset fields keep defaults. */
 	limits?: Partial<ArchiveLimits>;
+	/** Reject unsafe member metadata instead of normalizing it; extraction enables this. */
+	rejectUnsafePaths?: boolean;
+}
+
+/** Options for whole-archive materialization and rewrite. */
+export interface ReadArchiveEntriesOptions extends OpenArchiveOptions {
+	/** Retain raw file-member spellings instead of normalizing archive paths. */
+	preservePaths?: boolean;
 }
 
 interface ResolvedArchiveSource {
@@ -58,7 +66,7 @@ function resolveSource(input: ArchiveSource): ResolvedArchiveSource {
 export async function openArchive(input: ArchiveSource, options: OpenArchiveOptions = {}): Promise<ArchiveReader> {
 	const { source, format, archivePath } = resolveSource(input);
 	const limits = { ...DEFAULT_ARCHIVE_LIMITS, ...options.limits };
-	const readOptions: FormatReadOptions = { limits, archivePath };
+	const readOptions: FormatReadOptions = { limits, archivePath, rejectUnsafePaths: options.rejectUnsafePaths };
 	const entries = await formatReaderFor(format)(source, readOptions);
 	return new ArchiveReader(format, entries, limits);
 }
@@ -124,8 +132,29 @@ export async function listArchiveRoot(
  */
 export async function readArchiveEntries(
 	input: ArchiveSource,
-	options: OpenArchiveOptions = {},
+	options: ReadArchiveEntriesOptions = {},
 ): Promise<Map<string, Uint8Array>> {
+	if (options.preservePaths) {
+		const { source, format, archivePath } = resolveSource(input);
+		const limits = { ...DEFAULT_ARCHIVE_LIMITS, ...options.limits };
+		const indexed = await formatReaderFor(format)(source, { limits, archivePath, preservePaths: true });
+		const entries = new Map<string, Uint8Array>();
+		let total = 0;
+		for (const entry of indexed) {
+			if (entry.isDirectory) continue;
+			const memberPath = (entry.rawPath ?? entry.path).replace(/\\/g, "/");
+			if (entry.storage?.type !== "member") {
+				throw new ArchiveError(`Archive file '${memberPath}' has no readable storage`);
+			}
+			const bytes = await entry.storage.source.read(entry.size, entry.path);
+			entries.delete(memberPath);
+			entries.set(memberPath, bytes);
+			total += bytes.byteLength;
+			assertInMemorySize(total, limits);
+		}
+		return entries;
+	}
+
 	const archive = await openArchive(input, options);
 	const entries = new Map<string, Uint8Array>();
 	let total = 0;
@@ -165,7 +194,7 @@ export async function extractArchive(
 	destDir: string,
 	options: OpenArchiveOptions = {},
 ): Promise<number> {
-	const archive = await openArchive(input, options);
+	const archive = await openArchive(input, { ...options, rejectUnsafePaths: true });
 	const extractRoot = path.resolve(destDir);
 	await fs.mkdir(extractRoot, { recursive: true });
 	let count = 0;

@@ -15,7 +15,7 @@ import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-m
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import * as toolTimeouts from "@oh-my-pi/pi-coding-agent/tools/tool-timeouts";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
-import { extractArchive, openArchive, readArchiveEntries } from "@oh-my-pi/pi-coding-agent/utils/zip";
+import { extractArchive, openArchive, readArchiveEntries } from "@oh-my-pi/pi-utils/ar";
 import { $which, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { GlobTool } from "../src/tools/glob";
 import { DEFAULT_FILE_LIMIT, GrepTool, MULTI_FILE_PER_FILE_MATCHES } from "../src/tools/grep";
@@ -1257,8 +1257,8 @@ describe("Coding Agent Tools", () => {
 
 			const entries = await readArchiveEntries(archivePath);
 			const linkedContent = entries.get("pkg/linked.txt");
-			expect(linkedContent).toBeInstanceOf(File);
-			expect(await (linkedContent as File).text()).toBe("shared content\n");
+			expect(linkedContent).toBeInstanceOf(Uint8Array);
+			expect(new TextDecoder().decode(linkedContent)).toBe("shared content\n");
 		});
 
 		it("should preserve safe relative tar file symlinks", async () => {
@@ -1278,8 +1278,8 @@ describe("Coding Agent Tools", () => {
 
 			const entries = await readArchiveEntries(archivePath);
 			const linkedContent = entries.get("pkg/bin/tool");
-			expect(linkedContent).toBeInstanceOf(File);
-			expect(await (linkedContent as File).text()).toBe("export const linked = true;\n");
+			expect(linkedContent).toBeInstanceOf(Uint8Array);
+			expect(new TextDecoder().decode(linkedContent)).toBe("export const linked = true;\n");
 		});
 
 		it("should resolve directory symlinks lazily without materializing subtrees", async () => {
@@ -1408,8 +1408,8 @@ describe("Coding Agent Tools", () => {
 			const entries = await readArchiveEntries(archivePath);
 
 			const empty = entries.get("dup/file.txt");
-			expect(empty).toBeInstanceOf(File);
-			expect((empty as File).size).toBe(0);
+			expect(empty).toBeInstanceOf(Uint8Array);
+			expect(empty?.byteLength).toBe(0);
 		});
 
 		it("should discard a superseded tar hard link before resolving targets", async () => {
@@ -1424,8 +1424,8 @@ describe("Coding Agent Tools", () => {
 
 			const entries = await readArchiveEntries(archivePath);
 			const replacement = entries.get("dup/file.txt");
-			expect(replacement).toBeInstanceOf(File);
-			expect(await (replacement as File).text()).toBe("replacement\n");
+			expect(replacement).toBeInstanceOf(Uint8Array);
+			expect(new TextDecoder().decode(replacement)).toBe("replacement\n");
 		});
 
 		it("should skip old-GNU sparse extension blocks between header and data", async () => {
@@ -2092,7 +2092,7 @@ describe("Coding Agent Tools", () => {
 				content: "added\n",
 			});
 
-			const entries = await readArchiveEntries(archivePath);
+			const entries = await readArchiveEntries(archivePath, { preservePaths: true });
 			expect([...entries.keys()]).toEqual([
 				"same.txt",
 				"./same.txt",
@@ -2102,8 +2102,7 @@ describe("Coding Agent Tools", () => {
 				"added.txt",
 			]);
 			for (const rawPath of ["same.txt", "./same.txt", "a//b.txt", "/rooted.txt", "a/../drop.txt"]) {
-				expect(entries.get(rawPath)).toBeInstanceOf(File);
-				expect((entries.get(rawPath) as File).name).toBe(rawPath);
+				expect(entries.get(rawPath)).toBeInstanceOf(Uint8Array);
 			}
 		});
 

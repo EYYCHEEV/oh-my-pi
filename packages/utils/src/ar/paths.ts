@@ -42,6 +42,17 @@ export function isArchiveDirectoryName(rawPath: string): boolean {
 	return rawPath.endsWith("/") || rawPath.endsWith("\\");
 }
 
+/** Whether a raw member name is unsafe to materialize beneath an extraction root. */
+export function isUnsafeArchiveEntryPath(rawPath: string): boolean {
+	const portable = rawPath.replace(/\\/g, "/");
+	return (
+		portable.startsWith("/") ||
+		/^[A-Za-z]:\//.test(portable) ||
+		portable.includes("\0") ||
+		portable.split("/").includes("..")
+	);
+}
+
 /** Clamp an attacker-controlled path to a short preview for error messages. */
 export function formatArchivePathForError(value: string): string {
 	if (Buffer.byteLength(value, "utf-8") <= PATH_ERROR_PREVIEW_BYTES) return value;

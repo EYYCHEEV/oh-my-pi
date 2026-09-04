@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { ArchiveError } from "../../src/ar/error";
 import { type ArchiveLimits, DEFAULT_ARCHIVE_LIMITS } from "../../src/ar/limits";
+import { readArchiveEntries } from "../../src/ar/open";
 import { memoryByteSource } from "../../src/ar/source";
 import { encodeTar, readTar, readTarEntriesFromBuffer, sniffTar } from "../../src/ar/tar";
 import type { ArchiveIndexEntry, FormatReadOptions } from "../../src/ar/types";
@@ -205,6 +206,25 @@ describe("tar writer", () => {
 			]),
 		).rejects.toThrow("not a directory");
 		await expect(encodeTar([["empty/", new Uint8Array([1])]])).rejects.toThrow("cannot contain file data");
+	});
+
+	test("preserves raw file names only for explicit whole-archive rewrites", async () => {
+		const encode = new TextEncoder();
+		const bytes = await encodeTar(
+			[
+				["same.txt", encode.encode("first")],
+				["./same.txt", encode.encode("dot")],
+				["a//b.txt", encode.encode("double")],
+				["/rooted.txt", encode.encode("rooted")],
+				["a/../drop.txt", encode.encode("traversal")],
+				["same.txt", encode.encode("last")],
+			],
+			{ preservePaths: true },
+		);
+		const entries = await readArchiveEntries({ bytes, format: "tar" }, { preservePaths: true });
+
+		expect([...entries.keys()]).toEqual(["./same.txt", "a//b.txt", "/rooted.txt", "a/../drop.txt", "same.txt"]);
+		expect(new TextDecoder().decode(entries.get("same.txt"))).toBe("last");
 	});
 
 	test("empty output is a valid two-zero-block tar", async () => {

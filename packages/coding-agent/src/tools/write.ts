@@ -17,8 +17,8 @@ import {
 	archiveFormatFromPath,
 	isWritableArchiveFormat,
 	parseArchivePathCandidates,
-	readArchiveEntries as readGeneralArchiveEntries,
-	writeArchive as writeGeneralArchive,
+	readArchiveEntries,
+	writeArchive,
 } from "@oh-my-pi/pi-utils/ar";
 import { getEditStore } from "../edit/store";
 import { normalizeToLF } from "../edit/normalize";
@@ -35,7 +35,6 @@ import writeDeviceOnlyDescription from "../prompts/tools/write-device-only.md" w
 import type { ToolSession } from "../sdk";
 import { fileHyperlink, framedBlock, renderStatusLine } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
-import { readArchiveEntries as readContainedArchiveEntries, writeArchive as writeContainedArchive } from "../utils/zip";
 import { routeWriteThroughBridge } from "./acp-bridge";
 import { resolveToolTier, truncateForPrompt } from "./approval";
 import { assertEditableFile } from "./auto-generated-guard";
@@ -660,7 +659,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		if (!isWritableArchiveFormat(format)) {
 			throw new ToolError(`Writing entries inside ${format} archives is not supported (read-only format).`);
 		}
-		const usesContainedArchiveBoundary = format === "zip" || format === "tar" || format === "tar.gz";
+		const archiveOptions = { preservePaths: format === "zip" || format === "tar" || format === "tar.gz" };
 		// Rewrites are whole-archive: write to a temp file and rename so a
 		// crash/disk-full mid-write can't destroy the original archive.
 		const tmpPath = `${finalPath}.tmp-${process.pid}`;
@@ -673,9 +672,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		const entries = new Map<string, ArchiveMemberContent>();
 		if (resolvedArchivePath.exists) {
 			try {
-				const existing = usesContainedArchiveBoundary
-					? await readContainedArchiveEntries({ path: finalPath, format })
-					: await readGeneralArchiveEntries({ path: finalPath, format });
+				const existing = await readArchiveEntries({ path: finalPath, format }, archiveOptions);
 				for (const [entryPath, data] of existing) {
 					entries.set(entryPath, data);
 				}
@@ -691,8 +688,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		entries.set(resolvedArchivePath.archiveSubPath, content);
 
 		try {
-			if (usesContainedArchiveBoundary) await writeContainedArchive(tmpPath, format, entries);
-			else await writeGeneralArchive(tmpPath, format, entries);
+			await writeArchive(tmpPath, format, entries, archiveOptions);
 			await fs.rename(tmpPath, finalPath);
 		} catch (error) {
 			await fs.rm(tmpPath, { force: true }).catch(() => {});

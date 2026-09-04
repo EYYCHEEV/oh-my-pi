@@ -5005,19 +5005,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Subagents",
 			label: "Batch Task Calls",
 			description:
-				"Switch the task tool to its batch shape: one call carries { context, tasks[] } — one subagent per item, with optional per-item agent, model, output schema, and isolation plus a required shared context prepended to every assignment. With async.enabled=true, each spawn normally runs as an independent background agent; task.batchBlocking can instead make multi-item calls wait for merged results. With async disabled, the call always blocks. Disable to restore the flat single-spawn schema.",
-		},
-	},
-
-	"task.batchBlocking": {
-		type: "boolean",
-		default: false,
-		ui: {
-			tab: "tasks",
-			group: "Subagents",
-			label: "Block Multi-Item Batches",
-			description:
-				"When task.batch and async.enabled are both on, batches with two or more items still run concurrently but the call waits for every item and returns merged results. One-item batches and flat calls retain their normal asynchronous behavior.",
+				"Switch the task tool to its batch shape: one call carries { context, tasks[] } — one subagent per item, with optional per-item agent, model, output schema, and isolation plus a required shared context prepended to every assignment. With async.enabled=true, each non-blocking spawn runs as an independent background agent. With async disabled, the call always blocks. Disable to restore the flat single-spawn schema.",
 		},
 	},
 
