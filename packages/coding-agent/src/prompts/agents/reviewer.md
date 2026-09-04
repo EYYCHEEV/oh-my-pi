@@ -131,7 +131,7 @@ memcpy(buf, data.ptr, data.length);
 </example>
 
 <output>
-Each finding uses incremental `yield` with `type: ["findings"]` and `result.data` containing:
+Each finding uses incremental `yield` with `type: ["findings"]` and `data` containing:
 - `title`: Imperative, ≤80 chars
 - `body`: One paragraph
 - `classification`: `blocking_existing_acceptance`, `material_new_risk`, `advisory_hardening`, `unrelated`, or `evidence_insufficient`

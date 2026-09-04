@@ -638,7 +638,11 @@ export interface BuildSystemPromptOptions {
 	memoryRootEnabled?: boolean;
 	/** Whether the read-only security:// resource namespace is active. */
 	securityEnabled?: boolean;
-	/** Active model identifier (e.g. "anthropic/claude-opus-4") used by prompt policy and optionally surfaced. */
+	/** Whether the browser eval prelude is enabled for this session. */
+	browserEnabled?: boolean;
+	/** Whether the computer eval prelude is enabled for this session. */
+	computerEnabled?: boolean;
+	/** Active model identifier (e.g. "anthropic/claude-opus-4") surfaced in the workstation block. */
 	model?: string;
 	/** Whether to surface `model` in the workstation block. Default: true. */
 	includeModelInPrompt?: boolean;
@@ -706,8 +710,11 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		taskMaxConcurrency = 0,
 		secretsEnabled = false,
 		workspaceTree: providedWorkspaceTree,
+
 		memoryRootEnabled = false,
 		securityEnabled = false,
+		browserEnabled = false,
+		computerEnabled = false,
 		model,
 		includeModelInPrompt = true,
 		personality = "default",
@@ -991,6 +998,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		cwd: promptCwd,
 		additionalWorkspaceRoots: additionalWorkspaceRoots.filter(d => path.resolve(d) !== path.resolve(resolvedCwd)),
 		model: includeModelInPrompt ? (model ?? "") : "",
+
 		personality: personalityBlock,
 		intentTracing: !!intentField,
 		intentField: intentField ?? "",
@@ -1003,6 +1011,8 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		secretsEnabled,
 		hasMemoryRoot: memoryRootEnabled,
 		securityEnabled,
+		browserEnabled,
+		computerEnabled,
 		hasObsidian: hasObsidian(),
 		includeWorkspaceTree,
 		renderMermaid,
@@ -1015,7 +1025,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	};
 	const rendered = prompt.render(resolvedCustomPrompt ? customSystemPromptTemplate : systemPromptTemplate, data);
 	const systemPrompt = [rendered];
-	if (toolNames.includes("computer")) {
+	if (computerEnabled) {
 		systemPrompt.push(computerSafetyPrompt.trim());
 	}
 	// Custom prompt templates already render context files and append text; the

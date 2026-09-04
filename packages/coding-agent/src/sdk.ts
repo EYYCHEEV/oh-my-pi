@@ -89,6 +89,7 @@ import { wrapStreamFnWithBlobUrlFallback } from "./blob-broker/stream-fallback";
 import { initializeWithSettings } from "./discovery";
 import { setInvocationConfiguredExtensions, withOmpExtensionRootScope } from "./discovery/omp-extension-roots";
 import { disposeVmContextsByOwner } from "./eval/js/context-manager";
+import { getEnabledEvalPreludes, type EvalPreludeDefinition } from "./eval/preludes";
 import { disposeAllKernelSessions, disposeKernelSessionsByOwner } from "./eval/py/executor";
 import { defaultEvalSessionId } from "./eval/session-id";
 import type { EditMode } from "./edit";
@@ -141,6 +142,7 @@ import {
 	MCPToolCache,
 	type MCPToolsLoadResult,
 	parseMCPToolName,
+	shouldFilterBrowserMCPForPrelude,
 } from "./mcp";
 import { MCP_CONNECTION_STATUS_EVENT_CHANNEL, type McpConnectionStatusEvent } from "./mcp/startup-events";
 import { createSessionMemoryRuntimeContext, resolveMemoryBackend } from "./memory-backend";
@@ -236,7 +238,9 @@ import {
 	xdevDocsAll,
 	xdevEntries,
 } from "./tools";
+import { createBrowserPrelude } from "./tools/browser";
 import { isMCPToolName, normalizeToolNames } from "./tools/builtin-names";
+import { createComputerPrelude } from "./tools/computer";
 import { ToolContextStore } from "./tools/context";
 import { getImageGenTools } from "./tools/image-gen";
 import { wrapToolWithMetaNotice } from "./tools/output-meta";
@@ -957,6 +961,10 @@ export interface BuildSystemPromptOptions {
 	includeWorkspaceTree?: boolean;
 	/** Include the read-only security:// resource inventory entry. Default: false. */
 	securityEnabled?: boolean;
+	/** Include browser eval-prelude guidance. Default: false. */
+	browserEnabled?: boolean;
+	/** Include computer eval-prelude guidance and safety policy. Default: false. */
+	computerEnabled?: boolean;
 }
 
 /**
@@ -983,6 +991,8 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		inlineToolDescriptors: options.inlineToolDescriptors,
 		includeWorkspaceTree: options.includeWorkspaceTree,
 		securityEnabled: options.securityEnabled,
+		browserEnabled: options.browserEnabled,
+		computerEnabled: options.computerEnabled,
 		toolNames,
 		tools: promptTools,
 	});
@@ -1965,7 +1975,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getModelString: () => (hasExplicitModel && model ? formatModelString(model) : undefined),
 			getActiveModelString,
 			getActiveModel: () => agent?.state.model ?? model,
-			getInspectImageModeOverride: () => session?.getInspectImageModeOverride(),
 			getServiceTierByFamily: () => session?.serviceTierByFamily,
 			getImageAttachments: () => session?.getImageAttachments() ?? [],
 			getPlanModeState: () => session?.getPlanModeState(),
@@ -1993,7 +2002,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getFileMutationVersion: path => fileMutationVersions.get(path) ?? 0,
 			getTodoPhases: () => session.getTodoPhases(),
 			setTodoPhases: phases => session.setTodoPhases(phases),
-			getWorkPoolYieldItems: () => session.getWorkPoolYieldItems(),
+			getWorkPoolYieldItems: () => session?.getWorkPoolYieldItems() ?? [],
 			setWorkPoolYieldItems: items => session.setWorkPoolYieldItems(items),
 			getCheckpointState: () => session.getCheckpointState(),
 			setCheckpointState: state => session.setCheckpointState(state ?? undefined),
@@ -2038,6 +2047,22 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// instead of silently routing into the owning session (issue #1923).
 			asyncJobManager: scopedAsyncJobManager,
 		};
+		let browserPrelude: EvalPreludeDefinition | undefined;
+		let computerPrelude: EvalPreludeDefinition | undefined;
+		const getEvalPreludes = (): readonly EvalPreludeDefinition[] => {
+			if (restrictToolNames || !toolRegistry.has("eval") || !activeToolNames.has("eval")) return [];
+			const builtins: EvalPreludeDefinition[] = [];
+			if (settings.get("browser.enabled")) {
+				browserPrelude ??= createBrowserPrelude(toolSession);
+				builtins.push(browserPrelude);
+			}
+			if (settings.get("computer.enabled")) {
+				computerPrelude ??= createComputerPrelude(toolSession);
+				builtins.push(computerPrelude);
+			}
+			return getEnabledEvalPreludes(builtins);
+		};
+		toolSession.getEvalPreludes = getEvalPreludes;
 
 		// Wire process-wide internal URL singletons owned by their real classes.
 		// Top-level sessions install the active snapshots; subagents inherit them.
@@ -2071,6 +2096,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 		// Create built-in tools (already wrapped with meta notice formatting)
 		await logger.time("createAllTools", createTools, toolSession, options.toolNames);
+		const initialBrowserPreludeAvailable = shouldFilterBrowserMCPForPrelude({
+			restrictToolNames,
+			browserEnabled: settings.get("browser.enabled"),
+			evalRegistered: toolRegistry.has("eval"),
+			evalActive: activeToolNames.has("eval"),
+		});
 
 		// Restricted sessions cannot inherit or discover MCP capabilities.
 		const enableMCP = !restrictToolNames && (options.enableMCP ?? true);
@@ -2103,8 +2134,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			enableProjectConfig: settings.get("mcp.enableProjectConfig") ?? true,
 			// Always filter Exa - we have native integration
 			filterExa: true,
-			// Filter browser MCP servers when builtin browser tool is active
-			filterBrowser: settings.get("browser.enabled") ?? false,
+			// Filter browser MCP only when Eval can expose the built-in browser prelude.
+			filterBrowser: initialBrowserPreludeAvailable,
 			extensionRoots: buildSessionExtensionRoots(),
 		};
 		if (enableMCP && !mcpManager) {
@@ -3233,7 +3264,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				taskBatch: settings.get("task.batch"),
 				taskMaxConcurrency: settings.get("task.maxConcurrency"),
 				scoutAvailable: isScoutSpawnable(settings.get("task.disabledAgents"), options.spawns ?? "*"),
-
 				autoQaEnabled: !restrictToolNames && isAutoQaEnabled(settings),
 				writeTransportOnly:
 					toolSession.deviceOnlyWrite === true && toolSession.pendingFullWriteDescription !== true,
@@ -3242,6 +3272,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				includeWorkspaceTree,
 				memoryRootEnabled: memoryBackend?.id === "local",
 				securityEnabled: settings.get("security.enabled"),
+				browserEnabled: getEvalPreludes().some(definition => definition.name === "browser"),
+				computerEnabled: getEvalPreludes().some(definition => definition.name === "computer"),
 				model: getActiveModelString(),
 				includeModelInPrompt: settings.get("includeModelInPrompt"),
 				personality: agentKind === "sub" ? "none" : settings.get("personality"),
@@ -3711,11 +3743,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getAgentId: () => "advisor",
 			// The primary's availability signals are wrong for advisors: their tool
 			// slate is filtered separately at runtime (default read/grep/glob, no
-			// write transport), so xd:// devices are unreachable and read must never
-			// advertise inspect_image — images are inlined, and the provider
-			// boundary handles text-only advisor models.
+			// write transport), so xd:// devices are unreachable. Images are inlined,
+			// and the provider boundary handles text-only advisor models.
 			xdev: undefined,
-			isToolActive: name => name !== "inspect_image" && toolSession.isToolActive?.(name) === true,
+			isToolActive: name => toolSession.isToolActive?.(name) === true,
 		};
 		const advisorToolBuilds: Array<Tool | null | Promise<Tool | null>> = [];
 		for (const name in BUILTIN_TOOLS) {
@@ -3744,6 +3775,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// Owned only when this session created the manager; subagents receive a
 		// parent's manager via `options.mcpManager` and MUST NOT disconnect it.
 		const ownedMcpManager = options.mcpManager ? undefined : mcpManager;
+		const browserMcpManager = mcpManager;
 		// Advisor spend recorded before this resume is restored off the critical
 		// path below (issue #9553): a large advisor transcript would otherwise
 		// block createAgentSession for tens of seconds while the whole file is
@@ -3783,6 +3815,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			promptTemplates,
 			slashCommands,
 			extensionRunner,
+			getEvalPreludes,
 			customCommands: customCommandsResult.commands,
 			skills,
 			skillWarnings,
@@ -3791,6 +3824,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			modelRegistry,
 			rebindModelAfterDiscovery: options.model === undefined || options.rebindModelAfterDiscovery === true,
 			toolRegistry,
+			reconcileBrowserMcpFilter: browserMcpManager
+				? async enabled => {
+						await browserMcpManager.reconcileBrowserFilter(enabled);
+						return browserMcpManager.getTools();
+					}
+				: undefined,
 			memoryAgentDir: agentDir,
 			memoryTaskDepth: taskDepth,
 			createMemoryTools: restrictToolNames
@@ -3801,13 +3840,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						);
 						return tools.filter((tool): tool is AgentTool => tool !== null);
 					},
-			createComputerTool: restrictToolNames
-				? undefined
-				: async () => (await BUILTIN_TOOLS.computer(toolSession)) ?? null,
 			createThinkTool: async () => (await HIDDEN_TOOLS.think(toolSession)) ?? null,
-			createInspectImageTool: restrictToolNames
-				? undefined
-				: async () => (await BUILTIN_TOOLS.inspect_image(toolSession)) ?? null,
 			createVibeTools:
 				(options.taskDepth ?? 0) === 0 && !options.parentTaskPrefix
 					? () => createVibeTools(toolSession)

@@ -2,17 +2,25 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { Tool as AiTool } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { EvalPreludeDefinition } from "@oh-my-pi/pi-coding-agent/eval/preludes";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { EvalTool, getEvalToolDescription } from "@oh-my-pi/pi-coding-agent/tools/eval";
 
-function makeSession(opts: { spawns?: string | null; backends?: Record<string, boolean> }): ToolSession {
+function makeSession(opts: {
+	spawns?: string | null;
+	backends?: Record<string, boolean>;
+	preludes?: () => readonly EvalPreludeDefinition[];
+	taskEager?: "default" | "preferred" | "always";
+}): ToolSession {
 	const settings = Settings.isolated();
 	for (const [key, value] of Object.entries(opts.backends ?? {})) settings.set(key as never, value);
+	if (opts.taskEager) settings.set("task.eager", opts.taskEager);
 	return {
 		cwd: "/tmp/eval-test",
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => opts.spawns ?? "*",
+		...(opts.preludes ? { getEvalPreludes: opts.preludes } : {}),
 		settings,
 	} as unknown as ToolSession;
 }
@@ -63,6 +71,18 @@ describe("eval tool description", () => {
 		expect(denied).not.toContain("agent(prompt");
 	});
 
+	it("uses forceful delegation wording only for task.eager always", () => {
+		const defaultText = new EvalTool(makeSession({ spawns: "*", taskEager: "default" })).description;
+		const preferredText = new EvalTool(makeSession({ spawns: "*", taskEager: "preferred" })).description;
+		const alwaysText = new EvalTool(makeSession({ spawns: "*", taskEager: "always" })).description;
+
+		expect(defaultText).toContain("Keep-alive worker pool");
+		expect(preferredText).toContain("Keep-alive worker pool");
+		expect(defaultText).not.toContain("Default for 2+ independent items");
+		expect(preferredText).not.toContain("Default for 2+ independent items");
+		expect(alwaysText).toContain("Default for 2+ independent items");
+	});
+
 	it("hides eval-defined tool guidance when eval.tools.enabled is off", () => {
 		const enabled = getEvalToolDescription({ evalTools: true });
 		const disabled = getEvalToolDescription({ evalTools: false });
@@ -70,6 +90,25 @@ describe("eval tool description", () => {
 		expect(enabled).toContain("tools?=None");
 		expect(disabled).not.toContain("@tool");
 		expect(disabled).not.toContain("tools?=None");
+	});
+
+	it("composes only current enabled prelude documentation", () => {
+		let enabled = true;
+		const prelude: EvalPreludeDefinition = {
+			name: "fixture",
+			documentation: "CURRENT PRELUDE DOCUMENTATION",
+			javascript: "",
+			python: "",
+			exports: [],
+			enabled: () => enabled,
+			async invoke() {
+				return { content: [] };
+			},
+		};
+		const tool = new EvalTool(makeSession({ preludes: () => [prelude] }));
+		expect(tool.description).toContain("CURRENT PRELUDE DOCUMENTATION");
+		enabled = false;
+		expect(tool.description).not.toContain("CURRENT PRELUDE DOCUMENTATION");
 	});
 });
 
