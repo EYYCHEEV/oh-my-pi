@@ -282,7 +282,7 @@ describe("MCP image tool results", () => {
 
 		const result = await wrapped.execute("call-empty-head", {}, undefined, undefined, context);
 		expect(result.content.map(block => block.type)).toEqual(["text", "image", "text"]);
-		expect(result.content[0]).toEqual({ type: "text", text: "\n[…2050B elided…]" });
+		expect(result.content[0]).toEqual({ type: "text", text: `\n[…1030B elided…]\n${"x".repeat(1019)}` });
 		expect(result.content[1]).toEqual(JPEG_IMAGE);
 		expect(textBlocks(result.content)[1]).toStartWith(secondText);
 		const meta = (result.details as { meta?: OutputMeta } | undefined)?.meta;
