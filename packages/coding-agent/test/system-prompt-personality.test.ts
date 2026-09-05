@@ -14,8 +14,6 @@ const EMPTY_TREE = {
 	agentsMdFiles: [],
 };
 
-// Distinctive line from the bundled default preset (prompts/system/personalities/default.md).
-const DEFAULT_PRESET_MARKER = "Evidence-first terse engineer";
 const OVERRIDE = "Follow ASD-STE100 Simplified Technical English for all responses.";
 
 const originalAgentDir = getAgentDir();
@@ -63,7 +61,7 @@ describe("PERSONALITY.md override", () => {
 		const rendered = await renderPrompt("default");
 		expect(rendered).toContain("# Personality");
 		expect(rendered).toContain(OVERRIDE);
-		expect(rendered).not.toContain(DEFAULT_PRESET_MARKER);
+		expect(rendered).toBe(await renderPrompt("pragmatic"));
 	});
 
 	it(`omits the block for personality "none" even when PERSONALITY.md exists (subagent contract)`, async () => {
@@ -74,15 +72,14 @@ describe("PERSONALITY.md override", () => {
 		expect(rendered).not.toContain(OVERRIDE);
 	});
 
-	it("falls back to the configured preset when the file is empty", async () => {
+	it("restores the selected preset after an override is emptied", async () => {
+		const preset = await renderPrompt("default");
+		const otherPreset = await renderPrompt("pragmatic");
+		expect(preset).not.toBe(otherPreset);
+		writePersonalityFile(OVERRIDE);
+		expect(await renderPrompt("default")).not.toBe(preset);
+
 		writePersonalityFile("   \n");
-
-		const rendered = await renderPrompt("default");
-		expect(rendered).toContain(DEFAULT_PRESET_MARKER);
-	});
-
-	it("renders the selected preset when no override file exists", async () => {
-		const rendered = await renderPrompt("default");
-		expect(rendered).toContain(DEFAULT_PRESET_MARKER);
+		expect(await renderPrompt("default")).toBe(preset);
 	});
 });
