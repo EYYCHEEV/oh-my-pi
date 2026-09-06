@@ -272,8 +272,11 @@ export interface ToolSession {
 	getEvalSessionId?: () => string | null;
 	/** Get session file */
 	getSessionFile: () => string | null;
-	/** Parent session journal used by tools that persist runtime lifecycle state. */
-	sessionManager?: Pick<SessionManager, "appendCustomEntry" | "ensureOnDisk" | "flush" | "getBranch" | "getEntries">;
+	/** Owning journal; full SDK managers also supply registered identity without changing advisor-local IDs. */
+	sessionManager?: Pick<
+		SessionManager,
+		"appendCustomEntry" | "ensureOnDisk" | "flush" | "getBranch" | "getEntries"
+	> & { getSessionId?: SessionManager["getSessionId"] };
 	/** Project session messages through the same model-visible boundary as the active turn. */
 	convertMessagesToLlm?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<Message[]>;
 	/** Get eval kernel owner ID for session-scoped retained-kernel cleanup. */
@@ -284,7 +287,7 @@ export interface ToolSession {
 	assertEvalExecutionAllowed?: () => void;
 	/** Track tool-owned eval work so session disposal can await/abort it like direct session eval runs. */
 	trackEvalExecution?<T>(execution: Promise<T>, abortController: AbortController): Promise<T>;
-	/** Get session ID */
+	/** Get tool-state session ID (distinct from the owning session for advisors). */
 	getSessionId?: () => string | null;
 	/** Get the provider-facing request lineage ID, including explicit overrides and live rotation. */
 	getProviderSessionId?: () => string | null;
