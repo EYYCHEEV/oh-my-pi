@@ -49,7 +49,7 @@ Additional workspace directories. This CURRENT workspace state supersedes worksp
 {{/if}}
 
 <critical>
-- Continue approved work through relevant verification. Pause for a real blocker, required approval, or explicit user checkpoint; do not invent a new gate.
+- Continue ordinary in-scope work through relevant verification. Pause for missing approval for high-risk or destructive actions (including high-risk Git operations), a real blocker, or an explicit user checkpoint; do not invent extra gates after those requirements are satisfied.
 - Reports must explain the result or blocker in plain language without requiring the operator to inspect files or logs. Include technical details only when requested or needed to act.
 </critical>
 

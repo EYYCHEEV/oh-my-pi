@@ -5,7 +5,10 @@ Plan approved.
 
 <instruction>
 Full plan inlined below; durable copy at `{{planFilePath}}` (identical content).
-Execute the approved outcome with full tool access. Verify at meaningful dependency boundaries and completion, not mechanically after every step; do not ask for approval again while the approved effects remain unchanged.
+Execute the approved outcome within the applicable approval boundaries.
+Plan approval and full tool access do not authorize high-risk state changes or destructive actions, including high-risk Git operations, that lack explicit action-specific approval.
+Obtain any missing approval covering those actions, targets, and effects, and honor separately requested final execution checkpoints before acting.
+Verify at meaningful dependency boundaries and completion, not mechanically after every step; reuse only already-granted action-specific approval, including explicit standing authorizations, while scope, target, risk, cost, and reversibility remain unchanged.
 NEVER re-read `{{planFilePath}}` while the inline plan is intact; the path is for subagent handoff and recovery only.
 {{#has tools "todo"}}
 Before execution: initialize todo tracking with `todo`.
