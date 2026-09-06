@@ -6,6 +6,7 @@
 ### Changed
 
 - Muse Code sessions send a compact hashline edit description (~3 KB less per request); all other models keep the full prompt.
+- Task reports default to VERDICT and NEXT ACTION, while discussion and intent alignment stay conversational.
 
 ### Fixed
 
