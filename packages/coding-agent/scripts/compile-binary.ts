@@ -54,7 +54,8 @@ export async function compileCodingAgent(options: CodingAgentCompileOptions): Pr
 			compile: {
 				// Bun's process-wide fetch User-Agent default. Any explicit
 				// provider fingerprint (Anthropic/Codex OAuth) still wins.
-				execArgv: [`--user-agent=${USER_AGENT}`],
+				// Early admission reads runtime flags before any application dotenv loading.
+				execArgv: ["--no-env-file", `--user-agent=${USER_AGENT}`],
 				...(options.executablePath
 					? { executablePath: options.executablePath }
 					: options.target
