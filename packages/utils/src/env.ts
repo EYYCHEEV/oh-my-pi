@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, getConfigRootDir, getProjectDir, refreshDirsFromEnv } from "./dirs";
+import { getEvaluationPolicy } from "./evaluation-policy";
 
 export * from "./worker-host";
 
@@ -113,6 +114,11 @@ export function filterChildShellEnv(
 	cwd: string = process.cwd(),
 ): Record<string, string> {
 	const result = filterProcessEnv(env);
+	if (getEvaluationPolicy()) {
+		result.OMP_EVALUATION_POLICY = process.env.OMP_EVALUATION_POLICY!;
+		result.OMP_EVALUATION_POLICY_SHA256 = process.env.OMP_EVALUATION_POLICY_SHA256!;
+		return result;
+	}
 	const projectEnv = parseEnvFile(path.join(cwd, ".env"));
 	const launchNodeEnv = launchEnvValues ? launchEnvValues.get("NODE_ENV") : env.NODE_ENV;
 	const nodeEnvName = `.env.${launchNodeEnv || "development"}`;
@@ -240,7 +246,7 @@ export function parseEnvFile(filePath: string): Record<string, string> {
 const homeEnv = parseEnvFile(path.join(os.homedir(), ".env"));
 const piEnv = parseEnvFile(path.join(getConfigRootDir(), ".env"));
 const agentEnv = parseEnvFile(path.join(getAgentDir(), ".env"));
-const projectEnv = parseEnvFile(path.join(getProjectDir(), ".env"));
+const projectEnv = getEvaluationPolicy() ? {} : parseEnvFile(path.join(getProjectDir(), ".env"));
 
 for (const key of Object.keys(Bun.env)) {
 	const value = Bun.env[key];
@@ -251,6 +257,7 @@ for (const key of Object.keys(Bun.env)) {
 
 for (const file of [projectEnv, agentEnv, piEnv, homeEnv]) {
 	for (const key in file) {
+		if (/^(?:OMP|PI)_EVALUATION_POLICY(?:_SHA256)?$/.test(key)) continue;
 		if (!isMacosMallocStackLoggingEnvName(key) && !Bun.env[key]) {
 			Bun.env[key] = file[key];
 			if (file === projectEnv) projectEnvNamesLoadedByOmp.add(key);

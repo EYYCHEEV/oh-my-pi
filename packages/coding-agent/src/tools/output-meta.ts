@@ -683,6 +683,11 @@ function getSpillConfig(s: Settings | undefined) {
 	};
 }
 
+/** Maximum serialized inline text before the host spills a result to an artifact. */
+export function resolveToolOutputBudgetBytes(settings: Settings | undefined): number {
+	return getSpillConfig(settings).threshold;
+}
+
 /**
  * Resolve the OutputSink `headBytes` budget from session settings.
  * Exposed so streaming executors (bash/python/ssh/eval) can opt into

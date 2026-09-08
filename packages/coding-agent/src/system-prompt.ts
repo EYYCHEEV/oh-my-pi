@@ -1,3 +1,4 @@
+import { getEvaluationPolicy, readEvaluationEvidence } from "@oh-my-pi/pi-utils";
 /**
  * System prompt construction and project context loading
  */
@@ -384,6 +385,7 @@ export function discoverTitleSystemPromptFile(cwd?: string): string | undefined 
 
 /** Resolve input as file path or literal string */
 export async function resolvePromptInput(input: string | undefined, description: string): Promise<string | undefined> {
+	if (getEvaluationPolicy() && input !== undefined) return readEvaluationEvidence(input);
 	if (!input) {
 		return undefined;
 	} else if (input.includes("\n")) {

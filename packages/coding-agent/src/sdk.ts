@@ -1,3 +1,4 @@
+import { denyEvaluationIngress, getEvaluationPolicy, readEvaluationEvidence } from "@oh-my-pi/pi-utils";
 import * as path from "node:path";
 import {
 	Agent,
@@ -377,6 +378,10 @@ function applyMCPEnvironment(result: { exaApiKeys: string[] }): void {
 
 // Types
 export interface CreateAgentSessionOptions {
+	/** Explicit trusted file ingress for an evaluation session's system instructions. */
+	evaluationPromptFile?: string;
+	/** Admitted append instructions, retaining CLI --append-system-prompt semantics. */
+	evaluationAppendPromptFile?: string;
 	/** Working directory for project-local discovery. Default: getProjectDir() */
 	cwd?: string;
 	/** Additional workspace directories beyond cwd (multi-root), absolute or cwd-relative. */
@@ -1345,6 +1350,53 @@ export function createAutoLearnCaptureRunner(
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
+	const evaluation = getEvaluationPolicy();
+	if (evaluation) {
+		if (options.extensionRoots || options.taskDepth || options.parentTaskPrefix) {
+			denyEvaluationIngress("descendant or mutable extension roots");
+		}
+		if (!options.evaluationPromptFile) denyEvaluationIngress("SDK startup without an admitted prompt file");
+		if (options.sessionManager?.getBranch().length) denyEvaluationIngress("session history");
+		if (
+			options.contextFiles?.length ||
+			options.skills?.length ||
+			options.rules?.length ||
+			options.promptTemplates?.length ||
+			options.slashCommands?.length ||
+			options.systemPrompt !== undefined ||
+			(options.appendSystemPrompt !== undefined && !options.evaluationAppendPromptFile) ||
+			options.titleSystemPrompt !== undefined ||
+			options.customTools?.length
+		) {
+			denyEvaluationIngress("preloaded context or custom code");
+		}
+		const cwd = options.cwd ?? getProjectDir();
+		options = {
+			...options,
+			customSystemPrompt: readEvaluationEvidence(options.evaluationPromptFile!),
+			appendSystemPrompt: options.evaluationAppendPromptFile
+				? readEvaluationEvidence(options.evaluationAppendPromptFile)
+				: undefined,
+			restrictToolNames: true,
+			toolNames: [...evaluation.allowed_tools],
+			requireYieldTool: false,
+			disableExtensionDiscovery: true,
+			allowRestrictedCustomTools: false,
+			contextFiles: [],
+			skills: [],
+			rules: [],
+			promptTemplates: [],
+			slashCommands: [],
+			additionalDirectories: [],
+			workspaceTree: { rootPath: cwd, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] },
+			sessionManager: options.sessionManager ?? SessionManager.inMemory(cwd),
+			enableMCP: false,
+			enableLsp: false,
+			enableIrc: false,
+			skipPythonPreflight: true,
+			spawns: "",
+		};
+	}
 	const extensionRoots = options.extensionRoots?.();
 	const explicit = extensionRoots?.explicit ?? options.additionalExtensionPaths ?? [];
 	const mode = extensionRoots?.mode ?? (options.disableExtensionDiscovery ? "explicit-only" : "merge");
@@ -1352,6 +1404,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 }
 
 async function createAgentSessionScoped(options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> {
+	const evaluation = getEvaluationPolicy();
 	const cwd = options.cwd ?? getProjectDir();
 	const agentDir = options.agentDir ?? getAgentDir();
 	const eventBus = options.eventBus ?? new EventBus();
@@ -1364,6 +1417,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	const settings = await (options.settings ??
 		options.settingsManager ??
 		logger.time("settings", Settings.init, { cwd, agentDir }));
+	if (evaluation) {
+		settings.override("async.enabled", false);
+		settings.override("advisor.enabled", false);
+		settings.override("autolearn.enabled", false);
+		settings.override("todo.enabled", false);
+		settings.override("compaction.enabled", false);
+	}
 	logger.time("initializeWithSettings", initializeWithSettings, settings);
 	// Snapshot this session's effective configured lane onto its invocation scope
 	// so startup sub-discovery sees the same complete policy that post-startup
@@ -1412,7 +1472,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	});
 	await modelRegistry.hydrateCredentialScopedModelCaches();
 	const restrictToolNames = options.restrictToolNames === true;
-	const requiredExtension = restrictToolNames ? undefined : requiredExtensionFromSettings(options, settings);
+	const requiredExtension =
+		restrictToolNames && !evaluation ? undefined : requiredExtensionFromSettings(options, settings);
 	const requiredExtensionOptions = {
 		required: requiredExtension,
 		disabledExtensionIds: requiredExtension
@@ -1422,7 +1483,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	let extensionPaths: string[];
 	let extensionsResult: LoadExtensionsResult;
 	try {
-		if (restrictToolNames) {
+		if (restrictToolNames && !evaluation) {
 			extensionPaths = [];
 			extensionsResult = await logger.time(
 				"loadExtensions",
@@ -1512,6 +1573,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		: logger.time("discoverContextFiles", discoverContextFiles, cwd, agentDir);
 	contextFilesPromise.catch(() => {});
 	const resolveRepoContext = async (repoCwd: string) => {
+		if (evaluation) return null;
 		try {
 			return await resolveActiveRepoContext(repoCwd);
 		} catch (err) {
@@ -1521,9 +1583,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	};
 	const activeRepoContextPromise = logger.time("resolveActiveRepoContext", resolveRepoContext, cwd);
 	activeRepoContextPromise.catch(() => {});
-	const watchdogFilesPromise = logger.time("discoverWatchdogFiles", () => discoverWatchdogFiles(cwd, agentDir));
+	const watchdogFilesPromise = evaluation
+		? Promise.resolve([])
+		: logger.time("discoverWatchdogFiles", () => discoverWatchdogFiles(cwd, agentDir));
 	watchdogFilesPromise.catch(() => {});
-	const advisorConfigsPromise = logger.time("discoverAdvisorConfigs", () => discoverAdvisorConfigs(cwd, agentDir));
+	const advisorConfigsPromise = evaluation
+		? Promise.resolve({ advisors: [], sharedInstructions: "" })
+		: logger.time("discoverAdvisorConfigs", () => discoverAdvisorConfigs(cwd, agentDir));
 	advisorConfigsPromise.catch(() => {});
 	const promptTemplatesPromise = options.promptTemplates
 		? Promise.resolve(options.promptTemplates)
@@ -2095,7 +2161,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		);
 
 		// Create built-in tools (already wrapped with meta notice formatting)
-		await logger.time("createAllTools", createTools, toolSession, options.toolNames);
+		await logger.time("createAllTools", createTools, toolSession, evaluation ? [] : options.toolNames);
 		const initialBrowserPreludeAvailable = shouldFilterBrowserMCPForPrelude({
 			restrictToolNames,
 			browserEnabled: settings.get("browser.enabled"),
@@ -2260,6 +2326,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				inlineExtensions.push(createCustomToolsExtension(customTools, customToolSourcePaths));
 			}
 		}
+		if (evaluation) inlineExtensions.push(...(options.extensions ?? []));
 		// Forward the path list (NOT the loaded tools) to subagents so they
 		// re-bind under their own `CustomToolAPI` while skipping the FS scan.
 		toolSession.customToolPaths = customToolPaths;
@@ -2916,7 +2983,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// stay unwrapped. The extension runner exposes it to re-registered tools via createContext.
 		const nativeToolsByName = new Map<string, Tool>(toolSession.xdev?.tools ?? undefined);
 
-		const registeredTools = restrictToolNames ? [] : extensionRunner.getAllRegisteredTools();
+		const registeredTools =
+			restrictToolNames && !evaluation
+				? []
+				: extensionRunner
+						.getAllRegisteredTools()
+						.filter(tool => !evaluation || evaluation.allowed_tools.includes(tool.definition.name));
 		const initialRegisteredTools = new WeakSet(registeredTools);
 		const sdkCustomTools =
 			restrictToolNames && options.allowRestrictedCustomTools !== true
@@ -2969,10 +3041,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			toolRegistry.set(tool.name, tool);
 			builtInRegistryToolNames.delete(tool.name);
 		}
+		if (evaluation) {
+			for (const name of evaluation.allowed_tools) {
+				if (!toolRegistry.has(name))
+					throw new Error(`Evaluation policy requires a trusted extension tool: ${name}`);
+			}
+		}
 		// Expose the native built-ins to same-tool `ctx.invokeTool` on re-registered tools. Set after
 		// the override loop so the map holds the natives, not the extension replacements. The context
 		// factory is the loop's own tool context, so a delegated native call sees ordinary session state.
 		extensionRunner.setNativeToolResolver(name => {
+			if (evaluation) return undefined;
 			const tool = nativeToolsByName.get(name);
 			return tool ? { tool, makeContext: () => toolContextStore.getContext() } : undefined;
 		});
@@ -3003,7 +3082,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// The grant is captured here, independently of the session's provider:
 		// a session that starts on another provider can switch to Cursor later,
 		// and the roster is built once, at session creation.
-		const editWasGranted = toolRegistry.has("edit");
+		const editWasGranted = !evaluation && toolRegistry.has("edit");
 		// Built on first use rather than eagerly: a session that never reaches
 		// Cursor never constructs it.
 		let cursorBridgeEditTool: AgentTool | undefined;
@@ -3020,6 +3099,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 		let writeRegistration: Promise<boolean> | undefined;
 		const ensureWriteRegistered = (): Promise<boolean> => {
+			if (evaluation) return Promise.resolve(false);
 			if (toolRegistry.has("write")) return Promise.resolve(builtInRegistryToolNames.has("write"));
 			writeRegistration ??= (async () => {
 				const writeTool = await logger.time("createTools:write:session", BUILTIN_TOOLS.write, toolSession);
@@ -3124,14 +3204,16 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// the grant: the factory builds a fresh tool and `executeTool` prefers
 			// it over the registry, so installing it unconditionally would let a
 			// session without `grep` search anyway.
-			createGrepTool: toolRegistry.has("grep") ? createBridgeGrepFactory(toolSession, extensionRunner) : undefined,
+			createGrepTool:
+				!evaluation && toolRegistry.has("grep") ? createBridgeGrepFactory(toolSession, extensionRunner) : undefined,
 			// Native delete and resource-download frames mutate files without a
 			// registry tool. Resolve both the transactional active predicate and
 			// live access mode: Agent.state.tools commits only after prompt rebuilding,
 			// while this predicate revokes before the await and rolls back on failure.
 			allowDirectFileMutation: () =>
 				(editWasGranted && toolSession.isToolActive?.("edit") === true) ||
-				(toolSession.isToolActive?.("write") === true &&
+				(!evaluation &&
+					toolSession.isToolActive?.("write") === true &&
 					toolRegistry.has("write") &&
 					toolSession.deviceOnlyWrite !== true),
 		});
@@ -3155,6 +3237,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			tools: Map<string, AgentTool>,
 			rebuildOptions?: { directToolNames?: readonly string[] },
 		): Promise<BuildSystemPromptResult> => {
+			if (evaluation) {
+				const systemPrompt = [readEvaluationEvidence(options.evaluationPromptFile!)];
+				if (options.evaluationAppendPromptFile)
+					systemPrompt.push(readEvaluationEvidence(options.evaluationAppendPromptFile));
+				return { systemPrompt };
+			}
 			const promptCwd = sessionManager.getCwd();
 			const activeRepoContext = hasSession
 				? await logger.time("resolveActiveRepoContext", resolveRepoContext, promptCwd)
@@ -3749,8 +3837,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			isToolActive: name => toolSession.isToolActive?.(name) === true,
 		};
 		const advisorToolBuilds: Array<Tool | null | Promise<Tool | null>> = [];
-		for (const name in BUILTIN_TOOLS) {
-			advisorToolBuilds.push(BUILTIN_TOOLS[name as keyof typeof BUILTIN_TOOLS](advisorToolSession));
+		if (!evaluation) {
+			for (const name in BUILTIN_TOOLS) {
+				advisorToolBuilds.push(BUILTIN_TOOLS[name as keyof typeof BUILTIN_TOOLS](advisorToolSession));
+			}
 		}
 		const built = await Promise.all(advisorToolBuilds);
 		// Wrapped like every registry tool: `ExtensionToolWrapper` is where the

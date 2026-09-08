@@ -1,3 +1,4 @@
+import { denyEvaluationIngress } from "@oh-my-pi/pi-utils";
 import { logger } from "@oh-my-pi/pi-utils";
 import { Settings } from "../config/settings";
 import { OutputSink } from "../session/streaming-output";
@@ -428,6 +429,7 @@ export async function executeWithKernelBase<
 	TOptions extends KernelExecutorBaseOptions,
 	TEnv extends KernelEnvPatch = Record<string, string | null>,
 >(params: ExecuteWithKernelBaseParams<TOptions, TEnv>): Promise<KernelExecutionResult> {
+	denyEvaluationIngress("raw kernel evaluation");
 	const {
 		kernel,
 		code,

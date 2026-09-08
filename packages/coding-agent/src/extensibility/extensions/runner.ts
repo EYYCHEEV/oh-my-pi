@@ -1,3 +1,4 @@
+import { getEvaluationAdmission, getEvaluationPolicy } from "@oh-my-pi/pi-utils";
 /**
  * Extension runner - executes extensions and manages their lifecycle.
  */
@@ -20,6 +21,7 @@ import { type Theme, theme } from "../../modes/theme/theme";
 import type { AsyncJobSnapshot } from "../../session/agent-session";
 import type { SessionManager } from "../../session/session-manager";
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
+import { resolveToolOutputBudgetBytes } from "../../tools/output-meta";
 import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
 import type { RequiredExtensionHandlerSnapshot } from "./loader";
 import { ManagedTimers } from "./managed-timers";
@@ -614,6 +616,8 @@ export class ExtensionRunner {
 		getAsyncJobSnapshot?: () => AsyncJobSnapshot | null,
 		requiredHandlerSnapshot?: RequiredExtensionHandlerSnapshot,
 	) {
+		// The host selects explicit instances and enforces required-extension attestation.
+		// Keep their identity snapshot; a tool name never grants startup authority.
 		this.extensions = Object.freeze([...extensions]);
 		this.#uiContext = noOpUIContext;
 		this.#getMemoryFn = getMemory;
@@ -1197,6 +1201,8 @@ export class ExtensionRunner {
 	): ExtensionContext {
 		const getModel = model ? () => model : this.#getModel;
 		return {
+			toolOutputBudgetBytes: resolveToolOutputBudgetBytes(delegation?.context?.settings ?? this.settings),
+			evaluationAdmission: getEvaluationAdmission(),
 			ui: this.#uiContext,
 			mode: this.#mode,
 			getContextUsage: () => this.#getContextUsageFn(),
@@ -1345,6 +1351,13 @@ export class ExtensionRunner {
 			handlerFailure = { error };
 		} finally {
 			registrationScope.closed = true;
+		}
+		if (
+			getEvaluationPolicy() &&
+			event.type === "before_agent_start" &&
+			(handlerFailure || handlerResult === EXTENSION_HANDLER_TIMEOUT || handlerResult === EXTENSION_HANDLER_ABORTED)
+		) {
+			throw new Error("Evaluation mandatory startup hook failed");
 		}
 		if (handlerResult === EXTENSION_HANDLER_ABORTED) return undefined;
 		if (handlerResult === EXTENSION_HANDLER_TIMEOUT) {

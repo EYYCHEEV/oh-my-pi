@@ -1,3 +1,4 @@
+import { denyEvaluationIngress } from "@oh-my-pi/pi-utils";
 /**
  * In-process execution for subagents.
  *
@@ -2828,6 +2829,7 @@ export interface FollowUpTurnOptions {
  * revive), and an aborted turn only aborts the in-flight turn.
  */
 export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Promise<SingleResult> {
+	denyEvaluationIngress("subagent follow-up");
 	const { id, agent, message, signal } = options;
 	const index = options.index ?? 0;
 	const startTime = Date.now();
@@ -2912,6 +2914,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
  * Run a single agent in-process.
  */
 export async function runSubprocess(options: ExecutorOptions): Promise<SingleResult> {
+	denyEvaluationIngress("subagent spawn");
 	const {
 		cwd,
 		agent,

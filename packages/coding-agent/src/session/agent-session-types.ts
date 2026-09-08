@@ -327,6 +327,8 @@ export interface AgentSessionConfig {
 
 /** Options for AgentSession.prompt(). */
 export interface PromptOptions {
+	/** Trusted host file ingress. Scoped sessions read this file instead of raw text. */
+	evaluationInputFile?: string;
 	/** Whether to expand file-based prompt templates (default: true). */
 	expandPromptTemplates?: boolean;
 	/** Image attachments. */

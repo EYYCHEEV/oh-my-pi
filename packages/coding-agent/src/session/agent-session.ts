@@ -1,3 +1,9 @@
+import {
+	assertEvaluationTool,
+	denyEvaluationIngress,
+	getEvaluationPolicy,
+	readEvaluationEvidence,
+} from "@oh-my-pi/pi-utils";
 /**
  * AgentSession - Core abstraction for agent lifecycle and session management.
  *
@@ -5235,6 +5241,7 @@ export class AgentSession {
 
 	/** Rediscovers reloadable skills and refreshes prompt metadata. */
 	refreshSkills(): Promise<void> {
+		denyEvaluationIngress("skill refresh");
 		return this.#tools.refreshSkills();
 	}
 
@@ -5263,6 +5270,7 @@ export class AgentSession {
 
 	/** Selects enabled tools, ignoring names absent from the registry. */
 	setActiveToolsByName(toolNames: string[]): Promise<void> {
+		for (const name of toolNames) assertEvaluationTool(name);
 		return this.#tools.setActiveToolsByName(toolNames);
 	}
 
@@ -6024,6 +6032,13 @@ export class AgentSession {
 	 * the ACP agent) use this to know whether to expect an `agent_end` event.
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<boolean> {
+		const evaluation = getEvaluationPolicy();
+		if (evaluation) {
+			if (!options?.evaluationInputFile || options.images?.length || this.isStreaming)
+				denyEvaluationIngress("unattested prompt");
+			text = readEvaluationEvidence(options!.evaluationInputFile!);
+			options = { evaluationInputFile: options!.evaluationInputFile, expandPromptTemplates: false };
+		}
 		// Stamp the operator's submission instant before ANY async preprocessing —
 		// command execution, image normalization, vision-model description — so the
 		// prompt→yield delta includes the whole wait, whatever path the prompt takes.
@@ -6068,7 +6083,7 @@ export class AgentSession {
 		// Magic keywords ("ultrathink", "orchestrate"): append hidden system notices after the
 		// user's message that steer this turn. User-authored prompts only — synthetic /
 		// agent-initiated turns never trigger them.
-		const keywordNotices = options?.synthetic ? [] : this.#createMagicKeywordNotices(expandedText);
+		const keywordNotices = evaluation || options?.synthetic ? [] : this.#createMagicKeywordNotices(expandedText);
 
 		// A user-initiated prompt (typed message or the `.`/`c` continue shortcut)
 		// re-enables advisor auto-resume that a prior user interrupt suppressed.
@@ -6224,6 +6239,7 @@ export class AgentSession {
 			queueOnly?: boolean;
 		},
 	): Promise<boolean> {
+		denyEvaluationIngress("custom prompt");
 		const textContent =
 			typeof message.content === "string"
 				? message.content
@@ -6391,7 +6407,7 @@ export class AgentSession {
 			this.#pendingNextTurnMessages = [];
 
 			// Auto-read @filepath mentions
-			const fileMentions = extractFileMentions(expandedText);
+			const fileMentions = getEvaluationPolicy() ? [] : extractFileMentions(expandedText);
 			if (fileMentions.length > 0) {
 				const fileMentionMessages = await generateFileMentionMessages(fileMentions, this.sessionManager.getCwd(), {
 					autoResizeImages: this.settings.get("images.autoResize"),
@@ -6461,6 +6477,7 @@ export class AgentSession {
 
 			// Bail out if a newer abort/prompt cycle has started since we began setup
 			if (this.#promptGeneration !== generation) {
+				if (getEvaluationPolicy()) throw new Error("Evaluation mandatory startup was aborted");
 				return false;
 			}
 
@@ -6697,6 +6714,7 @@ export class AgentSession {
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
 	async steer(text: string, images?: ImageContent[]): Promise<void> {
+		denyEvaluationIngress("steering input");
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -6716,6 +6734,7 @@ export class AgentSession {
 	 * flipping advisor auto-resume.
 	 */
 	async followUp(text: string, images?: ImageContent[], options?: FollowUpOptions): Promise<void> {
+		denyEvaluationIngress("follow-up input");
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -7116,6 +7135,7 @@ export class AgentSession {
 			acceptTerminalEmptyStop?: boolean;
 		},
 	): Promise<boolean> {
+		denyEvaluationIngress("custom message");
 		// Captured before the normalization await below — see #sessionGeneration's doc comment.
 		const sessionGeneration = this.#sessionGeneration;
 		const normalizedPayload = normalizeCustomMessagePayload<T>(message);
@@ -7244,6 +7264,7 @@ export class AgentSession {
 		content: string | (TextContent | ImageContent)[],
 		options?: { deliverAs?: "steer" | "followUp" | "aside" },
 	): Promise<void> {
+		denyEvaluationIngress("user message");
 		// Normalize content to text string + optional images
 		let text: string;
 		let images: ImageContent[] | undefined;
@@ -7672,6 +7693,7 @@ export class AgentSession {
 	 * @returns true if completed, false if cancelled by hook
 	 */
 	async newSession(options?: NewSessionOptions): Promise<boolean> {
+		denyEvaluationIngress("new session");
 		this.#assertVibeSessionTransitionAllowed("start a new session");
 		const previousSessionFile = this.sessionFile;
 
@@ -7801,6 +7823,7 @@ export class AgentSession {
 	 * @returns true if completed, false if cancelled by hook or not persisting
 	 */
 	async fork(): Promise<boolean> {
+		denyEvaluationIngress("session fork");
 		this.#assertVibeSessionTransitionAllowed("fork the session");
 		const previousSessionFile = this.sessionFile;
 		const previousSessionId = this.sessionManager.getSessionId();
@@ -8801,6 +8824,7 @@ export class AgentSession {
 	 * file and re-emit session_switch hooks.
 	 */
 	async reload(): Promise<void> {
+		denyEvaluationIngress("session reload");
 		const sessionFile = this.sessionFile;
 		if (!sessionFile) return;
 		const switched = await this.switchSession(sessionFile);
@@ -8820,6 +8844,7 @@ export class AgentSession {
 			preserveLocalCwd?: boolean;
 		},
 	): Promise<boolean> {
+		denyEvaluationIngress("session switch");
 		const previousSessionFile = this.sessionManager.getSessionFile();
 		const switchingToDifferentSession = previousSessionFile
 			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
@@ -9181,6 +9206,7 @@ export class AgentSession {
 		selectedImages: ImageContent[];
 		cancelled: boolean;
 	}> {
+		denyEvaluationIngress("session branch");
 		const previousSessionFile = this.sessionFile;
 		const selectedEntry = this.sessionManager.getEntry(entryId);
 

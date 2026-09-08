@@ -17,6 +17,8 @@ import { initializeExtensions } from "./runtime-init";
  * Options for print mode.
  */
 export interface PrintModeOptions {
+	/** Existing CLI @file input, attested by the evaluation host. */
+	evaluationInputFile?: string;
 	/** Output mode: "text" for final response only, "json" for all events */
 	mode: "text" | "json";
 	/** Array of additional prompts to send after initialMessage */
@@ -170,7 +172,9 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	if (initialMessage !== undefined) {
 		writeTextWorkingIndicator();
 		if (mode === "text") session.setTextOutputCommitted(false);
-		await logger.time("print:prompt:initial", () => session.prompt(initialMessage, { images: initialImages }));
+		await logger.time("print:prompt:initial", () =>
+			session.prompt(initialMessage, { images: initialImages, evaluationInputFile: options.evaluationInputFile }),
+		);
 	}
 
 	// Send remaining messages

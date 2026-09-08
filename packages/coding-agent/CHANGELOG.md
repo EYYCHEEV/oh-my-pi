@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Restricted evaluation launchers now require generic version-2 policies and matching extension integrations; version-1 policies are refused.
+
+### Added
+
+- Added host-selected restricted extension sessions without product-specific tool policies.
+- Extensions can size complete context pages to the current tool execution's output budget.
+
 ### Fixed
 
 - Fixed restricted extension sessions failing to start in compiled OMP binaries.

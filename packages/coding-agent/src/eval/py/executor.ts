@@ -1,3 +1,4 @@
+import { denyEvaluationIngress } from "@oh-my-pi/pi-utils";
 import * as fs from "node:fs";
 
 import { getProjectDir, logger, Snowflake } from "@oh-my-pi/pi-utils";
@@ -534,6 +535,7 @@ export async function executePythonWithKernel(
 }
 
 export async function executePython(code: string, options?: PythonExecutorOptions): Promise<PythonResult> {
+	denyEvaluationIngress("Python evaluation");
 	const cwd = normalizeKernelSessionCwd(options?.cwd ?? getProjectDir());
 	const deadlineMs = getExecutionDeadlineMs(options);
 	const executionOptions: PythonExecutorOptions = {
