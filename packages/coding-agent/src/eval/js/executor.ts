@@ -1,3 +1,4 @@
+import { denyEvaluationIngress } from "@oh-my-pi/pi-utils";
 import { DEFAULT_MAX_BYTES, OutputSink } from "../../session/streaming-output";
 import type { ToolSession } from "../../tools";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../../tools/output-meta";
@@ -75,6 +76,7 @@ function formatJsTimeoutAnnotation(timeoutMs: number | undefined): string {
 }
 
 export async function executeJs(code: string, options: JsExecutorOptions): Promise<JsResult> {
+	denyEvaluationIngress("JavaScript evaluation");
 	const displayOutputs: JsDisplayOutput[] = [];
 	const outputSink = new OutputSink({
 		artifactPath: options.artifactPath,

@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { denyEvaluationIngress, getEvaluationPolicy } from "@oh-my-pi/pi-utils/evaluation-policy";
 // Strip macOS malloc-stack-logging vars in the parent entrypoint, before any
 // subprocess/worker spawn. libmalloc reads MallocStackLogging /
 // MallocStackLoggingNoCompact during malloc bootstrap (pre-main) in every child
@@ -349,10 +350,30 @@ async function runTinyWorker(): Promise<void> {
 
 /** Run the CLI with the given argv (no `process.argv` prefix). */
 export async function runCli(argv: string[]): Promise<void> {
+	if (getEvaluationPolicy() && (!argv[0]?.startsWith("-") || (!argv.includes("--print") && !argv.includes("-p")))) {
+		denyEvaluationIngress("CLI command or worker");
+	}
 	let resolvedArgv = argv;
 	try {
 		const extracted = extractProfileFlags(resolvedArgv);
+		if (getEvaluationPolicy() && extracted.aliasName !== undefined)
+			denyEvaluationIngress("profile alias installation");
 		resolvedArgv = extracted.argv;
+		if (
+			getEvaluationPolicy() &&
+			(!resolvedArgv[0]?.startsWith("-") ||
+				resolvedArgv.some(
+					arg =>
+						arg === "--smoke-test" ||
+						arg === "--license" ||
+						arg === "--help" ||
+						arg === "-h" ||
+						arg === "--version" ||
+						arg === "-v",
+				))
+		) {
+			denyEvaluationIngress("CLI command or worker");
+		}
 		if (extracted.profile !== undefined) {
 			setProfile(extracted.profile);
 		} else {
@@ -460,6 +481,9 @@ export async function runCli(argv: string[]): Promise<void> {
 			process.stderr.write(`error: ${resolved.error}\n`);
 			process.exitCode = 1;
 			return;
+		}
+		if (getEvaluationPolicy() && resolved.argv[0] !== "launch") {
+			denyEvaluationIngress("resolved CLI command");
 		}
 		await run({ bin: APP_NAME, version: VERSION, argv: resolved.argv, commands, metadataHelp: showHelp });
 	} finally {

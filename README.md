@@ -131,7 +131,7 @@ An upgrade fails before build or installation if the block is stale, any require
 - `terminal-resize-test-harness`: Exact Kitty terminal harness dependency pin
 - `socket-close-tool-call-recovery`: Bun socket-close tool-call recovery
 - `harmony-mitigation-resolved-model-tests`: Harmony mitigation resolved-model regressions
-- `handler-scoped-session-context`: Handler scoped session context and read-only evaluation
+- `handler-scoped-session-context`: Host-selected restricted extension sessions and context budgets
 <!-- stronk-omp:fork-contracts:end -->
 
 ## Upstream alignment

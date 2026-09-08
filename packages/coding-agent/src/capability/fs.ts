@@ -1,3 +1,4 @@
+import { getEvaluationPolicy, readEvaluationEvidence } from "@oh-my-pi/pi-utils";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -10,6 +11,9 @@ function resolvePath(filePath: string): string {
 
 export async function readFile(filePath: string): Promise<string | null> {
 	const abs = resolvePath(filePath);
+	// Scoped evidence never uses a process-wide content cache, including a cache
+	// populated by an earlier unscoped caller.
+	if (getEvaluationPolicy()) return readEvaluationEvidence(abs);
 	if (contentCache.has(abs)) {
 		return contentCache.get(abs) ?? null;
 	}

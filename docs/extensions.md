@@ -211,12 +211,56 @@ Handlers and tool `execute` receive `ctx` with:
 - `localProtocolOptions` (optional calling-session `local://` root mapping for external tool bridges)
 - `getContextUsage()`
 - `getAsyncJobSnapshot()` returns the current session's read-only async-job snapshot, or `null` when no session owns the context
+- `toolOutputBudgetBytes` is the current execution's serialized output ceiling before ordinary artifact spill.
+- `evaluationAdmission` is the optional frozen, process-scoped evidence admission for trusted helper calls.
 - `compact(...)`
 - `isIdle()`, `hasPendingMessages()`, `abort()`
 - `shutdown()`
 - `getSystemPrompt()`
 - `memory` (optional structured memory runtime — status/search/save across the configured backend)
 - `setInterval(fn, ms, ...args)` / `setTimeout(fn, ms, ...args)` / `clearTimer(timer)` — managed timers (see below)
+
+### Restricted evaluation
+
+Restricted evaluation is a generic host mode, not a product integration.
+The host supplies `OMP_EVALUATION_POLICY` and `OMP_EVALUATION_POLICY_SHA256` before module loading, with Bun's `--no-env-file` already active.
+Partial activation, changed policy identity, duplicate fields, and unsupported versions fail closed.
+
+The version-2 policy has exactly these root fields:
+
+```json
+{
+  "version": 2,
+  "run_id": "inspection-run",
+  "allowed_files": ["/absolute/system.txt", "/absolute/request.txt"],
+  "allowed_tools": ["inspection"],
+  "extension_data": {
+    "inspection": {"view": "summary"}
+  }
+}
+```
+
+`allowed_tools` is a nonempty, duplicate-free list of exact names, each at most 128 characters and without wildcards or surrounding whitespace.
+Each name must resolve to an explicitly loaded trusted extension tool.
+The CLI uses `--trusted-extension`; SDK callers supply explicit extension paths or factories.
+Required-extension attestation remains enforced.
+Raw built-in tools, same-name native delegation, alternate agent/kernel ingress, and ambient context discovery are unavailable.
+Startup-hook errors, timeouts, and aborted startup are fatal in this mode.
+
+`extension_data` is an opaque JSON object, limited by the 1 MiB policy cap and 64 nesting levels.
+Numbers must be finite and within JavaScript's safe integer range in magnitude; encode larger identifiers as strings so helper receipt transport cannot round them.
+OMP deeply freezes it but does not interpret it or grant authority from its contents.
+Extensions own their domain metadata, operation restrictions, state binding, and helper validation.
+Trusted extension code still runs in-process; this mode is not an OS sandbox.
+
+Forward `ctx.evaluationAdmission` unchanged to trusted helpers.
+Its version-2 receipt contains `version`, `policy` identity, the admitted policy under `admission`, and original canonical evidence identities under `files`.
+It does not prescribe a cache directory or product-specific schema.
+Helpers must not reconstruct the original admission from mutable current file aliases.
+Policy version 1 is unsupported; update producers and consumers as a matched pair.
+
+When generating context pages, fit the complete serialized response to the execution's `toolOutputBudgetBytes`, not a larger session default or only one text field.
+The output wrapper remains the final spill boundary.
 
 ### Background work (`ctx.setInterval` / `ctx.setTimeout`)
 

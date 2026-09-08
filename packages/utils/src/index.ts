@@ -4,6 +4,7 @@ export * from "./binary";
 export * from "./color";
 export * from "./dirs";
 export * from "./env";
+export * from "./evaluation-policy";
 export * from "./fetch-retry";
 export * from "./file-lock";
 export * from "./format";

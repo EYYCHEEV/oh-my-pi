@@ -1,3 +1,4 @@
+import { denyEvaluationIngress, getEvaluationPolicy, readEvaluationEvidence } from "@oh-my-pi/pi-utils";
 /**
  * Main entry point for the coding agent CLI.
  *
@@ -1093,6 +1094,8 @@ export async function buildSessionOptions(
 	modelRegistry: ModelRegistry,
 	activeSettings: Settings,
 ): Promise<CreateAgentSessionOptions> {
+	getEvaluationPolicy();
+	if (parsed.continue || parsed.resume || isForeignSessionImport(parsed)) denyEvaluationIngress("session restore");
 	const options: CreateAgentSessionOptions = {
 		cwd: parsed.cwd ?? getProjectDir(),
 		autoApprove: parsed.autoApprove ?? false,
@@ -1119,6 +1122,10 @@ export async function buildSessionOptions(
 		resolvePromptInput(appendPromptSource, "append system prompt"),
 		resolvePromptInput(titleSystemPromptSource, "title system prompt"),
 	]);
+	if (getEvaluationPolicy()) {
+		options.evaluationPromptFile = systemPromptSource;
+		options.evaluationAppendPromptFile = appendPromptSource;
+	}
 
 	if (sessionManager) {
 		options.sessionManager = sessionManager;
@@ -1404,11 +1411,42 @@ interface RunRootCommandDependencies {
 }
 const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
 
+function evaluationInputFile(parsed: Args): string | undefined {
+	if (!getEvaluationPolicy()) return undefined;
+	if (
+		!parsed.print ||
+		(parsed.mode !== undefined && parsed.mode !== "text" && parsed.mode !== "json") ||
+		parsed.messages.length ||
+		parsed.fileArgs.length !== 1 ||
+		!parsed.systemPrompt ||
+		!parsed.trustedExtensions?.length ||
+		parsed.continue ||
+		parsed.resume ||
+		parsed.fork ||
+		parsed.export ||
+		parsed.join ||
+		isForeignSessionImport(parsed) ||
+		parsed.pluginDirs?.length ||
+		parsed.advisor ||
+		parsed.planYolo ||
+		parsed.extensions?.length ||
+		parsed.hooks?.length
+	) {
+		denyEvaluationIngress(
+			"CLI route; evaluation requires print mode, one admitted @file, an admitted system prompt, and trusted extensions",
+		);
+	}
+	readEvaluationEvidence(parsed.fileArgs[0]);
+	return parsed.fileArgs[0];
+}
+
 export async function runRootCommand(
 	parsed: Args,
 	rawArgs: string[],
 	deps: RunRootCommandDependencies = DEFAULT_RUN_ROOT_DEPENDENCIES,
 ): Promise<void> {
+	const evaluation = getEvaluationPolicy();
+	evaluationInputFile(parsed);
 	logger.startTiming();
 	startStartupWatchdog();
 	try {
@@ -1458,8 +1496,9 @@ export async function runRootCommand(
 		// Kick off plugin-root preload in parallel with the remaining startup work.
 		// Awaited later (before extension/skill discovery in createAgentSession needs it).
 		const home = os.homedir();
-		const pluginPreloadPromise =
-			parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
+		const pluginPreloadPromise = evaluation
+			? Promise.resolve()
+			: parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
 				? logger.time("injectPluginDirRoots", injectPluginDirRoots, home, parsedArgs.pluginDirs, getProjectDir())
 				: logger.time("preloadPluginRoots", preloadPluginRoots, home, getProjectDir());
 		// Mark the promise as handled so a synchronous failure does not surface as an unhandled-rejection
@@ -1487,7 +1526,7 @@ export async function runRootCommand(
 		// See getDbBusyTimeoutMs().
 		const isProtocolMode = mode === "rpc" || mode === "rpc-ui" || mode === "acp";
 		// Protocol modes own stdin; treating it as prompt text would consume JSON-RPC frames before their transports start.
-		const pipedInput = isProtocolMode ? undefined : await logger.time("readPipedInput", readPipedInput);
+		const pipedInput = evaluation || isProtocolMode ? undefined : await logger.time("readPipedInput", readPipedInput);
 		const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
 		const isInteractive = !parsedArgs.print && !autoPrint && parsedArgs.mode === undefined;
 		// Only the interactive host renders a focusable Agent Hub / subagent session
@@ -1517,6 +1556,10 @@ export async function runRootCommand(
 		}
 
 		const settingsInstance = await settingsPromise;
+		if (evaluation) {
+			settingsInstance.override("autoResume", false);
+			settingsInstance.override("marketplace.autoUpdate", "off");
+		}
 		if (parsedArgs.approvalMode) {
 			// Runtime override (not persisted): every settings.get("tools.approvalMode") downstream
 			// sees this value. The wrapper still honours --auto-approve / --yolo on top of it.
@@ -1613,7 +1656,7 @@ export async function runRootCommand(
 				lightTheme: settingsInstance.get("theme.light"),
 			},
 		});
-		setStartupComposerLspServers(discoverStartupLspServers(cwd, "connecting"));
+		if (!evaluation) setStartupComposerLspServers(discoverStartupLspServers(cwd, "connecting"));
 
 		let scopedModels = await logger.time(
 			"resolveModelScope",
@@ -1695,6 +1738,8 @@ export async function runRootCommand(
 					const message = error instanceof Error ? error.message : String(error);
 					throw new SessionResolutionError(`Failed to import ${sourceName} session: ${message}`);
 				}
+			} else if (evaluation) {
+				sessionManager = SessionManager.inMemory(cwd);
 			} else {
 				sessionManager = await logger.time(
 					"createSessionManager",
@@ -1816,7 +1861,7 @@ export async function runRootCommand(
 			}
 		}
 		await pluginPreloadPromise;
-		if (deps === DEFAULT_RUN_ROOT_DEPENDENCIES) {
+		if (!evaluation && deps === DEFAULT_RUN_ROOT_DEPENDENCIES) {
 			await logger.time("registerDaemonProjectPresence", registerDaemonProjectPresence, cwd);
 		}
 
@@ -1844,7 +1889,7 @@ export async function runRootCommand(
 		// env, then switch on the agent loop's telemetry hooks so traces, run-level
 		// metrics, and structured logs have source events to export. Content capture
 		// remains governed by OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT.
-		await logger.time("initTelemetryExport", initTelemetryExport);
+		if (!evaluation) await logger.time("initTelemetryExport", initTelemetryExport);
 		if (isTelemetryExportEnabled()) {
 			sessionOptions.telemetry = createTelemetryExportConfig(sessionOptions.telemetry);
 		}
@@ -1902,9 +1947,10 @@ export async function runRootCommand(
 
 			const eventBus = new EventBus();
 			const subagentEventBus = new EventBus();
-			const extensionsResult = parsedArgs.trustedExtensions?.length
-				? await loadTrustedSessionExtensions(sessionOptions, cwd, eventBus)
-				: await loadSessionExtensions(sessionOptions, cwd, settingsInstance, eventBus);
+			const extensionsResult =
+				!evaluation && parsedArgs.trustedExtensions?.length
+					? await loadTrustedSessionExtensions(sessionOptions, cwd, eventBus)
+					: await loadSessionExtensions(sessionOptions, cwd, settingsInstance, eventBus);
 			const requiredExtensionAttestation = getRequiredExtensionAttestation(extensionsResult);
 			const attestedExtensionPaths = Object.freeze(
 				extensionsResult.extensions
@@ -1919,6 +1965,7 @@ export async function runRootCommand(
 			};
 			const initialArgs = applyExtensionFlags(extensionFlagSink, rawArgs) ?? parsedArgs;
 			normalizeContinueSessionArgs(initialArgs, rawArgs);
+			const admittedInputFile = evaluationInputFile(initialArgs);
 			if ((parsedArgs.trustedExtensions?.length ?? 0) > 0 && extensionsResult.errors.length > 0) {
 				throw new Error(
 					`Trusted extension failed to load: ${extensionsResult.errors.map(item => item.error).join("; ")}`,
@@ -1940,8 +1987,9 @@ export async function runRootCommand(
 			if (reportUnrecognizedFlags(initialArgs)) {
 				process.exit(2);
 			}
-			const processedFiles =
-				initialArgs.fileArgs.length > 0
+			const processedFiles = admittedInputFile
+				? { text: readEvaluationEvidence(admittedInputFile), images: [] }
+				: initialArgs.fileArgs.length > 0
 					? await logger.time("processFileArguments", () =>
 							processFileArguments(initialArgs.fileArgs, {
 								autoResizeImages: settingsInstance.get("images.autoResize"),
@@ -2119,19 +2167,26 @@ export async function runRootCommand(
 				// Branch-only single-shot runner: keep print-mode code out of normal interactive startup.
 				stopStartupWatchdog();
 				const runPrintMode: RunPrintMode = (await import("./modes/print-mode")).runPrintMode;
-				await runPrintMode(session, {
-					mode,
-					messages: initialArgs.messages,
-					initialMessage,
-					initialImages,
-					printThoughts: initialArgs.printThoughts,
-					planYolo: parsedArgs.planYolo,
-				});
-				if ($env.PI_TIMING) {
-					logger.printTimings();
+				try {
+					await runPrintMode(session, {
+						mode,
+						messages: initialArgs.messages,
+						initialMessage,
+						initialImages,
+						printThoughts: initialArgs.printThoughts,
+						planYolo: parsedArgs.planYolo,
+						evaluationInputFile: admittedInputFile,
+					});
+					if ($env.PI_TIMING) {
+						logger.printTimings();
+					}
+				} finally {
+					try {
+						await session.dispose();
+					} finally {
+						stopThemeWatcher();
+					}
 				}
-				await session.dispose();
-				stopThemeWatcher();
 				await postmortem.quit(0);
 			}
 		}

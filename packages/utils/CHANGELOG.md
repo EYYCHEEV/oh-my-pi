@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added generic version-2 evaluation admission with immutable extension metadata and host-selected tool access.
+
 ## [18.1.11] - 2026-09-05
 
 ### Fixed

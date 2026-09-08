@@ -8,6 +8,7 @@
  * - Interact with the user via UI primitives
  */
 
+import type { EvaluationAdmission } from "@oh-my-pi/pi-utils";
 import type { type as ArkType } from "@oh-my-pi/omptype";
 import type * as TypeBox from "@oh-my-pi/omptype/typebox";
 import type * as zod from "@oh-my-pi/omptype/zod";
@@ -459,6 +460,10 @@ export interface ExtensionModelQuery {
 export type ExtensionMode = "tui" | "rpc" | "json" | "print";
 
 export interface ExtensionContext {
+	/** Host-owned UTF-8 byte limit for serialized inline tool text, before artifact spill. */
+	readonly toolOutputBudgetBytes?: number;
+	/** Frozen initial evidence identities for a trusted restricted helper launch. */
+	readonly evaluationAdmission?: EvaluationAdmission;
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
 	/** Current run mode. Use `"tui"` to guard terminal-only UI such as custom components. */
