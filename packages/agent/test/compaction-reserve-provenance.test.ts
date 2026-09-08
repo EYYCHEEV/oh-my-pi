@@ -89,6 +89,24 @@ describe("compaction reserve provenance", () => {
 		expect(resolveBudgetReserveTokens(cw, settings)).toBe(2457); // floor(16385 * 0.15)
 	});
 
+	it("caps explicit token and percentage triggers before they can spend the usable-input reserve", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			reserveTokens: 65_536,
+			keepRecentTokens: 20_000,
+		};
+		const window = 272_384;
+		const budget = 206_848;
+
+		expect(shouldCompact(budget, window, { ...settings, thresholdTokens: 250_000 })).toBe(false);
+		expect(shouldCompact(budget + 1, window, { ...settings, thresholdTokens: 250_000 })).toBe(true);
+		expect(shouldCompact(budget + 1, window, { ...settings, thresholdPercent: 95 })).toBe(true);
+		expect(shouldCompact(150_001, window, { ...settings, thresholdTokens: 150_000 })).toBe(true);
+		expect(shouldCompact(140_000, window, { ...settings, thresholdPercent: 50 })).toBe(true);
+		expect(shouldCompact(budget + 1, window, { ...settings, enabled: false })).toBe(false);
+		expect(shouldCompact(budget + 1, window, { ...settings, strategy: "off" })).toBe(false);
+	});
+
 	it("exposes defaulted provenance through the public constants", () => {
 		// The fix rides on reserveTokens being ABSENT from the defaults: presence
 		// of the field is the provenance signal, not its value.

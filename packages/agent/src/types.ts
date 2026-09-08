@@ -70,10 +70,13 @@ export type AgentPreModelCallResult = AgentPreModelCallStop | undefined;
 /**
  * A pre-model-call gate. Return {@link AgentPreModelCallStop} to refuse the
  * request, or nothing to proceed; the signal aborts with the run.
+ * The model is the one captured for this prepared request, even if selection
+ * changes while an asynchronous context transform is running.
  */
 export type AgentBeforeModelCall = (
 	context: Context,
-	signal?: AbortSignal,
+	signal: AbortSignal | undefined,
+	model: Model,
 ) => AgentPreModelCallResult | void | Promise<AgentPreModelCallResult | void>;
 
 /**

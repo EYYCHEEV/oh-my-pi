@@ -92,6 +92,7 @@ const CONTEXT_OVERFLOW_EVIDENCE_PATTERNS = [
 	/requested tokens?.*exceed.*context (window|length|size)/i, // llama.cpp / OpenAI-compatible local servers
 	/context (window|length|size).*(exceeded|overflow|too small)/i, // Generic local server variants
 	/rendered input and requested output exceed configured context/i, // OpenAI-compatible local hard context gate
+	/rendered input exceeds configured limit/i, // Local gate's input-only rejection (input_length_exceeded)
 	/(prompt|input).*(too long|too large).*(context|n_ctx)/i, // llama.cpp phrasing variants
 	/requested tokens?.*(exceeds?|greater than).*(n_ctx|context)/i, // llama.cpp n_ctx variants
 	/greater than the context length/i, // LM Studio
@@ -127,6 +128,9 @@ function hasCauseTokenContextOverflowEvidence(error: unknown): boolean {
 		}
 		if (seen.has(link)) break;
 		seen.add(link);
+		if ("code" in link && (link.code === "input_length_exceeded" || link.code === "context_length_exceeded")) {
+			return true;
+		}
 		if ("message" in link) {
 			const message: unknown = link.message;
 			if (typeof message === "string" && hasTokenContextOverflowEvidence(message)) return true;
@@ -525,6 +529,7 @@ export function classify(error: unknown, api?: Api): number {
 	let kinds = 0;
 	const seen = new Set<object>();
 	const causeTokenEvidence = hasCauseTokenContextOverflowEvidence(error);
+	if (causeTokenEvidence) kinds |= Flag.ContextOverflow;
 	let link: unknown = error;
 	while (link !== undefined && link !== null) {
 		if (typeof link === "object") {

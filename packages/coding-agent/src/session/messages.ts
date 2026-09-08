@@ -1191,6 +1191,11 @@ interface ConvertArrayMemo {
 let convertGeneration = 0;
 const convertArrayCache = new WeakMap<AgentMessage[], ConvertArrayMemo>();
 
+/** Invalidate append-only conversion shortcuts after an owner rewrites an array's existing prefix. */
+export function invalidateMessageArrayCache(messages: AgentMessage[]): void {
+	convertArrayCache.delete(messages);
+}
+
 registerMessageCacheInvalidator(message => {
 	convertCache.delete(message);
 	convertGeneration++;

@@ -49,6 +49,28 @@ describe("isContextOverflow - configured local context", () => {
 		);
 		expect(isContextOverflow(message)).toBe(true);
 	});
+
+	it("routes the LiteLLM-wrapped input-only gate rejection to context recovery", () => {
+		const message = createErrorMessage(
+			"400 litellm.BadRequestError: OpenAIException - rendered input exceeds configured limit. Received Model Group=deepseek-v4-flash-vision-exp Available Model Group Fallbacks=None",
+		);
+		message.errorStatus = 400;
+		AIError.classifyMessage(message);
+
+		expect(isContextOverflow(message)).toBe(true);
+		expect(isPayloadRejection(message)).toBe(false);
+	});
+
+	it("recognizes a structured input overflow when the diagnostic text is opaque", () => {
+		const id = AIError.classify({ status: 400, code: "input_length_exceeded", message: "Request rejected" });
+		expect(AIError.is(id, AIError.Flag.ContextOverflow)).toBe(true);
+		expect(AIError.is(id, AIError.Flag.PayloadRejected)).toBe(false);
+	});
+
+	it("does not treat a configured image admission limit as token overflow", () => {
+		const message = createErrorMessage("400 image input exceeds configured limit");
+		expect(isContextOverflow(message)).toBe(false);
+	});
 });
 
 describe("isContextOverflow/isPayloadRejection - HTTP 413 variants", () => {
@@ -235,6 +257,15 @@ describe("classify - token evidence arbitrates the status fallback across cause 
 	it("keeps a wrapped token overflow pure when the wrapper's status comes from a nested 413", () => {
 		const inner = Object.assign(new Error("Error: maximum context length is 128000 tokens"), { status: 413 });
 		const id = AIError.classify(new Error("Provider returned error", { cause: inner }));
+		expect(AIError.is(id, AIError.Flag.ContextOverflow)).toBe(true);
+		expect(AIError.is(id, AIError.Flag.PayloadRejected)).toBe(false);
+	});
+
+	it("keeps a nested structured token overflow distinct from a status-only payload rejection", () => {
+		const id = AIError.classify({
+			message: "Provider returned error",
+			cause: { status: 413, code: "context_length_exceeded", message: "Request rejected" },
+		});
 		expect(AIError.is(id, AIError.Flag.ContextOverflow)).toBe(true);
 		expect(AIError.is(id, AIError.Flag.PayloadRejected)).toBe(false);
 	});

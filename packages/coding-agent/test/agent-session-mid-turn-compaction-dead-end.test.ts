@@ -28,9 +28,9 @@ const noopTool: AgentTool<typeof noopSchema, undefined> = {
 
 const DEAD_END_WARNING = "Compaction freed too little context to make progress";
 
-/** One threshold-tripping tool-call turn. */
+/** Above the early maintenance trigger, but still inside the usable-input budget. */
 function toolTurn(id: string): MockResponse {
-	return { content: [{ type: "toolCall", id, name: "noop", arguments: {} }], usage: { input: 190_000 } };
+	return { content: [{ type: "toolCall", id, name: "noop", arguments: {} }], usage: { input: 140_000 } };
 }
 
 describe("AgentSession mid-turn compaction dead-end", () => {
@@ -183,7 +183,7 @@ describe("AgentSession mid-turn compaction dead-end", () => {
 				turnPrefixMessages: [],
 				recentMessages: [],
 				isSplitTurn: false,
-				tokensBefore: 190_000,
+				tokensBefore: 140_000,
 				fileOps: { read: new Set(), written: new Set(), edited: new Set() },
 				settings: session.settings.getGroup("compaction"),
 			};
@@ -203,7 +203,7 @@ describe("AgentSession mid-turn compaction dead-end", () => {
 		vi.spyOn(session, "getContextUsage").mockImplementation(() =>
 			cutPointSeen
 				? { tokens: 1_000, contextWindow: 200_000, percent: 0.5 }
-				: { tokens: 190_000, contextWindow: 200_000, percent: 95 },
+				: { tokens: 140_000, contextWindow: 200_000, percent: 70 },
 		);
 
 		await session.prompt("Run two tools before answering");

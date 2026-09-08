@@ -297,16 +297,16 @@ describe("shouldCompact", () => {
 		expect(shouldCompact(10_001, 100_000, settings)).toBe(true);
 	});
 
-	it("should use configured threshold percent", () => {
+	it("uses a configured percentage trigger below the usable-input ceiling", () => {
 		const settings: CompactionSettings = {
 			enabled: true,
-			thresholdPercent: 90,
+			thresholdPercent: 70,
 			reserveTokens: 10000,
 			keepRecentTokens: 20000,
 		};
 
-		expect(shouldCompact(89_000, 100_000, settings)).toBe(false);
-		expect(shouldCompact(90_001, 100_000, settings)).toBe(true);
+		expect(shouldCompact(69_000, 100_000, settings)).toBe(false);
+		expect(shouldCompact(70_001, 100_000, settings)).toBe(true);
 	});
 
 	it("should use legacy reserve behavior when threshold is set to default sentinel", () => {

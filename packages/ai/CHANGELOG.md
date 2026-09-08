@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed local input-limit rejections failing to trigger context-overflow recovery.
+
 ## [18.1.12] - 2026-09-06
 
 ### Added

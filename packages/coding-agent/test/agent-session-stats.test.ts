@@ -6,6 +6,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { SessionStatsTracker } from "@oh-my-pi/pi-coding-agent/session/session-stats";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 describe("AgentSession session stats", () => {
@@ -175,6 +176,50 @@ describe("AgentSession session stats", () => {
 		});
 		expect(stats.contextUsage).toEqual(directUsage);
 	});
+
+	it.each([
+		["billable input and output", {}, 206_000],
+		["explicit context occupancy", { contextTokens: 204_000 }, 204_000],
+		["provider orchestration excluded", { orchestration: { input: 2_000, output: 1_000 } }, 203_000],
+		["orchestration exceeding output", { orchestration: { input: 10_000, output: 3_000 } }, 193_000],
+	] satisfies Array<[string, Partial<Usage>, number]>)(
+		"projects admission occupancy with %s and applies history rewrite savings once",
+		(_name, usageOverride, expected) => {
+			const target = model();
+			const manager = SessionManager.inMemory();
+			manager.appendMessage({ role: "user", content: "Earlier request", timestamp: 1 });
+			manager.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "Earlier answer" }],
+				api: target.api,
+				provider: target.provider,
+				model: target.id,
+				stopReason: "stop",
+				timestamp: 2,
+				usage: {
+					input: 200_000,
+					output: 6_000,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 206_000,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					...usageOverride,
+				},
+			});
+			session = createStatsSession(manager, target);
+			const tracker = new SessionStatsTracker({
+				session,
+				agent: session.agent,
+				sessionManager: manager,
+				modelRegistry,
+				model: () => target,
+				sessionId: () => manager.getSessionId(),
+			});
+			expect(tracker.getContextBreakdown({ includeAssistantOutput: true })?.usedTokens).toBe(expected);
+			tracker.recordAnchoredHistoryRewrite(10_000);
+			expect(tracker.getContextBreakdown({ includeAssistantOutput: true })?.usedTokens).toBe(expected - 10_000);
+		},
+	);
 
 	it("treats persisted assistant messages without usage as zero-cost history", async () => {
 		const model = modelRegistry.getAll().find(candidate => candidate.contextWindow && candidate.contextWindow > 0);

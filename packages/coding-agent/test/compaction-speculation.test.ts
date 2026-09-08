@@ -392,6 +392,35 @@ describe("async speculative compaction", () => {
 		expect(compactSpy).not.toHaveBeenCalled();
 	});
 
+	it("stops an in-flight speculation from spending the configured input reserve", async () => {
+		model = { ...defaultModel, contextWindow: 272_384, maxTokens: 65_536 };
+		maintenance = createMaintenance();
+		maintenanceSettings.override("compaction.thresholdPercent", -1);
+		maintenanceSettings.override("compaction.reserveTokens", 65_536);
+		const pending = Promise.withResolvers<compactionModule.CompactionResult>();
+		const started = Promise.withResolvers<void>();
+		vi.spyOn(compactionModule, "compact").mockImplementation(() => {
+			started.resolve();
+			return pending.promise;
+		});
+
+		try {
+			maintenance.maybeStartSpeculativeCompaction(190_000, 272_384);
+			await started.promise;
+			expect(maintenance.speculationState).toBe("running");
+			expect(maintenance.deferThresholdCompactionToSpeculation(206_848, 272_384)).toBe(false);
+			expect(maintenance.deferThresholdCompactionToSpeculation(207_301, 272_384)).toBe(false);
+			expect(maintenance.speculationState).toBe("running");
+		} finally {
+			maintenance.cancelSpeculation();
+			pending.resolve({
+				summary: "discarded speculation",
+				firstKeptEntryId: sessionManager.getLeafId()!,
+				tokensBefore: 190_000,
+			});
+		}
+	});
+
 	it("never defers when async compaction is disabled or a local method leads", () => {
 		maintenance = createMaintenance({ asyncEnabled: false });
 		expect(maintenance.deferThresholdCompactionToSpeculation(THRESHOLD + 1, CONTEXT_WINDOW)).toBe(false);

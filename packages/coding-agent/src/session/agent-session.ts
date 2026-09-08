@@ -710,6 +710,8 @@ export class AgentSession {
 	#usagePreflightReadyModel: Model | undefined;
 	#detachUsageBeforeQueueDequeue: (() => void) | undefined;
 	#detachUsageBeforeModelCall: (() => void) | undefined;
+	#detachContextBudgetGate: (() => void) | undefined;
+	#contextBudgetRefusal: string | undefined;
 
 	#transformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	#onPayload: SimpleStreamOptions["onPayload"] | undefined;
@@ -1814,7 +1816,7 @@ export class AgentSession {
 			resetAdvisorRuntimes: (reason?: string) => this.#advisors.resetAllRuntimes(reason),
 			rebaseAfterCompaction: () => this.#stats.rebaseAfterCompaction(),
 			recordAnchoredHistoryRewrite: tokensRemoved => this.#stats.recordAnchoredHistoryRewrite(tokensRemoved),
-			getContextBreakdown: options => this.getContextBreakdown(options),
+			getContextBreakdown: options => this.#stats.getContextBreakdown(options),
 			getContextUsage: options => this.getContextUsage(options),
 			shake: (mode, options) => this.shake(mode, options),
 			dropImages: () => this.dropImages(),
@@ -1831,6 +1833,16 @@ export class AgentSession {
 			abortHandoff: () => this.abortHandoff(),
 		};
 		this.#maintenance = new SessionMaintenance(maintenanceHost);
+		this.#detachContextBudgetGate = this.agent.addBeforeModelCall((context, signal, model) => {
+			const result = this.#maintenance.checkContextBudgetBeforeModelCall(context, signal, model);
+			if (result?.stop && result.reason) {
+				this.#contextBudgetRefusal = result.reason;
+				// A deliberate refusal is a terminal failure, not a silent scheduling
+				// pause. The loop's existing exception path balances its error turn.
+				throw new Error(result.reason);
+			}
+			return result;
+		});
 
 		const handoffHost: SessionHandoffHost = {
 			agent: this.agent,
@@ -3241,6 +3253,17 @@ export class AgentSession {
 				.find((message): message is AssistantMessage => message.role === "assistant");
 			const msg = this.#lastAssistantMessage ?? fallbackAssistant;
 			this.#lastAssistantMessage = undefined;
+			const budgetRefusal = this.#contextBudgetRefusal;
+			this.#contextBudgetRefusal = undefined;
+			if (budgetRefusal) {
+				this.#lastSuccessfulYieldToolCallId = undefined;
+				// Maintenance already had its opportunity before preparation. Do not
+				// retry or recompact an unchanged request after the final backstop.
+				if (msg) await this.#recovery.persistTerminalEmptyErrorTurn(msg);
+				await this.#recovery.settleRetryWithoutContinuation(budgetRefusal);
+				await emitAgentEndNotification();
+				return;
+			}
 			if (!msg) {
 				this.#lastSuccessfulYieldToolCallId = undefined;
 				logger.debug("agent_end maintenance routing", {
@@ -4452,6 +4475,8 @@ export class AgentSession {
 		this.#detachUsageBeforeQueueDequeue = undefined;
 		this.#detachUsageBeforeModelCall?.();
 		this.#detachUsageBeforeModelCall = undefined;
+		this.#detachContextBudgetGate?.();
+		this.#detachContextBudgetGate = undefined;
 		this.#memory.cancelLocalMemoryStartup();
 		this.#titleGenerationAbortController.abort();
 		this.#abortAutolearnCapture();
