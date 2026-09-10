@@ -10,6 +10,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type { GoalModeState } from "@oh-my-pi/pi-coding-agent/goals/state";
+import { runPrintMode } from "@oh-my-pi/pi-coding-agent/modes/print-mode";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
@@ -35,13 +36,13 @@ function activeGoalState(): GoalModeState {
 	};
 }
 
-function highUsage(input: number) {
+function highUsage(input: number, output = 100) {
 	return {
 		input,
-		output: 100,
+		output,
 		cacheRead: 0,
 		cacheWrite: 0,
-		totalTokens: input + 100,
+		totalTokens: input + output,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
 }
@@ -94,9 +95,15 @@ describe("AgentSession mid-run threshold compaction", () => {
 		options: {
 			extensionRunner?: ExtensionRunner;
 			firstTurnUsageInput?: number;
+			firstTurnUsageOutput?: number;
+			contextWindow?: number;
+			providerErrorAt?: number;
+			providerErrorStatus?: 400 | 503;
+			withHistory?: boolean;
 			onProviderCall?: (index: number) => void;
 			onToolExecute?: () => void;
 			configureAgent?: (agent: Agent) => void;
+			transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
 			toolOutput?: string;
 			toolResultDetails?: unknown;
 		} = {},
@@ -106,8 +113,9 @@ describe("AgentSession mid-run threshold compaction", () => {
 		sessionManager: SessionManager;
 	}> {
 		const observedContexts: string[][] = [];
-		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
-		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!bundled) throw new Error("Expected claude-sonnet-4-5 model to exist");
+		const model = { ...bundled, contextWindow: options.contextWindow ?? bundled.contextWindow };
 
 		const modelRegistry = sharedModelRegistry;
 		const settings = Settings.isolated({
@@ -124,6 +132,23 @@ describe("AgentSession mid-run threshold compaction", () => {
 			...settingsOverride,
 		});
 		const sessionManager = SessionManager.inMemory(tempDir.path());
+		if (options.withHistory) {
+			sessionManager.appendMessage({
+				role: "user",
+				content: "Earlier completed request ".repeat(100),
+				timestamp: Date.now(),
+			});
+			sessionManager.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "Earlier completed response ".repeat(100) }],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: highUsage(100, 20),
+				stopReason: "stop",
+				timestamp: Date.now(),
+			});
+		}
 
 		const mockBashTool: AgentTool = {
 			name: "bash",
@@ -142,40 +167,67 @@ describe("AgentSession mid-run threshold compaction", () => {
 		let call = 0;
 		const agent = new Agent({
 			getApiKey: () => "test-key",
-			initialState: { model, systemPrompt: ["Test"], tools: [mockBashTool], messages: [] },
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [mockBashTool],
+				messages: sessionManager.buildSessionContext().messages,
+			},
 			convertToLlm,
+			transformContext: options.transformContext,
 			streamFn: (_model, context) => {
 				const index = call++;
 				options.onProviderCall?.(index);
 				observedContexts.push(context.messages.map(message => JSON.stringify(message)));
 				const stream = new AssistantMessageEventStream();
 				const isToolTurn = index === 0;
-				const message = isToolTurn
-					? {
-							role: "assistant" as const,
-							content: [
-								{ type: "toolCall" as const, id: `tc-${index}`, name: "bash", arguments: { cmd: "pwd" } },
-							],
-							api: "anthropic-messages" as const,
-							provider: "anthropic" as const,
-							model: "claude-sonnet-4-5",
-							usage: highUsage(options.firstTurnUsageInput ?? 50_000),
-							stopReason: "toolUse" as const,
-							timestamp: Date.now(),
-						}
-					: {
-							role: "assistant" as const,
-							content: [{ type: "text" as const, text: "All done." }],
-							api: "anthropic-messages" as const,
-							provider: "anthropic" as const,
-							model: "claude-sonnet-4-5",
-							usage: highUsage(200),
-							stopReason: "stop" as const,
-							timestamp: Date.now(),
-						};
+				const message =
+					options.providerErrorAt === index
+						? {
+								role: "assistant" as const,
+								content: [],
+								api: "anthropic-messages" as const,
+								provider: "anthropic" as const,
+								model: "claude-sonnet-4-5",
+								usage: highUsage(0, 0),
+								stopReason: "error" as const,
+								errorStatus: options.providerErrorStatus ?? 400,
+								errorMessage:
+									options.providerErrorStatus === 503
+										? "503 service unavailable: overloaded_error"
+										: "400 litellm.BadRequestError: OpenAIException - rendered input exceeds configured limit. Received Model Group=deepseek-v4-flash-vision-exp Available Model Group Fallbacks=None",
+								timestamp: Date.now(),
+							}
+						: isToolTurn
+							? {
+									role: "assistant" as const,
+									content: [
+										{ type: "toolCall" as const, id: `tc-${index}`, name: "bash", arguments: { cmd: "pwd" } },
+									],
+									api: "anthropic-messages" as const,
+									provider: "anthropic" as const,
+									model: "claude-sonnet-4-5",
+									usage: highUsage(options.firstTurnUsageInput ?? 50_000, options.firstTurnUsageOutput),
+									stopReason: "toolUse" as const,
+									timestamp: Date.now(),
+								}
+							: {
+									role: "assistant" as const,
+									content: [{ type: "text" as const, text: "All done." }],
+									api: "anthropic-messages" as const,
+									provider: "anthropic" as const,
+									model: "claude-sonnet-4-5",
+									usage: highUsage(200),
+									stopReason: "stop" as const,
+									timestamp: Date.now(),
+								};
 				queueMicrotask(() => {
 					stream.push({ type: "start", partial: message });
-					stream.push({ type: "done", reason: message.stopReason, message });
+					if (message.stopReason === "error") {
+						stream.push({ type: "error", reason: "error", error: message });
+					} else {
+						stream.push({ type: "done", reason: message.stopReason, message });
+					}
 				});
 				return stream;
 			},
@@ -244,6 +296,297 @@ describe("AgentSession mid-run threshold compaction", () => {
 		expect(runAutoSpy.mock.invocationCallOrder[0]).toBeLessThan(onProviderCall.mock.invocationCallOrder[1]);
 		expect(await runAutoSpy.mock.results[0]?.value).toMatchObject({ historyRewritten: true });
 		expect(observedContexts[1].join("\n")).not.toContain(toolOutput);
+	});
+
+	it("compacts before sending when the prior response already filled the reserved input budget", async () => {
+		const { session, observedContexts } = await createHarness(
+			{
+				"compaction.asyncEnabled": true,
+				"compaction.thresholdTokens": -1,
+				"compaction.reserveTokens": 65_536,
+				"compaction.keepRecentTokens": 20_000,
+			},
+			{
+				withHistory: true,
+				contextWindow: 272_384,
+				firstTurnUsageInput: 206_291,
+				firstTurnUsageOutput: 571,
+			},
+		);
+		mockCompaction("RESERVE-SAFE-CONTEXT");
+
+		await session.prompt("continue without spending the output reserve");
+
+		expect(observedContexts).toHaveLength(2);
+		expect(observedContexts[1].some(message => message.includes("RESERVE-SAFE-CONTEXT"))).toBe(true);
+	});
+
+	it("compacts and transparently retries the input-only gate rejection with no usage data", async () => {
+		const retry = Promise.withResolvers<void>();
+		const { session, observedContexts } = await createHarness(
+			{ "compaction.thresholdTokens": 100_000, "compaction.keepRecentTokens": 50 },
+			{
+				withHistory: true,
+				firstTurnUsageInput: 200,
+				providerErrorAt: 1,
+				onProviderCall: index => {
+					if (index === 2) retry.resolve();
+				},
+			},
+		);
+		mockCompaction("GATE-OVERFLOW-RECOVERED");
+
+		await session.prompt("recover this request if the proxy rejects its input");
+
+		expect(
+			await raceWithTimeout(
+				retry.promise.then(() => true),
+				3_000,
+				false,
+			),
+		).toBe(true);
+		expect(observedContexts).toHaveLength(3);
+		expect(observedContexts[2].join("\n")).toContain("GATE-OVERFLOW-RECOVERED");
+	});
+
+	it("warns once and stops a still-oversized tool turn after ineffective maintenance", async () => {
+		const { session, observedContexts } = await createHarness(
+			{
+				"compaction.thresholdTokens": -1,
+				"compaction.reserveTokens": 65_536,
+			},
+			{
+				contextWindow: 272_384,
+				firstTurnUsageInput: 206_291,
+				firstTurnUsageOutput: 571,
+				toolOutput: "trailing tool data ".repeat(200),
+			},
+		);
+		const maintenanceSpy = vi.spyOn(SessionMaintenance.prototype, "runAutoCompaction").mockResolvedValue({
+			deferredHandoff: false,
+			continuationScheduled: false,
+			automaticContinuationBlocked: true,
+		});
+		const notices: string[] = [];
+		session.subscribe(event => {
+			if (event.type === "notice" && event.level === "warning" && event.source === "compaction") {
+				notices.push(event.message);
+			}
+		});
+
+		await session.prompt("do not resend an input that maintenance could not reduce");
+
+		expect(observedContexts).toHaveLength(1);
+		expect(notices).toHaveLength(1);
+		expect(maintenanceSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("checks pending input against a switched model and removes its gate on disposal", async () => {
+		const { session, observedContexts } = await createHarness(
+			{ "compaction.midTurnEnabled": false, "compaction.reserveTokens": 1_000 },
+			{
+				contextWindow: 100_000,
+				configureAgent: agent => {
+					agent.addBeforeModelCallHook(() => {
+						const model = agent.state.model;
+						if (model) agent.setModel({ ...model, contextWindow: 4_096 });
+					});
+				},
+				transformContext: async messages => [
+					...messages,
+					{ role: "user", content: "pending ".repeat(10_000), timestamp: Date.now() },
+				],
+			},
+		);
+
+		await session.prompt("small original prompt");
+		expect(observedContexts).toHaveLength(0);
+		await session.dispose();
+
+		await session.agent.prompt("the detached session must no longer gate this agent");
+		expect(observedContexts).toHaveLength(2);
+	});
+
+	it("counts fresh pending input once when it fits the usable budget", async () => {
+		const { session, observedContexts } = await createHarness(
+			{
+				"compaction.midTurnEnabled": false,
+				"compaction.thresholdTokens": -1,
+				"compaction.reserveTokens": 1_000,
+			},
+			{ contextWindow: 4_096, firstTurnUsageInput: 100 },
+		);
+		await session.prompt("pending ".repeat(1_000));
+		expect(observedContexts).toHaveLength(2);
+		expect(session.getLastAssistantMessage()?.stopReason).toBe("stop");
+	});
+
+	it("refuses incident occupancy even when mid-turn maintenance is disabled", async () => {
+		const { session, observedContexts } = await createHarness(
+			{
+				"compaction.midTurnEnabled": false,
+				"compaction.thresholdTokens": -1,
+				"compaction.reserveTokens": 65_536,
+			},
+			{ contextWindow: 272_384, firstTurnUsageInput: 206_291, firstTurnUsageOutput: 571, toolOutput: "ok" },
+		);
+		const compactSpy = mockCompaction("must not compact");
+		await session.prompt("continue");
+		expect(observedContexts).toHaveLength(1);
+		expect(compactSpy).not.toHaveBeenCalled();
+		expect(session.getLastAssistantMessage()).toMatchObject({
+			stopReason: "error",
+			errorMessage: expect.stringContaining("206,848-token usable budget"),
+		});
+	});
+
+	it("adds transformed pending input to the provider occupancy floor", async () => {
+		let transforms = 0;
+		const { session, observedContexts } = await createHarness(
+			{
+				"compaction.midTurnEnabled": false,
+				"compaction.thresholdTokens": -1,
+				"compaction.reserveTokens": 65_536,
+			},
+			{
+				contextWindow: 272_384,
+				firstTurnUsageInput: 200_000,
+				firstTurnUsageOutput: 100,
+				transformContext: async messages =>
+					++transforms === 1
+						? messages
+						: [...messages, { role: "user", content: "pending ".repeat(10_000), timestamp: Date.now() }],
+			},
+		);
+		await session.prompt("continue");
+		expect(observedContexts).toHaveLength(1);
+		expect(session.getLastAssistantMessage()?.stopReason).toBe("error");
+	});
+
+	it("checks the captured model when selection changes during an awaited transform", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let transformSignal: AbortSignal | undefined;
+		const { session, observedContexts } = await createHarness(
+			{ "compaction.midTurnEnabled": false, "compaction.reserveTokens": 1_000 },
+			{
+				contextWindow: 4_096,
+				transformContext: async (messages, signal) => {
+					transformSignal = signal;
+					entered.resolve();
+					await release.promise;
+					return [...messages, { role: "user", content: "pending ".repeat(10_000), timestamp: Date.now() }];
+				},
+			},
+		);
+		const prompt = session.prompt("small request");
+		try {
+			expect(
+				await raceWithTimeout(
+					entered.promise.then(() => true),
+					3_000,
+					false,
+				),
+			).toBe(true);
+			const model = session.model;
+			if (!model) throw new Error("Expected model");
+			await session.setModelTemporary({ ...model, id: "larger-fixture", contextWindow: 100_000 });
+			expect(transformSignal?.aborted).toBe(false);
+			release.resolve();
+			expect(
+				await raceWithTimeout(
+					prompt.then(() => true),
+					3_000,
+					false,
+				),
+			).toBe(true);
+			expect(observedContexts).toHaveLength(0);
+			expect(session.getLastAssistantMessage()).toMatchObject({
+				stopReason: "error",
+				errorMessage: expect.stringContaining("3,096-token usable budget"),
+			});
+		} finally {
+			release.resolve();
+			await session.abort();
+			await prompt;
+		}
+	});
+
+	it("settles automatic retry when oversized steering is refused before dispatch", async () => {
+		const { session, observedContexts } = await createHarness(
+			{
+				"compaction.midTurnEnabled": false,
+				"compaction.reserveTokens": 1_000,
+				"retry.baseDelayMs": 20,
+				"retry.maxDelayMs": 100,
+				"retry.maxRetries": 1,
+				"retry.modelFallback": false,
+			},
+			{ contextWindow: 4_096, providerErrorAt: 0, providerErrorStatus: 503 },
+		);
+		const retryEnds: Array<{ success: boolean; finalError?: string }> = [];
+		let steering: Promise<void> | undefined;
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") steering = session.steer("pending ".repeat(10_000));
+			if (event.type === "auto_retry_end") retryEnds.push(event);
+		});
+		const prompt = session.prompt("start");
+		try {
+			expect(
+				await raceWithTimeout(
+					prompt.then(() => true),
+					3_000,
+					false,
+				),
+			).toBe(true);
+			await steering;
+			expect(observedContexts).toHaveLength(1);
+			expect(retryEnds).toHaveLength(1);
+			expect(retryEnds[0]).toMatchObject({
+				success: false,
+				finalError: expect.stringContaining("usable budget"),
+			});
+			expect(session.getLastAssistantMessage()?.stopReason).toBe("error");
+		} finally {
+			await session.abort();
+			await prompt;
+			await steering;
+		}
+	});
+
+	it.each([false, true])("surfaces text-mode refusal without stale output (history=%s)", async withHistory => {
+		const { session, observedContexts } = await createHarness(
+			{ "compaction.midTurnEnabled": false, "compaction.reserveTokens": 1_000 },
+			{
+				withHistory,
+				contextWindow: 4_096,
+				transformContext: async messages => [
+					...messages,
+					{ role: "user", content: "pending ".repeat(10_000), timestamp: Date.now() },
+				],
+			},
+		);
+		const stderr: string[] = [];
+		const stdout: string[] = [];
+		vi.spyOn(process.stderr, "write").mockImplementation(chunk => {
+			stderr.push(String(chunk));
+			return true;
+		});
+		vi.spyOn(process.stdout, "write").mockImplementation((...args: unknown[]) => {
+			stdout.push(String(args[0]));
+			const callback = args.at(-1);
+			if (typeof callback === "function") callback();
+			return true;
+		});
+		const exit = new Error("captured print-mode exit");
+		const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
+			throw exit;
+		});
+		await expect(runPrintMode(session, { mode: "text", initialMessage: "new request" })).rejects.toBe(exit);
+		expect(exitSpy).toHaveBeenCalledWith(1);
+		expect(stderr.join("")).toContain("3,096-token usable budget");
+		expect(stdout.join("")).toBe("");
+		expect(observedContexts).toHaveLength(0);
 	});
 
 	it("compacts in place between tool-call turns during an active goal run", async () => {

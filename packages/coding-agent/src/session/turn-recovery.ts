@@ -462,15 +462,21 @@ export class TurnRecovery {
 	/** Closes a failed retry saga when no compaction continuation took ownership. */
 	async onErrorSettledWithoutRetry(message: AssistantMessage, compaction: RecoveryCompactionResult): Promise<void> {
 		if (message.stopReason !== "error" || this.#retryAttempt === 0 || compaction.continuationScheduled) return;
+		await this.settleRetryWithoutContinuation(message.errorMessage);
+	}
+
+	/** Close a deliberate terminal stop, including a continuation refused before dispatch. */
+	async settleRetryWithoutContinuation(finalError?: string): Promise<void> {
 		const attempt = this.#retryAttempt;
 		this.#retryAttempt = 0;
-		await this.#host.emitSessionEvent({
-			type: "auto_retry_end",
-			success: false,
-			attempt,
-			finalError: message.errorMessage,
-		});
-		this.#clearPendingRetryErrors();
+		try {
+			if (attempt > 0) {
+				await this.#host.emitSessionEvent({ type: "auto_retry_end", success: false, attempt, finalError });
+			}
+		} finally {
+			this.#clearPendingRetryErrors();
+			this.resolveRetry();
+		}
 	}
 
 	/** Persists an otherwise skipped terminal empty error turn. */

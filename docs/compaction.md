@@ -434,7 +434,10 @@ From `settings-schema.ts`:
 - `compaction.remoteEndpoint` = `undefined`
 - `compaction.remoteStreamingV2Enabled` = `true`
 - `compaction.v2RetainedMessageBudget` = `64000`
-- `compaction.thresholdPercent` = `-1` and `compaction.thresholdTokens` = `-1`; a positive fixed token limit takes precedence over percentage, and otherwise the reserve-based threshold is used.
+- `compaction.thresholdPercent` = `-1` and `compaction.thresholdTokens` = `-1`; a positive fixed token limit takes precedence over percentage, and otherwise the reserve-based threshold is used. Every trigger is capped by the usable-input budget (`contextWindow - effective reserve`).
+- Speculative grace may pass an early threshold only while below both the usable-input budget and the existing grace ceiling. When deferral is no longer safe, maintenance uses a valid armed summary or runs synchronously before the next request is prepared.
+- With automatic compaction enabled, the existing pre-send gate checks the prepared request against its captured model and matching tokenizer. The provider-anchored occupancy includes completed output and pending-input growth, while honoring explicit occupancy reports and history rewrites. If it still does not fit, the session stops with an actionable error without sending or restarting automatic retries; reduce pending input, compact, or switch models before continuing.
+- Provider token estimates can still differ. Input-only local gate rejections are treated as context overflow, and ordinary summarization can shrink rejected chunks instead of replaying an unchanged oversized summary request.
 - `compaction.idleEnabled` = `false`
 - `compaction.idleThresholdTokens` = `200000`
 - `compaction.idleTimeoutSeconds` = `300`

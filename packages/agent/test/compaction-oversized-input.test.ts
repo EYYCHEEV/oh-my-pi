@@ -124,6 +124,42 @@ describe("summarization input budget", () => {
 		}
 	});
 
+	test("shrinks rejected summary chunks when the gate returns an input-only error with zero usage", async () => {
+		const providerCapChars = 160_000;
+		const rejected: number[] = [];
+		let acceptedCount = 0;
+		const spy = vi
+			.spyOn(ai, "completeSimple")
+			.mockImplementation(async (_model, context): Promise<AssistantMessage> => {
+				const prompt = promptTextOf([_model, context]);
+				if (prompt.length > providerCapChars) {
+					rejected.push(prompt.length);
+					return {
+						...createAssistantMessage(""),
+						content: [],
+						stopReason: "error",
+						errorStatus: 400,
+						errorMessage:
+							"400 litellm.BadRequestError: OpenAIException - rendered input exceeds configured limit. Received Model Group=deepseek-v4-flash-vision-exp",
+					};
+				}
+				return createAssistantMessage(`summary ${++acceptedCount}`);
+			});
+		try {
+			const messages = Array.from({ length: 60 }, (_, index) => turn(index, 4_000)).flat();
+			const summary = await generateSummary(messages, getModel(400_000), 16_384, "test-key");
+
+			expect(rejected.length).toBeGreaterThan(0);
+			expect(rejected.length).toBeLessThan(4);
+			expect(summary).toBe(`summary ${acceptedCount}`);
+			const accepted = spy.mock.calls.map(promptTextOf).filter(prompt => prompt.length <= providerCapChars);
+			expect(accepted[0]).toContain("turn 0");
+			expect(accepted[accepted.length - 1]).toContain("turn 59");
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
 	test("keeps the window floor inside a small model's context", async () => {
 		// The absolute 16,384-token floor plus the carried summary and output
 		// reserves exceeds a 40k window outright, and overflow recovery would then

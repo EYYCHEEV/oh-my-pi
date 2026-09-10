@@ -4,11 +4,14 @@ import { scheduler } from "node:timers/promises";
 import {
 	type Agent,
 	type AgentMessage,
+	type AgentPreModelCallResult,
 	type AgentTurnEndContext,
 	type MessageCountOptions,
 	resolveTelemetry,
 	type StreamFn,
 	type ThinkingLevel,
+	Tokenizer,
+	tokenizerEncodingForModel,
 } from "@oh-my-pi/pi-agent-core";
 import {
 	AGGRESSIVE_SHAKE_CONFIG,
@@ -34,7 +37,7 @@ import {
 	prepareCompaction,
 	RESCUE_SHAKE_CONFIG,
 	remotePreserveReusable,
-	resolveBudgetReserveTokens,
+	resolveUsableInputTokens,
 	resolveThresholdTokens,
 	type ShakeConfig,
 	type ShakeRegion,
@@ -50,7 +53,14 @@ import {
 	readToolSupersedeKey,
 } from "@oh-my-pi/pi-agent-core/compaction/pruning";
 import type { ProtectedToolMatcher } from "@oh-my-pi/pi-agent-core/compaction/tool-protection";
-import type { AssistantMessage, CodexCompactionContext, Message, Model, ProviderSessionState } from "@oh-my-pi/pi-ai";
+import type {
+	AssistantMessage,
+	CodexCompactionContext,
+	Context,
+	Message,
+	Model,
+	ProviderSessionState,
+} from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
@@ -79,7 +89,12 @@ import {
 	resolveMethodSettings,
 	resolveSpeculationMethod,
 } from "./compaction-methods";
-import { assistantTurnProducedOutput, convertToLlm, stripImagesFromMessage } from "./messages";
+import {
+	assistantTurnProducedOutput,
+	convertToLlm,
+	invalidateMessageArrayCache,
+	stripImagesFromMessage,
+} from "./messages";
 import { isTerminalTextAssistantAnswer } from "./queued-messages";
 import {
 	resolveCompactionConfiguredTarget,
@@ -326,6 +341,8 @@ export interface SessionMaintenanceHost {
 	getContextBreakdown(options?: {
 		contextWindow?: number;
 		pendingMessages?: AgentMessage[];
+		includeAssistantOutput?: boolean;
+		tokenizer?: Tokenizer;
 	}): ContextUsageBreakdown | undefined;
 	getContextUsage(options?: { contextWindow?: number }): ContextUsage | undefined;
 	shake(mode: ShakeMode, options?: { config?: ShakeConfig; signal?: AbortSignal }): Promise<ShakeResult>;
@@ -358,6 +375,12 @@ export interface SessionMaintenanceHost {
 
 /** Owns compaction, pruning, shake, promotion, and automatic context maintenance. */
 export class SessionMaintenance {
+	/** Stable adapter for the shared overhead cache; provider contexts themselves remain untouched. */
+	readonly #providerTokenSource: {
+		systemPrompt?: string[];
+		agent: { state: { tools?: Context["tools"] } };
+	} = { agent: { state: {} } };
+
 	#compactionAbortController: AbortController | undefined;
 	/** Resolves after an active manual compaction has reconnected the agent subscription. */
 	#manualCompactionCleanup: Promise<void> | undefined;
@@ -1309,10 +1332,10 @@ export class SessionMaintenance {
 	 * the caller MUST skip its blocking compaction then.
 	 *
 	 * Deferral ends — and the blocking pass resumes — once context grows past
-	 * `threshold + lead`, clamped to keep {@link SPECULATION_LEAD_MIN_TOKENS}
-	 * of headroom below the window. A provider overflow inside the band is
-	 * recovered by the existing overflow path (compact + retry). Never defers
-	 * for local-first method orders (shake/snapcompact are instant), when
+	 * `threshold + lead`, capped by the usable-input budget and the minimum
+	 * window headroom. Speculation must never spend the configured reserve;
+	 * provider tokenization differences still use overflow recovery.
+	 * Never defers for local-first method orders (shake/snapcompact are instant), when
 	 * async compaction is disabled, or when a `session_before_compact`
 	 * extension must keep exact blocking semantics.
 	 */
@@ -1330,6 +1353,7 @@ export class SessionMaintenance {
 		const thresholdTokens = resolveThresholdTokens(contextWindow, settings);
 		const graceCapTokens = Math.min(
 			thresholdTokens + resolveSpeculationLeadTokens(thresholdTokens),
+			resolveUsableInputTokens(contextWindow, settings),
 			contextWindow - SPECULATION_LEAD_MIN_TOKENS,
 		);
 		if (contextTokens >= graceCapTokens) return false;
@@ -1820,6 +1844,7 @@ export class SessionMaintenance {
 		const compactedMessages = this.#host.agent.state.messages;
 		if (compactedMessages !== activeMessages) {
 			activeMessages.splice(0, activeMessages.length, ...compactedMessages);
+			invalidateMessageArrayCache(activeMessages);
 		}
 		logger.debug("Mid-run compaction ran between provider calls", {
 			contextTokens,
@@ -2661,8 +2686,55 @@ export class SessionMaintenance {
 			Math.max(0, (this.#host.getContextUsage({ contextWindow })?.tokens ?? 0) - providerExcludedTokens),
 			Math.max(0, this.#estimateStoredContextTokens() - storedExcludedTokens),
 		);
-		const fitBudget = Math.max(0, contextWindow - resolveBudgetReserveTokens(contextWindow, compactionSettings));
+		const fitBudget = resolveUsableInputTokens(contextWindow, compactionSettings);
 		return residualTokens <= fitBudget;
+	}
+
+	/** Refuse a prepared request that still exceeds the budget after maintenance. Never rewrites history here. */
+	checkContextBudgetBeforeModelCall(
+		context: Context,
+		signal: AbortSignal | undefined,
+		model: Model,
+	): AgentPreModelCallResult {
+		if (signal?.aborted || this.#host.isDisposed()) return { stop: true };
+		const contextWindow = model.contextWindow ?? 0;
+		const settings = this.#host.settings.getGroup("compaction");
+		if (contextWindow <= 0 || !settings.enabled) return;
+
+		const tokenizer =
+			tokenizerEncodingForModel(model) === this.#tokenizer.encoding ? this.#tokenizer : new Tokenizer(model);
+		const source = this.#providerTokenSource;
+		source.systemPrompt = context.systemPrompt;
+		source.agent.state.tools = context.tools;
+		const preparedTokens =
+			computeNonMessageTokens(source, tokenizer) +
+			tokenizer.countMessages(context.messages, { excludeEncryptedReasoning: true });
+		const occupancy = this.#host.getContextBreakdown({
+			contextWindow,
+			includeAssistantOutput: true,
+			tokenizer,
+		});
+		let contextTokens = preparedTokens;
+		if (occupancy?.anchored) {
+			const storedTokens =
+				computeNonMessageTokens(this.#host.nonMessageTokenSource(), tokenizer) +
+				tokenizer.countMessages(this.#host.messages(), { excludeEncryptedReasoning: true });
+			// Add uncommitted prepared growth only to a real provider anchor.
+			// UI pending snapshots already include the pending user input.
+			contextTokens = compactionContextTokens(
+				occupancy.usedTokens + Math.max(0, preparedTokens - storedTokens),
+				preparedTokens,
+			);
+		}
+		const budget = resolveUsableInputTokens(contextWindow, settings);
+		if (contextTokens <= budget) return;
+
+		const reason =
+			`The next request still needs approximately ${contextTokens.toLocaleString("en-US")} input tokens, ` +
+			`above the ${budget.toLocaleString("en-US")}-token usable budget. ` +
+			"Paused before sending; reduce the pending input, compact the conversation, or switch to a larger-context model.";
+		this.#host.emitNotice("warning", reason, "compaction");
+		return { stop: true, reason };
 	}
 
 	/**

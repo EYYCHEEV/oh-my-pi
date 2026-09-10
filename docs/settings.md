@@ -655,6 +655,12 @@ memory:
 | `autolearn.autoContinue`      | boolean | `false`       | When `autolearn.enabled`, auto-run one capture turn at stop (uses extra tokens). Off = a passive reminder rides your next turn.                                                                                                           |
 | `autolearn.minToolCalls`      | number  | `5`           | Only nudge after a turn that used at least this many tools.                                                                                                                                                                               |
 
+Compaction thresholds and speculative grace cannot exceed the usable-input budget: the context window minus the effective reserve.
+An earlier fixed or percentage trigger can still leave room for background compaction, but a later trigger is capped at that budget.
+With automatic compaction enabled, a prepared request that still exceeds the budget stops with an actionable error before sending, including when mid-turn maintenance is disabled or could not reduce the context enough.
+Reduce the pending input, compact the conversation, or switch to a larger-context model before continuing.
+Text mode reports the refusal as a failure rather than printing an earlier answer; automatic retries settle instead of hanging.
+
 `compaction` has additional tuning keys (idle compaction, supersede/drop heuristics) visible in `omp config list`. See [Compaction](./compaction.md) for the full strategy reference.
 
 ### Appearance and terminal

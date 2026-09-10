@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed late compaction thresholds consuming the configured input reserve.
+- Fixed pre-request checks using a different model from the prepared request during asynchronous model switches.
+
 ## [18.1.10] - 2026-09-04
 
 ### Fixed

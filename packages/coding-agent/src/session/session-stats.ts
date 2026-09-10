@@ -1,5 +1,6 @@
-import type { Agent, AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { Agent, AgentMessage, Tokenizer } from "@oh-my-pi/pi-agent-core";
 import {
+	calculateContextTokens,
 	calculatePromptTokens,
 	findTranscriptUsageAnchor,
 	isTranscriptUsageAnchor,
@@ -41,8 +42,10 @@ export interface SessionStatsTrackerHost {
 	sessionId(): string;
 }
 
-function correctedPromptTokens(assistant: AssistantMessage): number {
-	const providerPromptTokens = assistant.contextSnapshot?.promptTokens ?? calculatePromptTokens(assistant.usage);
+function correctedPromptTokens(assistant: AssistantMessage, includeAssistantOutput = false): number {
+	const promptTokens = calculatePromptTokens(assistant.usage);
+	const occupancyAdjustment = includeAssistantOutput ? calculateContextTokens(assistant.usage) - promptTokens : 0;
+	const providerPromptTokens = (assistant.contextSnapshot?.promptTokens ?? promptTokens) + occupancyAdjustment;
 	return Math.max(0, providerPromptTokens - (assistant.contextSnapshot?.historyRewriteTokensRemoved ?? 0));
 }
 
@@ -98,11 +101,12 @@ export class SessionStatsTracker {
 		tailFromIndex: number,
 		activeMessages: readonly AgentMessage[],
 		pendingTokens: number,
+		tokenizer: Tokenizer = this.#tokenizer,
 	): number {
 		return (
 			base +
 			Math.max(0, currentNonMessageTokens - anchorNonMessageTokens) +
-			this.#tokenizer.countMessages(activeMessages.slice(tailFromIndex)) +
+			tokenizer.countMessages(activeMessages.slice(tailFromIndex)) +
 			pendingTokens
 		);
 	}
@@ -199,22 +203,27 @@ export class SessionStatsTracker {
 	getContextBreakdown(options?: {
 		contextWindow?: number;
 		pendingMessages?: AgentMessage[];
+		/** Admission includes completed output and does not reuse UI-only pending snapshots. */
+		includeAssistantOutput?: boolean;
+		/** Match the prepared request even when the selected model changes mid-transform. */
+		tokenizer?: Tokenizer;
 	}): ContextUsageBreakdown | undefined {
+		const tokenizer = options?.tokenizer ?? this.#tokenizer;
 		const rawContextWindow = options?.contextWindow ?? this.#host.model()?.contextWindow ?? 0;
 		const contextWindow = Number.isFinite(rawContextWindow) && rawContextWindow > 0 ? rawContextWindow : 0;
 		const { skillsTokens, toolsTokens, systemContextTokens, systemPromptTokens } = computeNonMessageBreakdown(
 			this.#host.session,
-			this.#tokenizer,
+			tokenizer,
 		);
 		const categoryNonMessageTokens = skillsTokens + toolsTokens + systemContextTokens + systemPromptTokens;
-		const currentNonMessageTokens = computeNonMessageTokens(this.#host.session, this.#tokenizer);
+		const currentNonMessageTokens = computeNonMessageTokens(this.#host.session, tokenizer);
 		const branchEntries = this.#host.sessionManager.getBranch();
 		const latestCompaction = getLatestCompactionEntry(branchEntries);
 		const compactionIndex = latestCompaction ? branchEntries.lastIndexOf(latestCompaction) : -1;
 		let usedTokens = 0;
 		let anchored = false;
 		const pendingMessages = options?.pendingMessages ?? [];
-		const pendingTokens = this.#tokenizer.countMessages(pendingMessages);
+		const pendingTokens = tokenizer.countMessages(pendingMessages);
 		const pending = this.#pendingContextSnapshot;
 
 		let anchorEntry: SessionMessageEntry | undefined;
@@ -228,6 +237,7 @@ export class SessionStatsTracker {
 		const activeMessages = this.#host.agent.state.messages;
 		let anchorIndex = -1;
 		let anchorAssistant: AssistantMessage | undefined;
+		let unpersistedAnchor = false;
 		if (anchorEntry?.message.role === "assistant") {
 			const assistant = anchorEntry.message;
 			anchorAssistant = assistant;
@@ -238,26 +248,47 @@ export class SessionStatsTracker {
 				);
 			}
 		}
+		// Admission cannot wait for the journal: a tool loop may already be
+		// preparing its next call while message_end persistence is still pending.
+		if (options?.includeAssistantOutput) {
+			const liveAnchor = findTranscriptUsageAnchor(activeMessages);
+			if (liveAnchor && liveAnchor.index > anchorIndex) {
+				const entryIndex = branchEntries.findIndex(
+					entry =>
+						entry.type === "message" &&
+						entry.message.role === "assistant" &&
+						(entry.message === liveAnchor.message || entry.message.timestamp === liveAnchor.message.timestamp),
+				);
+				if (entryIndex === -1 || entryIndex > compactionIndex) {
+					anchorAssistant = liveAnchor.message;
+					anchorIndex = liveAnchor.index;
+					unpersistedAnchor = entryIndex === -1;
+				}
+			}
+		}
 
-		const anchorEpoch = anchorAssistant?.contextSnapshot?.compactionEpoch ?? 0;
+		const anchorEpoch =
+			anchorAssistant?.contextSnapshot?.compactionEpoch ?? (unpersistedAnchor ? this.#compactionEpoch : 0);
 		const useAnchor =
 			anchorAssistant !== undefined &&
 			anchorIndex !== -1 &&
-			(!pending || (anchorIndex >= pending.cutoffCount && anchorEpoch >= pending.epoch));
+			(options?.includeAssistantOutput
+				? anchorEpoch >= this.#compactionEpoch
+				: !pending || (anchorIndex >= pending.cutoffCount && anchorEpoch >= pending.epoch));
 		if (useAnchor && anchorAssistant) {
 			const nonMessageTokens =
-				anchorAssistant.contextSnapshot?.nonMessageTokens ??
-				computeNonMessageTokens(this.#host.session, this.#tokenizer);
+				anchorAssistant.contextSnapshot?.nonMessageTokens ?? computeNonMessageTokens(this.#host.session, tokenizer);
 			anchored = true;
 			usedTokens = this.#anchoredUsedTokens(
-				correctedPromptTokens(anchorAssistant),
+				correctedPromptTokens(anchorAssistant, options?.includeAssistantOutput),
 				nonMessageTokens,
 				currentNonMessageTokens,
 				anchorIndex + 1,
 				activeMessages,
 				pendingTokens,
+				tokenizer,
 			);
-		} else if (pending) {
+		} else if (pending && !options?.includeAssistantOutput) {
 			anchored = true;
 			usedTokens = this.#anchoredUsedTokens(
 				pending.promptTokens,
@@ -266,28 +297,30 @@ export class SessionStatsTracker {
 				pending.cutoffCount,
 				activeMessages,
 				pendingTokens,
+				tokenizer,
 			);
 		}
 
-		if (!anchored && !pending && branchEntries.length === 0) {
+		if (!options?.includeAssistantOutput && !anchored && !pending && branchEntries.length === 0) {
 			const liveAnchor = findTranscriptUsageAnchor(activeMessages);
 			if (liveAnchor) {
 				const nonMessageTokens =
 					liveAnchor.message.contextSnapshot?.nonMessageTokens ??
-					computeNonMessageTokens(this.#host.session, this.#tokenizer);
+					computeNonMessageTokens(this.#host.session, tokenizer);
 				usedTokens = this.#anchoredUsedTokens(
-					correctedPromptTokens(liveAnchor.message),
+					correctedPromptTokens(liveAnchor.message, options?.includeAssistantOutput),
 					nonMessageTokens,
 					currentNonMessageTokens,
 					liveAnchor.index + 1,
 					activeMessages,
 					pendingTokens,
+					tokenizer,
 				);
 				anchored = true;
 			}
 		}
 		if (!anchored) {
-			usedTokens = currentNonMessageTokens + this.#tokenizer.countMessages(activeMessages) + pendingTokens;
+			usedTokens = currentNonMessageTokens + tokenizer.countMessages(activeMessages) + pendingTokens;
 		}
 		return {
 			contextWindow,
