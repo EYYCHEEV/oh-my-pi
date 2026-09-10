@@ -1833,14 +1833,20 @@ export class AgentSession {
 			abortHandoff: () => this.abortHandoff(),
 		};
 		this.#maintenance = new SessionMaintenance(maintenanceHost);
-		this.#detachContextBudgetGate = this.agent.addBeforeModelCall((context, signal, model) => {
-			const result = this.#maintenance.checkContextBudgetBeforeModelCall(context, signal, model);
+		this.#detachContextBudgetGate = this.agent.addBeforeModelCall((context, signal, model, sourceMessageTokens) => {
+			const result = this.#maintenance.checkContextBudgetBeforeModelCall(
+				context,
+				signal,
+				model,
+				sourceMessageTokens,
+			);
 			if (result?.stop && result.reason) {
 				this.#contextBudgetRefusal = result.reason;
 				// A deliberate refusal is a terminal failure, not a silent scheduling
 				// pause. The loop's existing exception path balances its error turn.
 				throw new Error(result.reason);
 			}
+			if (result && !result.stop) result.contextSnapshot.compactionEpoch = this.#stats.compactionEpoch;
 			return result;
 		});
 
@@ -2702,6 +2708,7 @@ export class AgentSession {
 					nonMessageTokens:
 						this.#stats.pendingNonMessageTokens ?? computeNonMessageTokens(this, this.agent.tokenizer),
 					compactionEpoch: this.#stats.compactionEpoch,
+					...assistantMsg.contextSnapshot,
 				};
 			}
 		}

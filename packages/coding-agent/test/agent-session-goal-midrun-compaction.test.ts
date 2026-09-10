@@ -97,6 +97,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 			firstTurnUsageInput?: number;
 			firstTurnUsageOutput?: number;
 			contextWindow?: number;
+			intentTracing?: boolean;
 			providerErrorAt?: number;
 			providerErrorStatus?: 400 | 503;
 			withHistory?: boolean;
@@ -167,6 +168,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 		let call = 0;
 		const agent = new Agent({
 			getApiKey: () => "test-key",
+			intentTracing: options.intentTracing,
 			initialState: {
 				model,
 				systemPrompt: ["Test"],
@@ -321,6 +323,52 @@ describe("AgentSession mid-run threshold compaction", () => {
 		expect(observedContexts[1].some(message => message.includes("RESERVE-SAFE-CONTEXT"))).toBe(true);
 	});
 
+	it("does not count unchanged normalized tool schemas twice near the input budget", async () => {
+		const { session, observedContexts } = await createHarness(
+			{
+				"compaction.thresholdTokens": -1,
+				"compaction.reserveTokens": 65_536,
+			},
+			{
+				contextWindow: 272_384,
+				firstTurnUsageInput: 206_738,
+				firstTurnUsageOutput: 100,
+				intentTracing: true,
+				toolOutput: "ok",
+			},
+		);
+		const compactSpy = mockCompaction("must not compact");
+
+		await session.prompt("continue with the same tool schema");
+
+		expect(observedContexts).toHaveLength(2);
+		expect(session.getLastAssistantMessage()?.stopReason).toBe("stop");
+		expect(compactSpy).not.toHaveBeenCalled();
+	});
+
+	it("charges growth when a previously shrinking transform stops removing history", async () => {
+		let transforms = 0;
+		const { session, observedContexts } = await createHarness(
+			{ "compaction.thresholdTokens": -1, "compaction.reserveTokens": 65_536 },
+			{
+				withHistory: true,
+				contextWindow: 272_384,
+				firstTurnUsageInput: 206_738,
+				firstTurnUsageOutput: 100,
+				toolOutput: "ok",
+				transformContext: async messages => (transforms++ === 0 ? messages.slice(-1) : messages),
+			},
+		);
+
+		await session.prompt("keep the transform growth inside the budget");
+
+		expect(observedContexts).toHaveLength(1);
+		expect(session.getLastAssistantMessage()).toMatchObject({
+			stopReason: "error",
+			errorMessage: expect.stringContaining("usable budget"),
+		});
+	});
+
 	it("compacts and transparently retries the input-only gate rejection with no usage data", async () => {
 		const retry = Promise.withResolvers<void>();
 		const { session, observedContexts } = await createHarness(
@@ -440,8 +488,37 @@ describe("AgentSession mid-run threshold compaction", () => {
 		});
 	});
 
-	it("adds transformed pending input to the provider occupancy floor", async () => {
+	it.each([false, true])(
+		"charges transformed growth after a larger deferred first prompt (in-place=%s)",
+		async inPlace => {
+			let transforms = 0;
+			const { session, observedContexts } = await createHarness(
+				{
+					"compaction.midTurnEnabled": false,
+					"compaction.thresholdTokens": -1,
+					"compaction.reserveTokens": 65_536,
+				},
+				{
+					contextWindow: 272_384,
+					firstTurnUsageInput: 206_698,
+					firstTurnUsageOutput: 100,
+					transformContext: async messages => {
+						if (++transforms === 1) return messages;
+						const transformed = inPlace ? messages : [...messages];
+						transformed.push({ role: "user", content: "x".repeat(400), timestamp: Date.now() });
+						return transformed;
+					},
+				},
+			);
+			await session.prompt("x".repeat(4_000));
+			expect(observedContexts).toHaveLength(1);
+			expect(session.getLastAssistantMessage()?.stopReason).toBe("error");
+		},
+	);
+
+	it("keeps one-shot in-place transform additions request-local without recharging them", async () => {
 		let transforms = 0;
+		const injectedText = "x".repeat(400);
 		const { session, observedContexts } = await createHarness(
 			{
 				"compaction.midTurnEnabled": false,
@@ -450,17 +527,23 @@ describe("AgentSession mid-run threshold compaction", () => {
 			},
 			{
 				contextWindow: 272_384,
-				firstTurnUsageInput: 200_000,
+				firstTurnUsageInput: 206_698,
 				firstTurnUsageOutput: 100,
-				transformContext: async messages =>
-					++transforms === 1
-						? messages
-						: [...messages, { role: "user", content: "pending ".repeat(10_000), timestamp: Date.now() }],
+				transformContext: async messages => {
+					if (++transforms === 1) {
+						messages.push({ role: "user", content: injectedText, timestamp: Date.now() });
+					}
+					return messages;
+				},
 			},
 		);
-		await session.prompt("continue");
-		expect(observedContexts).toHaveLength(1);
-		expect(session.getLastAssistantMessage()?.stopReason).toBe("error");
+
+		await session.prompt("continue with the retained input");
+
+		expect(observedContexts).toHaveLength(2);
+		expect(session.getLastAssistantMessage()?.stopReason).toBe("stop");
+		expect(observedContexts[0].some(message => message.includes(injectedText))).toBe(true);
+		expect(observedContexts[1].some(message => message.includes(injectedText))).toBe(false);
 	});
 
 	it("checks the captured model when selection changes during an awaited transform", async () => {
@@ -601,7 +684,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 		expect(observedContexts[1].join("\n")).toContain("ACTIVE-GOAL-MID-RUN-COMPACTED");
 	});
 
-	it("does not wait for message persistence below the mid-run threshold", async () => {
+	it("uses request-local schema accounting before delayed message persistence", async () => {
 		const releaseMessageEnd = Promise.withResolvers<void>();
 		const messageEndEntered = Promise.withResolvers<void>();
 		const nextProviderCall = Promise.withResolvers<void>();
@@ -620,9 +703,14 @@ describe("AgentSession mid-run threshold compaction", () => {
 			}),
 		} as unknown as ExtensionRunner;
 		const { session } = await createHarness(
-			{ "compaction.thresholdTokens": 100_000 },
+			{ "compaction.thresholdTokens": -1, "compaction.reserveTokens": 65_536 },
 			{
 				extensionRunner,
+				contextWindow: 272_384,
+				firstTurnUsageInput: 206_738,
+				firstTurnUsageOutput: 100,
+				intentTracing: true,
+				toolOutput: "ok",
 				onProviderCall: index => {
 					if (index === 1) nextProviderCall.resolve();
 				},

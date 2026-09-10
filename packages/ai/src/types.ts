@@ -970,6 +970,13 @@ export type AssistantRetryRecovery =
 export interface ContextSnapshot {
 	promptTokens: number; // authoritative provider prompt/input tokens
 	nonMessageTokens: number; // estimated non-message total at send time
+	/** Signed local prepared-minus-complete-source token difference for this provider request. */
+	preparedContext?: {
+		tokenDelta: number;
+		provider: string;
+		model: string;
+		tokenizer: string | null;
+	};
 	/** Estimated prompt tokens removed by local history rewrites after this provider snapshot was recorded. */
 	historyRewriteTokensRemoved?: number;
 	/**

@@ -8,6 +8,7 @@ import {
 	type ComputerAction,
 	type ComputerSafetyCheck,
 	type Context,
+	type ContextSnapshot,
 	EventStream,
 	isApiKeyResolver,
 	type Model,
@@ -48,6 +49,7 @@ import {
 } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import { logger, sanitizeText, structuredCloneJSON } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
+import { calculatePromptTokens } from "./compaction/compaction";
 import { agentPauseGate } from "./pause";
 import { type AgentRunCoverage, type AgentRunSummary, ToolCallBlockedError } from "./run-collector";
 import {
@@ -66,6 +68,7 @@ import {
 	startExecuteToolSpan,
 	startInvokeAgentSpan,
 } from "./telemetry";
+import { Tokenizer, tokenizerEncodingForModel } from "./tokenizer";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -394,6 +397,14 @@ function snapshotAssistantMessage(message: AssistantMessage): AssistantMessage {
 			...message.usage,
 			cost: { ...message.usage.cost },
 		},
+		contextSnapshot: message.contextSnapshot
+			? {
+					...message.contextSnapshot,
+					preparedContext: message.contextSnapshot.preparedContext
+						? { ...message.contextSnapshot.preparedContext }
+						: undefined,
+				}
+			: undefined,
 		disabledFeatures: message.disabledFeatures ? [...message.disabledFeatures] : undefined,
 		toolCallAbortMessages: message.toolCallAbortMessages ? { ...message.toolCallAbortMessages } : undefined,
 	};
@@ -1205,8 +1216,12 @@ async function runLoopBody(
 
 					preparedProviderCall = await prepareProviderCall(currentContext, config, signal);
 					gateResult =
-						(await config.beforeModelCall?.(preparedProviderCall.context, signal, preparedProviderCall.model)) ||
-						undefined;
+						(await config.beforeModelCall?.(
+							preparedProviderCall.context,
+							signal,
+							preparedProviderCall.model,
+							preparedProviderCall.sourceMessageTokens,
+						)) || undefined;
 				} catch (error) {
 					if (!turnOpen) {
 						stream.push({ type: "turn_start" });
@@ -1262,6 +1277,7 @@ async function runLoopBody(
 					turnOpen = true;
 				}
 
+				preparedProviderCall.contextSnapshot = gateResult?.contextSnapshot;
 				// Stream assistant response
 				let recovered: HarmonyRecoveredToolCall | undefined;
 				let message: AssistantMessage;
@@ -1600,6 +1616,8 @@ interface PreparedProviderCall {
 	context: Context;
 	promptToolWireTools: Context["tools"];
 	ownedDialect: Dialect | undefined;
+	contextSnapshot?: Omit<ContextSnapshot, "promptTokens">;
+	sourceMessageTokens?: number;
 }
 
 async function prepareProviderCall(
@@ -1608,9 +1626,17 @@ async function prepareProviderCall(
 	signal: AbortSignal | undefined,
 ): Promise<PreparedProviderCall> {
 	const model = config.getModel?.() ?? config.model;
+	let sourceMessageTokens: number | undefined;
+	if (config.beforeModelCall) {
+		const sharedTokenizer = config.getTokenizer?.();
+		const tokenizer =
+			sharedTokenizer?.encoding === tokenizerEncodingForModel(model) ? sharedTokenizer : new Tokenizer(model);
+		sourceMessageTokens = tokenizer.countMessages(context.messages, { excludeEncryptedReasoning: true });
+	}
 	let messages = context.messages;
 	if (config.transformContext) {
-		messages = await config.transformContext(messages, signal);
+		// Transform-only additions/removals must not become unjournaled loop history.
+		messages = await config.transformContext(messages.slice(), signal);
 	}
 
 	const llmMessages = await config.convertToLlm(messages);
@@ -1648,7 +1674,7 @@ async function prepareProviderCall(
 			tools: undefined,
 		};
 	}
-	return { model, context: llmContext, promptToolWireTools, ownedDialect };
+	return { model, context: llmContext, promptToolWireTools, ownedDialect, sourceMessageTokens };
 }
 
 /**
@@ -1883,6 +1909,16 @@ async function streamAssistantResponse(
 						// dispatch — so a single mutation is the source of truth for all three.
 						if (config.transformAssistantMessage) {
 							await config.transformAssistantMessage(finalMessage, requestSignal);
+						}
+						if (
+							providerCall.contextSnapshot &&
+							finalMessage.stopReason !== "error" &&
+							finalMessage.stopReason !== "aborted"
+						) {
+							finalMessage.contextSnapshot = {
+								...providerCall.contextSnapshot,
+								promptTokens: calculatePromptTokens(finalMessage.usage),
+							};
 						}
 						// Prepare tool dispatch (validation + the `beforeToolCall` hook)
 						// BEFORE the message is snapshotted for consumers: a hook args

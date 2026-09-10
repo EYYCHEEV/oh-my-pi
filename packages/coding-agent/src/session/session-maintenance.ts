@@ -343,6 +343,8 @@ export interface SessionMaintenanceHost {
 		pendingMessages?: AgentMessage[];
 		includeAssistantOutput?: boolean;
 		tokenizer?: Tokenizer;
+		preparedTokenDelta?: number;
+		model?: Model;
 	}): ContextUsageBreakdown | undefined;
 	getContextUsage(options?: { contextWindow?: number }): ContextUsage | undefined;
 	shake(mode: ShakeMode, options?: { config?: ShakeConfig; signal?: AbortSignal }): Promise<ShakeResult>;
@@ -1759,14 +1761,9 @@ export class SessionMaintenance {
 		const providerReportedContextTokens = hasContextTokenUsage(lastAssistant.usage)
 			? calculateContextTokens(lastAssistant.usage)
 			: 0;
-		let projectedProviderContextTokens = providerReportedContextTokens;
-		if (providerReportedContextTokens > 0) {
-			for (let index = lastAssistantIndex + 1; index < activeMessages.length; index++) {
-				projectedProviderContextTokens += this.#tokenizer.countMessage(activeMessages[index]!);
-			}
-		}
+		const occupancy = this.#host.getContextBreakdown({ contextWindow, includeAssistantOutput: true });
 		const storedContextTokens = this.#estimateStoredContextTokens();
-		const contextTokens = compactionContextTokens(projectedProviderContextTokens, storedContextTokens);
+		const contextTokens = compactionContextTokens(occupancy?.usedTokens ?? 0, storedContextTokens);
 		// Never defer the first boundary that crosses the threshold on messages
 		// appended after the provider's usage anchor. The next request would carry
 		// those unreported tool results before speculation can protect it.
@@ -2695,6 +2692,7 @@ export class SessionMaintenance {
 		context: Context,
 		signal: AbortSignal | undefined,
 		model: Model,
+		sourceMessageTokens?: number,
 	): AgentPreModelCallResult {
 		if (signal?.aborted || this.#host.isDisposed()) return { stop: true };
 		const contextWindow = model.contextWindow ?? 0;
@@ -2709,25 +2707,40 @@ export class SessionMaintenance {
 		const preparedTokens =
 			computeNonMessageTokens(source, tokenizer) +
 			tokenizer.countMessages(context.messages, { excludeEncryptedReasoning: true });
+		const nonMessageTokens = computeNonMessageTokens(this.#host.nonMessageTokenSource(), tokenizer);
+		const storedMessageTokens = tokenizer.countMessages(this.#host.messages(), { excludeEncryptedReasoning: true });
+		const completeSourceMessageTokens = sourceMessageTokens ?? storedMessageTokens;
+		const preparedTokenDelta = preparedTokens - nonMessageTokens - completeSourceMessageTokens;
+		// Deferred prompts/steering are unsent source input, not reusable formatting overhead.
+		const pendingSourceTokens = Math.max(0, completeSourceMessageTokens - storedMessageTokens);
 		const occupancy = this.#host.getContextBreakdown({
 			contextWindow,
 			includeAssistantOutput: true,
 			tokenizer,
+			preparedTokenDelta,
+			model,
 		});
-		let contextTokens = preparedTokens;
-		if (occupancy?.anchored) {
-			const storedTokens =
-				computeNonMessageTokens(this.#host.nonMessageTokenSource(), tokenizer) +
-				tokenizer.countMessages(this.#host.messages(), { excludeEncryptedReasoning: true });
-			// Add uncommitted prepared growth only to a real provider anchor.
-			// UI pending snapshots already include the pending user input.
-			contextTokens = compactionContextTokens(
-				occupancy.usedTokens + Math.max(0, preparedTokens - storedTokens),
-				preparedTokens,
-			);
-		}
+		const contextTokens = compactionContextTokens(
+			occupancy?.anchored ? occupancy.usedTokens + pendingSourceTokens : 0,
+			preparedTokens,
+		);
 		const budget = resolveUsableInputTokens(contextWindow, settings);
-		if (contextTokens <= budget) return;
+		if (contextTokens <= budget) {
+			return {
+				contextSnapshot: {
+					nonMessageTokens,
+					preparedContext:
+						sourceMessageTokens === undefined
+							? undefined
+							: {
+									tokenDelta: preparedTokenDelta,
+									provider: model.provider,
+									model: model.id,
+									tokenizer: tokenizer.encoding,
+								},
+				},
+			};
+		}
 
 		const reason =
 			`The next request still needs approximately ${contextTokens.toLocaleString("en-US")} input tokens, ` +

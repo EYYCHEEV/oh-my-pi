@@ -108,6 +108,7 @@ export interface AgentOptions {
 	/**
 	 * Optional transform applied to context before convertToLlm.
 	 * Use for context pruning, injecting external context, etc.
+	 * Receives a request-local array; return new message objects when changing content.
 	 */
 	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
 
@@ -1444,16 +1445,20 @@ export class Agent {
 				context.systemPrompt = this.#state.systemPrompt;
 				context.tools = this.#toolsForModel(this.#state.model ?? model);
 			},
+			getTokenizer: () => this.#tokenizer,
 			beforeModelCall:
 				this.#beforeModelCall || this.#additionalBeforeModelCalls.size > 0
-					? async (context, signal, model) => {
-							const result = (await this.#beforeModelCall?.(context, signal, model)) || undefined;
+					? async (context, signal, model, sourceMessageTokens) => {
+							let result =
+								(await this.#beforeModelCall?.(context, signal, model, sourceMessageTokens)) || undefined;
 							if (result?.stop) return result;
 							for (const callback of this.#additionalBeforeModelCalls) {
-								const callbackResult = (await callback(context, signal, model)) || undefined;
+								const callbackResult =
+									(await callback(context, signal, model, sourceMessageTokens)) || undefined;
 								if (callbackResult?.stop) return callbackResult;
+								if (callbackResult) result = callbackResult;
 							}
-							return undefined;
+							return result;
 						}
 					: undefined,
 			cursorExecHandlers: this.#cursorExecHandlers,

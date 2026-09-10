@@ -4,6 +4,7 @@ import type {
 	AssistantMessageEvent,
 	AssistantMessageEventStream,
 	Context,
+	ContextSnapshot,
 	Effort,
 	ImageContent,
 	Message,
@@ -25,6 +26,7 @@ import type { HarmonyAuditEvent } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import type { AppendOnlyContextManager } from "./append-only-context";
 import type { AgentRunCoverage, AgentRunSummary } from "./run-collector";
 import type { AgentTelemetryConfig } from "./telemetry";
+import type { Tokenizer } from "./tokenizer";
 
 /** Stream function - can return sync or Promise for async config lookup */
 export type StreamFn = (
@@ -65,18 +67,29 @@ export interface AgentPreModelCallStop {
 	reason?: string;
 }
 
-export type AgentPreModelCallResult = AgentPreModelCallStop | undefined;
+export type AgentPreModelCallResult =
+	| AgentPreModelCallStop
+	| {
+			stop?: false;
+			/** Request-local accounting stamped on the successful assistant before event delivery. */
+			contextSnapshot: Omit<ContextSnapshot, "promptTokens">;
+	  }
+	| undefined;
 
 /**
  * A pre-model-call gate. Return {@link AgentPreModelCallStop} to refuse the
- * request, or nothing to proceed; the signal aborts with the run.
+ * request, or return accounting for the admitted request (or nothing) to proceed.
+ * The signal aborts with the run.
  * The model is the one captured for this prepared request, even if selection
  * changes while an asynchronous context transform is running.
+ * sourceMessageTokens counts the complete source messages before transforms,
+ * including queued input whose events have not yet reached session history.
  */
 export type AgentBeforeModelCall = (
 	context: Context,
 	signal: AbortSignal | undefined,
 	model: Model,
+	sourceMessageTokens?: number,
 ) => AgentPreModelCallResult | void | Promise<AgentPreModelCallResult | void>;
 
 /**
@@ -335,6 +348,8 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * the run is canceled or its deadline expires.
 	 */
 	beforeModelCall?: AgentBeforeModelCall;
+	/** Reuse the live tokenizer when measuring source messages for admission. */
+	getTokenizer?: () => Tokenizer;
 
 	/**
 	 * Optional transform applied to tool call arguments before execution.

@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Fixed restricted extension sessions failing to start in compiled OMP binaries.
+- Fixed false near-budget compaction refusals caused by counting unchanged request-formatting overhead twice.
 - Fixed background compaction allowing requests beyond the usable-input budget; requests that still do not fit now stop with an actionable error before sending.
 - Fixed completed mid-turn compaction replaying a cached copy of the old conversation in the next request.
 - Fixed budget refusals hanging automatic retries or printing an earlier answer as success in text mode.

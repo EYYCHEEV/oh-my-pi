@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added optional prepared-context accounting to saved context snapshots.
+
 ### Fixed
 
 - Fixed local input-limit rejections failing to trigger context-overflow recovery.

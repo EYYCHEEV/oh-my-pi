@@ -207,6 +207,9 @@ export class SessionStatsTracker {
 		includeAssistantOutput?: boolean;
 		/** Match the prepared request even when the selected model changes mid-transform. */
 		tokenizer?: Tokenizer;
+		/** Signed representation difference measured from the actual prepared request. */
+		preparedTokenDelta?: number;
+		model?: Model;
 	}): ContextUsageBreakdown | undefined {
 		const tokenizer = options?.tokenizer ?? this.#tokenizer;
 		const rawContextWindow = options?.contextWindow ?? this.#host.model()?.contextWindow ?? 0;
@@ -288,6 +291,21 @@ export class SessionStatsTracker {
 				pendingTokens,
 				tokenizer,
 			);
+			if (options?.includeAssistantOutput && options.preparedTokenDelta !== undefined) {
+				const prepared = anchorAssistant.contextSnapshot?.preparedContext;
+				const model = options.model ?? this.#host.model();
+				const baseline =
+					prepared &&
+					prepared.provider === model?.provider &&
+					prepared.model === model?.id &&
+					prepared.tokenizer === tokenizer.encoding &&
+					Number.isFinite(prepared.tokenDelta)
+						? prepared.tokenDelta
+						: 0;
+				// The provider already paid the anchor's representation overhead.
+				// Legacy or incompatible anchors keep the conservative zero baseline.
+				usedTokens += Math.max(0, options.preparedTokenDelta - baseline);
+			}
 		} else if (pending && !options?.includeAssistantOutput) {
 			anchored = true;
 			usedTokens = this.#anchoredUsedTokens(
