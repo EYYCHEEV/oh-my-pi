@@ -3569,6 +3569,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			if (extensionRunner) {
 				extensionRunner.initialize(
 					{
+						requireRuntime: (extension, declaration) => session.requireRuntime(extension, declaration),
+						sendMessageWithReceipt: (message, options) =>
+							session.sendCustomMessageWithReceipt(message, options, completion => {
+								pendingExtensionMessages.push(
+									completion.catch(error => {
+										logger.error("Extension sendMessage failed", { error });
+									}),
+								);
+							}),
 						sendMessage: (message, options) => {
 							const sendPromise = session.sendCustomMessage(message, options).catch(e => {
 								logger.error("Extension sendMessage failed", {
@@ -3607,6 +3616,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						},
 					},
 					{
+						flushSession: sessionId => session.flushSession(sessionId),
 						getModel: () => session.model,
 						isIdle: () => !session.isStreaming,
 						abort: () => session.abort({ reason: USER_INTERRUPT_LABEL }),
@@ -3621,6 +3631,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					logger.error("Extension error", { path: err.extensionPath, error: err.error });
 				});
 				await awaitAbortable(extensionRunner.emit({ type: "session_start" }));
+				await awaitAbortable(extensionRunner.emit({ type: "session_ready", sessionId: session.sessionId }));
 				while (pendingExtensionMessages.length > 0) {
 					await awaitAbortable(Promise.all(pendingExtensionMessages.splice(0)));
 				}

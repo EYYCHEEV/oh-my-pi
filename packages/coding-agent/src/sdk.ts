@@ -1,3 +1,4 @@
+import type { RequiredRuntimeExtension } from "./session/runtime-requirements";
 import { denyEvaluationIngress, getEvaluationPolicy, readEvaluationEvidence } from "@oh-my-pi/pi-utils";
 import * as path from "node:path";
 import {
@@ -504,6 +505,8 @@ export interface CreateAgentSessionOptions {
 	 * `tool_call` handler before this session can activate tools.
 	 */
 	requiredExtension?: RequiredExtensionSpec;
+	/** Explicit startup conditions, independent of the mandatory tool-call guard. */
+	requiredRuntimeExtensions?: readonly RequiredRuntimeExtension[];
 	/**
 	 * Session-independent imported extension factories. Child sessions rebind
 	 * these to their own ExtensionAPI without re-evaluating the module graph.
@@ -3887,6 +3890,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			serviceTierByFamily: initialServiceTierByFamily,
 			sessionManager,
 			settings,
+			requiredRuntimeExtensions: options.requiredRuntimeExtensions ?? settings.getHost("requiredRuntimeExtensions"),
 			additionalExtensionPaths: options.additionalExtensionPaths,
 			extensionRoots: buildSessionExtensionRoots,
 			preparedExtensions: extensionsResult.preparedExtensions,

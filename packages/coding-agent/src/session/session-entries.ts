@@ -51,6 +51,8 @@ export interface SessionHeader {
 	previousSessionFiles?: string[];
 	/** Provider prompt-cache identity inherited by exact-route full forks. */
 	providerPromptCacheKey?: string;
+	/** Session-wide presence is preserved even when invalid or unsupported by this host. */
+	runtimeRequirements?: unknown;
 }
 
 export interface NewSessionOptions {

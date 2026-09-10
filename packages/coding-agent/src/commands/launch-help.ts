@@ -87,6 +87,9 @@ export const launchHelp = {
 			description: "Load an extension file (can be used multiple times)",
 			multiple: true,
 		}),
+		"require-runtime-contract": Flags.string({
+			description: "Refuse startup unless the requested runtime-requirement contract version is supported",
+		}),
 		"no-extensions": Flags.boolean({
 			description: "Disable extension discovery (explicit -e paths still work)",
 		}),

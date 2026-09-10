@@ -64,6 +64,96 @@ Important constraint from `loader.ts`:
 - calling action methods like `pi.sendMessage()` during extension load throws `ExtensionRuntimeNotInitializedError`
 - register first; perform runtime behavior from events/commands/tools
 
+### Session-wide runtime requirements (contract version 1)
+
+Use `pi.requireRuntime(...)` when a conversation must not execute without a live extension attachment.
+This is independent of the host's existing `requiredExtension` tool-call guard.
+The extension must be loaded from an explicitly selected or normally discovered file, not an inline factory or a fabricated preloaded record.
+
+```ts
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+
+export default function runtimeExtension(pi: ExtensionAPI) {
+  pi.on("session_ready", async ({ sessionId }) => {
+    const attachment = await attachForSession(sessionId);
+    await pi.requireRuntime({
+      sessionId,
+      id: "example.runtime",
+      version: 1,
+      recoveryHint: "Open the runtime settings and reconnect this conversation.",
+      check: ({ sessionId, signal }) =>
+        attachment.isReadyFor(sessionId, signal),
+    });
+  });
+}
+```
+
+`attachForSession` above represents the extension's own attachment code, not a host API.
+The check must return exactly `true`, synchronously or asynchronously, within one second.
+Use its cancellation signal and keep it cheap: the host checks freshly before admission, dequeue, provider dispatch, and tool execution.
+The host refuses false, throwing, timed-out, cancelled, missing, disabled, disposed, stale, or transitioning attachments.
+Checks and declarations belong to the current session generation; an earlier conversation's successful check never authorizes a later one.
+A declaration still being persisted or checked blocks execution, including when other concurrent declarations have finished.
+An operation also refuses if the requirement set changes while its checks are awaited.
+
+The returned `SessionPersistenceReceipt` acknowledges persistence of the requirement, not a provider turn or future satisfaction.
+An in-memory session returns `persistence: "memory-only"`; a durable journal returns `"flushed"`.
+Saved requirements are monotonic obligations identified by canonical entry path, entry SHA-256, requirement ID, and positive integer version.
+They survive resume, copies, forks, branch journals, compaction, and replication.
+Malformed or unsupported saved markers refuse execution while leaving history readable.
+Neither a saved path nor recovery guidance is used to load or execute code.
+`recoveryHint` is nonsecret, display-only guidance, limited to 512 printable characters on one line.
+Do not put secrets in it: it is saved in the journal and may appear in error reports.
+
+Loader provenance attests the entry file and its loader-created factory, not imported dependency graphs or arbitrary extension behavior.
+If a platform's module cache returns an older factory after entry bytes change, that factory cannot satisfy the changed identity.
+Restart with the intended code when cache reuse prevents fresh attachment.
+Changing entry bytes does not silently replace a conversation's saved requirement with a new identity.
+
+#### Readiness and navigation
+
+`session_ready: { type: "session_ready", sessionId: string }` is emitted after initial runtime initialization and after successful new-session, resume, fork, branch, and `/btw` branch restoration.
+At that point a handler may await `requireRuntime` and finish attachment without waiting on its own readiness event.
+Until restoration completes, execution and new runtime declarations refuse.
+The existing `session_start` and `session_switch` events retain their timing; do not treat `session_switch` as proof that target restoration has finished.
+Same-journal tree navigation and compaction do not emit `session_ready`: neither creates a new attachment lifecycle.
+Their existing navigation/compaction events remain available, saved obligations remain in force, and the next execution boundary checks satisfaction again.
+Unmarked legacy conversations remain ordinary sessions; titles and chat content are not inferred as protection markers.
+History inspection and leaving a refused conversation remain available.
+
+#### Requiring a runtime before its first declaration
+
+A launcher or SDK caller can require an attachment before allowing a new conversation's first turn:
+
+```ts
+const options = {
+  additionalExtensionPaths: ["/absolute/path/runtime.ts"],
+  requiredRuntimeExtensions: [
+    { path: "/absolute/path/runtime.ts", id: "example.runtime", version: 1 },
+  ],
+};
+// Pass options to createAgentSession and initialize the normal mode runtime.
+```
+
+`requiredRuntimeExtensions` is also a host configuration setting with the same array shape.
+Paths are resolved through the host's normal platform path handling.
+Select/load the extension through the normal extension configuration or `-e`; the requirement itself is not an extension loader.
+A missing extension, failed factory, or extension that never declares leaves the first turn refused.
+This pre-declaration condition belongs to the initial session selected at startup, not every unrelated session later opened in the process.
+Leaving for a fresh unmarked session does not replay the rejected draft or attach an obligation to that new history.
+Once declared, saved requirements remain authoritative obligations on any session that carries them, including forks and copies.
+
+Launchers that rely on this behavior should pass `--require-runtime-contract=1` through the normal CLI parser.
+This flag asserts host support; it does not load an extension or satisfy a requirement.
+Missing or unsupported assertion values are usage errors, and extension flags cannot shadow it.
+SDK callers can check the exported `RUNTIME_REQUIREMENTS_VERSION === 1`.
+The actual root `omp --help` entrypoint advertises the same support on a plain `runtime-requirements: 1` line under `Runtime Capabilities`.
+Launchers may inspect this read-only positive capability before starting a session; missing, malformed, or unsupported capability output must not be treated as support.
+Bind the check to the executable that will be launched rather than checking a different source checkout or trusting an unknown flag accepted on a help-only path.
+The known older parser rejects the unknown flag, but arbitrary older binaries that ignore unknown options or journal fields cannot be retroactively protected.
+Use a supported host rather than relying on journal data alone as a version fence.
+`sendMessage` remains void, and message admission receipts and persistence barriers keep their existing meanings.
+
 ## Quick start
 
 ```ts
@@ -118,7 +208,7 @@ Core methods:
 - `registerStatusSegment({ id, placement, render })` (returns a disposer), `requestStatusLineRender`
 - `registerComposerShape`
 - `setLabel`, `getFlag`
-- `sendMessage`, `sendUserMessage`, `appendEntry`, `exec`
+- `sendMessage`, `sendMessageWithReceipt`, `sendUserMessage`, `appendEntry`, `exec`
 - `getActiveTools`, `getAllTools`, `setActiveTools`
 - `getCommands`
 - `getSessionName`, `setSessionName`
@@ -198,6 +288,31 @@ Also exposed:
 
 Payloads passed to `pi.sendMessage` are normalized before delivery (`normalizeCustomMessagePayload` in `session/messages.ts`): non-object payloads are coerced to string content under the default custom type, missing `customType`/`attribution` fields are defaulted, and invalid content collapses to an empty string — malformed payloads no longer persist entries that crash later session resumes.
 
+`await pi.sendMessageWithReceipt(message, options)` uses the same delivery rules, but resolves when the captured session's existing in-memory queue or context owns the normalized message:
+
+```ts
+const admission = await pi.sendMessageWithReceipt(
+  { customType: "com.example.worker.result", content: resultText, details: { correlationId } },
+  { deliverAs: "followUp" },
+);
+// Success: { sessionId, admitted: true, location: "queue" | "context", deliverAs }
+// Refusal: { sessionId, admitted: false, reason }
+```
+
+`deliverAs` is the requested delivery mode, defaulting to `"steer"`; `location` describes the actual admission destination.
+An idle client-deferred turn is admitted to a queue, while an idle non-triggering message is appended to context.
+Admission resolves before an initiated provider turn finishes.
+It proves neither persistence nor processing, and queues can subsequently be cleared or the session disposed.
+Caller-owned correlation belongs in `details`, which remains available through public session entries and reopening persisted sessions.
+OMP does not deduplicate or retry these messages.
+
+Only a provable pre-admission refusal returns `admitted: false`: `"session-changed"`, `"session-transition"`, `"session-disposed"`, or `"turn-not-started"`.
+Normalization and other errors before admission reject.
+Once admission succeeds, later turn or persistence failures are reported through the host's existing error handling without changing the receipt to a refusal.
+Do not treat a rejected operation or a lost caller response as retry permission.
+Existing `pi.sendMessage(): void` and `AgentSession.sendCustomMessage(): Promise<boolean>` retain their error and turn-completion behavior.
+Hosts that do not bind receipt support reject explicitly rather than returning a fabricated success.
+
 ## 2) Handler context (`ExtensionContext`)
 
 Handlers and tool `execute` receive `ctx` with:
@@ -206,6 +321,7 @@ Handlers and tool `execute` receive `ctx` with:
 - `hasUI`
 - `cwd`
 - `sessionManager` (read-only)
+- `flushSession()` (session-scoped persistence barrier, described below)
 - `modelRegistry`, `model`
 - `models` (read-only model query — see below)
 - `localProtocolOptions` (optional calling-session `local://` root mapping for external tool bridges)
@@ -219,6 +335,29 @@ Handlers and tool `execute` receive `ctx` with:
 - `getSystemPrompt()`
 - `memory` (optional structured memory runtime — status/search/save across the configured backend)
 - `setInterval(fn, ms, ...args)` / `setTimeout(fn, ms, ...args)` / `clearTimer(timer)` — managed timers (see below)
+
+### Persistence barrier
+
+`await ctx.flushSession()` captures a physical journal cutoff under the session manager's persistence serialization and drains the existing backing writes:
+
+```ts
+pi.appendEntry("com.example.worker.state", { correlationId, state: "recorded" });
+const persisted = await ctx.flushSession();
+// { sessionId, throughEntryId: string | null, persistence: "flushed" | "memory-only" }
+```
+
+`throughEntryId` is the last recorded physical journal entry at capture, not the active branch leaf.
+Persistent sessions are materialized even before the first assistant message, so the captured entries can be read by reopening the session.
+`"flushed"` means the existing storage backend has completed its writes: software-crash visibility, not `fsync` or power-loss durability.
+Memory-only sessions explicitly return `"memory-only"` and never claim disk durability.
+Storage failures, indeterminate writes, changed session ownership and disposal reject rather than returning a success receipt.
+An older retained handler context cannot flush a replacement session.
+Unsupported hosts reject explicitly.
+
+The barrier does not drain message queues or wait for extension events to finish.
+It is safe to await inside `message_end`, but that notification arrives before its input has been appended to the session journal.
+The receipt therefore covers only entries already recorded when the barrier captures its cutoff, not necessarily the message being observed.
+Neither `message_end` nor a persistence receipt proves that a model processed the input.
 
 ### Restricted evaluation
 

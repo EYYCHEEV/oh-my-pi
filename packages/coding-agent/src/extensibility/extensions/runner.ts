@@ -19,11 +19,11 @@ import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "../../modes/theme/theme";
 import type { AsyncJobSnapshot } from "../../session/agent-session";
-import type { SessionManager } from "../../session/session-manager";
+import type { SessionManager, SessionPersistenceReceipt } from "../../session/session-manager";
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
 import { resolveToolOutputBudgetBytes } from "../../tools/output-meta";
 import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
-import type { RequiredExtensionHandlerSnapshot } from "./loader";
+import { getLoadedRuntimeOrigin, type RequiredExtensionHandlerSnapshot } from "./loader";
 import { ManagedTimers } from "./managed-timers";
 import { createExtensionModelQuery } from "./model-api";
 import type {
@@ -451,6 +451,9 @@ export class ExtensionRunner {
 	#getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	#compactFn: (instructionsOrOptions?: string | CompactOptions) => Promise<void> = async () => {};
 	#getSystemPromptFn: () => string[] = () => [];
+	#flushSessionFn: (sessionId: string) => Promise<SessionPersistenceReceipt> = async () => {
+		throw new Error("Session persistence barriers are unavailable in this host.");
+	};
 	#getAsyncJobSnapshotFn: () => AsyncJobSnapshot | null = () => null;
 	#newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	#branchHandler: BranchHandler = async () => ({ cancelled: false });
@@ -630,6 +633,15 @@ export class ExtensionRunner {
 			: undefined;
 	}
 
+	/** Match private loader provenance to this runner's actual runtime, not preloaded metadata. */
+	async getRuntimeOrigin(
+		extension: Extension,
+		disabledIds: readonly string[],
+	): Promise<{ path: string; sha256: string } | undefined> {
+		if (!this.extensions.includes(extension)) return undefined;
+		return getLoadedRuntimeOrigin(extension, this.runtime, disabledIds);
+	}
+
 	/**
 	 * Live session directory, not a session-start snapshot: `/move`
 	 * (`SessionManager.moveTo()`) relocates the owning session by updating
@@ -669,6 +681,16 @@ export class ExtensionRunner {
 	): void {
 		// Copy actions into the shared runtime (all extension APIs reference this)
 		this.runtime.sendMessage = actions.sendMessage;
+		this.runtime.sendMessageWithReceipt =
+			actions.sendMessageWithReceipt ??
+			(async () => {
+				throw new Error("Message admission receipts are unavailable in this host.");
+			});
+		this.runtime.requireRuntime =
+			actions.requireRuntime ??
+			(async () => {
+				throw new Error("Session runtime requirements are unavailable in this host.");
+			});
 		this.runtime.sendUserMessage = actions.sendUserMessage;
 		this.runtime.appendEntry = actions.appendEntry;
 		this.runtime.getActiveTools = actions.getActiveTools;
@@ -702,6 +724,11 @@ export class ExtensionRunner {
 		this.#getContextUsageFn = contextActions.getContextUsage;
 		this.#compactFn = contextActions.compact;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
+		this.#flushSessionFn =
+			contextActions.flushSession ??
+			(async () => {
+				throw new Error("Session persistence barriers are unavailable in this host.");
+			});
 
 		// Command context actions (optional, only for interactive mode)
 		if (commandContextActions) {
@@ -1200,6 +1227,7 @@ export class ExtensionRunner {
 		},
 	): ExtensionContext {
 		const getModel = model ? () => model : this.#getModel;
+		const sessionId = this.sessionId;
 		return {
 			toolOutputBudgetBytes: resolveToolOutputBudgetBytes(delegation?.context?.settings ?? this.settings),
 			evaluationAdmission: getEvaluationAdmission(),
@@ -1211,6 +1239,7 @@ export class ExtensionRunner {
 			hasUI: this.hasUI(),
 			cwd: this.cwd,
 			sessionManager: this.sessionManager,
+			flushSession: () => this.#flushSessionFn(sessionId),
 			modelRegistry: this.modelRegistry,
 			isProjectTrusted: () => true,
 			get model() {

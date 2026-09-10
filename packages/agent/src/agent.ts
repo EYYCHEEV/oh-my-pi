@@ -425,6 +425,7 @@ export class Agent {
 	#onTurnEnd?: (messages: AgentMessage[], signal?: AbortSignal, context?: AgentTurnEndContext) => Promise<void> | void;
 	#beforeModelCall?: AgentBeforeModelCall;
 	#additionalBeforeModelCalls = new Set<AgentBeforeModelCall>();
+	#beforeRunHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
 	#asideMessageProvider?: () => AsideMessage[] | Promise<AsideMessage[]>;
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
@@ -805,6 +806,13 @@ export class Agent {
 	subscribe(fn: (e: AgentEvent) => void): () => void {
 		this.#listeners.add(fn);
 		return () => this.#listeners.delete(fn);
+	}
+
+	/** Run admission under cancellation/lock ownership, before input append or continuation recovery. */
+	addBeforeRunHook(hook: (signal?: AbortSignal) => Promise<void> | void): () => void {
+		const registration = (signal?: AbortSignal) => hook(signal);
+		this.#beforeRunHooks.add(registration);
+		return () => this.#beforeRunHooks.delete(registration);
 	}
 
 	/** Register an independently removable hook that runs before queued messages are consumed. */
@@ -1229,6 +1237,7 @@ export class Agent {
 
 		try {
 			const dequeueSignal = this.#continuationDequeueSignal(signal);
+			for (const hook of this.#beforeRunHooks) await hook(dequeueSignal);
 			const messages = this.#state.messages;
 			if (messages.length === 0) {
 				// An empty transcript has nothing to resume, but a queued steer/follow-up
@@ -1523,8 +1532,11 @@ export class Agent {
 		let partial: AgentMessage | null = null;
 		const completedToolCallIds = new Set<string>();
 		let turnOpen = false;
+		let runAdmitted = false;
 
 		try {
+			for (const hook of this.#beforeRunHooks) await hook(loopSignal);
+			runAdmitted = true;
 			const stream = messages
 				? agentLoop(messages, context, config, loopSignal, this.streamFn)
 				: agentLoopContinue(context, config, loopSignal, this.streamFn);
@@ -1600,6 +1612,7 @@ export class Agent {
 				}
 			}
 		} catch (err) {
+			if (!runAdmitted) throw err;
 			const stoppedForAbort = loopSignal.aborted;
 			const errorMessage = stoppedForAbort
 				? abortReasonText(loopSignal)

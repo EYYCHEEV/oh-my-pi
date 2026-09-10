@@ -1,3 +1,4 @@
+import { RuntimeRequirementError } from "../session/runtime-requirements";
 /**
  * Generate session titles using a smol, fast model.
  */
@@ -149,6 +150,7 @@ export async function generateSessionTitle(
 	customSystemPrompt?: string,
 	signal?: AbortSignal,
 	credentialSourceSessionId?: string,
+	beforeInference?: () => Promise<void>,
 ): Promise<string | null> {
 	// Defer titling for greetings / acknowledgements / empty input. The default
 	// tiny title model can't reliably decline trivial input, so this happens
@@ -172,6 +174,7 @@ export async function generateSessionTitle(
 			signal,
 			titleSystemPrompt,
 			credentialSourceSessionId,
+			beforeInference,
 		);
 	}
 
@@ -190,6 +193,7 @@ export async function generateSessionTitle(
 		return null;
 	}
 	try {
+		await beforeInference?.();
 		let localTitle: string | null;
 		if (signal) {
 			localTitle = await tinyTitleClient.generate(
@@ -212,6 +216,7 @@ export async function generateSessionTitle(
 		}
 		return localTitle;
 	} catch (err) {
+		if (err instanceof RuntimeRequirementError) throw err;
 		logger.warn("title-generator: local tiny model errored; skipping (no online fallback)", {
 			sessionId,
 			model: tinyModel,
@@ -231,6 +236,7 @@ export async function generateTitleOnline(
 	signal?: AbortSignal,
 	customSystemPrompt?: string,
 	credentialSourceSessionId?: string,
+	beforeInference?: () => Promise<void>,
 ): Promise<string | null> {
 	const model = getTitleModel(registry, settings, currentModel);
 	if (!model) {
@@ -280,8 +286,9 @@ export async function generateTitleOnline(
 		logger.debug("title-generator: request", { ...modelContext, maxTokens });
 
 		const response = await retryTransientCompletion(
-			() =>
-				completeSimple(
+			async () => {
+				await beforeInference?.();
+				return completeSimple(
 					model,
 					{
 						systemPrompt,
@@ -300,7 +307,8 @@ export async function generateTitleOnline(
 						metadata,
 						signal,
 					},
-				),
+				);
+			},
 			{ signal },
 		);
 
@@ -335,6 +343,7 @@ export async function generateTitleOnline(
 
 		return title;
 	} catch (err) {
+		if (err instanceof RuntimeRequirementError) throw err;
 		logger.warn("title-generator: error", {
 			...modelContext,
 			reason: "exception",

@@ -2538,6 +2538,8 @@ export class AcpAgent implements Agent {
 
 		extensionRunner.initialize(
 			{
+				requireRuntime: (extension, declaration) => record.session.requireRuntime(extension, declaration),
+				sendMessageWithReceipt: (message, options) => record.session.sendCustomMessageWithReceipt(message, options),
 				sendMessage: (message, options) => {
 					record.session.sendCustomMessage(message, options).catch((error: unknown) => {
 						logger.warn("ACP extension sendMessage failed", { error });
@@ -2574,6 +2576,7 @@ export class AcpAgent implements Agent {
 				},
 			},
 			{
+				flushSession: sessionId => record.session.flushSession(sessionId),
 				getModel: () => record.session.model,
 				isIdle: () => !record.session.isStreaming,
 				abort: () => {
@@ -2616,6 +2619,7 @@ export class AcpAgent implements Agent {
 			"rpc",
 		);
 		await extensionRunner.emit({ type: "session_start" });
+		await extensionRunner.emit({ type: "session_ready", sessionId: record.session.sessionId });
 		record.extensionsConfigured = true;
 	}
 

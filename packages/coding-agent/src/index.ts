@@ -58,6 +58,7 @@ export * from "./session/session-entries";
 export * from "./session/session-listing";
 export * from "./session/session-loader";
 export * from "./session/session-manager";
+export * from "./session/runtime-requirements";
 export * from "./session/session-migrations";
 export * from "./session/session-storage";
 export * from "./session/sql-session-storage";
