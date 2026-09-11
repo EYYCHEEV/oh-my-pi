@@ -317,6 +317,12 @@ export interface AgentOptions {
 	afterToolCall?: AgentLoopConfig["afterToolCall"];
 
 	/**
+	 * Synchronously wraps the assistant stream after owned-dialect tool synthesis.
+	 * See {@link AgentLoopConfig.transformAssistantStream}.
+	 */
+	transformAssistantStream?: AgentLoopConfig["transformAssistantStream"];
+
+	/**
 	 * Called once an assistant message is finalized, before it reaches the
 	 * context, the UI, or tool dispatch. May mutate the message in place (text +
 	 * tool-call arguments). See {@link AgentLoopConfig.transformAssistantMessage}.
@@ -447,6 +453,9 @@ export class Agent {
 	 * message emission. Reassign at any time to swap the implementation.
 	 */
 	afterToolCall?: AgentLoopConfig["afterToolCall"];
+	/** Post-dialect assistant stream wrapper. Reassignable for host lifecycle changes. */
+	transformAssistantStream?: AgentLoopConfig["transformAssistantStream"];
+
 	/**
 	 * Hook invoked once an assistant message is finalized, before context append,
 	 * UI emission, and tool dispatch. Reassign at any time to swap the implementation.
@@ -508,6 +517,7 @@ export class Agent {
 		this.#onHarmonyLeak = opts.onHarmonyLeak;
 		this.beforeToolCall = opts.beforeToolCall;
 		this.afterToolCall = opts.afterToolCall;
+		this.transformAssistantStream = opts.transformAssistantStream;
 		this.transformAssistantMessage = opts.transformAssistantMessage;
 		this.#telemetry = opts.telemetry;
 		this.#appendOnlyContext = opts.appendOnlyContext;
@@ -1478,6 +1488,7 @@ export class Agent {
 			appendOnlyContext: this.#appendOnlyContext,
 			beforeToolCall: this.beforeToolCall ? (ctx, signal) => this.beforeToolCall?.(ctx, signal) : undefined,
 			afterToolCall: this.afterToolCall ? (ctx, signal) => this.afterToolCall?.(ctx, signal) : undefined,
+			transformAssistantStream: this.transformAssistantStream,
 			transformAssistantMessage: this.transformAssistantMessage
 				? (message, signal) => this.transformAssistantMessage?.(message, signal)
 				: undefined,
