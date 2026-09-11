@@ -287,7 +287,13 @@ test("changed policy bytes refuse an already admitted public prompt", async () =
 test("fresh helper admission retains original evidence identities after same-path replacement", async () => {
 	const original = await fs.stat(promptPath);
 	const saved = `${promptPath}.original`;
-	const runner = new ExtensionRunner([], {} as never, root, { getCwd: () => root } as never, registry);
+	const runner = new ExtensionRunner(
+		[],
+		{} as never,
+		root,
+		{ getCwd: () => root, getSessionId: () => "evaluation-policy-fixture" } as never,
+		registry,
+	);
 	await fs.rename(promptPath, saved);
 	try {
 		await writeFile(promptPath, "REPLACEMENT_MUST_NOT_BE_READMITTED");

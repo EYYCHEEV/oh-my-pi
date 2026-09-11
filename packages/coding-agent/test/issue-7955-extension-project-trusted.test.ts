@@ -7,7 +7,13 @@ function createRunner(): ExtensionRunner {
 		flagValues: new Map(),
 		pendingProviderRegistrations: [],
 	} as unknown as ExtensionRuntime;
-	return new ExtensionRunner([], runtime, "/tmp", { getCwd: () => "/tmp" } as never, {} as never);
+	return new ExtensionRunner(
+		[],
+		runtime,
+		"/tmp",
+		{ getCwd: () => "/tmp", getSessionId: () => "issue-7955" } as never,
+		{} as never,
+	);
 }
 
 describe("ExtensionRunner project-trust context (issue #7955)", () => {

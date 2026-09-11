@@ -12,7 +12,7 @@ function createRunner(getAsyncJobSnapshot?: () => AsyncJobSnapshot | null): Exte
 		[],
 		runtime,
 		"/tmp",
-		{ getCwd: () => "/tmp" } as never,
+		{ getCwd: () => "/tmp", getSessionId: () => "extension-context-async-jobs" } as never,
 		{} as never,
 		undefined,
 		undefined,
