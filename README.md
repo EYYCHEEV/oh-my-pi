@@ -132,6 +132,8 @@ An upgrade fails before build or installation if the block is stale, any require
 - `socket-close-tool-call-recovery`: Bun socket-close tool-call recovery
 - `harmony-mitigation-resolved-model-tests`: Harmony mitigation resolved-model regressions
 - `handler-scoped-session-context`: Host-selected restricted extension sessions and context budgets
+- `extension-runtime-requirements`: Durable extension admission and runtime requirements
+- `streamed-tool-call-normalization`: Canonical streamed tool-call normalization
 <!-- stronk-omp:fork-contracts:end -->
 
 ## Upstream alignment
