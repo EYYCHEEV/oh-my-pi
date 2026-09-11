@@ -113,6 +113,7 @@ export function filterChildShellEnv(
 	env: Record<string, string | undefined>,
 	cwd: string = process.cwd(),
 ): Record<string, string> {
+	const runtimeLaunchEnvValues = env === Bun.env || env === process.env ? launchEnvValues : undefined;
 	const result = filterProcessEnv(env);
 	if (getEvaluationPolicy()) {
 		result.OMP_EVALUATION_POLICY = process.env.OMP_EVALUATION_POLICY!;
@@ -120,7 +121,7 @@ export function filterChildShellEnv(
 		return result;
 	}
 	const projectEnv = parseEnvFile(path.join(cwd, ".env"));
-	const launchNodeEnv = launchEnvValues ? launchEnvValues.get("NODE_ENV") : env.NODE_ENV;
+	const launchNodeEnv = runtimeLaunchEnvValues ? runtimeLaunchEnvValues.get("NODE_ENV") : env.NODE_ENV;
 	const nodeEnvName = `.env.${launchNodeEnv || "development"}`;
 	const modeEnv = parseEnvFile(path.join(cwd, nodeEnvName));
 	const localEnv = parseEnvFile(path.join(cwd, ".env.local"));
@@ -134,7 +135,7 @@ export function filterChildShellEnv(
 	};
 	let fallbackLaunchEnv: Record<string, string> | undefined;
 	let expandedFallbackLaunchEnv: Record<string, string> | undefined;
-	if (!launchEnvValues && nodeEnvName !== ".env.development") {
+	if (!runtimeLaunchEnvValues && nodeEnvName !== ".env.development") {
 		const fallbackModeEnv = parseEnvFile(path.join(cwd, ".env.development"));
 		const fallbackModeLocalEnv = parseEnvFile(path.join(cwd, ".env.development.local"));
 		const candidate = { ...projectEnv, ...fallbackModeEnv, ...localEnv, ...fallbackModeLocalEnv };
@@ -153,7 +154,7 @@ export function filterChildShellEnv(
 	}
 	const allLaunchEnv = fallbackLaunchEnv ? { ...launchEnv, ...fallbackLaunchEnv } : launchEnv;
 	for (const key in allLaunchEnv) {
-		const launchValue = launchEnvValues?.get(key);
+		const launchValue = runtimeLaunchEnvValues?.get(key);
 		if (launchValue !== undefined) {
 			// Launcher-owned name: it keeps the launcher's own value. Bun overwrites
 			// an empty launcher value with the dotenv one, so restore the launcher
@@ -169,7 +170,7 @@ export function filterChildShellEnv(
 			}
 			continue;
 		}
-		if (launchEnvValues || projectEnvNamesLoadedByOmp.has(key)) {
+		if (runtimeLaunchEnvValues || projectEnvNamesLoadedByOmp.has(key)) {
 			// Strong provenance: the launch environment is known and this name is
 			// absent from it, or OMP itself injected the value — either way it came
 			// from a project dotenv file, not the parent shell.

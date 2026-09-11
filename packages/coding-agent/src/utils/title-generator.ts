@@ -150,7 +150,7 @@ export async function generateSessionTitle(
 	customSystemPrompt?: string,
 	signal?: AbortSignal,
 	credentialSourceSessionId?: string,
-	beforeInference?: () => Promise<void>,
+	beforeInference?: () => void | Promise<void>,
 ): Promise<string | null> {
 	// Defer titling for greetings / acknowledgements / empty input. The default
 	// tiny title model can't reliably decline trivial input, so this happens
@@ -193,7 +193,8 @@ export async function generateSessionTitle(
 		return null;
 	}
 	try {
-		await beforeInference?.();
+		const inferenceGate = beforeInference?.();
+		if (inferenceGate) await inferenceGate;
 		let localTitle: string | null;
 		if (signal) {
 			localTitle = await tinyTitleClient.generate(
@@ -236,7 +237,7 @@ export async function generateTitleOnline(
 	signal?: AbortSignal,
 	customSystemPrompt?: string,
 	credentialSourceSessionId?: string,
-	beforeInference?: () => Promise<void>,
+	beforeInference?: () => void | Promise<void>,
 ): Promise<string | null> {
 	const model = getTitleModel(registry, settings, currentModel);
 	if (!model) {
@@ -287,7 +288,8 @@ export async function generateTitleOnline(
 
 		const response = await retryTransientCompletion(
 			async () => {
-				await beforeInference?.();
+				const inferenceGate = beforeInference?.();
+				if (inferenceGate) await inferenceGate;
 				return completeSimple(
 					model,
 					{

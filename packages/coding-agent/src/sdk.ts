@@ -1827,7 +1827,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		: logger.time("discoverWatchdogFiles", () => discoverWatchdogFiles(cwd, agentDir));
 	watchdogFilesPromise.catch(() => {});
 	const advisorConfigsPromise = evaluation
-		? Promise.resolve({ advisors: [], sharedInstructions: "" })
+		? Promise.resolve({ advisors: [], sharedInstructions: "", sharedMaxNotesPerUpdate: undefined })
 		: logger.time("discoverAdvisorConfigs", () => discoverAdvisorConfigs(cwd, agentDir));
 	advisorConfigsPromise.catch(() => {});
 	const promptTemplatesPromise = options.promptTemplates
@@ -3635,15 +3635,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		) {
 			explicitlyRequestedToolNames.push("yield");
 		}
-		// Auto-learn builtins are force-included into the registry by `createTools`
-		// for enabled top-level sessions (tools/index.ts), but — like `yield` above —
-		// an explicit `toolNames` list would otherwise drop them from the ACTIVE set,
-		// leaving the nudge/guidance pointing at tools the model cannot call. Activate
-		// exactly the builtins createTools built (`builtInToolNames` — provenance, so a
-		// same-named custom/extension tool is never force-activated when auto-learn is
-		// off) to keep guidance, controller, and the active set consistent.
+		// Session-managed builtins may be force-included by createTools. Keep the
+		// active set consistent with that registry decision, using built-in
+		// provenance so same-named extension tools are never force-activated.
 		if (!restrictToolNames && explicitlyRequestedToolNames) {
-			for (const name of ["manage_skill", "learn"]) {
+			for (const name of ["manage_skill", "learn", "context_notes", "new_context"]) {
 				if (builtInToolNames.includes(name) && !explicitlyRequestedToolNames.includes(name)) {
 					explicitlyRequestedToolNames.push(name);
 				}
@@ -4117,6 +4113,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			advisorContextPrompt,
 			advisorMemoryPrompt,
 			advisorSharedInstructions: discoveredAdvisors.sharedInstructions,
+			advisorSharedMaxNotesPerUpdate: discoveredAdvisors.sharedMaxNotesPerUpdate,
 			advisorConfigs: discoveredAdvisors.advisors,
 			agent,
 			pruneToolDescriptions: inlineToolDescriptors,
