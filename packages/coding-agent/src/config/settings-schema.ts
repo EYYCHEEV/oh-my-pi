@@ -1,3 +1,4 @@
+import type { RequiredRuntimeExtension } from "../session/runtime-requirements";
 import { THINKING_EFFORTS } from "@oh-my-pi/pi-ai";
 import { DEFAULT_SHARE_URL } from "@oh-my-pi/pi-wire";
 import { SHAPE_VARIANT_NAMES } from "@oh-my-pi/snapcompact";
@@ -602,6 +603,7 @@ export const SETTINGS_SCHEMA = {
 	"requiredExtension.path": { type: "string", default: undefined },
 	"requiredExtension.id": { type: "string", default: undefined },
 	"requiredExtension.sha256": { type: "string", default: undefined },
+	requiredRuntimeExtensions: { type: "array", default: [] as RequiredRuntimeExtension[] },
 
 	enabledModels: { type: "array", default: EMPTY_STRING_ARRAY },
 

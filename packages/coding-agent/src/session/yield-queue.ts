@@ -15,6 +15,10 @@ export interface YieldQueueOptions {
 	injectStreaming?(msg: AgentMessage): void;
 	injectIdle(messages: AgentMessage[]): Promise<void>;
 	scheduleIdleFlush(run: () => Promise<void>): void;
+	/** Host-owned admission policy, checked before consuming or building queued work. */
+	beforeFlush?(): Promise<void>;
+	/** Retryable refusal before admission keeps entries and their receipts pending. */
+	retainOnFailure?(error: unknown): boolean;
 }
 
 type YieldFlushMode = "streaming" | "idle";
@@ -32,6 +36,7 @@ interface StoredEntry {
 }
 
 interface BuiltMessage {
+	kind: string;
 	message: AgentMessage;
 	entries: StoredEntry[];
 }
@@ -116,6 +121,7 @@ export class YieldQueue {
 		if (mode === "idle") {
 			this.#idleFlushPending = false;
 		}
+		await this.#options.beforeFlush?.();
 		const idleMessages: BuiltMessage[] = [];
 		for (const [kind, dispatcher] of this.#dispatchers) {
 			if (mode === "idle" && dispatcher.skipIdleFlush) continue;
@@ -146,6 +152,12 @@ export class YieldQueue {
 				}
 			} catch (error) {
 				const dispatchError = error instanceof Error ? error : new Error(String(error));
+				if (this.#options.retainOnFailure?.(error)) {
+					for (const item of idleMessages) {
+						this.#entries.set(item.kind, [...item.entries, ...(this.#entries.get(item.kind) ?? [])]);
+					}
+					return;
+				}
 				for (const item of idleMessages) {
 					(item.message as AgentMessage & { [ASIDE_MESSAGE_DISCARD]?: (error: Error) => void })[
 						ASIDE_MESSAGE_DISCARD
@@ -247,7 +259,7 @@ export class YieldQueue {
 				this.#rejectEntries(survivors, new Error(`Yield queue dispatcher skipped entry: ${kind}`));
 				return null;
 			}
-			return { message, entries: survivors };
+			return { kind, message, entries: survivors };
 		} catch (error) {
 			const buildError = error instanceof Error ? error : new Error(String(error));
 			this.#rejectEntries(survivors, buildError);

@@ -1813,6 +1813,7 @@ async function streamAssistantResponse(
 					config.abortOnFabricatedToolResult ?? true,
 				);
 			}
+			if (config.transformAssistantStream) response = config.transformAssistantStream(response);
 
 			let partialMessage: AssistantMessage | null = null;
 			let addedPartial = false;

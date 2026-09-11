@@ -3,6 +3,7 @@ import { type } from "@oh-my-pi/omptype";
 import { agentLoop } from "@oh-my-pi/pi-agent-core/agent-loop";
 import type { AgentContext, AgentLoopConfig, AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core/types";
 import type { AssistantMessage, Context, Message, TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { createUserMessage } from "./helpers";
 
@@ -102,6 +103,62 @@ describe("agentLoop with owned in-band tool calls", () => {
 		expect(wireText(internalResult!)).toBe("echoed:hello world");
 	});
 
+	it("applies assistant stream transforms after owned-dialect tool synthesis", async () => {
+		const echoArgs: Array<{ msg: string }> = [];
+		const toolSchema = type({ msg: "string" });
+		const echoTool: AgentTool<typeof toolSchema, { msg: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo a message back",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				echoArgs.push(params);
+				return { content: [{ type: "text", text: params.msg }], details: params };
+			},
+		};
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						"…\n<tool_call>echo\n<arg_key>msg</arg_key>\n<arg_value>after synthesis</arg_value>\n</tool_call>",
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		let sawSynthesizedToolCall = false;
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			dialect: "glm",
+			transformAssistantStream: inner => {
+				const outer = new AssistantMessageEventStream();
+				void (async () => {
+					try {
+						outer.forwardLocalWorkFrom(inner);
+						for await (const event of inner) {
+							if (event.type === "toolcall_start") {
+								sawSynthesizedToolCall = event.partial.content[event.contentIndex]?.type === "toolCall";
+							}
+							outer.push(event);
+						}
+						if (!outer.done) outer.end();
+					} catch (error) {
+						if (!outer.done) outer.fail(error);
+					} finally {
+						outer.forwardLocalWorkFrom(undefined);
+					}
+				})();
+				return outer;
+			},
+		};
+		const context: AgentContext = { systemPrompt: ["BASE PROMPT"], messages: [], tools: [echoTool] };
+
+		await agentLoop([createUserMessage("say hi")], context, config, undefined, mock.stream).result();
+
+		expect(sawSynthesizedToolCall).toBe(true);
+		expect(echoArgs).toEqual([{ msg: "after synthesis" }]);
+	});
 	it("prunes native tool descriptions from the wire when pruneToolDescriptions is set", async () => {
 		const toolSchema = type({ msg: type("string").describe("the message to echo") });
 		const echoTool: AgentTool<typeof toolSchema, { msg: string }> = {

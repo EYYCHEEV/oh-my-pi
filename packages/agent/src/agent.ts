@@ -318,6 +318,12 @@ export interface AgentOptions {
 	afterToolCall?: AgentLoopConfig["afterToolCall"];
 
 	/**
+	 * Synchronously wraps the assistant stream after owned-dialect tool synthesis.
+	 * See {@link AgentLoopConfig.transformAssistantStream}.
+	 */
+	transformAssistantStream?: AgentLoopConfig["transformAssistantStream"];
+
+	/**
 	 * Called once an assistant message is finalized, before it reaches the
 	 * context, the UI, or tool dispatch. May mutate the message in place (text +
 	 * tool-call arguments). See {@link AgentLoopConfig.transformAssistantMessage}.
@@ -426,6 +432,7 @@ export class Agent {
 	#onTurnEnd?: (messages: AgentMessage[], signal?: AbortSignal, context?: AgentTurnEndContext) => Promise<void> | void;
 	#beforeModelCall?: AgentBeforeModelCall;
 	#additionalBeforeModelCalls = new Set<AgentBeforeModelCall>();
+	#beforeRunHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
 	#asideMessageProvider?: () => AsideMessage[] | Promise<AsideMessage[]>;
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
@@ -447,6 +454,9 @@ export class Agent {
 	 * message emission. Reassign at any time to swap the implementation.
 	 */
 	afterToolCall?: AgentLoopConfig["afterToolCall"];
+	/** Post-dialect assistant stream wrapper. Reassignable for host lifecycle changes. */
+	transformAssistantStream?: AgentLoopConfig["transformAssistantStream"];
+
 	/**
 	 * Hook invoked once an assistant message is finalized, before context append,
 	 * UI emission, and tool dispatch. Reassign at any time to swap the implementation.
@@ -508,6 +518,7 @@ export class Agent {
 		this.#onHarmonyLeak = opts.onHarmonyLeak;
 		this.beforeToolCall = opts.beforeToolCall;
 		this.afterToolCall = opts.afterToolCall;
+		this.transformAssistantStream = opts.transformAssistantStream;
 		this.transformAssistantMessage = opts.transformAssistantMessage;
 		this.#telemetry = opts.telemetry;
 		this.#appendOnlyContext = opts.appendOnlyContext;
@@ -806,6 +817,13 @@ export class Agent {
 	subscribe(fn: (e: AgentEvent) => void): () => void {
 		this.#listeners.add(fn);
 		return () => this.#listeners.delete(fn);
+	}
+
+	/** Run admission under cancellation/lock ownership, before input append or continuation recovery. */
+	addBeforeRunHook(hook: (signal?: AbortSignal) => Promise<void> | void): () => void {
+		const registration = (signal?: AbortSignal) => hook(signal);
+		this.#beforeRunHooks.add(registration);
+		return () => this.#beforeRunHooks.delete(registration);
 	}
 
 	/** Register an independently removable hook that runs before queued messages are consumed. */
@@ -1230,6 +1248,7 @@ export class Agent {
 
 		try {
 			const dequeueSignal = this.#continuationDequeueSignal(signal);
+			for (const hook of this.#beforeRunHooks) await hook(dequeueSignal);
 			const messages = this.#state.messages;
 			if (messages.length === 0) {
 				// An empty transcript has nothing to resume, but a queued steer/follow-up
@@ -1474,6 +1493,7 @@ export class Agent {
 			appendOnlyContext: this.#appendOnlyContext,
 			beforeToolCall: this.beforeToolCall ? (ctx, signal) => this.beforeToolCall?.(ctx, signal) : undefined,
 			afterToolCall: this.afterToolCall ? (ctx, signal) => this.afterToolCall?.(ctx, signal) : undefined,
+			transformAssistantStream: this.transformAssistantStream,
 			transformAssistantMessage: this.transformAssistantMessage
 				? (message, signal) => this.transformAssistantMessage?.(message, signal)
 				: undefined,
@@ -1528,8 +1548,11 @@ export class Agent {
 		let partial: AgentMessage | null = null;
 		const completedToolCallIds = new Set<string>();
 		let turnOpen = false;
+		let runAdmitted = false;
 
 		try {
+			for (const hook of this.#beforeRunHooks) await hook(loopSignal);
+			runAdmitted = true;
 			const stream = messages
 				? agentLoop(messages, context, config, loopSignal, this.streamFn)
 				: agentLoopContinue(context, config, loopSignal, this.streamFn);
@@ -1605,6 +1628,7 @@ export class Agent {
 				}
 			}
 		} catch (err) {
+			if (!runAdmitted) throw err;
 			const stoppedForAbort = loopSignal.aborted;
 			const errorMessage = stoppedForAbort
 				? abortReasonText(loopSignal)

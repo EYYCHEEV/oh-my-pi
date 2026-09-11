@@ -521,6 +521,12 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	onTurnEnd?: (messages: AgentMessage[], signal?: AbortSignal, context?: AgentTurnEndContext) => Promise<void> | void;
 
 	/**
+	 * Synchronously wraps the assistant event stream after owned-dialect tool
+	 * synthesis and before any event reaches context or subscribers.
+	 */
+	transformAssistantStream?: (stream: AssistantMessageEventStream) => AssistantMessageEventStream;
+
+	/**
 	 * Called once an assistant message is finalized from the model stream, before
 	 * it is appended to the context, emitted as `message_end`, or its tool calls
 	 * are validated and dispatched. The hook may mutate the message in place —

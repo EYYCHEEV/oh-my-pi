@@ -28,7 +28,9 @@ import { execCommand } from "../../exec/exec";
 // Runtime self-reference: dereference this namespace only inside loader functions to keep the index.ts cycle safe.
 import * as PiCodingAgent from "../../index";
 import { ALL_SEGMENT_IDS } from "../../modes/components/status-line/segments";
-import type { CustomMessagePayload } from "../../session/messages";
+import type { CustomMessagePayload, MessageAdmission } from "../../session/messages";
+import type { RuntimeRequirementDeclaration } from "../../session/runtime-requirements";
+import type { SessionPersistenceReceipt } from "../../session/session-manager";
 import type { FileDeleteFallbackHandler, FileWriteFallbackHandler } from "../../tools/file-write-fallback";
 import { EventBus } from "../../utils/event-bus";
 import * as TypeBox from "../legacy-typebox";
@@ -64,6 +66,43 @@ const requiredAttestations = new WeakMap<LoadExtensionsResult, RequiredExtension
 const eventBusByExtension = new WeakMap<Extension, EventBus>();
 const disposedExtensions = new WeakSet<Extension>();
 const disposedResults = new WeakSet<LoadExtensionsResult>();
+const preparedRuntimeOrigins = new WeakMap<
+	PreparedExtension,
+	Readonly<{ path: string; sha256: string; factory: ExtensionFactory }>
+>();
+const loadedRuntimeOrigins = new WeakMap<
+	Extension,
+	Readonly<{ path: string; sha256: string; runtime: IExtensionRuntime }>
+>();
+// Some supported platforms reuse a cached factory despite a new import tag.
+// Never relabel that same executable object with newer entry bytes.
+const runtimeFactoryOrigins = new WeakMap<ExtensionFactory, Readonly<{ path: string; sha256: string }>>();
+const ambiguousRuntimeFactories = new WeakSet<ExtensionFactory>();
+
+/** Loader-owned provenance; serialized/preloaded lookalikes never create an entry. */
+export async function getLoadedRuntimeOrigin(
+	extension: Extension,
+	runtime?: IExtensionRuntime,
+	disabledIds: readonly string[] = [],
+): Promise<{ path: string; sha256: string } | undefined> {
+	const origin = loadedRuntimeOrigins.get(extension);
+	if (origin && disabledIds.includes(`extension-module:${getExtensionNameFromPath(origin.path)}`)) return undefined;
+	if (
+		!origin ||
+		disposedExtensions.has(extension) ||
+		(runtime && origin.runtime !== runtime) ||
+		extension.resolvedPath !== origin.path
+	)
+		return undefined;
+	try {
+		const hash = new Bun.CryptoHasher("sha256").update(await Bun.file(origin.path).arrayBuffer()).digest("hex");
+		if (hash !== origin.sha256 || disposedExtensions.has(extension) || extension.resolvedPath !== origin.path)
+			return undefined;
+		return { path: origin.path, sha256: origin.sha256 };
+	} catch {
+		return undefined;
+	}
+}
 
 interface RuntimeRegistrationSnapshot {
 	flagValues: Map<string, boolean | string>;
@@ -217,6 +256,14 @@ export class ExtensionRuntime implements IExtensionRuntime {
 	}
 
 	sendMessage(): void {
+		throw new ExtensionRuntimeNotInitializedError();
+	}
+
+	async sendMessageWithReceipt(): Promise<never> {
+		throw new ExtensionRuntimeNotInitializedError();
+	}
+
+	async requireRuntime(): Promise<never> {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
 
@@ -446,6 +493,17 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 		this.runtime.sendMessage(message, options);
 	}
 
+	sendMessageWithReceipt<T = unknown>(
+		message: CustomMessagePayload<T>,
+		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" },
+	): Promise<MessageAdmission> {
+		return this.runtime.sendMessageWithReceipt(message, options);
+	}
+
+	requireRuntime(declaration: RuntimeRequirementDeclaration): Promise<SessionPersistenceReceipt> {
+		return this.runtime.requireRuntime(this.extension, declaration);
+	}
+
 	sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
 		options?: { deliverAs?: "steer" | "followUp" | "aside" },
@@ -564,6 +622,7 @@ async function runExtensionFactory(
 async function importExtensionModule(extensionPath: string, cwd: string): Promise<PreparedExtension> {
 	const resolvedPath = canonicalizeExtensionPath(extensionPath, cwd);
 	try {
+		const sha256 = new Bun.CryptoHasher("sha256").update(await Bun.file(resolvedPath).arrayBuffer()).digest("hex");
 		const module = (await withHostGuard(() => loadLegacyPiModule(resolvedPath))) as LoadedExtensionModule;
 		const factory = getExtensionFactory(module);
 
@@ -576,7 +635,18 @@ async function importExtensionModule(extensionPath: string, cwd: string): Promis
 			};
 		}
 
-		return { path: extensionPath, factory, resolvedPath, error: null };
+		const prepared = { path: extensionPath, factory, resolvedPath, error: null };
+		const afterHash = new Bun.CryptoHasher("sha256").update(await Bun.file(resolvedPath).arrayBuffer()).digest("hex");
+		const prior = runtimeFactoryOrigins.get(factory);
+		if (sha256 !== afterHash) ambiguousRuntimeFactories.add(factory);
+		if (
+			!ambiguousRuntimeFactories.has(factory) &&
+			(!prior || (prior.path === resolvedPath && prior.sha256 === sha256))
+		) {
+			runtimeFactoryOrigins.set(factory, Object.freeze({ path: resolvedPath, sha256 }));
+			preparedRuntimeOrigins.set(prepared, Object.freeze({ path: resolvedPath, sha256, factory }));
+		}
+		return prepared;
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		return { path: extensionPath, factory: null, resolvedPath, error: `Failed to load extension: ${message}` };
@@ -601,6 +671,10 @@ async function bindExtension(
 		await eventBus.runWithSubscriptionOwner(extension, () =>
 			withHostGuard(() => runExtensionFactory(factory, api, runtime)),
 		);
+		const origin = preparedRuntimeOrigins.get(imported);
+		if (origin && origin.factory === factory && origin.path === imported.resolvedPath) {
+			loadedRuntimeOrigins.set(extension, Object.freeze({ path: origin.path, sha256: origin.sha256, runtime }));
+		}
 
 		return { extension, error: null };
 	} catch (err) {

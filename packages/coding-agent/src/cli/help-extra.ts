@@ -1,9 +1,13 @@
 import "@oh-my-pi/pi-utils/env";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { APP_NAME, CONFIG_DIR_NAME } from "@oh-my-pi/pi-utils/dirs";
+import { RUNTIME_REQUIREMENTS_VERSION } from "../session/runtime-requirements";
 
 export function getExtraHelpText(): string {
-	return `${chalk.bold("Environment Variables:")}
+	return `${chalk.bold("Runtime Capabilities:")}
+  runtime-requirements: ${RUNTIME_REQUIREMENTS_VERSION}
+
+${chalk.bold("Environment Variables:")}
   ${chalk.dim("# Core Providers")}
   ANTHROPIC_API_KEY          - Anthropic Claude models
   ANTHROPIC_OAUTH_TOKEN      - Anthropic OAuth (takes precedence over API key)

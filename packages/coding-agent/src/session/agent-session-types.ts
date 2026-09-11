@@ -1,3 +1,4 @@
+import type { RequiredRuntimeExtension } from "./runtime-requirements";
 import type {
 	Agent,
 	AgentMessage,
@@ -128,6 +129,8 @@ export interface AgentSessionConfig {
 	codeModeState?: { namespacesInfo?: unknown };
 	sessionManager: SessionManager;
 	settings: Settings;
+	/** Fail closed until each explicitly configured runtime has declared for this session. */
+	requiredRuntimeExtensions?: readonly RequiredRuntimeExtension[];
 	/**
 	 * Live extension-root policy inherited from the owning session. Subagents use
 	 * this provider so explicit roots, discovery mode, configured roots, and

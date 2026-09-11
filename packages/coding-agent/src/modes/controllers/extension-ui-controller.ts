@@ -5,6 +5,7 @@ import { KeybindingsManager } from "../../config/keybindings";
 import type {
 	CompactOptions,
 	ExtensionActions,
+	ExtensionAPI,
 	ExtensionAskDialogQuestion,
 	ExtensionAskDialogResult,
 	ExtensionAskDialogResultItem,
@@ -92,6 +93,20 @@ export class ExtensionUiController {
 	#toolUIContext: ExtensionUIContext | undefined;
 	constructor(private ctx: InteractiveModeContext) {}
 
+	#sendExtensionMessageWithReceipt: ExtensionAPI["sendMessageWithReceipt"] = async (message, options) => {
+		const wasStreaming = this.ctx.session.isStreaming;
+		const normalized = normalizeCustomMessagePayload(message);
+		return this.ctx.session.sendCustomMessageWithReceipt(normalized, options, completion => {
+			void completion.then(
+				() => this.#applyCustomMessageDisplay(wasStreaming, normalized.display),
+				(error: unknown) =>
+					this.ctx.showError(
+						`Extension sendMessage failed: ${error instanceof Error ? error.message : String(error)}`,
+					),
+			);
+		});
+	};
+
 	#syncExtensionComposerShapes(): void {
 		this.disposeComposerShapes();
 		for (const definition of this.ctx.session.extensionRunner?.getComposerShapes() ?? []) {
@@ -178,6 +193,8 @@ export class ExtensionUiController {
 		}
 
 		const actions: ExtensionActions = {
+			requireRuntime: (extension, declaration) => this.ctx.session.requireRuntime(extension, declaration),
+			sendMessageWithReceipt: this.#sendExtensionMessageWithReceipt,
 			sendMessage: (message, options) => {
 				const wasStreaming = this.ctx.session.isStreaming;
 				const normalized = normalizeCustomMessagePayload(message);
@@ -215,6 +232,7 @@ export class ExtensionUiController {
 			setSessionName: name => this.#updateSessionName(name),
 		};
 		const contextActions: ExtensionContextActions = {
+			flushSession: sessionId => this.ctx.session.flushSession(sessionId),
 			getModel: () => this.ctx.session.model,
 			isIdle: () => !this.ctx.session.isStreaming,
 			abort: () => this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL }),
@@ -325,6 +343,7 @@ export class ExtensionUiController {
 		await extensionRunner.emit({
 			type: "session_start",
 		});
+		await extensionRunner.emit({ type: "session_ready", sessionId: this.ctx.session.sessionId });
 	}
 
 	/**
@@ -412,6 +431,8 @@ export class ExtensionUiController {
 		}
 
 		const actions: ExtensionActions = {
+			requireRuntime: (extension, declaration) => this.ctx.session.requireRuntime(extension, declaration),
+			sendMessageWithReceipt: this.#sendExtensionMessageWithReceipt,
 			sendMessage: (message, options) => {
 				const wasStreaming = this.ctx.session.isStreaming;
 				const normalized = normalizeCustomMessagePayload(message);
@@ -448,6 +469,7 @@ export class ExtensionUiController {
 			setSessionName: name => this.#updateSessionName(name),
 		};
 		const contextActions: ExtensionContextActions = {
+			flushSession: sessionId => this.ctx.session.flushSession(sessionId),
 			getModel: () => this.ctx.session.model,
 			isIdle: () => !this.ctx.session.isStreaming,
 			abort: () => this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL }),

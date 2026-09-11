@@ -981,6 +981,7 @@ export class SessionAdvisors {
 				onSseEvent: this.#host.onSseEvent,
 				transformProviderContext: this.#transformProviderContext,
 				intentTracing: false,
+				transformAssistantStream: this.#host.agent.transformAssistantStream,
 				transformAssistantMessage: message => {
 					quarantinedAdvisorOutput = quarantineAdvisorUnsafeOutput(
 						message,

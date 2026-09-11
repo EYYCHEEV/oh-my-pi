@@ -18,6 +18,16 @@
 - Fixed background compaction allowing requests beyond the usable-input budget; requests that still do not fit now stop with an actionable error before sending.
 - Fixed completed mid-turn compaction replaying a cached copy of the old conversation in the next request.
 - Fixed budget refusals hanging automatic retries or printing an earlier answer as success in text mode.
+- Added awaitable extension custom-message admission receipts and session-scoped persistence barriers, without changing existing message-send completion behavior.
+- Added generic session-wide runtime requirements with durable obligations, fresh loader-backed attachment checks, `session_ready`, startup `requiredRuntimeExtensions`, and the `--require-runtime-contract=1` support assertion. Refused execution preserves queued work and keeps saved history readable; recovery guidance is bounded and display-only.
+
+### Fixed
+
+- Fixed restricted extension sessions failing to start in compiled OMP binaries.
+- Fixed background compaction allowing requests beyond the usable-input budget; requests that still do not fit now stop with an actionable error before sending.
+- Fixed completed mid-turn compaction replaying a cached copy of the old conversation in the next request.
+- Fixed budget refusals hanging automatic retries or printing an earlier answer as success in text mode.
+- Prevented custom messages from crossing session changes or disposal while image normalization is pending, for every delivery mode.
 
 ## [18.1.12] - 2026-09-06
 

@@ -1,3 +1,4 @@
+import type { RequiredRuntimeExtension } from "./session/runtime-requirements";
 import { denyEvaluationIngress, getEvaluationPolicy, readEvaluationEvidence } from "@oh-my-pi/pi-utils";
 import * as path from "node:path";
 import {
@@ -12,6 +13,8 @@ import {
 	type ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
 import type {
+	AssistantMessage,
+	AssistantMessageEvent,
 	Context,
 	CredentialDisabledEvent,
 	Effort,
@@ -28,6 +31,7 @@ import {
 	getOpenAICodexTransportDetails,
 	prewarmOpenAICodexResponses,
 } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { FALLBACK_DIALECT, preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import type { Component } from "@oh-my-pi/pi-tui";
 import {
@@ -40,6 +44,7 @@ import {
 	postmortem,
 	prompt,
 	Snowflake,
+	structuredCloneJSON,
 } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import {
@@ -504,6 +509,8 @@ export interface CreateAgentSessionOptions {
 	 * `tool_call` handler before this session can activate tools.
 	 */
 	requiredExtension?: RequiredExtensionSpec;
+	/** Explicit startup conditions, independent of the mandatory tool-call guard. */
+	requiredRuntimeExtensions?: readonly RequiredRuntimeExtension[];
 	/**
 	 * Session-independent imported extension factories. Child sessions rebind
 	 * these to their own ExtensionAPI without re-evaluating the module graph.
@@ -693,6 +700,237 @@ export interface CreateAgentSessionResult {
 }
 
 export type DialectFormat = "auto" | "native" | Dialect;
+
+const SUBSTANTIVE_ASSISTANT_TEXT = /[\p{L}\p{N}\p{M}]/u;
+
+/**
+ * Remove non-substantive text blocks from assistant content that also invokes tools.
+ * Returns the original array unless a block must be removed.
+ */
+export function normalizeAssistantToolCallContent(content: AssistantMessage["content"]): AssistantMessage["content"] {
+	if (!content.some(block => block.type === "toolCall")) return content;
+
+	let normalized: AssistantMessage["content"] | undefined;
+	for (let index = 0; index < content.length; index++) {
+		const block = content[index]!;
+		if (block.type === "text" && !SUBSTANTIVE_ASSISTANT_TEXT.test(block.text)) {
+			normalized ??= content.slice(0, index);
+			continue;
+		}
+		normalized?.push(block);
+	}
+	return normalized ?? content;
+}
+
+type AssistantContentBlock = AssistantMessage["content"][number];
+type TextAssistantMessageEvent = Extract<AssistantMessageEvent, { type: "text_start" | "text_delta" | "text_end" }>;
+
+function snapshotAssistantContentBlock(block: AssistantContentBlock): AssistantContentBlock {
+	switch (block.type) {
+		case "text":
+		case "image":
+		case "thinking":
+		case "redactedThinking":
+			return { ...block };
+		case "anthropicServerTool":
+			return { ...block, block: structuredCloneJSON(block.block) };
+		case "fallback":
+			return { ...block, from: { ...block.from }, to: { ...block.to } };
+		case "toolCall":
+			return {
+				...block,
+				arguments: structuredCloneJSON(block.arguments),
+				providerMetadata: structuredCloneJSON(block.providerMetadata),
+			};
+	}
+}
+
+function snapshotAssistantMessage(message: AssistantMessage): AssistantMessage {
+	return {
+		...message,
+		content: message.content.map(snapshotAssistantContentBlock),
+		usage: {
+			...message.usage,
+			cost: { ...message.usage.cost },
+		},
+		disabledFeatures: message.disabledFeatures ? [...message.disabledFeatures] : undefined,
+		toolCallAbortMessages: message.toolCallAbortMessages ? { ...message.toolCallAbortMessages } : undefined,
+	};
+}
+
+function snapshotAssistantToolCallEvent(event: AssistantMessageEvent): AssistantMessageEvent {
+	switch (event.type) {
+		case "start":
+		case "text_start":
+		case "text_delta":
+		case "text_end":
+		case "image_end":
+		case "thinking_start":
+		case "thinking_delta":
+		case "thinking_end":
+		case "toolcall_start":
+		case "toolcall_delta":
+			return { ...event, partial: snapshotAssistantMessage(event.partial) };
+		case "toolcall_end":
+			return {
+				...event,
+				toolCall: snapshotAssistantContentBlock(event.toolCall) as Extract<
+					AssistantContentBlock,
+					{ type: "toolCall" }
+				>,
+				partial: snapshotAssistantMessage(event.partial),
+			};
+		case "done":
+			return { ...event, message: snapshotAssistantMessage(event.message) };
+		case "error":
+			return { ...event, error: snapshotAssistantMessage(event.error) };
+	}
+}
+
+function projectAssistantMessage(message: AssistantMessage, removedIndices: ReadonlySet<number>): AssistantMessage {
+	if (removedIndices.size === 0) return message;
+
+	let content: AssistantMessage["content"] | undefined;
+	for (let index = 0; index < message.content.length; index++) {
+		const block = message.content[index]!;
+		if (removedIndices.has(index)) {
+			content ??= message.content.slice(0, index);
+			continue;
+		}
+		content?.push(block);
+	}
+	return content ? { ...message, content } : message;
+}
+
+function projectAssistantToolCallEvent(
+	event: AssistantMessageEvent,
+	removedIndices: ReadonlySet<number>,
+): AssistantMessageEvent | undefined {
+	if (event.type === "done" || event.type === "error") {
+		const message = projectAssistantMessage(event.type === "done" ? event.message : event.error, removedIndices);
+		const content = normalizeAssistantToolCallContent(message.content);
+		const normalized = content === message.content ? message : { ...message, content };
+		if (event.type === "done") return normalized === event.message ? event : { ...event, message: normalized };
+		return normalized === event.error ? event : { ...event, error: normalized };
+	}
+
+	const partial = projectAssistantMessage(event.partial, removedIndices);
+	if (event.type === "start") return partial === event.partial ? event : { ...event, partial };
+	if (removedIndices.has(event.contentIndex)) return undefined;
+
+	let contentIndex = event.contentIndex;
+	for (const removedIndex of removedIndices) {
+		if (removedIndex < event.contentIndex) contentIndex--;
+	}
+	if (contentIndex === event.contentIndex && partial === event.partial) return event;
+	return { ...event, contentIndex, partial } as AssistantMessageEvent;
+}
+
+function isTextAssistantMessageEvent(event: AssistantMessageEvent): event is TextAssistantMessageEvent {
+	return event.type === "text_start" || event.type === "text_delta" || event.type === "text_end";
+}
+
+/**
+ * Hold non-substantive text lifecycles until they become substantive or a tool
+ * call makes them removable. Buffered events are snapshotted because providers
+ * mutate cumulative partials in place.
+ */
+export function normalizeAssistantToolCallStream(
+	innerStream: AssistantMessageEventStream | Promise<AssistantMessageEventStream>,
+): AssistantMessageEventStream {
+	const outer = new AssistantMessageEventStream();
+	void (async () => {
+		let inner: AssistantMessageEventStream | undefined;
+		const pending: AssistantMessageEvent[] = [];
+		const unresolvedTextIndices = new Map<number, boolean>();
+		const removedTextIndices = new Set<number>();
+		const flushPending = (): void => {
+			for (const event of pending) {
+				const projected = projectAssistantToolCallEvent(event, removedTextIndices);
+				if (projected) outer.push(projected);
+			}
+			pending.length = 0;
+		};
+		try {
+			inner = await innerStream;
+			outer.forwardLocalWorkFrom(inner);
+			for await (const event of inner) {
+				if (event.type === "done" || event.type === "error") {
+					const message = event.type === "done" ? event.message : event.error;
+					if (message.content.some(block => block.type === "toolCall")) {
+						for (let index = 0; index < message.content.length; index++) {
+							const block = message.content[index]!;
+							if (block.type === "text" && !SUBSTANTIVE_ASSISTANT_TEXT.test(block.text)) {
+								removedTextIndices.add(index);
+							}
+						}
+					}
+					unresolvedTextIndices.clear();
+					flushPending();
+					outer.push(projectAssistantToolCallEvent(event, removedTextIndices)!);
+					return;
+				}
+
+				if (isTextAssistantMessageEvent(event)) {
+					const block = event.partial.content[event.contentIndex];
+					if (block?.type !== "text" || SUBSTANTIVE_ASSISTANT_TEXT.test(block.text)) {
+						unresolvedTextIndices.delete(event.contentIndex);
+					} else {
+						unresolvedTextIndices.set(event.contentIndex, event.type !== "text_end");
+					}
+				}
+
+				for (const index of unresolvedTextIndices.keys()) {
+					const block = event.partial.content[index];
+					if (block?.type === "text" && SUBSTANTIVE_ASSISTANT_TEXT.test(block.text)) {
+						unresolvedTextIndices.delete(index);
+					}
+				}
+
+				if (event.partial.content.some(block => block.type === "toolCall")) {
+					for (let index = 0; index < event.partial.content.length; index++) {
+						const block = event.partial.content[index]!;
+						if (
+							block.type === "text" &&
+							!SUBSTANTIVE_ASSISTANT_TEXT.test(block.text) &&
+							unresolvedTextIndices.get(index) !== true
+						) {
+							removedTextIndices.add(index);
+							unresolvedTextIndices.delete(index);
+						}
+					}
+				}
+
+				if (pending.length > 0 || unresolvedTextIndices.size > 0) {
+					pending.push(snapshotAssistantToolCallEvent(event));
+					if (unresolvedTextIndices.size > 0) continue;
+					flushPending();
+					continue;
+				}
+
+				const projected = projectAssistantToolCallEvent(event, removedTextIndices);
+				if (projected) outer.push(projected);
+			}
+			if (pending.length > 0) {
+				unresolvedTextIndices.clear();
+				flushPending();
+			}
+			if (!outer.done) outer.end();
+		} catch (error) {
+			if (!outer.done) outer.fail(error);
+		} finally {
+			outer.forwardLocalWorkFrom(undefined);
+		}
+	})();
+	return outer;
+}
+
+/** Recover an eligible inline edit before tool-call text normalization. */
+export function normalizeFinalAssistantMessage(message: AssistantMessage, recoverInlineEdit: boolean): number {
+	const recovered = recoverInlineEdit ? recoverInlineSloppyEdit(message) : 0;
+	message.content = normalizeAssistantToolCallContent(message.content);
+	return recovered;
+}
 
 export function resolveDialect(
 	format: DialectFormat,
@@ -1280,6 +1518,7 @@ export function createAutoLearnCaptureRunner(
 			promptCacheKey: captureSessionId,
 			providerSessionState: captureProviderSessionState,
 			getApiKey: requestModel => options.sourceAgent.getApiKey?.(requestModel),
+			transformAssistantStream: options.sourceAgent.transformAssistantStream,
 			onPayload: options.onPayload,
 			onResponse: options.onResponse,
 		});
@@ -3744,19 +3983,21 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						: { toolNamespacesInfo: codeModeState.namespacesInfo }),
 				});
 			},
+			transformAssistantStream: normalizeAssistantToolCallStream,
 			cursorExecHandlers,
 			getCursorTools: () => (toolSession.xdev ? listXdevTools(toolSession.xdev) : []),
 			transformToolCallArguments,
 			// A stray sloppy payload in plain text becomes a real edit tool call so
 			// the normal pipeline (validation, approval, rendering) executes it.
 			transformAssistantMessage: message => {
-				if (!settings.get("edit.recoverInlineEdits")) return;
 				// The live tool is an ExtensionToolWrapper whose proxy forwards the
 				// EditTool `mode` getter; a bridge/custom edit tool without a sloppy
 				// mode (e.g. Cursor's replace-pinned pi_edit) never recovers.
 				const editTool = agent.state.tools.find(tool => tool.name === "edit") as { mode?: EditMode } | undefined;
-				if (editTool?.mode !== "sloppy") return;
-				const recovered = recoverInlineSloppyEdit(message);
+				const recovered = normalizeFinalAssistantMessage(
+					message,
+					settings.get("edit.recoverInlineEdits") && editTool?.mode === "sloppy",
+				);
 				if (recovered > 0) {
 					logger.info("recovered inline sloppy edit payload into edit tool call", { regions: recovered });
 				}
@@ -3887,6 +4128,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			serviceTierByFamily: initialServiceTierByFamily,
 			sessionManager,
 			settings,
+			requiredRuntimeExtensions: options.requiredRuntimeExtensions ?? settings.getHost("requiredRuntimeExtensions"),
 			additionalExtensionPaths: options.additionalExtensionPaths,
 			extensionRoots: buildSessionExtensionRoots,
 			preparedExtensions: extensionsResult.preparedExtensions,
