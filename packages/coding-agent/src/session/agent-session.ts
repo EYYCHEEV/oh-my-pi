@@ -1703,8 +1703,7 @@ export class AgentSession {
 		// injection boundary, but also expose a non-consuming interrupt peek so
 		// `hub` waits can return early before the boundary drains them.
 		this.agent.hasIrcInterrupts = () => this.#irc.hasInterrupts();
-		this.agent.setAsideMessageProvider(async () => {
-			await this.#assertRuntimeRequirements();
+		const drainAsideMessages = (): AsideMessage[] => {
 			const thunks: AsideMessage[] = this.#irc.drainPending().map(record => () => record);
 			thunks.push(...this.yieldQueue.drainLazy());
 			// Mid-run todo reconciliation — evaluated at injection time so a turn
@@ -1724,6 +1723,10 @@ export class AgentSession {
 				}
 			}
 			return thunks;
+		};
+		this.agent.setAsideMessageProvider(() => {
+			if (!this.#runtimeRequirementValidationNeeded()) return drainAsideMessages();
+			return this.#assertRuntimeRequirements().then(() => drainAsideMessages());
 		});
 		this.#convertToLlm = config.convertToLlm ?? convertToLlm;
 		this.getXdevToolEntries = config.getXdevToolEntries ?? (() => []);
