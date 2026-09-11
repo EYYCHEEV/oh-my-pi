@@ -39,7 +39,9 @@ import {
 	type AgentToolResult,
 	type AgentTurnEndContext,
 	AppendOnlyContextManager,
+	ASIDE_MESSAGE_COMMIT,
 	type AsideMessage,
+	type CommittableAsideMessage,
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
 	EventLoopKeepalive,
@@ -404,6 +406,7 @@ import { TtsrCoordinator, type TtsrCoordinatorHost } from "./ttsr-coordinator";
 
 const PLAN_MODE_REMINDER_MAX = 3;
 const POST_PROMPT_DRAIN_TIMEOUT_MS = 5_000;
+const RUNTIME_PROVENANCE_TIMEOUT_MS = 1_000;
 
 /** Internal marker for hook messages queued through the agent loop */
 // ============================================================================
@@ -7157,43 +7160,92 @@ export class AgentSession {
 		}
 	}
 
+	/** Admit an already-normalized custom message to the active turn's requested queue. */
+	#queueNormalizedCustomMessage(message: CustomMessage, options?: CustomMessageOptions): void {
+		if (options?.deliverAs === "nextTurn") {
+			this.#queueHiddenNextTurnMessage(message, options.triggerTurn ?? false);
+			return;
+		}
+		if (options?.deliverAs === "aside") {
+			this.#irc.queueAside([message]);
+			return;
+		}
+		this.#allowQueuedMessageDrainRetry();
+		if (options?.deliverAs === "followUp") {
+			this.agent.followUp(message);
+		} else {
+			this.agent.steer(message);
+		}
+		this.#scheduleIdleQueueDrain();
+	}
+
 	/** @returns true iff `agent.prompt` was actually invoked. An abort or session-generation
 	 *  change racing the usage-aware preflight can return before dispatch — callers that treat
 	 *  this as proof of agent work (e.g. suppressing a local prompt_result because agent events
 	 *  are expected) must not assume dispatch happened just because this was awaited. */
 	async #promptAgentInitiatedMessage(
 		message: CustomMessage,
-		options?: { acceptTerminalEmptyStop?: boolean; onAdmission?: () => void },
+		options: {
+			expectedSessionId: string;
+			expectedSessionGeneration: number;
+			sendOptions?: CustomMessageOptions;
+			acceptTerminalEmptyStop?: boolean;
+			onAdmission?: (location: "queue" | "context") => void;
+		},
 	): Promise<boolean> {
 		const inFlightGeneration = this.#beginInFlight();
-		const sessionGeneration = this.#sessionGeneration;
-		let unsubscribeAdmission: (() => void) | undefined;
+		let admittedToContext = false;
+		const committableMessage = message as CommittableAsideMessage;
+		const clearAdmissionCommit = (): void => {
+			delete committableMessage[ASIDE_MESSAGE_COMMIT];
+		};
+		const commitAdmission = (): void => {
+			if (admittedToContext) return;
+			admittedToContext = true;
+			clearAdmissionCommit();
+			options.onAdmission?.("context");
+		};
 		try {
 			await this.#assertRuntimeRequirements();
 			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return false;
-			if ((await this.#sessionGenerationChanged(sessionGeneration)) || this.#sessionGeneration !== sessionGeneration)
+			if (
+				(await this.#sessionGenerationChanged(options.expectedSessionGeneration)) ||
+				this.#sessionGeneration !== options.expectedSessionGeneration
+			)
 				return false;
 			if (this.#isDisposed || this.#unsubscribeAgent === undefined) return false;
-			const acceptTerminalEmptyStop = options?.acceptTerminalEmptyStop === true;
+			const acceptTerminalEmptyStop = options.acceptTerminalEmptyStop === true;
 			if (acceptTerminalEmptyStop) {
 				this.#resetPromptMaintenanceState();
 			}
 			this.#recovery.setAcceptTerminalEmptyStop(acceptTerminalEmptyStop);
-			if (options?.onAdmission) {
-				// Agent emits this exact input only after appending it to its context.
-				// This is admission evidence, not extension-event persistence or processing evidence.
-				unsubscribeAdmission = this.agent.subscribe(event => {
-					if (event.type === "message_end" && event.message === message) {
-						options.onAdmission?.();
-						unsubscribeAdmission?.();
-					}
-				});
+			Object.defineProperty(committableMessage, ASIDE_MESSAGE_COMMIT, {
+				configurable: true,
+				value: commitAdmission,
+			});
+			try {
+				await this.agent.prompt(message);
+			} catch (error) {
+				if (
+					admittedToContext ||
+					!(error instanceof AgentBusyError) ||
+					this.#isDisposed ||
+					this.#unsubscribeAgent === undefined ||
+					this.#sessionGeneration !== options.expectedSessionGeneration ||
+					this.sessionManager.getSessionId() !== options.expectedSessionId
+				) {
+					throw error;
+				}
+				clearAdmissionCommit();
+				this.#queueNormalizedCustomMessage(message, options.sendOptions);
+				options.onAdmission?.("queue");
+				return false;
 			}
-			await this.agent.prompt(message);
+			if (!admittedToContext) return false;
 			await this.#waitForPostPromptRecovery();
 			return true;
 		} finally {
-			unsubscribeAdmission?.();
+			clearAdmissionCommit();
 			this.#usagePreflightReadyForNextModelCall = false;
 			this.#recovery.setAcceptTerminalEmptyStop(false);
 			this.#endInFlight(inFlightGeneration);
@@ -7263,6 +7315,31 @@ export class AgentSession {
 		await this.#extensionRunner?.emit({ type: "session_ready", sessionId: this.sessionId });
 	}
 
+	async #getFreshRuntimeOrigin(
+		extension: Extension,
+		sessionId: string,
+		recoveryHint?: string,
+		signal?: AbortSignal,
+	): Promise<{ path: string; sha256: string } | undefined> {
+		try {
+			return await withTimeout(
+				Promise.resolve().then(() =>
+					this.#extensionRunner?.getRuntimeOrigin(extension, this.settings.getHost("disabledExtensions") ?? []),
+				),
+				RUNTIME_PROVENANCE_TIMEOUT_MS,
+				new RuntimeRequirementError(sessionId, "the fresh loader provenance check timed out", recoveryHint),
+				signal,
+			);
+		} catch (error) {
+			if (error instanceof RuntimeRequirementError) throw error;
+			throw new RuntimeRequirementError(
+				sessionId,
+				"the fresh loader provenance check failed or was cancelled",
+				recoveryHint,
+			);
+		}
+	}
+
 	/** Runtime bindings must pass the extension instance captured by its loader-created API. */
 	async requireRuntime(
 		extension: Extension,
@@ -7296,10 +7373,7 @@ export class AgentSession {
 		};
 		try {
 			assertOwner();
-			const origin = await this.#extensionRunner?.getRuntimeOrigin(
-				extension,
-				this.settings.getHost("disabledExtensions") ?? [],
-			);
+			const origin = await this.#getFreshRuntimeOrigin(extension, sessionId, declaration.recoveryHint);
 			assertOwner();
 			if (!origin)
 				throw new RuntimeRequirementError(sessionId, "the declaring extension lacks fresh loader provenance");
@@ -7318,12 +7392,7 @@ export class AgentSession {
 			assertOwner();
 			await this.#checkRuntimeRequirement(declaration, sessionId);
 			assertOwner();
-			if (
-				!(await this.#extensionRunner?.getRuntimeOrigin(
-					extension,
-					this.settings.getHost("disabledExtensions") ?? [],
-				))
-			)
+			if (!(await this.#getFreshRuntimeOrigin(extension, sessionId, requirement.recoveryHint)))
 				throw new RuntimeRequirementError(sessionId, "the declaring extension changed");
 			assertOwner();
 			this.#runtimeDeclarations = this.#runtimeDeclarations.filter(
@@ -7400,10 +7469,7 @@ export class AgentSession {
 				);
 				if (
 					!registration ||
-					!(await this.#extensionRunner?.getRuntimeOrigin(
-						registration.extension,
-						this.settings.getHost("disabledExtensions") ?? [],
-					))
+					!(await this.#getFreshRuntimeOrigin(registration.extension, sessionId, requirement.recoveryHint, signal))
 				) {
 					throw new RuntimeRequirementError(
 						sessionId,
@@ -7420,9 +7486,11 @@ export class AgentSession {
 						requirement.recoveryHint,
 					);
 				}
-				const currentOrigin = await this.#extensionRunner?.getRuntimeOrigin(
+				const currentOrigin = await this.#getFreshRuntimeOrigin(
 					registration.extension,
-					this.settings.getHost("disabledExtensions") ?? [],
+					sessionId,
+					requirement.recoveryHint,
+					signal,
 				);
 				if (
 					this.#isDisposed ||
@@ -7511,8 +7579,15 @@ export class AgentSession {
 				if (!admitted) receipt.resolve({ sessionId, admitted: false, reason: "turn-not-started" });
 			},
 			error => {
-				if (!admitted) receipt.reject(error);
-				else if (!observeCompletion) logger.error("Custom message failed after admission", { error });
+				if (!admitted) {
+					receipt.resolve({
+						sessionId,
+						admitted: false,
+						reason: error instanceof RuntimeRequirementError ? "runtime-requirement" : "admission-failed",
+					});
+				} else if (!observeCompletion) {
+					logger.error("Custom message failed after admission", { error });
+				}
 			},
 		);
 		observeCompletion?.(completion);
@@ -7567,29 +7642,8 @@ export class AgentSession {
 			return false;
 		}
 		if (this.isStreaming) {
-			if (options?.deliverAs === "nextTurn") {
-				this.#queueHiddenNextTurnMessage(normalizedAppMessage, options?.triggerTurn ?? false);
-				admit?.("queue");
-				return false;
-			}
-			if (options?.deliverAs === "aside") {
-				// Non-interrupting: the agent loop's step-boundary poll (see the setAsideMessageProvider
-				// registration in the constructor) picks this up without interrupting the current tool
-				// batch. Not an agent-core queue entry, so no drain-retry latch and no idle-queue drain
-				// scheduling here.
-				this.#irc.queueAside([normalizedAppMessage]);
-				admit?.("queue");
-				return false;
-			}
-			this.#allowQueuedMessageDrainRetry();
-
-			if (options?.deliverAs === "followUp") {
-				this.agent.followUp(normalizedAppMessage);
-			} else {
-				this.agent.steer(normalizedAppMessage);
-			}
+			this.#queueNormalizedCustomMessage(normalizedAppMessage, options);
 			admit?.("queue");
-			this.#scheduleIdleQueueDrain();
 			return false;
 		}
 
@@ -7601,8 +7655,11 @@ export class AgentSession {
 					return false;
 				}
 				return await this.#promptAgentInitiatedMessage(normalizedAppMessage, {
+					expectedSessionId: sessionId,
+					expectedSessionGeneration: sessionGeneration,
+					sendOptions: options,
 					acceptTerminalEmptyStop: options.acceptTerminalEmptyStop === true,
-					onAdmission: admit ? () => admit("context") : undefined,
+					onAdmission: admit,
 				});
 			}
 			this.agent.appendMessage(normalizedAppMessage);
@@ -7644,8 +7701,11 @@ export class AgentSession {
 				return false;
 			}
 			return await this.#promptAgentInitiatedMessage(normalizedAppMessage, {
+				expectedSessionId: sessionId,
+				expectedSessionGeneration: sessionGeneration,
+				sendOptions: options,
 				acceptTerminalEmptyStop: options.acceptTerminalEmptyStop === true,
-				onAdmission: admit ? () => admit("context") : undefined,
+				onAdmission: admit,
 			});
 		}
 
@@ -7656,7 +7716,10 @@ export class AgentSession {
 				return false;
 			}
 			return await this.#promptAgentInitiatedMessage(normalizedAppMessage, {
-				onAdmission: admit ? () => admit("context") : undefined,
+				expectedSessionId: sessionId,
+				expectedSessionGeneration: sessionGeneration,
+				sendOptions: options,
+				onAdmission: admit,
 			});
 		}
 

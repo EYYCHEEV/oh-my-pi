@@ -136,6 +136,7 @@ async function harness(
 		manager,
 		bus,
 		loaded,
+		runner,
 		extensionPath,
 		mock,
 		side,
@@ -160,18 +161,61 @@ describe("session-wide runtime requirements", () => {
 		expect(cold.manager.getEntries().filter(entry => entry.type === "message")).toEqual([]);
 	});
 
-	it("refuses custom follow-up admission without queuing the rejected draft", async () => {
+	it("returns a typed pre-admission runtime rejection without queuing or weakening legacy failure", async () => {
 		const original = await harness();
 		await original.declaration;
 		const cold = await harness({ file: original.manager.getSessionFile(), extension: false });
-		await expect(
-			cold.session.sendCustomMessageWithReceipt(
-				{ customType: "probe", content: "REJECTED" },
+		expect(
+			await cold.session.sendCustomMessageWithReceipt(
+				{ customType: "probe", content: "REJECTED_RECEIPT" },
 				{ deliverAs: "followUp" },
 			),
+		).toEqual({
+			sessionId: cold.session.sessionId,
+			admitted: false,
+			reason: "runtime-requirement",
+		});
+		await expect(
+			cold.session.sendCustomMessage({ customType: "probe", content: "REJECTED_LEGACY" }, { deliverAs: "followUp" }),
 		).rejects.toThrow("runtime requirement");
 		expect(cold.session.queuedMessageCount).toBe(0);
 		expect(cold.modelCalls()).toBe(0);
+	});
+
+	it("settles a receipt when a concurrent runtime provenance read never returns", async () => {
+		const h = await harness();
+		await h.declaration;
+		const originEntered = Promise.withResolvers<void>();
+		const stalledOrigin = Promise.withResolvers<never>().promise;
+		const getRuntimeOrigin = h.runner.getRuntimeOrigin.bind(h.runner);
+		let originLookups = 0;
+		const runtimeOrigin = spyOn(h.runner, "getRuntimeOrigin").mockImplementation(async (extension, disabledIds) => {
+			originLookups++;
+			if (originLookups === 1) {
+				originEntered.resolve();
+				return await stalledOrigin;
+			}
+			return getRuntimeOrigin(extension, disabledIds);
+		});
+		try {
+			const receipt = h.session.sendCustomMessageWithReceipt(
+				{ customType: "probe", content: "STALLED_PROVENANCE" },
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
+			await originEntered.promise;
+
+			expect(await h.session.prompt("OPERATOR_TURN", { streamingBehavior: "steer" })).toBe(true);
+			expect(h.modelCalls()).toBe(1);
+			expect(await withTimeout(receipt, 2_000, "receipt remained pending")).toEqual({
+				sessionId: h.session.sessionId,
+				admitted: false,
+				reason: "runtime-requirement",
+			});
+			expect(h.session.queuedMessageCount).toBe(0);
+			expect(JSON.stringify(h.session.agent.state.messages)).not.toContain("STALLED_PROVENANCE");
+		} finally {
+			runtimeOrigin.mockRestore();
+		}
 	});
 
 	it("accepts freshly checked exact code on resume, rejects a later false check, and never replays that draft", async () => {
@@ -208,15 +252,20 @@ describe("session-wide runtime requirements", () => {
 		expect(cold.modelCalls()).toBe(0);
 	});
 
-	for (const [name, dispatch] of [
-		["follow-up", (session: AgentSession) => session.followUp("REJECTED")],
-		["synthetic follow-up", (session: AgentSession) => session.followUp("REJECTED", undefined, { synthetic: true })],
+	for (const [name, dispatch, returnsReceipt] of [
+		["follow-up", (session: AgentSession) => session.followUp("REJECTED"), false],
+		[
+			"synthetic follow-up",
+			(session: AgentSession) => session.followUp("REJECTED", undefined, { synthetic: true }),
+			false,
+		],
 		[
 			"custom prompt",
 			(session: AgentSession) =>
 				session.promptCustomMessage({ customType: "probe", content: "REJECTED", display: true }),
+			false,
 		],
-		["user aside", (session: AgentSession) => session.sendUserMessage("REJECTED", { deliverAs: "aside" })],
+		["user aside", (session: AgentSession) => session.sendUserMessage("REJECTED", { deliverAs: "aside" }), false],
 		[
 			"hidden next turn",
 			(session: AgentSession) =>
@@ -224,13 +273,23 @@ describe("session-wide runtime requirements", () => {
 					{ customType: "probe", content: "REJECTED" },
 					{ deliverAs: "nextTurn", triggerTurn: true },
 				),
+			true,
 		],
 	] as const) {
 		it(`refuses ${name} before admission or side inference`, async () => {
 			const original = await harness();
 			await original.declaration;
 			const cold = await harness({ file: original.manager.getSessionFile(), extension: false });
-			await expect(dispatch(cold.session)).rejects.toThrow("runtime requirement");
+			const result = dispatch(cold.session);
+			if (returnsReceipt) {
+				expect(await result).toEqual({
+					sessionId: cold.session.sessionId,
+					admitted: false,
+					reason: "runtime-requirement",
+				});
+			} else {
+				await expect(result).rejects.toThrow("runtime requirement");
+			}
 			expect(cold.session.queuedMessageCount).toBe(0);
 			expect(cold.modelCalls()).toBe(0);
 			expect(cold.side.calls).toHaveLength(0);

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
-import { Agent } from "@oh-my-pi/pi-agent-core";
+import { Agent, AgentBusyError } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Context, ImageContent } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
@@ -21,7 +21,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import * as imageLoading from "@oh-my-pi/pi-coding-agent/utils/image-loading";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 
 const image: ImageContent = { type: "image", data: "aW1hZ2U=", mimeType: "image/png" };
 
@@ -121,7 +121,7 @@ async function createHarness(
 			);
 		},
 	});
-	return { api, context, session, manager, runner, entered, release, contexts, invocations };
+	return { api, context, session, manager, registry, settings, runner, entered, release, contexts, invocations };
 }
 
 describe("extension message receipts", () => {
@@ -161,6 +161,132 @@ describe("extension message receipts", () => {
 			await h.session.waitForIdle();
 		}
 		expect(await Promise.all(h.invocations)).toEqual([true]);
+	});
+
+	it("queues one follow-up when an operator turn wins the idle dispatch race", async () => {
+		const h = await createHarness();
+		const prompt = h.session.agent.prompt.bind(h.session.agent);
+		let operatorTurn: Promise<void> | undefined;
+		const dispatch = spyOn(h.session.agent, "prompt").mockImplementationOnce(async () => {
+			operatorTurn = prompt("OPERATOR_TURN");
+			await h.entered.promise;
+			throw new AgentBusyError();
+		});
+		try {
+			const receipt = await h.api.sendMessageWithReceipt(
+				{ customType: "probe", content: "RACING_FOLLOW_UP", display: true },
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
+			expect(receipt).toEqual({
+				sessionId: h.manager.getSessionId(),
+				admitted: true,
+				location: "queue",
+				deliverAs: "followUp",
+			});
+			expect(h.session.queuedMessageCount).toBe(1);
+			h.release.resolve();
+			await operatorTurn;
+			await h.session.waitForIdle();
+			expect(JSON.stringify(h.contexts).match(/RACING_FOLLOW_UP/g)).toHaveLength(1);
+		} finally {
+			h.release.resolve();
+			dispatch.mockRestore();
+		}
+	});
+
+	it("settles a pre-admission failure while an operator turn waits behind its preflight", async () => {
+		const h = await createHarness();
+		h.settings.override("retry.modelFallback", false);
+		h.settings.override("retry.usageAwareFallback", true);
+		h.settings.override("retry.usageReservePolicy", "fail-closed");
+		const preflightEntered = Promise.withResolvers<void>();
+		const releasePreflight = Promise.withResolvers<void>();
+		let preflightChecks = 0;
+		const usageHealth = spyOn(h.registry.authStorage, "getModelUsageHealth").mockImplementation(async () => {
+			preflightChecks++;
+			if (preflightChecks === 1) {
+				preflightEntered.resolve();
+				await releasePreflight.promise;
+				return { state: "reserve", accounts: [] };
+			}
+			return { state: "healthy", accounts: [] };
+		});
+		try {
+			const sending = h.api.sendMessageWithReceipt(
+				{ customType: "probe", content: "FAILED_BEFORE_ADMISSION" },
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
+			const outcome = sending.catch((error: unknown) => error);
+			await preflightEntered.promise;
+
+			expect(await h.session.prompt("OPERATOR_TURN", { streamingBehavior: "steer" })).toBe(true);
+			expect(h.session.queuedMessageCount).toBe(1);
+			releasePreflight.resolve();
+
+			expect(await outcome).toEqual({
+				sessionId: h.manager.getSessionId(),
+				admitted: false,
+				reason: "admission-failed",
+			});
+			await h.entered.promise;
+			h.release.resolve();
+			await h.session.waitForIdle();
+			expect(JSON.stringify(h.contexts).match(/OPERATOR_TURN/g)).toHaveLength(1);
+			expect(JSON.stringify(h.contexts)).not.toContain("FAILED_BEFORE_ADMISSION");
+			expect(usageHealth).toHaveBeenCalledTimes(2);
+		} finally {
+			releasePreflight.resolve();
+			h.release.resolve();
+			usageHealth.mockRestore();
+		}
+	});
+
+	it("settles context admission before a queued operator turn can block input emission", async () => {
+		const h = await createHarness();
+		const beforeRunEntered = Promise.withResolvers<void>();
+		const releaseBeforeRun = Promise.withResolvers<void>();
+		const dequeueEntered = Promise.withResolvers<void>();
+		const releaseDequeue = Promise.withResolvers<void>();
+		let beforeRuns = 0;
+		const removeBeforeRun = h.session.agent.addBeforeRunHook(async () => {
+			beforeRuns++;
+			if (beforeRuns !== 1) return;
+			beforeRunEntered.resolve();
+			await releaseBeforeRun.promise;
+		});
+		const removeDequeue = h.session.agent.addBeforeQueuedMessageDequeueHook(async () => {
+			dequeueEntered.resolve();
+			await releaseDequeue.promise;
+		});
+		const sending = h.api.sendMessageWithReceipt(
+			{ customType: "probe", content: "RACING_REPORT" },
+			{ deliverAs: "followUp", triggerTurn: true },
+		);
+		try {
+			await beforeRunEntered.promise;
+			expect(await h.session.prompt("OPERATOR_TURN", { streamingBehavior: "steer" })).toBe(true);
+			expect(h.session.queuedMessageCount).toBe(1);
+			releaseBeforeRun.resolve();
+			await dequeueEntered.promise;
+
+			expect(h.contexts).toHaveLength(0);
+			expect(await withTimeout(sending, 250, "receipt remained pending after context admission")).toEqual({
+				sessionId: h.manager.getSessionId(),
+				admitted: true,
+				location: "context",
+				deliverAs: "followUp",
+			});
+		} finally {
+			removeBeforeRun();
+			removeDequeue();
+			releaseBeforeRun.resolve();
+			releaseDequeue.resolve();
+			h.release.resolve();
+			await h.session.waitForIdle();
+			await sending;
+		}
+		expect(JSON.stringify(h.contexts).match(/RACING_REPORT/g)).toHaveLength(1);
+		expect(JSON.stringify(h.contexts).match(/OPERATOR_TURN/g)).toHaveLength(1);
 	});
 
 	it("flushes a lazy pre-assistant journal and preserves correlation after reopening", async () => {
@@ -272,13 +398,17 @@ describe("extension message receipts", () => {
 		});
 	});
 
-	it("rejects normalization errors without admitting a message and preserves the legacy rejection", async () => {
+	it("types normalization failures before admission and preserves the legacy rejection", async () => {
 		const h = await createHarness();
 		const failure = spyOn(imageLoading, "normalizeModelContextImages").mockRejectedValue(
 			new Error("image decode failed"),
 		);
 		try {
-			await expect(h.api.sendMessageWithReceipt({ content: [image] })).rejects.toThrow("image decode failed");
+			expect(await h.api.sendMessageWithReceipt({ content: [image] })).toEqual({
+				sessionId: h.manager.getSessionId(),
+				admitted: false,
+				reason: "admission-failed",
+			});
 			await expect(h.session.sendCustomMessage({ content: [image] })).rejects.toThrow("image decode failed");
 			expect(h.session.agent.state.messages.some(message => message.role === "custom")).toBe(false);
 		} finally {

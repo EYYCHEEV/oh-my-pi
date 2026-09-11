@@ -330,7 +330,13 @@ export type MessageAdmission =
 	| {
 			sessionId: string;
 			admitted: false;
-			reason: "session-changed" | "session-transition" | "session-disposed" | "turn-not-started";
+			reason:
+				| "admission-failed"
+				| "runtime-requirement"
+				| "session-changed"
+				| "session-transition"
+				| "session-disposed"
+				| "turn-not-started";
 	  };
 
 export type CustomMessageDelivery = "steer" | "followUp" | "nextTurn" | "aside";
