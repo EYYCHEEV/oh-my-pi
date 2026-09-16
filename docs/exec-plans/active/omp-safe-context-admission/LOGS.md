@@ -126,3 +126,22 @@ Agent and coding-agent package lint, formatting, and type checks passed; coding-
 A fixture tool-type mismatch found by type checking was corrected using the repository's existing Tool type.
 No live-provider inference or managed-install success is claimed by these source checks.
 The managed updater receipt owns subsequent baseline, build, installation, rollback, and publication evidence.
+
+## 2026-09-16 Pinned v18.2.1 Integration
+The first managed apply stopped at upstream merge conflicts, restored its pre-sync source, and left the installed runtime unchanged.
+The approved manual integration preserves both upstream input-retention and fork runtime-admission behavior.
+Custom message admission and receipt sends share one dispatch path, including manual-compaction resume ownership.
+Upstream now owns conversion-array cache invalidation; all affected maintenance consumers use that owner.
+Overflow recovery carries both fork continuation controls and upstream media-exclusion controls.
+
+The concurrent-turn regression exposed a deadlock in the prepared-recovery patch: run preparation drained all end-of-turn handlers, including a normal TTSR handler awaiting the retry itself.
+Preparation now waits only for a captured budget-refusal dispatch and its settlement, not unrelated end-of-turn work.
+Normal delayed agent-end notifications remain observable without marking a newer run idle.
+The combined concurrent-turn, queued-policy, and prepared-budget suites passed 113 tests after that correction.
+Agent, coding-agent, AI, and utilities package checks passed during integration.
+
+Upstream print mode now returns an exit code; refusal tests assert its nonzero result, empty stdout, and exact budget warning instead of intercepting process.exit.
+The trailing-output maintenance fixture supplies a synthetic summary and checks that the next request contains the rewritten context; recent kept history remains allowed.
+Upstream policy fixtures now add handlers to a pre-registered extension identity rather than mutating the loader-owned identity roster.
+The parked-extension-send fixture exercises real Agent admission with a mock provider and real timers; the reminder fixture waits for session settlement rather than a fixed microtask count.
+These are local synthetic-provider proofs, not authenticated live-provider or installed-runtime proof.

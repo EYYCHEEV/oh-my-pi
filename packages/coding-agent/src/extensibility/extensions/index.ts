@@ -18,6 +18,7 @@ export {
 	ExtensionRuntimeNotInitializedError,
 	getRequiredExtensionAttestation,
 	getRequiredExtensionHandlerSnapshot,
+	extensionToolSourceInfo,
 	loadExtensionFromFactory,
 	loadExtensions,
 	loadExtensionsWithRequiredAttestation,

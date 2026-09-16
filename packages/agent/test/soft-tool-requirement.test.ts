@@ -10,16 +10,14 @@ import type {
 } from "@oh-my-pi/pi-agent-core/types";
 import type { Message, ToolChoice } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
-import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { createUserMessage } from "./helpers";
+import { createHarmonyMitigationModel, createUserMessage } from "./helpers";
 
 function identityConverter(messages: AgentMessage[]): Message[] {
 	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
 }
 
 const emptySchema = type({});
-const codexModel = buildModel({ ...getBundledModel("openai-codex", "gpt-5.4") });
+const codexModel = createHarmonyMitigationModel();
 
 /**
  * Build a host that gates `resolve` as a soft requirement while a preview is

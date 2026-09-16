@@ -330,6 +330,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 			},
 		);
 
+		const compactSpy = mockCompaction("TRAILING-RESULT-COMPACTED");
 		await session.prompt("process the large tool result");
 
 		expect(onProviderCall).toHaveBeenNthCalledWith(1, 0);
@@ -338,8 +339,8 @@ describe("AgentSession mid-run threshold compaction", () => {
 		expect(onProviderCall.mock.invocationCallOrder[0]).toBeLessThan(onToolExecute.mock.invocationCallOrder[0]);
 		expect(onToolExecute.mock.invocationCallOrder[0]).toBeLessThan(runAutoSpy.mock.invocationCallOrder[0]);
 		expect(runAutoSpy.mock.invocationCallOrder[0]).toBeLessThan(onProviderCall.mock.invocationCallOrder[1]);
-		expect(await runAutoSpy.mock.results[0]?.value).toMatchObject({ historyRewritten: true });
-		expect(observedContexts[1].join("\n")).not.toContain(toolOutput);
+		expect(compactSpy).toHaveBeenCalledTimes(1);
+		expect(observedContexts[1].join("\n")).toContain("TRAILING-RESULT-COMPACTED");
 	});
 
 	it("compacts before sending when the prior response already filled the reserved input budget", async () => {
@@ -1217,12 +1218,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 			if (typeof callback === "function") callback();
 			return true;
 		});
-		const exit = new Error("captured print-mode exit");
-		const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
-			throw exit;
-		});
-		await expect(runPrintMode(session, { mode: "text", initialMessage: "new request" })).rejects.toBe(exit);
-		expect(exitSpy).toHaveBeenCalledWith(1);
+		expect(await runPrintMode(session, { mode: "text", initialMessage: "new request" })).toBe(1);
 		expect(stderr.join("")).toContain("3,096-token usable budget");
 		expect(stdout.join("")).toBe("");
 		expect(observedContexts).toHaveLength(0);

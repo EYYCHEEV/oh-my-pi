@@ -58,6 +58,8 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			const invokingTask = sendTask.then(started => {
 				if (!started) throw new Error("send did not invoke the agent");
 			});
+			// A no-turn result is normal and must be handled even outside a prompt scope.
+			invokingTask.catch(() => {});
 			if (trackAgentInvokingMessage) {
 				trackAgentInvokingMessage(invokingTask);
 			} else {
