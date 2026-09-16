@@ -2695,6 +2695,7 @@ describe("ExtensionRunner", () => {
 				name: "signal_test",
 				label: "Signal test",
 				description: "Test caller signal propagation",
+				approval: "read",
 				parameters: Type.Object({}),
 				strict: true,
 				execute: async () => {

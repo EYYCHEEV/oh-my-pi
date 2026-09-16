@@ -33,7 +33,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import { createAssistantMessage, createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 describe("createAgentSession preloadedExtensions isolation (issue #2190)", () => {
 	let sharedDir: string;
@@ -524,17 +524,18 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 			"requiredExtension.id": required.extensionId,
 			"requiredExtension.sha256": required.expectedSha256,
 		});
-		vi.spyOn(SessionManager, "peekSessionInit").mockResolvedValue({
-			cwd: sharedDir,
-			init: {
-				systemPrompt: "cold revive",
-				task: "resume",
-				tools: ["read", "yield"],
-				spawns: "",
-				readSummarize: true,
-			},
+		const persisted = SessionManager.create(sharedDir, path.join(sharedDir, "cold-required-sessions"));
+		const sessionFile = persisted.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted fixture session");
+		persisted.appendSessionInit({
+			systemPrompt: "cold revive",
+			task: "resume",
+			tools: ["read", "yield"],
+			spawns: "",
+			readSummarize: true,
 		});
-		vi.spyOn(SessionManager, "open").mockImplementation(async () => SessionManager.inMemory(sharedDir));
+		persisted.appendMessage(createAssistantMessage("persisted task progress"));
+		await persisted.close();
 		const factory = createPersistedSubagentReviverFactory({
 			session: {
 				sessionManager: {
@@ -556,25 +557,29 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 			parentId: "main",
 			status: "parked",
 			session: null,
-			sessionFile: path.join(sharedDir, "cold-required.jsonl"),
+			sessionFile,
 			createdAt: Date.now(),
 			lastActivity: Date.now(),
 		} as const;
-		const registeredRef = AgentRegistry.global().register(ref);
-		const revive = await factory(registeredRef);
-		if (!revive) throw new Error("expected cold reviver");
+		let registeredRef = AgentRegistry.global().register(ref);
+		try {
+			const revive = await factory(registeredRef);
+			if (!revive) throw new Error("expected cold reviver");
 
-		settings.set("requiredExtension.path", path.join(sharedDir, "wrong.ts"));
-		settings.set("requiredExtension.id", "extension-module:wrong");
-		settings.set("requiredExtension.sha256", "0".repeat(64));
-		const revived = await revive(registeredRef);
-		expect(revived).toBeDefined();
-		await revived.dispose();
+			settings.set("requiredExtension.path", path.join(sharedDir, "wrong.ts"));
+			settings.set("requiredExtension.id", "extension-module:wrong");
+			settings.set("requiredExtension.sha256", "0".repeat(64));
+			const revived = await revive(registeredRef);
+			expect(revived).toBeDefined();
+			await revived.dispose();
 
-		fs.writeFileSync(extensionPath, `${content}\n// changed`);
-		const mismatchRef = AgentRegistry.global().register(ref);
-		const mismatchedRevive = await factory(mismatchRef);
-		if (!mismatchedRevive) throw new Error("expected mismatch cold reviver");
-		await expect(mismatchedRevive(mismatchRef)).rejects.toMatchObject({ code: "hash-mismatch" });
+			fs.writeFileSync(extensionPath, `${content}\n// changed`);
+			registeredRef = AgentRegistry.global().register(ref);
+			const mismatchedRevive = await factory(registeredRef);
+			if (!mismatchedRevive) throw new Error("expected mismatch cold reviver");
+			await expect(mismatchedRevive(registeredRef)).rejects.toMatchObject({ code: "hash-mismatch" });
+		} finally {
+			AgentRegistry.global().unregister(ref.id, registeredRef);
+		}
 	});
 });

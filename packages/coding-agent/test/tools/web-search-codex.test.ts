@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { AgentMessage, AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import type { AuthStorage, FetchImpl, Message } from "@oh-my-pi/pi-ai";
+import * as catalogModels from "@oh-my-pi/pi-catalog/models";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { customToolToDefinition } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -851,6 +852,9 @@ describe("searchCodex model selection", () => {
 
 	it("does not add live-only models to the bundled fallback chain", async () => {
 		delete process.env.PI_CODEX_WEB_SEARCH_MODEL;
+		const bundled = catalogModels.getBundledModels("openai-codex").find(model => model.id === "gpt-5.5");
+		if (!bundled) throw new Error("Expected a bundled hosted-search model");
+		vi.spyOn(catalogModels, "getBundledModels").mockReturnValue([bundled]);
 		const attemptedModels: unknown[] = [];
 		const allLiveModelRegistry = {
 			...liveSolModelRegistry,
@@ -875,7 +879,7 @@ describe("searchCodex model selection", () => {
 				modelRegistry: allLiveModelRegistry,
 			}),
 		).rejects.toThrow("not supported");
-		expect(attemptedModels).toEqual(["gpt-5.6-sol", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.4"]);
+		expect(attemptedModels).toEqual(["gpt-5.6-sol", "gpt-5.5"]);
 	});
 
 	function sentUserText(): string | undefined {

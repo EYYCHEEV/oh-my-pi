@@ -239,15 +239,12 @@ async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
 		// runtime and postmortem/inspector graph out of ordinary startup without
 		// putting an await ahead of the subprocess message handler.
 		const { startJsEvalProcess }: typeof JsProcessEntry = require("./eval/js/process-entry");
-		// The .js subpath is the package's unconditional export for synchronous loading.
-		const { interceptUnhandledRejections }: typeof Postmortem = require("@oh-my-pi/pi-utils/postmortem.js");
 		// The JS evaluator forwards user-controlled payloads (tool-call args,
 		// display outputs); a non-serializable one must fail that cell, not
 		// SIGKILL the kernel and erase the eval session's state.
-		await runIpcSubprocessWorker<JsWorkerInbound, JsWorkerOutbound>(
-			transport => startJsEvalProcess(transport, interceptUnhandledRejections),
-			{ rethrowConnectedSendErrors: true },
-		);
+		await runIpcSubprocessWorker<JsWorkerInbound, JsWorkerOutbound>(startJsEvalProcess, {
+			rethrowConnectedSendErrors: true,
+		});
 		return true;
 	}
 	if (arg === STT_WORKER_ARG) {

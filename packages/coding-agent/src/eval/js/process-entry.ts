@@ -1,3 +1,4 @@
+import { interceptUnhandledRejections as interceptProcessRejections } from "@oh-my-pi/pi-utils/postmortem";
 import { type RejectionInterceptor, WorkerCore } from "./worker-core";
 import type { WorkerInbound, WorkerOutbound } from "./worker-protocol";
 
@@ -7,7 +8,7 @@ export function startJsEvalProcess(
 		send(message: WorkerOutbound): void;
 		onMessage(handler: (message: WorkerInbound) => void): () => void;
 	},
-	interceptUnhandledRejections: RejectionInterceptor,
+	interceptUnhandledRejections: RejectionInterceptor = interceptProcessRejections,
 ): void {
 	new WorkerCore(
 		{

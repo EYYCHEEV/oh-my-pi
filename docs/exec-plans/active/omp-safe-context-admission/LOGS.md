@@ -145,3 +145,21 @@ The trailing-output maintenance fixture supplies a synthetic summary and checks 
 Upstream policy fixtures now add handlers to a pre-registered extension identity rather than mutating the loader-owned identity roster.
 The parked-extension-send fixture exercises real Agent admission with a mock provider and real timers; the reminder fixture waits for session settlement rather than a fixed microtask count.
 These are local synthetic-provider proofs, not authenticated live-provider or installed-runtime proof.
+
+## 2026-09-16 Protected Gate Repairs
+The native build and dependency installation passed, then the updater stopped on an outdated cold-revival fixture before installing anything.
+The fixture now reopens a real saved session contract and conversation, and unregisters only its owned agent reference during cleanup.
+The caller-signal fixture declares its harmless tool read-only; its cancellation and backend-dispatch assertions remain intact.
+The model fallback fixture supplies a bounded catalog instead of pinning the changing bundled roster.
+SSE turn-state fixtures explicitly select SSE; WebSocket coverage remains enabled in its own cases.
+The handshake-join regression now waits for the second caller to inspect a CONNECTING socket instead of guessing readiness with a five-millisecond sleep.
+
+The public profile-hidden JS worker test also exposed a real synchronous package-resolution failure: requiring the cleanup module after importing the CLI repeatedly prefixed the source path with file: until NameTooLong.
+The cleanup-handler import now belongs to the already-lazy JavaScript subprocess entry module, preserving synchronous handler installation and optional interceptor injection.
+Ordinary source CLI startup, bundled and compiled entry graphs, subprocess stdio, worker spawning, and worker-core checks passed: 30 tests, zero failures.
+No asynchronous bootstrap delay, runtime bypass, credential change, or warning suppression was introduced.
+
+Final combined protected source verification passed 1878 tests, with two skips and zero failures, across all 81 manifest-selected source files.
+Coding-agent and AI package lint, formatting, and type checks passed after the corrections.
+The fork manifest protects the added subprocess entry dependency and its startup/stdio checks.
+The installed runtime and remote fork remain unchanged at this source checkpoint; the managed updater must still build, test the candidate, install, verify, and publish.

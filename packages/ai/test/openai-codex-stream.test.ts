@@ -5657,11 +5657,25 @@ describe("openai-codex streaming", () => {
 
 		let constructorCount = 0;
 		const sockets: DeferredOpenWebSocket[] = [];
+		const socketCreated = Promise.withResolvers<void>();
+		const pendingConnectionChecked = Promise.withResolvers<void>();
+		let observeJoin = false;
 		class DeferredOpenWebSocket extends MockWebSocket {
 			constructor(url: string, options?: { headers?: WsHeaders }) {
 				super(url, options);
 				constructorCount += 1;
+				let readyState = this.readyState;
+				Object.defineProperty(this, "readyState", {
+					get: () => {
+						if (observeJoin && readyState === MockWebSocket.CONNECTING) pendingConnectionChecked.resolve();
+						return readyState;
+					},
+					set: (value: number) => {
+						readyState = value;
+					},
+				});
 				sockets.push(this);
+				socketCreated.resolve();
 			}
 
 			open(): void {
@@ -5691,6 +5705,8 @@ describe("openai-codex streaming", () => {
 			sessionId: "ws-join-session",
 			providerSessionState,
 		});
+		await socketCreated.promise;
+		observeJoin = true;
 		const streamResult = streamOpenAICodexResponses(model, createCodexTestContext(), {
 			fetch: fetchMock as FetchImpl,
 			apiKey: token,
@@ -5698,8 +5714,8 @@ describe("openai-codex streaming", () => {
 			providerSessionState,
 		}).result();
 
-		// Let both callers reach the handshake before the socket opens.
-		await Bun.sleep(5);
+		// The second caller must inspect the still-CONNECTING socket before it opens.
+		await pendingConnectionChecked.promise;
 		for (const socket of sockets) socket.open();
 
 		await prewarmPromise;
@@ -5715,7 +5731,7 @@ describe("openai-codex streaming", () => {
 		});
 		expect(details.websocketDisabled).toBe(false);
 		expect(fetchMock).not.toHaveBeenCalled();
-	}, 15_000); // real handshake join; 5s default flakes under full-suite load
+	}, 15_000); // failure-only bound for a real pending-handshake join
 
 	it("surfaces a whitespace flood arriving after a delivered tool call instead of replaying", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
@@ -6316,6 +6332,7 @@ describe("openai-codex streaming", () => {
 			fetch: fetchMock as FetchImpl,
 			apiKey: token,
 			sessionId: "turn-state-session",
+			preferWebsockets: false,
 			providerSessionState,
 		};
 
@@ -6694,6 +6711,7 @@ describe("openai-codex streaming", () => {
 			fetch: fetchMock as FetchImpl,
 			apiKey: createCodexTestToken(),
 			sessionId: "metadata-turn-state-session",
+			preferWebsockets: false,
 			providerSessionState,
 		};
 
