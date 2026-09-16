@@ -88,6 +88,19 @@ function refreshToolChoiceForActiveTools(
 	return tools.some(tool => tool.name === toolName) ? toolChoice : undefined;
 }
 
+/**
+ * Synchronous ownership transition committed only after every before-run
+ * preparation hook and the Agent's model validation succeed.
+ */
+export type AgentRunCommit = () => void;
+
+/**
+ * Prepare an Agent run after it claims busy state but before it snapshots the
+ * active model and conversation. A returned commit is held until every hook
+ * succeeds, so failed preparation cannot partially advance host lifecycle state.
+ */
+export type AgentBeforeRunHook = (signal?: AbortSignal) => AgentRunCommit | void | Promise<AgentRunCommit | void>;
+
 export class AgentBusyError extends Error {
 	constructor(
 		message: string = "Agent is already processing. Use steer() or followUp() to queue messages, or wait for completion.",
@@ -431,6 +444,7 @@ export class Agent {
 	#appendOnlyContext?: AppendOnlyContextManager;
 	#beforeQueuedMessageDequeueHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
 	#beforeModelCallHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
+	#beforeRunHooks = new Set<AgentBeforeRunHook>();
 
 	/** Buffered Cursor tool results with text length at time of call (for correct ordering) */
 	#cursorToolResultBuffer: CursorToolResultEntry[] = [];
@@ -808,6 +822,28 @@ export class Agent {
 		return () => this.#listeners.delete(fn);
 	}
 
+	/**
+	 * Register an independently removable hook that prepares a claimed Agent
+	 * run before its model and conversation are captured. A hook may return a
+	 * synchronous commit; commits run only after every hook and model validation
+	 * succeed, so a later preparation failure cannot partially advance host
+	 * lifecycle state.
+	 */
+	addBeforeRunHook(hook: AgentBeforeRunHook): () => void {
+		const registration: AgentBeforeRunHook = signal => hook(signal);
+		this.#beforeRunHooks.add(registration);
+		return () => this.#beforeRunHooks.delete(registration);
+	}
+
+	async #prepareBeforeRunHooks(signal?: AbortSignal): Promise<AgentRunCommit[]> {
+		const commits: AgentRunCommit[] = [];
+		for (const hook of this.#beforeRunHooks) {
+			const commit = await hook(signal);
+			if (commit) commits.push(commit);
+		}
+		return commits;
+	}
+
 	/** Register an independently removable hook that runs before queued messages are consumed. */
 	addBeforeQueuedMessageDequeueHook(hook: (signal?: AbortSignal) => Promise<void> | void): () => void {
 		const registration = (signal?: AbortSignal) => hook(signal);
@@ -1157,9 +1193,6 @@ export class Agent {
 			throw new AgentBusyError();
 		}
 
-		const model = this.#state.model;
-		if (!model) throw new Error("No model configured");
-
 		let msgs: AgentMessage[];
 		let promptOptions: AgentPromptOptions | undefined;
 		let images: ImageContent[] | undefined;
@@ -1302,9 +1335,6 @@ export class Agent {
 		continuationSignal?: AbortSignal,
 		runStateClaimed = false,
 	) {
-		const model = this.#state.model;
-		if (!model) throw new Error("No model configured");
-
 		let skipInitialSteeringPoll = options?.skipInitialSteeringPoll === true;
 		using _ = new EventLoopKeepalive();
 		if (!runStateClaimed) {
@@ -1322,7 +1352,26 @@ export class Agent {
 		this.#state.isStreaming = true;
 		this.#state.streamMessage = null;
 		this.#state.error = undefined;
-
+		let model: Model;
+		try {
+			const commits = await this.#prepareBeforeRunHooks(loopSignal);
+			if (!this.#state.model) throw new Error("No model configured");
+			for (const commit of commits) commit();
+			const activeModel = this.#state.model;
+			if (!activeModel) throw new Error("No model configured");
+			model = activeModel;
+		} catch (error) {
+			resolveRun?.();
+			if (this.#abortController === loopAbortController) {
+				this.#state.isStreaming = false;
+				this.#state.streamMessage = null;
+				this.#state.pendingToolCalls.clear();
+				this.#abortController = undefined;
+				this.#runningPrompt = undefined;
+				this.#resolveRunningPrompt = undefined;
+			}
+			throw error;
+		}
 		// Clear Cursor tool result buffer at start of each run
 		this.#cursorToolResultBuffer = [];
 

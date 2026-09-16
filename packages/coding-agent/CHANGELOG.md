@@ -18,6 +18,7 @@
 - Fixed background compaction allowing requests beyond the usable-input budget; requests that still do not fit now stop with an actionable error before sending.
 - Fixed completed mid-turn compaction replaying a cached copy of the old conversation in the next request.
 - Fixed budget refusals hanging automatic retries or printing an earlier answer as success in text mode.
+- Fixed late provider-request growth stopping at the budget gate when OMP could safely compact and retry.
 
 ## [18.1.12] - 2026-09-06
 

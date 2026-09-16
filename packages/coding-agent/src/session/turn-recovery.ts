@@ -46,6 +46,7 @@ import type {
 	UsageFallbackConfirmer,
 } from "./agent-session-types";
 import { assistantTurnProducedOutput, isEmptyAssistantStop, isEmptyErrorTurn } from "./messages";
+import type { CompactionContinuationControl } from "./session-maintenance";
 import {
 	type ActiveRetryFallbackState,
 	calculateRetryBackoffDelayMs,
@@ -228,6 +229,8 @@ export interface TurnRecoveryHost {
 			suppressHandoff?: boolean;
 			phase?: CodexCompactionContext["phase"];
 			terminalTextAnswer?: boolean;
+			continuationControl?: CompactionContinuationControl;
+			suppressDeadEndNotice?: boolean;
 		},
 	): Promise<RecoveryCompactionResult>;
 	withBashBranchTransition<T>(operation: () => T): T;
@@ -561,7 +564,12 @@ export class TurnRecovery {
 		reason: "overflow" | "incomplete",
 		message: AssistantMessage,
 		allowDefer: boolean,
-		options: { autoContinue: boolean; triggerContextTokens?: number },
+		options: {
+			autoContinue: boolean;
+			triggerContextTokens?: number;
+			continuationControl?: CompactionContinuationControl;
+			suppressDeadEndNotice?: boolean;
+		},
 	): Promise<RecoveryCompactionResult> {
 		return this.#runRecoveryCompactionWithRollback(reason, message, allowDefer, options);
 	}
@@ -639,8 +647,12 @@ export class TurnRecovery {
 	}
 
 	/** Prompts after transient overlap with a prior agent run. */
-	promptAgentWithIdleRetry(messages: AgentMessage[], options?: { toolChoice?: ToolChoice }): Promise<void> {
-		return this.#promptAgentWithIdleRetry(messages, options);
+	promptAgentWithIdleRetry(
+		messages: AgentMessage[],
+		options?: { toolChoice?: ToolChoice },
+		continuationControl?: CompactionContinuationControl,
+	): Promise<boolean> {
+		return this.#promptAgentWithIdleRetry(messages, options, continuationControl);
 	}
 
 	/** Parses provider retry and rate-limit reset hints into a delay. */
@@ -1050,7 +1062,12 @@ export class TurnRecovery {
 		reason: "overflow" | "incomplete",
 		assistantMessage: AssistantMessage,
 		allowDefer: boolean,
-		options: { autoContinue: boolean; triggerContextTokens?: number },
+		options: {
+			autoContinue: boolean;
+			triggerContextTokens?: number;
+			continuationControl?: CompactionContinuationControl;
+			suppressDeadEndNotice?: boolean;
+		},
 	): Promise<RecoveryCompactionResult> {
 		const compactionEntryBefore = getLatestCompactionEntry(this.#host.sessionManager.getBranch());
 		await this.dropPersistedAssistantTurn(assistantMessage);
@@ -1058,6 +1075,8 @@ export class TurnRecovery {
 			autoContinue: options.autoContinue,
 			triggerContextTokens: options.triggerContextTokens,
 			phase: "mid_turn",
+			continuationControl: options.continuationControl,
+			suppressDeadEndNotice: options.suppressDeadEndNotice,
 		});
 		const compactionEntryAfter = getLatestCompactionEntry(this.#host.sessionManager.getBranch());
 		if (result.historyRewritten !== true && compactionEntryAfter === compactionEntryBefore) {
@@ -2600,12 +2619,17 @@ export class TurnRecovery {
 		this.resolveRetry();
 	}
 
-	async #promptAgentWithIdleRetry(messages: AgentMessage[], options?: { toolChoice?: ToolChoice }): Promise<void> {
+	async #promptAgentWithIdleRetry(
+		messages: AgentMessage[],
+		options?: { toolChoice?: ToolChoice },
+		continuationControl?: CompactionContinuationControl,
+	): Promise<boolean> {
 		const deadline = Date.now() + 30_000;
 		for (;;) {
+			if (continuationControl && !continuationControl.beginLaunch()) return false;
 			try {
 				await this.#host.agent.prompt(messages, options);
-				return;
+				return true;
 			} catch (err) {
 				if (!(err instanceof AgentBusyError)) {
 					throw err;
@@ -2614,6 +2638,8 @@ export class TurnRecovery {
 					throw new Error("Timed out waiting for prior agent run to finish before prompting.");
 				}
 				await this.#host.agent.waitForIdle();
+			} finally {
+				continuationControl?.endLaunch();
 			}
 		}
 	}

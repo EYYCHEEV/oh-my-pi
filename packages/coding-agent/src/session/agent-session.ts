@@ -357,7 +357,11 @@ import type { BranchSummaryEntry, NewSessionOptions } from "./session-entries";
 import { SessionHandoff, type SessionHandoffHost } from "./session-handoff";
 import {
 	COMPACTION_CHECK_NONE,
+	type CompactionCheckResult,
+	type CompactionContinuationControl,
 	createCodexCompactionContext as createMaintenanceCodexCompactionContext,
+	type PreparedBudgetRecoveryContext,
+	type PreparedBudgetRecoveryOwner,
 	SessionMaintenance,
 	type SessionMaintenanceHost,
 } from "./session-maintenance";
@@ -444,6 +448,7 @@ type ScheduledAgentContinueOptions = {
 	delayMs?: number;
 	generation?: number;
 	shouldContinue?: () => boolean;
+	continuationControl?: CompactionContinuationControl;
 	onSkip?: (reason: AgentContinueSkipReason) => void;
 	onError?: (error: unknown) => void;
 };
@@ -475,6 +480,22 @@ type SetSessionNameWithTrigger = (
 
 const kPersistedSessionEntryId = Symbol("persistedSessionEntryId");
 type PersistedAssistantMessage = AssistantMessage & { [kPersistedSessionEntryId]?: string };
+
+type PreparedBudgetRefusal = Readonly<{
+	reason: string;
+	recoveryOwner: PreparedBudgetRecoveryOwner | undefined;
+	model: Pick<Model, "api" | "provider" | "id">;
+}>;
+
+type AgentEndMaintenanceSnapshot = Readonly<{
+	assistantMessage: AssistantMessage | undefined;
+	budgetRefusal: PreparedBudgetRefusal | undefined;
+}>;
+
+type PendingPreparedBudgetRecovery = Readonly<{
+	continuation: CompactionContinuationControl;
+	settle: () => Promise<void>;
+}>;
 
 /**
  * Clone one top-level notification field without ever returning an object owned
@@ -717,7 +738,10 @@ export class AgentSession {
 	#detachUsageBeforeQueueDequeue: (() => void) | undefined;
 	#detachUsageBeforeModelCall: (() => void) | undefined;
 	#detachContextBudgetGate: (() => void) | undefined;
-	#contextBudgetRefusal: string | undefined;
+	#detachBeforeAgentRun: (() => void) | undefined;
+	#contextBudgetRefusal: PreparedBudgetRefusal | undefined;
+	#pendingPreparedBudgetRecovery: PendingPreparedBudgetRecovery | undefined;
+	#preparedBudgetContinuationLaunch: CompactionContinuationControl | undefined;
 
 	#transformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	#onPayload: SimpleStreamOptions["onPayload"] | undefined;
@@ -815,7 +839,9 @@ export class AgentSession {
 
 	#resetPromptMaintenanceState(): void {
 		this.#recovery.resetForNewPrompt();
-		this.#maintenance.resetForNewPrompt();
+		this.#maintenance.resetForNewPrompt({
+			deferPreparedBudgetBoundary: this.#pendingPreparedBudgetRecovery !== undefined,
+		});
 		this.#yieldTerminationPending = false;
 	}
 
@@ -1839,6 +1865,21 @@ export class AgentSession {
 			abortHandoff: () => this.abortHandoff(),
 		};
 		this.#maintenance = new SessionMaintenance(maintenanceHost);
+		this.#detachBeforeAgentRun = this.agent.addBeforeRunHook(async () => {
+			await this.#drainInFlightEventHandlers();
+			const pendingRecovery = this.#pendingPreparedBudgetRecovery;
+			if (pendingRecovery && this.#preparedBudgetContinuationLaunch !== pendingRecovery.continuation) {
+				await pendingRecovery.settle();
+			}
+			await this.#drainPreparedBudgetSettlements();
+			if (this.#isDisposed) return;
+			const preparedBudgetLaunch = this.#preparedBudgetContinuationLaunch;
+			return () => {
+				preparedBudgetLaunch?.commitLaunch();
+				this.#agentRunSequence++;
+				this.#maintenance.beginAgentRun();
+			};
+		});
 		this.#detachContextBudgetGate = this.agent.addBeforeModelCall((context, signal, model, sourceMessageTokens) => {
 			const result = this.#maintenance.checkContextBudgetBeforeModelCall(
 				context,
@@ -1847,9 +1888,13 @@ export class AgentSession {
 				sourceMessageTokens,
 			);
 			if (result?.stop && result.reason) {
-				this.#contextBudgetRefusal = result.reason;
-				// A deliberate refusal is a terminal failure, not a silent scheduling
-				// pause. The loop's existing exception path balances its error turn.
+				this.#contextBudgetRefusal = {
+					reason: result.reason,
+					recoveryOwner: this.#maintenance.claimPreparedBudgetRecovery(),
+					model: { api: model.api, provider: model.provider, id: model.id },
+				};
+				// Throw through the loop's balanced error-turn path. `agent_end`
+				// either recovers preparation-only growth or preserves the refusal.
 				throw new Error(result.reason);
 			}
 			if (result && !result.stop) result.contextSnapshot.compactionEpoch = this.#stats.compactionEpoch;
@@ -2469,12 +2514,14 @@ export class AgentSession {
 	// Track last assistant message for auto-compaction check
 	#lastAssistantMessage: AssistantMessage | undefined = undefined;
 	/**
-	 * Classifier-refusal turn pruned from active context at settle (#3591).
-	 * Retained until the next run starts so post-settle readers
-	 * ({@link getLastAssistantMessage}: print mode, task executor) still see
-	 * the terminal error instead of a silently successful-looking state.
+	 * Terminal refusal pruned from active context during recovery. Retained until
+	 * the next run starts so post-settle readers ({@link getLastAssistantMessage}:
+	 * print mode, task executor) still see the terminal error instead of a
+	 * silently successful-looking state.
 	 */
 	#prunedTerminalRefusal: AssistantMessage | undefined = undefined;
+	/** Monotonic ownership token preventing an older async settle from masking a newer run. */
+	#agentRunSequence = 0;
 
 	/**
 	 * In-flight {@link #dispatchAgentEvent} promises. agent-core invokes the
@@ -2485,6 +2532,8 @@ export class AgentSession {
 	 * memory release, never after it.
 	 */
 	#inFlightEventHandlers = new Set<Promise<void>>();
+	/** Terminal fallback work started after a scheduled recovery fails to launch. */
+	#preparedBudgetSettlementTasks = new Set<Promise<void>>();
 
 	/**
 	 * Subscriber entry point. Delegates to {@link #dispatchAgentEvent} and
@@ -2523,6 +2572,18 @@ export class AgentSession {
 		}
 	}
 
+	async #drainPreparedBudgetSettlements(): Promise<void> {
+		while (this.#preparedBudgetSettlementTasks.size > 0) {
+			await Promise.allSettled(this.#preparedBudgetSettlementTasks);
+		}
+	}
+
+	#trackPreparedBudgetSettlement(task: Promise<void>): void {
+		this.#preparedBudgetSettlementTasks.add(task);
+		void task.finally(() => this.#preparedBudgetSettlementTasks.delete(task)).catch(() => {});
+		this.#trackPostPromptTask(task);
+	}
+
 	/** Internal handler for agent events - shared by subscribe and reconnect.
 	 *
 	 * `agent_end` handling schedules deferred post-prompt recovery work
@@ -2537,7 +2598,26 @@ export class AgentSession {
 	 * `#postPromptTasksPromise` is set the moment `#emit` invokes this handler, so
 	 * the recovery wait always sees the in-flight handler and blocks until it — and
 	 * everything it schedules — settles. */
+	#stampPreparedBudgetRefusalMessage(message: AgentMessage): void {
+		const refusal = this.#contextBudgetRefusal;
+		if (
+			!refusal ||
+			message.role !== "assistant" ||
+			message.stopReason !== "error" ||
+			message.errorMessage !== refusal.reason
+		) {
+			return;
+		}
+		message.api = refusal.model.api;
+		message.provider = refusal.model.provider;
+		message.model = refusal.model.id;
+		message.errorId = AIError.create(AIError.Flag.ContextOverflow);
+	}
+
 	#dispatchAgentEvent = async (event: AgentEvent): Promise<void> => {
+		if (event.type === "message_start" || event.type === "message_end") {
+			this.#stampPreparedBudgetRefusalMessage(event.message);
+		}
 		if (event.type === "tool_execution_end" && this.#isTerminalYieldToolResult(event)) {
 			const alreadyTerminated = this.#synchronouslyTerminatedYieldToolCallIds.delete(event.toolCallId);
 			if (!alreadyTerminated) {
@@ -2553,10 +2633,19 @@ export class AgentSession {
 			}
 			return processing;
 		}
+		const fallbackAssistant = event.messages.findLast(
+			(message): message is AssistantMessage => message.role === "assistant",
+		);
+		const maintenanceSnapshot: AgentEndMaintenanceSnapshot = {
+			assistantMessage: this.#lastAssistantMessage ?? fallbackAssistant,
+			budgetRefusal: this.#contextBudgetRefusal,
+		};
+		this.#lastAssistantMessage = undefined;
+		this.#contextBudgetRefusal = undefined;
 		const { promise, resolve } = Promise.withResolvers<void>();
 		this.#trackPostPromptTask(promise);
 		try {
-			await this.#processAgentEvent(event);
+			await this.#processAgentEvent(event, maintenanceSnapshot);
 		} finally {
 			resolve();
 		}
@@ -2864,8 +2953,45 @@ export class AgentSession {
 		return true;
 	}
 
-	#processAgentEvent = async (event: AgentEvent): Promise<void> => {
+	#isPreparedBudgetRefusalCurrent(refusal: PreparedBudgetRefusal, agentRunSequence: number): boolean {
+		return (
+			agentRunSequence === this.#agentRunSequence &&
+			(refusal.recoveryOwner === undefined || this.#maintenance.isPreparedBudgetRecoveryOwner(refusal.recoveryOwner))
+		);
+	}
+
+	#retainTerminalRefusalForReaders(message: AssistantMessage, agentRunSequence: number): void {
+		if (agentRunSequence === this.#agentRunSequence) this.#prunedTerminalRefusal = message;
+	}
+
+	async #settlePreparedBudgetRefusal(
+		refusal: PreparedBudgetRefusal,
+		message: AssistantMessage | undefined,
+		agentRunSequence: number,
+	): Promise<boolean> {
+		if (!this.#isPreparedBudgetRefusalCurrent(refusal, agentRunSequence)) return false;
+		this.emitNotice("warning", refusal.reason, "compaction");
+		if (message) {
+			await this.#recovery.persistTerminalEmptyErrorTurn(message);
+			this.#retainTerminalRefusalForReaders(message, agentRunSequence);
+		}
+		await this.#recovery.settleRetryWithoutContinuation(refusal.reason);
+		return true;
+	}
+
+	async #settlePreparedBudgetRecovery(
+		refusal: PreparedBudgetRefusal,
+		message: AssistantMessage,
+		result: CompactionCheckResult,
+		agentRunSequence: number,
+	): Promise<boolean> {
+		if (result.deferredHandoff || result.continuationScheduled) return false;
+		return this.#settlePreparedBudgetRefusal(refusal, message, agentRunSequence);
+	}
+
+	#processAgentEvent = async (event: AgentEvent, agentEndSnapshot?: AgentEndMaintenanceSnapshot): Promise<void> => {
 		const eventPromptGeneration = this.#promptGeneration;
+		const agentRunSequence = this.#agentRunSequence;
 		if (event.type === "agent_start") {
 			// A fresh run supersedes the previously settled (and pruned) refusal
 			// turn: state-based lookups take over again.
@@ -3243,11 +3369,13 @@ export class AgentSession {
 			// maintenance can emit agent_end, so preserve the state at settle entry.
 			const ttsrAbortPendingAtAgentEnd = this.#ttsr.abortPending;
 			const emitAgentEndNotification = async (options?: { willContinue?: boolean }) => {
+				if (agentRunSequence !== this.#agentRunSequence) return;
 				this.#emitRunState("idle");
 				// Public agent_end is held out of the eager display pass and emitted
 				// here after maintenance routing, tagged isTerminal so subscribers can
 				// tell final settles from scheduled continuations.
 				await this.#emitSessionEvent({ ...event, isTerminal: !options?.willContinue });
+				if (agentRunSequence !== this.#agentRunSequence) return;
 				void this.#emitAgentEndNotification([...activeMessages], options).catch(err => {
 					logger.error("Agent end extension notification failed", { err });
 				});
@@ -3261,20 +3389,92 @@ export class AgentSession {
 					cacheWrite: usage.cacheWrite,
 				},
 			});
-			const fallbackAssistant = [...settledMessages]
-				.reverse()
-				.find((message): message is AssistantMessage => message.role === "assistant");
-			const msg = this.#lastAssistantMessage ?? fallbackAssistant;
-			this.#lastAssistantMessage = undefined;
-			const budgetRefusal = this.#contextBudgetRefusal;
-			this.#contextBudgetRefusal = undefined;
-			if (budgetRefusal) {
+			const msg = agentEndSnapshot?.assistantMessage;
+			const budgetRefusal = agentEndSnapshot?.budgetRefusal;
+			let recoveryClosed = false;
+			let preparedBudgetFallback: Promise<void> | undefined;
+			let pendingPreparedBudgetRecovery: PendingPreparedBudgetRecovery | undefined;
+			let continuationControl: CompactionContinuationControl | undefined;
+			const ownsPreparedBudgetRecovery = () =>
+				budgetRefusal !== undefined &&
+				!recoveryClosed &&
+				this.#isPreparedBudgetRefusalCurrent(budgetRefusal, agentRunSequence) &&
+				!this.#isDisposed;
+			const closePreparedBudgetRecovery = () => {
+				recoveryClosed = true;
+				if (
+					pendingPreparedBudgetRecovery &&
+					this.#pendingPreparedBudgetRecovery === pendingPreparedBudgetRecovery
+				) {
+					this.#pendingPreparedBudgetRecovery = undefined;
+				}
+				if (continuationControl && this.#preparedBudgetContinuationLaunch === continuationControl) {
+					this.#preparedBudgetContinuationLaunch = undefined;
+				}
+			};
+			if (budgetRefusal && !this.#isPreparedBudgetRefusalCurrent(budgetRefusal, agentRunSequence)) {
+				logger.debug("Skipping stale prepared-budget recovery after a newer agent run started", {
+					refusingModel: `${budgetRefusal.model.provider}/${budgetRefusal.model.id}`,
+				});
+				if (msg) this.#recovery.removeAssistantMessageFromActiveContext(msg);
+				return;
+			}
+			const settlePreparedBudgetFallback = (): Promise<void> => {
+				if (preparedBudgetFallback) return preparedBudgetFallback;
+				if (!budgetRefusal || !msg || !ownsPreparedBudgetRecovery()) return Promise.resolve();
+				const refusal = budgetRefusal;
+				const refusalMessage = msg;
+				closePreparedBudgetRecovery();
+				preparedBudgetFallback = (async () => {
+					// Continuation launch can fail before the originating agent_end
+					// handler emits its nonterminal pause. Let that handler finish so
+					// any pause it emits precedes the terminal fallback.
+					await this.#drainInFlightEventHandlers();
+					const settled = await this.#settlePreparedBudgetRefusal(refusal, refusalMessage, agentRunSequence);
+					if (settled) await emitAgentEndNotification();
+				})();
+				this.#trackPreparedBudgetSettlement(preparedBudgetFallback);
+				return preparedBudgetFallback;
+			};
+			const schedulePreparedBudgetFallback = () => {
+				void settlePreparedBudgetFallback();
+			};
+			let preparedBudgetRecovery: PreparedBudgetRecoveryContext | undefined;
+			if (budgetRefusal?.recoveryOwner !== undefined && msg) {
+				const control: CompactionContinuationControl = {
+					shouldContinue: ownsPreparedBudgetRecovery,
+					beginLaunch: () => {
+						if (!ownsPreparedBudgetRecovery() || this.#preparedBudgetContinuationLaunch) return false;
+						this.#preparedBudgetContinuationLaunch = control;
+						return true;
+					},
+					commitLaunch: () => {
+						if (this.#preparedBudgetContinuationLaunch === control) closePreparedBudgetRecovery();
+					},
+					endLaunch: () => {
+						if (this.#preparedBudgetContinuationLaunch === control) {
+							this.#preparedBudgetContinuationLaunch = undefined;
+						}
+					},
+					onSkip: schedulePreparedBudgetFallback,
+					onError: schedulePreparedBudgetFallback,
+				};
+				continuationControl = control;
+				pendingPreparedBudgetRecovery = {
+					continuation: control,
+					settle: settlePreparedBudgetFallback,
+				};
+				this.#pendingPreparedBudgetRecovery = pendingPreparedBudgetRecovery;
+				preparedBudgetRecovery = {
+					owner: budgetRefusal.recoveryOwner,
+					continuation: control,
+				};
+			}
+			if (budgetRefusal && (!msg || !preparedBudgetRecovery)) {
+				closePreparedBudgetRecovery();
 				this.#lastSuccessfulYieldToolCallId = undefined;
-				// Maintenance already had its opportunity before preparation. Do not
-				// retry or recompact an unchanged request after the final backstop.
-				if (msg) await this.#recovery.persistTerminalEmptyErrorTurn(msg);
-				await this.#recovery.settleRetryWithoutContinuation(budgetRefusal);
-				await emitAgentEndNotification();
+				const settled = await this.#settlePreparedBudgetRefusal(budgetRefusal, msg, agentRunSequence);
+				if (settled) await emitAgentEndNotification();
 				return;
 			}
 			if (!msg) {
@@ -3287,6 +3487,11 @@ export class AgentSession {
 				await emitAgentEndNotification();
 				return;
 			}
+			const settlePreparedBudgetRecovery = async (result: CompactionCheckResult): Promise<boolean> => {
+				if (!budgetRefusal) return false;
+				if (!result.deferredHandoff && !result.continuationScheduled) closePreparedBudgetRecovery();
+				return this.#settlePreparedBudgetRecovery(budgetRefusal, msg, result, agentRunSequence);
+			};
 
 			const yieldOnThisMessage = this.#assistantEndedWithSuccessfulYield(msg);
 			const successfulYieldMessage = yieldOnThisMessage
@@ -3434,14 +3639,17 @@ export class AgentSession {
 					}
 				}
 				maintenanceRoute("active-goal-pre-empt-checkCompaction");
-				const compactionTask = this.#maintenance.checkCompaction(msg);
+				const compactionTask = this.#maintenance.checkCompaction(msg, true, true, true, preparedBudgetRecovery);
 				this.#trackPostPromptTask(compactionTask);
 				compactionResult = await compactionTask;
 				checkedCompaction = true;
 				const compactionContinues = compactionResult.deferredHandoff || compactionResult.continuationScheduled;
 				if (compactionContinues || compactionResult.automaticContinuationBlocked) {
-					// Early return skips the error tail; persist the terminal 413 so the JSONL records why the goal stopped (#9235).
+					const preparedBudgetSettled = await settlePreparedBudgetRecovery(compactionResult);
+					// Early return skips the error tail; persist a terminal 413 so the
+					// JSONL records why the goal stopped (#9235).
 					if (
+						!preparedBudgetSettled &&
 						compactionResult.automaticContinuationBlocked &&
 						(AIError.isPayloadRejection(msg) || !AIError.isContextOverflow(msg, this.model?.contextWindow ?? 0))
 					) {
@@ -3452,9 +3660,12 @@ export class AgentSession {
 						continuationScheduled: compactionResult.continuationScheduled,
 						automaticContinuationBlocked: compactionResult.automaticContinuationBlocked === true,
 					});
-					this.#recovery.resolveRetry();
+					if (!preparedBudgetSettled) this.#recovery.resolveRetry();
 					await emitAgentEndNotification(
-						compactionResult.continuationScheduled ? { willContinue: true } : undefined,
+						compactionResult.continuationScheduled ||
+							(budgetRefusal !== undefined && compactionResult.deferredHandoff)
+							? { willContinue: true }
+							: undefined,
 					);
 					return;
 				}
@@ -3549,18 +3760,22 @@ export class AgentSession {
 				// persisting one would replay an empty assistant turn on reload.
 				await this.#recovery.persistTerminalEmptyErrorTurn(msg);
 			}
-			this.#recovery.resolveRetry();
+			if (!budgetRefusal) this.#recovery.resolveRetry();
 
 			if (!checkedCompaction) {
 				maintenanceRoute("bottom-checkCompaction");
-				const compactionTask = this.#maintenance.checkCompaction(msg);
+				const compactionTask = this.#maintenance.checkCompaction(msg, true, true, true, preparedBudgetRecovery);
 				this.#trackPostPromptTask(compactionTask);
 				compactionResult = await compactionTask;
 			}
-			if (compactionResult.automaticContinuationBlocked && AIError.isPayloadRejection(msg)) {
-				await this.#recovery.persistTerminalEmptyErrorTurn(msg);
+			const preparedBudgetSettled = await settlePreparedBudgetRecovery(compactionResult);
+			if (!preparedBudgetSettled) {
+				if (budgetRefusal) this.#recovery.resolveRetry();
+				if (compactionResult.automaticContinuationBlocked && AIError.isPayloadRejection(msg)) {
+					await this.#recovery.persistTerminalEmptyErrorTurn(msg);
+				}
+				await this.#recovery.onErrorSettledWithoutRetry(msg, compactionResult);
 			}
-			await this.#recovery.onErrorSettledWithoutRetry(msg, compactionResult);
 			// Stop-time todo reconciliation only fires at a text-only final stop. A run
 			// that ends still mid-tool-use (deadline hit, context full, etc.) skips the
 			// reminder so we don't pile a follow-up onto an already in-flight turn.
@@ -3580,7 +3795,12 @@ export class AgentSession {
 				compactionResult.continuationScheduled ||
 				compactionResult.automaticContinuationBlocked
 			) {
-				await emitAgentEndNotification(compactionResult.continuationScheduled ? { willContinue: true } : undefined);
+				await emitAgentEndNotification(
+					compactionResult.continuationScheduled ||
+						(budgetRefusal !== undefined && compactionResult.deferredHandoff)
+						? { willContinue: true }
+						: undefined,
+				);
 				return;
 			}
 			if (msg.stopReason !== "error") {
@@ -3674,6 +3894,7 @@ export class AgentSession {
 			source: request.options.source,
 			schedulerToken: request.schedulerToken,
 		});
+		request.options.continuationControl?.onSkip(reason);
 		request.options.onSkip?.(reason);
 	}
 
@@ -3681,6 +3902,7 @@ export class AgentSession {
 		if (outcome.status === "skipped") {
 			this.#skipAgentContinue(outcome.reason, request);
 		} else if (outcome.status === "failed") {
+			request.options.continuationControl?.onError(outcome.error);
 			request.options.onError?.(outcome.error);
 		}
 	}
@@ -3712,6 +3934,10 @@ export class AgentSession {
 				}
 			}
 			for (;;) {
+				const continuationControl = request.options.continuationControl;
+				if (continuationControl && !continuationControl.beginLaunch()) {
+					return { status: "skipped", reason: "should-continue-false" };
+				}
 				try {
 					await this.agent.continue(signal);
 					return { status: "completed" };
@@ -3733,9 +3959,14 @@ export class AgentSession {
 					if (request.options.generation !== undefined && this.#promptGeneration !== request.options.generation) {
 						return { status: "skipped", reason: "stale-generation" };
 					}
-					if (request.options.shouldContinue && !request.options.shouldContinue()) {
+					if (
+						(request.options.shouldContinue && !request.options.shouldContinue()) ||
+						(continuationControl && !continuationControl.shouldContinue())
+					) {
 						return { status: "skipped", reason: "should-continue-false" };
 					}
+				} finally {
+					continuationControl?.endLaunch();
 				}
 			}
 		} catch (error) {
@@ -3770,7 +4001,10 @@ export class AgentSession {
 					this.#skipAgentContinue("session-unavailable", request);
 					return;
 				}
-				if (options.shouldContinue && !options.shouldContinue()) {
+				if (
+					(options.shouldContinue && !options.shouldContinue()) ||
+					(options.continuationControl && !options.continuationControl.shouldContinue())
+				) {
 					this.#skipAgentContinue("should-continue-false", request);
 					return;
 				}
@@ -3825,7 +4059,9 @@ export class AgentSession {
 		autoContinue: boolean;
 		terminalTextAnswer: boolean;
 		suppressContinuation: boolean;
+		continuationControl?: CompactionContinuationControl;
 	}): boolean {
+		const continuationControl = options.continuationControl;
 		if (options.suppressContinuation) return false;
 		if (this.agent.hasQueuedMessages()) {
 			this.#scheduleAgentContinue({
@@ -3833,23 +4069,24 @@ export class AgentSession {
 				delayMs: 100,
 				generation: options.generation,
 				shouldContinue: () => this.agent.hasQueuedMessages(),
+				continuationControl,
 			});
 			return true;
 		}
 		if (!options.autoContinue) return false;
 		const activeGoal = this.#goalModeState?.enabled === true && this.#goalModeState.goal.status === "active";
 		if (options.terminalTextAnswer && !activeGoal) return false;
-		return this.#scheduleAutoContinuePrompt(options.generation);
+		return this.#scheduleAutoContinuePrompt(options.generation, continuationControl);
 	}
 
-	#scheduleAutoContinuePrompt(generation: number): boolean {
-		const continuePrompt = async () => {
+	#scheduleAutoContinuePrompt(generation: number, continuationControl?: CompactionContinuationControl): boolean {
+		const continuePrompt = async (): Promise<boolean> => {
 			// Compaction summarizes away the first-message eager preludes, so re-assert the
 			// delegate-via-tasks / phased-todo reminders on this auto-resumed turn. This runs
 			// at invocation (past the abort check below), so an aborted continuation queues
 			// nothing; scoped to this request via prependMessages, never the shared queue.
 			const eagerNudges = this.#todo.buildPostCompactionEagerNudges();
-			await this.#promptWithMessage(
+			return this.#promptWithMessage(
 				{
 					role: "developer",
 					content: [{ type: "text", text: autoContinuePrompt }],
@@ -3864,24 +4101,43 @@ export class AgentSession {
 				{
 					skipPostPromptRecoveryWait: true,
 					prependMessages: eagerNudges.length > 0 ? eagerNudges : undefined,
+					continuationControl,
 				},
 			);
 		};
 		this.#schedulePostPromptTask(
 			async signal => {
 				await Promise.resolve();
-				if (signal.aborted) return;
+				if (signal.aborted) {
+					continuationControl?.onSkip("aborted");
+					return;
+				}
+				if (continuationControl && !continuationControl.shouldContinue()) {
+					continuationControl.onSkip("should-continue-false");
+					return;
+				}
 				if (this.agent.hasQueuedMessages()) {
 					this.#scheduleAgentContinue({
 						source: "auto-continue-queued-message",
 						generation,
 						shouldContinue: () => this.agent.hasQueuedMessages(),
+						continuationControl,
 					});
 					return;
 				}
-				await continuePrompt();
+				try {
+					const dispatched = await continuePrompt();
+					if (!dispatched) {
+						continuationControl?.onSkip(
+							this.#promptGeneration === generation ? "session-unavailable" : "stale-generation",
+						);
+					}
+				} catch (error) {
+					continuationControl?.onError(error);
+					throw error;
+				}
 			},
-			{ generation },
+			{ generation, onSkip: continuationControl?.onSkip },
 		);
 		return true;
 	}
@@ -4490,6 +4746,8 @@ export class AgentSession {
 		this.#detachUsageBeforeModelCall = undefined;
 		this.#detachContextBudgetGate?.();
 		this.#detachContextBudgetGate = undefined;
+		this.#detachBeforeAgentRun?.();
+		this.#detachBeforeAgentRun = undefined;
 		this.#memory.cancelLocalMemoryStartup();
 		this.#titleGenerationAbortController.abort();
 		this.#abortAutolearnCapture();
@@ -6310,6 +6568,7 @@ export class AgentSession {
 		options?: Pick<PromptOptions, "toolChoice" | "images" | "skipCompactionCheck"> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
+			continuationControl?: CompactionContinuationControl;
 			acceptTerminalEmptyStop?: boolean;
 		},
 	): Promise<boolean> {
@@ -6539,7 +6798,12 @@ export class AgentSession {
 				this.#planReferenceSent = true;
 			}
 			try {
-				await this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions);
+				const dispatched = await this.#recovery.promptAgentWithIdleRetry(
+					messages,
+					agentPromptOptions,
+					options?.continuationControl,
+				);
+				if (!dispatched) return false;
 			} finally {
 				this.#stats.setPendingSnapshot(undefined);
 			}
@@ -7647,6 +7911,8 @@ export class AgentSession {
 			this.agent.abort(options?.reason);
 			await postPromptDrain;
 			await this.agent.waitForIdle();
+			await this.#drainInFlightEventHandlers();
+			await this.#drainPreparedBudgetSettlements();
 			// `/compact` disconnects the agent subscription until its finally block.
 			// Do not let abort-and-replace callers start a new prompt before that cleanup
 			// finishes, or the replacement turn's events are neither forwarded nor persisted.

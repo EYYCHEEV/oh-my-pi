@@ -115,6 +115,31 @@ export type CompactionCheckResult = Readonly<{
 	historyRewritten?: boolean;
 }>;
 
+export type PreparedBudgetRecoveryOwner = number;
+
+export type CompactionContinuationSkipReason =
+	| "aborted"
+	| "stale-generation"
+	| "session-unavailable"
+	| "should-continue-false"
+	| "post-restore-unavailable";
+
+export type CompactionContinuationControl = Readonly<{
+	shouldContinue: () => boolean;
+	beginLaunch: () => boolean;
+	commitLaunch: () => void;
+	endLaunch: () => void;
+	onSkip: (reason: CompactionContinuationSkipReason) => void;
+	onError: (error: unknown) => void;
+}>;
+
+export type PreparedBudgetRecoveryContext = Readonly<{
+	owner: PreparedBudgetRecoveryOwner;
+	continuation: CompactionContinuationControl;
+}>;
+
+type PreparedBudgetRecoveryState = "available" | "maintenance-consumed" | "recovery-claimed";
+
 /** Shared no-op result for dispatcher paths that perform no maintenance. */
 export const COMPACTION_CHECK_NONE: CompactionCheckResult = {
 	deferredHandoff: false,
@@ -306,21 +331,16 @@ export interface SessionMaintenanceHost {
 		delayMs?: number;
 		generation?: number;
 		shouldContinue?: () => boolean;
-		onSkip?: (
-			reason:
-				| "aborted"
-				| "stale-generation"
-				| "session-unavailable"
-				| "should-continue-false"
-				| "post-restore-unavailable",
-		) => void;
-		onError?: () => void;
+		continuationControl?: CompactionContinuationControl;
+		onSkip?: (reason: CompactionContinuationSkipReason) => void;
+		onError?: (error: unknown) => void;
 	}): void;
 	scheduleCompactionContinuation(options: {
 		generation: number;
 		autoContinue: boolean;
 		terminalTextAnswer: boolean;
 		suppressContinuation: boolean;
+		continuationControl?: CompactionContinuationControl;
 	}): boolean;
 	persistTurnMessagesForMidRunCompaction(context: AgentTurnEndContext | undefined): Promise<boolean>;
 	findLastAssistantMessage(): AssistantMessage | undefined;
@@ -359,7 +379,12 @@ export interface SessionMaintenanceHost {
 		reason: "overflow" | "incomplete",
 		message: AssistantMessage,
 		allowDefer: boolean,
-		options: { autoContinue: boolean; triggerContextTokens?: number },
+		options: {
+			autoContinue: boolean;
+			triggerContextTokens?: number;
+			continuationControl?: CompactionContinuationControl;
+			suppressDeadEndNotice?: boolean;
+		},
 	): Promise<CompactionCheckResult>;
 	parseRetryAfterMsFromError(errorMessage: string): number | undefined;
 	setModelTemporary(
@@ -400,6 +425,13 @@ export class SessionMaintenance {
 	 * persisted turn, but a new agent loop still gets its own live-array guard.
 	 */
 	#midTurnDeadEndPendingPrePrompt = false;
+	/**
+	 * Boundary-owned state for the one blocking recovery opportunity. A prompt
+	 * reset prepares the next run's boundary; direct Agent runs begin their own.
+	 */
+	#preparedBudgetRecoveryOwner: PreparedBudgetRecoveryOwner = 0;
+	#preparedBudgetRecoveryState: PreparedBudgetRecoveryState = "maintenance-consumed";
+	#preparedBudgetRecoveryPreparedForRun = false;
 	/** In-flight or armed background speculative compaction, if any. */
 	#speculation: SpeculationRun | undefined;
 	#skipPostTurnMaintenanceAssistantTimestamp: number | undefined;
@@ -428,9 +460,64 @@ export class SessionMaintenance {
 		this.#host = host;
 	}
 
-	/** Clears per-prompt recovery counters when a new user prompt starts. */
-	resetForNewPrompt(): void {
+	#beginPreparedBudgetRecoveryBoundary(preparedForRun: boolean): PreparedBudgetRecoveryOwner {
+		this.#preparedBudgetRecoveryOwner++;
+		this.#preparedBudgetRecoveryState = "available";
+		this.#preparedBudgetRecoveryPreparedForRun = preparedForRun;
+		return this.#preparedBudgetRecoveryOwner;
+	}
+
+	/** Clears per-prompt recovery state and prepares it for the next Agent run. */
+	resetForNewPrompt(options?: { deferPreparedBudgetBoundary?: boolean }): void {
 		this.#incompleteRecoveryAttempts = 0;
+		if (!options?.deferPreparedBudgetBoundary) this.#beginPreparedBudgetRecoveryBoundary(true);
+	}
+
+	/**
+	 * Claim the boundary prepared by the high-level prompt path, or begin one for
+	 * a direct Agent.prompt/continue call that bypassed that setup.
+	 */
+	beginAgentRun(): PreparedBudgetRecoveryOwner {
+		if (this.#preparedBudgetRecoveryPreparedForRun) {
+			this.#preparedBudgetRecoveryPreparedForRun = false;
+			return this.#preparedBudgetRecoveryOwner;
+		}
+		return this.#beginPreparedBudgetRecoveryBoundary(false);
+	}
+
+	isPreparedBudgetRecoveryOwner(owner: PreparedBudgetRecoveryOwner): boolean {
+		return owner === this.#preparedBudgetRecoveryOwner;
+	}
+
+	#consumePreparedBudgetRecovery(owner: PreparedBudgetRecoveryOwner): boolean {
+		if (!this.isPreparedBudgetRecoveryOwner(owner)) return false;
+		this.#preparedBudgetRecoveryState = "maintenance-consumed";
+		return true;
+	}
+
+	/**
+	 * Claim one overflow-recovery pass for growth introduced during provider
+	 * preparation. A proactive attempt or known dead end consumes the same pass
+	 * so the final gate cannot retry an unchanged request.
+	 */
+	claimPreparedBudgetRecovery(): PreparedBudgetRecoveryOwner | undefined {
+		const settings = this.#host.settings.getGroup("compaction");
+		if (
+			this.#preparedBudgetRecoveryState !== "available" ||
+			!settings.enabled ||
+			settings.midTurnEnabled === false ||
+			!hasConfiguredCompactionMethod(settings)
+		) {
+			return undefined;
+		}
+		this.#preparedBudgetRecoveryState = "recovery-claimed";
+		return this.#preparedBudgetRecoveryOwner;
+	}
+
+	#releasePreparedBudgetRecoveryAfterPromotion(owner: PreparedBudgetRecoveryOwner): void {
+		if (this.isPreparedBudgetRecoveryOwner(owner) && this.#preparedBudgetRecoveryState === "recovery-claimed") {
+			this.#preparedBudgetRecoveryState = "available";
+		}
 	}
 
 	/** Whether manual or automatic context maintenance is active. */
@@ -1647,6 +1734,7 @@ export class SessionMaintenance {
 	}
 
 	async runPrePromptCompactionIfNeeded(messages: AgentMessage[]): Promise<void> {
+		const recoveryOwner = this.#preparedBudgetRecoveryOwner;
 		const model = this.#model;
 		if (!model) return;
 		const contextWindow = model.contextWindow ?? 0;
@@ -1664,6 +1752,7 @@ export class SessionMaintenance {
 			prepareCompaction(this.#host.sessionManager.getBranch(), compactionSettings, model, this.#tokenizer) ===
 				undefined
 		) {
+			this.#consumePreparedBudgetRecovery(recoveryOwner);
 			// The prior tool loop already attempted the rescue and warned for this
 			// persisted oversized turn. Only a later persisted cut point makes a
 			// pre-prompt retry useful; the new agent loop may warn for its own turn.
@@ -1698,6 +1787,7 @@ export class SessionMaintenance {
 			contextWindow,
 			model: `${model.provider}/${model.id}`,
 		});
+		if (!this.#consumePreparedBudgetRecovery(recoveryOwner)) return;
 		await this.runAutoCompaction("threshold", false, false, false, {
 			autoContinue: false,
 			triggerContextTokens: contextTokens,
@@ -1729,6 +1819,7 @@ export class SessionMaintenance {
 			!context?.willContinue
 		)
 			return;
+		const recoveryOwner = this.#beginPreparedBudgetRecoveryBoundary(false);
 
 		const model = this.#model;
 		const contextWindow = model?.contextWindow ?? 0;
@@ -1788,6 +1879,7 @@ export class SessionMaintenance {
 		}
 
 		if (!(await this.#host.persistTurnMessagesForMidRunCompaction(context))) return;
+		if (!this.isPreparedBudgetRecoveryOwner(recoveryOwner)) return;
 		if (this.#midTurnCompactionDeadEnds.has(activeMessages)) {
 			// A prior boundary already ran the dead-end rescue and could not reduce
 			// this turn. Re-running the rescue and re-emitting its warning on every
@@ -1803,6 +1895,7 @@ export class SessionMaintenance {
 				prepareCompaction(this.#host.sessionManager.getBranch(), compactionSettings, model, this.#tokenizer) ===
 					undefined
 			) {
+				this.#consumePreparedBudgetRecovery(recoveryOwner);
 				return;
 			}
 			this.#midTurnCompactionDeadEnds.delete(activeMessages);
@@ -1823,8 +1916,10 @@ export class SessionMaintenance {
 			});
 			return;
 		}
+		if (!this.isPreparedBudgetRecoveryOwner(recoveryOwner)) return;
 
 		const messagesBefore = activeMessages.length;
+		if (!this.#consumePreparedBudgetRecovery(recoveryOwner)) return;
 		const result = await this.runAutoCompaction("threshold", false, false, false, {
 			autoContinue: false,
 			suppressContinuation: true,
@@ -1883,7 +1978,13 @@ export class SessionMaintenance {
 		skipAbortedCheck = true,
 		allowDefer = true,
 		autoContinue = true,
+		preparedBudgetRecovery?: PreparedBudgetRecoveryContext,
 	): Promise<CompactionCheckResult> {
+		const recoveryOwner = preparedBudgetRecovery?.owner ?? this.#preparedBudgetRecoveryOwner;
+		if (preparedBudgetRecovery && !this.isPreparedBudgetRecoveryOwner(recoveryOwner)) {
+			return COMPACTION_CHECK_NONE;
+		}
+		const continuationControl = preparedBudgetRecovery?.continuation;
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
 		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return COMPACTION_CHECK_NONE;
 		const contextWindow = this.#model?.contextWindow ?? 0;
@@ -1919,7 +2020,9 @@ export class SessionMaintenance {
 			storedTokens < contextWindow * PAYLOAD_REJECTION_OCCUPANCY_CEILING;
 		if ((payloadRejection && !ambiguousPayloadRejection && contextWindow <= 0) || trustedPayloadRejection) {
 			this.#host.removeAssistantMessageFromActiveContext(assistantMessage);
-			this.#host.emitNotice("warning", payloadRejectionNotice(storedTokens, contextWindow), "compaction");
+			if (!preparedBudgetRecovery) {
+				this.#host.emitNotice("warning", payloadRejectionNotice(storedTokens, contextWindow), "compaction");
+			}
 			logger.debug("Payload-shaped 413 withheld from token compaction", {
 				provider: assistantMessage.provider,
 				model: assistantMessage.model,
@@ -1937,12 +2040,14 @@ export class SessionMaintenance {
 			// Try context promotion first - switch to a larger model and retry without compacting
 			const promoted = await this.#tryContextPromotion(assistantMessage);
 			if (promoted) {
+				this.#releasePreparedBudgetRecoveryAfterPromotion(recoveryOwner);
 				await this.#host.dropPersistedAssistantTurn(assistantMessage);
 				// Retry on the promoted (larger) model without compacting
 				this.#host.scheduleAgentContinue({
 					source: "context-promotion-overflow",
 					delayMs: 100,
 					generation,
+					continuationControl,
 				});
 				return COMPACTION_CHECK_CONTINUATION;
 			}
@@ -1950,19 +2055,24 @@ export class SessionMaintenance {
 			// No promotion target available fall through to compaction
 			const compactionSettings = this.#host.settings.getGroup("compaction");
 			if (compactionSettings.enabled && hasConfiguredCompactionMethod(compactionSettings)) {
+				if (!this.#consumePreparedBudgetRecovery(recoveryOwner)) return COMPACTION_CHECK_NONE;
 				return await this.#host.runRecoveryCompactionWithRollback("overflow", assistantMessage, allowDefer, {
 					autoContinue,
+					continuationControl,
+					suppressDeadEndNotice: preparedBudgetRecovery !== undefined,
 				});
 			}
 			if (payloadRejection) {
 				const usageBackedOverflow = AIError.isUsageBackedContextOverflow(assistantMessage, contextWindow);
-				this.#host.emitNotice(
-					"warning",
-					usageBackedOverflow
-						? usageOverflowDeadEndNotice(reportedInputTokens, contextWindow)
-						: payloadRejectionNotice(storedTokens, contextWindow),
-					"compaction",
-				);
+				if (!preparedBudgetRecovery) {
+					this.#host.emitNotice(
+						"warning",
+						usageBackedOverflow
+							? usageOverflowDeadEndNotice(reportedInputTokens, contextWindow)
+							: payloadRejectionNotice(storedTokens, contextWindow),
+						"compaction",
+					);
+				}
 				logger.debug("Payload-shaped 413 has no runnable recovery; blocking automatic continuation", {
 					provider: assistantMessage.provider,
 					model: assistantMessage.model,
@@ -2006,6 +2116,7 @@ export class SessionMaintenance {
 				modelsAreEqual(promotionTarget, this.#model) &&
 				AIError.isContextOverflow(assistantMessage, failedWindow)
 			) {
+				this.#releasePreparedBudgetRecoveryAfterPromotion(recoveryOwner);
 				this.#host.removeAssistantMessageFromActiveContext(assistantMessage);
 				await this.#host.dropPersistedAssistantTurn(assistantMessage);
 				logger.debug("Overflow on pre-promotion model; retrying on promoted model", {
@@ -2016,6 +2127,7 @@ export class SessionMaintenance {
 					source: "promoted-model-overflow",
 					delayMs: 100,
 					generation,
+					continuationControl,
 				});
 				return COMPACTION_CHECK_CONTINUATION;
 			}
@@ -2081,9 +2193,12 @@ export class SessionMaintenance {
 					methods: resolveCompactionMethodOrder(incompleteCompactionSettings.methodOrder),
 					attempt: this.#incompleteRecoveryAttempts,
 				});
+				if (!this.#consumePreparedBudgetRecovery(recoveryOwner)) return COMPACTION_CHECK_NONE;
 				return await this.#host.runRecoveryCompactionWithRollback("incomplete", assistantMessage, allowDefer, {
 					autoContinue,
 					triggerContextTokens: calculateContextTokens(assistantMessage.usage),
+					continuationControl,
+					suppressDeadEndNotice: preparedBudgetRecovery !== undefined,
 				});
 			}
 			// Neither promotion nor compaction is available — surface the dead-end so
@@ -2173,11 +2288,14 @@ export class SessionMaintenance {
 			// Try promotion first — if a larger model is available, switch instead of compacting
 			const promoted = await this.#tryContextPromotion(assistantMessage);
 			if (!promoted) {
+				if (!this.#consumePreparedBudgetRecovery(recoveryOwner)) return COMPACTION_CHECK_NONE;
 				return await this.runAutoCompaction("threshold", false, false, allowDefer, {
 					autoContinue,
 					triggerContextTokens: postMaintenanceContextTokens,
 					phase: "pre_turn",
 					terminalTextAnswer: isTerminalTextAssistantAnswer(assistantMessage),
+					continuationControl,
+					suppressDeadEndNotice: preparedBudgetRecovery !== undefined,
 				});
 			}
 			logger.debug("Auto-compaction threshold satisfied but context promotion took over", {
@@ -2746,7 +2864,6 @@ export class SessionMaintenance {
 			`The next request still needs approximately ${contextTokens.toLocaleString("en-US")} input tokens, ` +
 			`above the ${budget.toLocaleString("en-US")}-token usable budget. ` +
 			"Paused before sending; reduce the pending input, compact the conversation, or switch to a larger-context model.";
-		this.#host.emitNotice("warning", reason, "compaction");
 		return { stop: true, reason };
 	}
 
@@ -3072,6 +3189,8 @@ export class SessionMaintenance {
 			suppressContinuation?: boolean;
 			phase?: CodexCompactionContext["phase"];
 			terminalTextAnswer?: boolean;
+			continuationControl?: CompactionContinuationControl;
+			suppressDeadEndNotice?: boolean;
 			/** Mid-turn: splice history then return; do not await UI/extension fan-out. */
 			detachPostCommit?: boolean;
 			/** Index to resume from after an earlier preferred method failed. */
@@ -3088,6 +3207,7 @@ export class SessionMaintenance {
 		const terminalTextAnswer =
 			options.terminalTextAnswer ?? isTerminalTextAssistantAnswer(this.#host.findLastAssistantMessage());
 		const suppressContinuation = options.suppressContinuation === true;
+		const continuationControl = options.continuationControl;
 		const shouldAutoContinue =
 			!suppressContinuation && options.autoContinue !== false && compactionSettings.autoContinue !== false;
 		const startIndex = options.methodIndex ?? 0;
@@ -3134,6 +3254,7 @@ export class SessionMaintenance {
 				options.triggerContextTokens,
 				suppressContinuation,
 				options.detachPostCommit === true,
+				continuationControl,
 			);
 			if (outcome !== "fallback") return outcome;
 			return await this.runAutoCompaction(reason, willRetry, deferred, allowDefer, {
@@ -3157,14 +3278,32 @@ export class SessionMaintenance {
 			this.#host.schedulePostPromptTask(
 				async signal => {
 					await Promise.resolve();
-					if (signal.aborted) return;
-					await this.runAutoCompaction(reason, willRetry, true, true, {
-						...options,
-						methodIndex,
-						terminalTextAnswer,
-					});
+					if (signal.aborted) {
+						continuationControl?.onSkip("aborted");
+						return;
+					}
+					if (continuationControl && !continuationControl.shouldContinue()) {
+						continuationControl.onSkip("should-continue-false");
+						return;
+					}
+					try {
+						const result = await this.runAutoCompaction(reason, willRetry, true, true, {
+							...options,
+							methodIndex,
+							terminalTextAnswer,
+						});
+						if (!result.continuationScheduled) {
+							continuationControl?.onSkip("should-continue-false");
+						}
+					} catch (error) {
+						continuationControl?.onError(error);
+						throw error;
+					}
 				},
-				{ generation },
+				{
+					generation,
+					onSkip: continuationControl?.onSkip,
+				},
 			);
 			return {
 				...COMPACTION_CHECK_DEFERRED_HANDOFF,
@@ -3226,6 +3365,8 @@ export class SessionMaintenance {
 					shouldAutoContinue,
 					terminalTextAnswer,
 					suppressContinuation,
+					continuationControl,
+					suppressDeadEndNotice: options.suppressDeadEndNotice === true,
 					fallbackFromShake,
 					detachPostCommit: options.detachPostCommit === true,
 					autoCompactionSignal,
@@ -3381,6 +3522,7 @@ export class SessionMaintenance {
 							autoContinue: shouldAutoContinue,
 							terminalTextAnswer,
 							suppressContinuation,
+							continuationControl,
 						});
 					} else if (!suppressContinuation && this.#host.agent.hasQueuedMessages()) {
 						this.#host.scheduleAgentContinue({
@@ -3388,10 +3530,11 @@ export class SessionMaintenance {
 							delayMs: 100,
 							generation,
 							shouldContinue: () => this.#host.agent.hasQueuedMessages(),
+							continuationControl,
 						});
 						continuationScheduled = true;
 					}
-					if (deadEndWarning) {
+					if (deadEndWarning && options.suppressDeadEndNotice !== true) {
 						this.#host.emitNotice("warning", deadEndWarning, "compaction");
 					}
 					// A rescue that offloaded content but still could not produce a
@@ -3849,6 +3992,8 @@ export class SessionMaintenance {
 				shouldAutoContinue,
 				terminalTextAnswer,
 				suppressContinuation,
+				continuationControl,
+				suppressDeadEndNotice: options.suppressDeadEndNotice === true,
 				fallbackFromShake,
 				detachPostCommit: options.detachPostCommit === true,
 				autoCompactionSignal,
@@ -3942,6 +4087,8 @@ export class SessionMaintenance {
 		shouldAutoContinue: boolean;
 		terminalTextAnswer: boolean;
 		suppressContinuation: boolean;
+		continuationControl: CompactionContinuationControl | undefined;
+		suppressDeadEndNotice: boolean;
 		fallbackFromShake: boolean;
 		detachPostCommit: boolean;
 		autoCompactionSignal: AbortSignal;
@@ -4087,6 +4234,7 @@ export class SessionMaintenance {
 				source: "compaction-retry",
 				delayMs: 100,
 				generation: args.generation,
+				continuationControl: args.continuationControl,
 			});
 			continuationScheduled = true;
 		} else {
@@ -4095,10 +4243,11 @@ export class SessionMaintenance {
 				autoContinue: hasHeadroom && args.shouldAutoContinue,
 				terminalTextAnswer: args.terminalTextAnswer,
 				suppressContinuation: args.suppressContinuation,
+				continuationControl: args.continuationControl,
 			});
 		}
 
-		if (deadEndWarning) {
+		if (deadEndWarning && !args.suppressDeadEndNotice) {
 			this.#host.emitNotice("warning", deadEndWarning, "compaction");
 		}
 		if (continuationScheduled) return COMPACTION_CHECK_CONTINUATION;
@@ -4123,6 +4272,7 @@ export class SessionMaintenance {
 		triggerContextTokens?: number,
 		suppressContinuation = false,
 		detachPostCommit = false,
+		continuationControl?: CompactionContinuationControl,
 	): Promise<CompactionCheckResult | "fallback"> {
 		const action = "shake";
 		this.#autoCompactionAbortController?.abort();
@@ -4229,6 +4379,7 @@ export class SessionMaintenance {
 					source: "shake-retry",
 					delayMs: 100,
 					generation,
+					continuationControl,
 				});
 				continuationScheduled = true;
 			} else {
@@ -4237,6 +4388,7 @@ export class SessionMaintenance {
 					autoContinue: reason !== "idle" && autoContinue,
 					terminalTextAnswer,
 					suppressContinuation,
+					continuationControl,
 				});
 			}
 			if (!reclaimed) {

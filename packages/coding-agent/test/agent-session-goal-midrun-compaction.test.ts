@@ -1,8 +1,11 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import { scheduler } from "node:timers/promises";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import * as compactionModule from "@oh-my-pi/pi-agent-core/compaction";
+import type { Model } from "@oh-my-pi/pi-ai";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -97,6 +100,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 			firstTurnUsageInput?: number;
 			firstTurnUsageOutput?: number;
 			contextWindow?: number;
+			model?: Model;
 			intentTracing?: boolean;
 			providerErrorAt?: number;
 			providerErrorStatus?: 400 | 503;
@@ -116,7 +120,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 		const observedContexts: string[][] = [];
 		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!bundled) throw new Error("Expected claude-sonnet-4-5 model to exist");
-		const model = { ...bundled, contextWindow: options.contextWindow ?? bundled.contextWindow };
+		const model = options.model ?? { ...bundled, contextWindow: options.contextWindow ?? bundled.contextWindow };
 
 		const modelRegistry = sharedModelRegistry;
 		const settings = Settings.isolated({
@@ -262,6 +266,21 @@ describe("AgentSession mid-run threshold compaction", () => {
 		});
 	}
 
+	function collectPreparedBudgetWarnings(session: AgentSession): string[] {
+		const warnings: string[] = [];
+		session.subscribe(event => {
+			if (
+				event.type === "notice" &&
+				event.level === "warning" &&
+				event.source === "compaction" &&
+				event.message.includes("usable budget")
+			) {
+				warnings.push(event.message);
+			}
+		});
+		return warnings;
+	}
+
 	it("compacts in place between tool-call turns outside goal mode", async () => {
 		const { session, observedContexts } = await createHarness();
 		const compactSpy = mockCompaction("MID-RUN-COMPACTED");
@@ -346,7 +365,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 		expect(compactSpy).not.toHaveBeenCalled();
 	});
 
-	it("charges growth when a previously shrinking transform stops removing history", async () => {
+	it("compacts and retries when a previously shrinking transform stops removing history", async () => {
 		let transforms = 0;
 		const { session, observedContexts } = await createHarness(
 			{ "compaction.thresholdTokens": -1, "compaction.reserveTokens": 65_536 },
@@ -359,14 +378,385 @@ describe("AgentSession mid-run threshold compaction", () => {
 				transformContext: async messages => (transforms++ === 0 ? messages.slice(-1) : messages),
 			},
 		);
+		const compactSpy = mockCompaction("PREPARED-BUDGET-RECOVERED");
+		const refusalWarnings = collectPreparedBudgetWarnings(session);
 
-		await session.prompt("keep the transform growth inside the budget");
+		await session.prompt("recover after the transform restores history");
 
-		expect(observedContexts).toHaveLength(1);
-		expect(session.getLastAssistantMessage()).toMatchObject({
-			stopReason: "error",
-			errorMessage: expect.stringContaining("usable budget"),
+		expect(transforms).toBe(3);
+		expect(compactSpy).toHaveBeenCalledTimes(1);
+		expect(observedContexts).toHaveLength(2);
+		expect(observedContexts[1].join("\n")).toContain("PREPARED-BUDGET-RECOVERED");
+		expect(session.getLastAssistantMessage()?.stopReason).toBe("stop");
+		expect(refusalWarnings).toHaveLength(0);
+	});
+
+	it("persists one prepared-budget refusal after a real recovery rewrite cannot make the next request fit", async () => {
+		let transforms = 0;
+		const oversized = "persistent prepared growth ".repeat(10_000);
+		const { session, sessionManager, observedContexts } = await createHarness(
+			{
+				"compaction.thresholdTokens": -1,
+				"compaction.reserveTokens": 1_000,
+				"compaction.keepRecentTokens": 100,
+			},
+			{
+				withHistory: true,
+				contextWindow: 8_192,
+				firstTurnUsageInput: 100,
+				firstTurnUsageOutput: 20,
+				toolOutput: "ok",
+				transformContext: async messages =>
+					transforms++ === 0
+						? messages.slice(-1)
+						: [...messages, { role: "user", content: oversized, timestamp: Date.now() }],
+			},
+		);
+		const compactSpy = mockCompaction("REAL-REWRITE-BEFORE-TERMINAL-REFUSAL");
+		const compactionWarnings: string[] = [];
+		const terminalStates: boolean[] = [];
+		session.subscribe(event => {
+			if (event.type === "notice" && event.level === "warning" && event.source === "compaction") {
+				compactionWarnings.push(event.message);
+			}
+			if (event.type === "agent_end") terminalStates.push(event.isTerminal === true);
 		});
+
+		await session.prompt("preserve the refusal after rewritten recovery cannot continue");
+
+		expect(transforms).toBe(3);
+		expect(compactSpy).toHaveBeenCalledTimes(1);
+		expect(observedContexts).toHaveLength(1);
+		expect(compactionWarnings).toHaveLength(1);
+		expect(compactionWarnings[0]).toContain("usable budget");
+		expect(terminalStates).toEqual([true]);
+		const terminalRefusal = session.getLastAssistantMessage();
+		expect(terminalRefusal?.stopReason).toBe("error");
+		expect(terminalRefusal?.errorMessage).toContain("usable budget");
+		const branch = sessionManager.getBranch();
+		const compactionIndex = branch.findIndex(entry => entry.type === "compaction");
+		const refusalIndexes = branch.flatMap((entry, index) => {
+			if (
+				entry.type === "message" &&
+				entry.message.role === "assistant" &&
+				entry.message.stopReason === "error" &&
+				entry.message.errorMessage?.includes("usable budget")
+			) {
+				return [index];
+			}
+			return [];
+		});
+		expect(compactionIndex).toBeGreaterThanOrEqual(0);
+		expect(refusalIndexes).toHaveLength(1);
+		expect(refusalIndexes[0]).toBeGreaterThan(compactionIndex);
+	});
+
+	it("offers only one new prepared-budget recovery attempt on the next explicit prompt", async () => {
+		const oversized = "repeatable prepared growth ".repeat(10_000);
+		const { session, observedContexts } = await createHarness(
+			{
+				"compaction.thresholdTokens": -1,
+				"compaction.reserveTokens": 1_000,
+				"compaction.keepRecentTokens": 100,
+			},
+			{
+				contextWindow: 4_096,
+				transformContext: async messages => [
+					...messages,
+					{ role: "user", content: oversized, timestamp: Date.now() },
+				],
+			},
+		);
+		const maintenanceSpy = vi.spyOn(SessionMaintenance.prototype, "runAutoCompaction").mockResolvedValue({
+			deferredHandoff: false,
+			continuationScheduled: false,
+		});
+		const refusalWarnings = collectPreparedBudgetWarnings(session);
+
+		await session.prompt("first bounded recovery");
+		await session.prompt("second bounded recovery");
+
+		expect(observedContexts).toHaveLength(0);
+		expect(maintenanceSpy).toHaveBeenCalledTimes(2);
+		expect(refusalWarnings).toHaveLength(2);
+	});
+
+	it("recovers the exact model whose prepared request crossed the budget", async () => {
+		let transforms = 0;
+		let hookCalls = 0;
+		const oversized = "prepared-model growth ".repeat(10_000);
+		const { session, observedContexts } = await createHarness(
+			{
+				"compaction.thresholdTokens": -1,
+				"compaction.reserveTokens": 1_000,
+				"compaction.keepRecentTokens": 100,
+			},
+			{
+				withHistory: true,
+				contextWindow: 272_384,
+				firstTurnUsageInput: 200,
+				firstTurnUsageOutput: 100,
+				toolOutput: "ok",
+				configureAgent: agent => {
+					agent.addBeforeModelCallHook(() => {
+						hookCalls++;
+						if (hookCalls !== 2) return;
+						const model = agent.state.model;
+						if (model) {
+							agent.setModel({ ...model, id: "prepared-model-fixture", contextWindow: 4_096 });
+						}
+					});
+				},
+				transformContext: async messages => {
+					transforms++;
+					return transforms === 2
+						? [...messages, { role: "user", content: oversized, timestamp: Date.now() }]
+						: messages;
+				},
+			},
+		);
+		const compactSpy = mockCompaction("PREPARED-MODEL-RECOVERED");
+		const preparedRefusalEvents: Array<{
+			type: "message_start" | "message_end";
+			model: string;
+			provider: string;
+			contextOverflow: boolean;
+		}> = [];
+		session.agent.subscribe(event => {
+			if (
+				(event.type === "message_start" || event.type === "message_end") &&
+				event.message.role === "assistant" &&
+				event.message.errorMessage?.includes("usable budget")
+			) {
+				preparedRefusalEvents.push({
+					type: event.type,
+					model: event.message.model,
+					provider: event.message.provider,
+					contextOverflow: AIError.is(event.message.errorId, AIError.Flag.ContextOverflow),
+				});
+			}
+		});
+
+		await session.prompt("recover on the model selected during provider preparation");
+		expect(preparedRefusalEvents).toEqual([
+			{
+				type: "message_start",
+				model: "prepared-model-fixture",
+				provider: "anthropic",
+				contextOverflow: true,
+			},
+			{
+				type: "message_end",
+				model: "prepared-model-fixture",
+				provider: "anthropic",
+				contextOverflow: true,
+			},
+		]);
+
+		expect({
+			hookCalls,
+			transforms,
+			compactions: compactSpy.mock.calls.length,
+			providerCalls: observedContexts.length,
+			lastStop: session.getLastAssistantMessage()?.stopReason,
+		}).toEqual({
+			hookCalls: 3,
+			transforms: 3,
+			compactions: 1,
+			providerCalls: 2,
+			lastStop: "stop",
+		});
+	});
+
+	it("releases the recovery claim after promotion so the promoted request can compact once", async () => {
+		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!bundled) throw new Error("Expected claude-sonnet-4-5 model to exist");
+		const promotedModel: Model = {
+			...bundled,
+			id: "prepared-promotion-target",
+			contextWindow: 8_192,
+			contextPromotionTarget: undefined,
+		};
+		const sourceModel: Model = {
+			...bundled,
+			id: "prepared-promotion-source",
+			contextWindow: 4_096,
+			contextPromotionTarget: `anthropic/${promotedModel.id}`,
+		};
+		vi.spyOn(sharedModelRegistry, "getAvailable").mockReturnValue([sourceModel, promotedModel]);
+		let transforms = 0;
+		const oversized = "post-promotion growth ".repeat(10_000);
+		const { session, observedContexts } = await createHarness(
+			{
+				"compaction.thresholdTokens": -1,
+				"compaction.reserveTokens": 1_000,
+				"compaction.keepRecentTokens": 100,
+				"contextPromotion.enabled": true,
+			},
+			{
+				model: sourceModel,
+				withHistory: true,
+				firstTurnUsageInput: 100,
+				firstTurnUsageOutput: 20,
+				toolOutput: "ok",
+				transformContext: async messages => {
+					transforms++;
+					return transforms <= 2
+						? [...messages, { role: "user", content: oversized, timestamp: Date.now() }]
+						: messages;
+				},
+			},
+		);
+		const compactSpy = mockCompaction("PROMOTED-PREPARED-BUDGET-RECOVERED");
+		const refusalWarnings = collectPreparedBudgetWarnings(session);
+
+		await session.prompt("promote, then compact the still-oversized prepared request");
+
+		expect(session.model?.id).toBe(promotedModel.id);
+		expect(transforms).toBe(4);
+		expect(compactSpy).toHaveBeenCalledTimes(1);
+		expect(observedContexts).toHaveLength(2);
+		expect(observedContexts[0]?.join("\n")).toContain("PROMOTED-PREPARED-BUDGET-RECOVERED");
+		expect(refusalWarnings).toHaveLength(0);
+		expect(session.getLastAssistantMessage()?.stopReason).toBe("stop");
+	});
+
+	it("settles rewritten prepared recovery before a direct Agent run can overtake its delayed continuation", async () => {
+		let transforms = 0;
+		const lifecycle: string[] = [];
+		const oversized = "delayed refusal growth ".repeat(10_000);
+		const directRunStarted = Promise.withResolvers<void>();
+		let directPrompt: Promise<void> | undefined;
+		const { session, sessionManager, observedContexts } = await createHarness(
+			{
+				"compaction.thresholdTokens": -1,
+				"compaction.reserveTokens": 1_000,
+				"compaction.keepRecentTokens": 100,
+			},
+			{
+				withHistory: true,
+				contextWindow: 8_192,
+				firstTurnUsageInput: 100,
+				firstTurnUsageOutput: 20,
+				onProviderCall: index => lifecycle.push(`provider:${index}`),
+				transformContext: async messages => {
+					transforms++;
+					if (transforms === 1) return messages.slice(-1);
+					if (transforms === 2) {
+						return [...messages, { role: "user", content: oversized, timestamp: Date.now() }];
+					}
+					return messages.slice(-1);
+				},
+			},
+		);
+		const compactSpy = mockCompaction("REWRITE-BEFORE-DIRECT-RUN");
+		const warnings = collectPreparedBudgetWarnings(session);
+		const terminalStates: boolean[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end" && !directPrompt) {
+				directPrompt = session.agent.prompt("direct run after the refusal settles");
+				directRunStarted.resolve();
+			}
+			if (event.type === "notice" && event.source === "compaction") lifecycle.push("warning");
+			if (event.type === "agent_end") terminalStates.push(event.isTerminal === true);
+		});
+
+		await session.prompt("create a rewritten prepared refusal");
+		await directRunStarted.promise;
+		await directPrompt;
+
+		expect(compactSpy).toHaveBeenCalledTimes(1);
+		expect(transforms).toBe(3);
+		expect(observedContexts).toHaveLength(2);
+		expect(warnings).toHaveLength(1);
+		expect(lifecycle.indexOf("warning")).toBeLessThan(lifecycle.indexOf("provider:1"));
+		expect(terminalStates).toEqual([true]);
+		expect(session.getLastAssistantMessage()?.stopReason).toBe("stop");
+		const branch = sessionManager.getBranch();
+		const compactionIndex = branch.findIndex(entry => entry.type === "compaction");
+		const refusalIndexes = branch.flatMap((entry, index) => {
+			if (
+				entry.type === "message" &&
+				entry.message.role === "assistant" &&
+				entry.message.errorMessage?.includes("usable budget")
+			) {
+				return [index];
+			}
+			return [];
+		});
+		expect(compactionIndex).toBeGreaterThanOrEqual(0);
+		expect(refusalIndexes).toHaveLength(1);
+		expect(refusalIndexes[0]).toBeGreaterThan(compactionIndex);
+	});
+
+	it("settles rewritten prepared recovery before abort returns", async () => {
+		let transforms = 0;
+		const oversized = "aborted refusal growth ".repeat(10_000);
+		const continuationDelayStarted = Promise.withResolvers<void>();
+		const { session, sessionManager, observedContexts } = await createHarness(
+			{
+				"compaction.thresholdTokens": -1,
+				"compaction.reserveTokens": 1_000,
+				"compaction.keepRecentTokens": 100,
+			},
+			{
+				withHistory: true,
+				contextWindow: 8_192,
+				firstTurnUsageInput: 100,
+				firstTurnUsageOutput: 20,
+				transformContext: async messages => {
+					transforms++;
+					if (transforms === 1) return messages.slice(-1);
+					if (transforms === 2) {
+						return [...messages, { role: "user", content: oversized, timestamp: Date.now() }];
+					}
+					return messages.slice(-1);
+				},
+			},
+		);
+		const schedulerWait = scheduler.wait.bind(scheduler);
+		vi.spyOn(scheduler, "wait").mockImplementation(async (delay, options) => {
+			if (delay !== 100) return schedulerWait(delay, options);
+			const signal = options?.signal;
+			if (!signal) throw new Error("Expected continuation delay to be abortable");
+			if (signal.aborted) throw signal.reason;
+			const cancelled = Promise.withResolvers<void>();
+			const onAbort = () => cancelled.reject(signal.reason);
+			signal.addEventListener("abort", onAbort, { once: true });
+			continuationDelayStarted.resolve();
+			try {
+				await cancelled.promise;
+			} finally {
+				signal.removeEventListener("abort", onAbort);
+			}
+		});
+		const compactSpy = mockCompaction("REWRITE-BEFORE-ABORT");
+		const warnings = collectPreparedBudgetWarnings(session);
+		const terminalStates: boolean[] = [];
+		session.subscribe(event => {
+			if (event.type === "agent_end") terminalStates.push(event.isTerminal === true);
+		});
+
+		const prompt = session.prompt("abort the delayed recovery");
+		await continuationDelayStarted.promise;
+		await session.abort();
+		await prompt;
+
+		expect(compactSpy).toHaveBeenCalledTimes(1);
+		expect(transforms).toBe(2);
+		expect(observedContexts).toHaveLength(1);
+		expect(warnings).toHaveLength(1);
+		expect(terminalStates.filter(Boolean)).toHaveLength(1);
+		const branch = sessionManager.getBranch();
+		const compactionIndex = branch.findIndex(entry => entry.type === "compaction");
+		const refusalIndex = branch.findIndex(
+			entry =>
+				entry.type === "message" &&
+				entry.message.role === "assistant" &&
+				entry.message.errorMessage?.includes("usable budget"),
+		);
+		expect(compactionIndex).toBeGreaterThanOrEqual(0);
+		expect(refusalIndex).toBeGreaterThan(compactionIndex);
 	});
 
 	it("compacts and transparently retries the input-only gate rejection with no usage data", async () => {
@@ -397,36 +787,37 @@ describe("AgentSession mid-run threshold compaction", () => {
 		expect(observedContexts[2].join("\n")).toContain("GATE-OVERFLOW-RECOVERED");
 	});
 
-	it("warns once and stops a still-oversized tool turn after ineffective maintenance", async () => {
+	it("emits only the exact prepared-budget warning when configured compaction has no cut point", async () => {
 		const { session, observedContexts } = await createHarness(
 			{
 				"compaction.thresholdTokens": -1,
-				"compaction.reserveTokens": 65_536,
+				"compaction.reserveTokens": 1_000,
+				"compaction.keepRecentTokens": 100,
 			},
 			{
-				contextWindow: 272_384,
-				firstTurnUsageInput: 206_291,
-				firstTurnUsageOutput: 571,
-				toolOutput: "trailing tool data ".repeat(200),
+				contextWindow: 4_096,
+				transformContext: async messages => [
+					...messages,
+					{ role: "user", content: "uncut prepared growth ".repeat(10_000), timestamp: Date.now() },
+				],
 			},
 		);
-		const maintenanceSpy = vi.spyOn(SessionMaintenance.prototype, "runAutoCompaction").mockResolvedValue({
-			deferredHandoff: false,
-			continuationScheduled: false,
-			automaticContinuationBlocked: true,
-		});
 		const notices: string[] = [];
+		const terminalStates: boolean[] = [];
 		session.subscribe(event => {
 			if (event.type === "notice" && event.level === "warning" && event.source === "compaction") {
 				notices.push(event.message);
 			}
+			if (event.type === "agent_end") terminalStates.push(event.isTerminal === true);
 		});
 
-		await session.prompt("do not resend an input that maintenance could not reduce");
+		await session.prompt("do not duplicate the terminal warning");
 
-		expect(observedContexts).toHaveLength(1);
+		expect(observedContexts).toHaveLength(0);
 		expect(notices).toHaveLength(1);
-		expect(maintenanceSpy).toHaveBeenCalledTimes(1);
+		expect(notices[0]).toContain("usable budget");
+		expect(terminalStates).toEqual([true]);
+		expect(session.getLastAssistantMessage()?.stopReason).toBe("error");
 	});
 
 	it("checks pending input against a switched model and removes its gate on disposal", async () => {
@@ -486,6 +877,28 @@ describe("AgentSession mid-run threshold compaction", () => {
 			stopReason: "error",
 			errorMessage: expect.stringContaining("206,848-token usable budget"),
 		});
+	});
+
+	it("surfaces the prepared-budget refusal when no compaction method is configured", async () => {
+		const { session, observedContexts } = await createHarness(
+			{ "compaction.methodOrder": [], "compaction.reserveTokens": 1_000 },
+			{
+				contextWindow: 4_096,
+				transformContext: async messages => [
+					...messages,
+					{ role: "user", content: "prepared growth ".repeat(10_000), timestamp: Date.now() },
+				],
+			},
+		);
+		const maintenanceSpy = vi.spyOn(SessionMaintenance.prototype, "runAutoCompaction");
+		const refusalWarnings = collectPreparedBudgetWarnings(session);
+
+		await session.prompt("surface an unavailable recovery");
+
+		expect(observedContexts).toHaveLength(0);
+		expect(maintenanceSpy).not.toHaveBeenCalled();
+		expect(refusalWarnings).toHaveLength(1);
+		expect(session.getLastAssistantMessage()?.stopReason).toBe("error");
 	});
 
 	it.each([false, true])(
@@ -634,6 +1047,90 @@ describe("AgentSession mid-run threshold compaction", () => {
 			await session.abort();
 			await prompt;
 			await steering;
+		}
+	});
+
+	it("settles an active-goal retry when a later before-run hook rejects the recovery continuation", async () => {
+		let transforms = 0;
+		const { session, sessionManager, observedContexts } = await createHarness(
+			{
+				"compaction.thresholdTokens": -1,
+				"compaction.reserveTokens": 1_000,
+				"compaction.keepRecentTokens": 100,
+				"retry.baseDelayMs": 20,
+				"retry.maxDelayMs": 100,
+				"retry.maxRetries": 1,
+				"retry.modelFallback": false,
+			},
+			{
+				withHistory: true,
+				contextWindow: 8_192,
+				providerErrorAt: 0,
+				providerErrorStatus: 503,
+				transformContext: async messages =>
+					++transforms === 2
+						? [
+								...messages,
+								{ role: "user", content: "retry prepared growth ".repeat(10_000), timestamp: Date.now() },
+							]
+						: messages,
+			},
+		);
+		session.setGoalModeState(activeGoalState());
+		const compactSpy = mockCompaction("REWRITE-BEFORE-CONTINUATION-FAILURE");
+		const continueSpy = vi.spyOn(session.agent, "continue");
+		let beforeRunCalls = 0;
+		session.agent.addBeforeRunHook(() => {
+			beforeRunCalls++;
+			if (beforeRunCalls === 3) throw new Error("continuation launch failed");
+		});
+		const retryEnds: Array<{ success: boolean; finalError?: string }> = [];
+		const warnings: string[] = [];
+		const terminalStates: boolean[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_end") retryEnds.push(event);
+			if (event.type === "notice" && event.level === "warning" && event.source === "compaction") {
+				warnings.push(event.message);
+			}
+			if (event.type === "agent_end") terminalStates.push(event.isTerminal === true);
+		});
+		const prompt = session.prompt("start an active goal retry");
+		try {
+			expect(
+				await raceWithTimeout(
+					prompt.then(() => true),
+					3_000,
+					false,
+				),
+			).toBe(true);
+			expect(transforms).toBe(2);
+			expect(observedContexts).toHaveLength(1);
+			expect(compactSpy).toHaveBeenCalledTimes(1);
+			expect(continueSpy).toHaveBeenCalledTimes(2);
+			expect(beforeRunCalls).toBe(3);
+			expect(retryEnds).toHaveLength(1);
+			expect(retryEnds[0]).toMatchObject({
+				success: false,
+				finalError: expect.stringContaining("usable budget"),
+			});
+			expect(session.isRetrying).toBe(false);
+			expect(warnings).toHaveLength(1);
+			expect(warnings[0]).toContain("usable budget");
+			expect(terminalStates.filter(Boolean)).toHaveLength(1);
+			expect(terminalStates.at(-1)).toBe(true);
+			const branch = sessionManager.getBranch();
+			const compactionIndex = branch.findIndex(entry => entry.type === "compaction");
+			const refusalIndex = branch.findIndex(
+				entry =>
+					entry.type === "message" &&
+					entry.message.role === "assistant" &&
+					entry.message.errorMessage?.includes("usable budget"),
+			);
+			expect(compactionIndex).toBeGreaterThanOrEqual(0);
+			expect(refusalIndex).toBeGreaterThan(compactionIndex);
+		} finally {
+			await session.abort();
+			await prompt;
 		}
 	});
 
