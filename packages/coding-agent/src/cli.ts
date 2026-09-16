@@ -611,8 +611,8 @@ export async function runCli(argv: string[]): Promise<void> {
 	}
 }
 
-// Floating call instead of top-level await: TLA forces `--bytecode` (CJS
-// lowering) builds to fail, and the entrypoint needs nothing after this.
+// A floating call keeps this entry compatible with CommonJS lowering and
+// installs worker selector handlers before entry module evaluation completes.
 // The catch mirrors what an unhandled TLA rejection produced: error dump to
 // stderr, exit code 1. Success paths resolve without touching the exit code.
 // Guarded so importing `runCli` (profile CLI tests, SDK embedding) does not

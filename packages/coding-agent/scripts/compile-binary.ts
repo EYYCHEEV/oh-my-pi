@@ -48,8 +48,10 @@ export async function compileCodingAgent(options: CodingAgentCompileOptions): Pr
 			},
 			// Precompiled bytecode skips parsing the ~20 MB bundle at boot:
 			// `omp --version` 256 ms -> 30 ms on M4 Max (+52 MB binary).
-			// Bytecode rejects top-level await in the bundle graph.
+			// Preserve ESM: Bun 1.3.14 rejects this graph in its CJS bytecode loader
+			// before any entrypoint code runs.
 			bytecode: true,
+			format: "esm",
 			minify: {
 				identifiers: options.minifyIdentifiers ?? false,
 				keepNames: true,
