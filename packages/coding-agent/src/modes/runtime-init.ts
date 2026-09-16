@@ -10,7 +10,7 @@ import { runExtensionCompact, runExtensionSetModel } from "../extensibility/exte
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
 import type { ExtensionError, ExtensionMode, ExtensionUIContext } from "../extensibility/extensions/types";
 import type { AgentSession } from "../session/agent-session";
-import { USER_INTERRUPT_LABEL } from "../session/messages";
+import { type CustomMessageOptions, USER_INTERRUPT_LABEL } from "../session/messages";
 
 /** Action name for an extension-originated send failure. */
 export type ExtensionSendAction = "extension_send" | "extension_send_user";
@@ -52,32 +52,34 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 		trackAgentInvokingMessage,
 	} = options;
 	const shutdown = onShutdown ?? (() => {});
+	const observeCustomMessage = (sendTask: Promise<boolean>, sendOptions?: CustomMessageOptions) => {
+		if (sendOptions?.triggerTurn || sendOptions?.deliverAs === "aside") {
+			// Queues, plan-mode folds and deferred turns resolve false: they own no agent turn.
+			const invokingTask = sendTask.then(started => {
+				if (!started) throw new Error("send did not invoke the agent");
+			});
+			if (trackAgentInvokingMessage) {
+				trackAgentInvokingMessage(invokingTask);
+			} else {
+				void invokingTask.then(
+					() => markAgentInvokingMessage?.(),
+					() => {},
+				);
+			}
+		}
+		void sendTask.catch(e => {
+			reportSendError("extension_send", e instanceof Error ? e : new Error(String(e)));
+		});
+	};
 
 	runner.initialize(
 		// ExtensionActions
 		{
+			requireRuntime: (extension, declaration) => session.requireRuntime(extension, declaration),
+			sendMessageWithReceipt: (message, sendOptions) =>
+				session.sendCustomMessageWithReceipt(message, sendOptions, task => observeCustomMessage(task, sendOptions)),
 			sendMessage: (message, sendOptions) => {
-				const sendTask = session.sendCustomMessage(message, sendOptions);
-				if (sendOptions?.triggerTurn || sendOptions?.deliverAs === "aside") {
-					// sendCustomMessage resolves `false` for outcomes that provably start no turn
-					// (streaming queue, idle plan-mode fold, deferred ACP turn) — only a `true`
-					// result should mark this send as agent-invoking, so downstream trackers (RPC's
-					// hasAgentMessageTask) don't wait on agent events that will never arrive.
-					const invokingTask = sendTask.then(started => {
-						if (!started) throw new Error("send did not invoke the agent");
-					});
-					if (trackAgentInvokingMessage) {
-						trackAgentInvokingMessage(invokingTask);
-					} else {
-						invokingTask.then(
-							() => markAgentInvokingMessage?.(),
-							() => {},
-						);
-					}
-				}
-				sendTask.catch(e => {
-					reportSendError("extension_send", e instanceof Error ? e : new Error(String(e)));
-				});
+				observeCustomMessage(session.sendCustomMessage(message, sendOptions), sendOptions);
 			},
 			sendUserMessage: (content, sendOptions) => {
 				const sendTask = session.sendUserMessage(content, sendOptions);
@@ -112,6 +114,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 		},
 		// ExtensionContextActions
 		{
+			flushSession: sessionId => session.flushSession(sessionId),
 			getModel: () => session.model,
 			isIdle: () => !session.isStreaming,
 			abort: () => session.abort({ reason: USER_INTERRUPT_LABEL }),
@@ -155,4 +158,5 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 
 	runner.onError(reportRuntimeError);
 	await runner.emit({ type: "session_start" });
+	await runner.emit({ type: "session_ready", sessionId: session.sessionId });
 }

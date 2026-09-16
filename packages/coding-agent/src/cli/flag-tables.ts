@@ -49,6 +49,7 @@ export interface ParseDeps {
 	parseThinking: (value: string | null | undefined) => ConfiguredThinkingLevel | undefined;
 	normalizeToolNames: (values: Iterable<string>) => string[];
 	thinkingEfforts: readonly string[];
+	runtimeRequirementsVersion: number;
 }
 
 export type StringSetter = (result: Args, value: string, deps: ParseDeps) => void;
@@ -111,6 +112,13 @@ function parseMaxTimeSeconds(value: string): number {
  * a registered boolean extension can shadow them before profile bootstrap.
  */
 export const STRING_SETTERS: Record<string, StringSetter> = {
+	"--require-runtime-contract": (_result, value, deps) => {
+		if (value !== String(deps.runtimeRequirementsVersion)) {
+			throw new CliUsageError(
+				`This host supports session runtime contract ${deps.runtimeRequirementsVersion}; an exact supported version is required.`,
+			);
+		}
+	},
 	"--cwd": (result, value) => {
 		result.cwd = value;
 	},

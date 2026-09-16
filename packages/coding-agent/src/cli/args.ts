@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { $env, APP_NAME, logger } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import type { ServiceTierOpenAISettingValue } from "../config/service-tier";
+import { RUNTIME_REQUIREMENTS_VERSION } from "../session/runtime-requirements";
 import { CLI_THINKING_LEVELS, type ConfiguredThinkingLevel, parseCliThinkingLevel } from "../thinking";
 import { normalizeToolNames } from "../tools/builtin-names";
 import {
@@ -110,6 +111,7 @@ const PARSE_DEPS: ParseDeps = {
 	parseThinking: parseCliThinkingLevel,
 	normalizeToolNames,
 	thinkingEfforts: CLI_THINKING_LEVELS,
+	runtimeRequirementsVersion: RUNTIME_REQUIREMENTS_VERSION,
 };
 
 const WINDOWS_PATH_VALUE_FLAGS = new Set(["--extension", "-e", "--hook", "--trusted-extension"]);
@@ -191,7 +193,9 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 		// the following token — eating the user's message and setting the wrong
 		// built-in field — so registered flags shadow same-named built-ins here.
 		const extFlag = arg.startsWith("--") ? extensionFlags?.get(arg.slice(2)) : undefined;
-		if (extFlag) {
+		if (arg === "--require-runtime-contract") {
+			STRING_SETTERS[arg](result, args[++i] ?? "", parseDeps);
+		} else if (extFlag) {
 			const flagName = arg.slice(2);
 			if (extFlag.type === "boolean") {
 				result.unknownFlags.set(flagName, true);

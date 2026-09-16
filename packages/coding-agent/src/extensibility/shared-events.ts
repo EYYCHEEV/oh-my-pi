@@ -29,6 +29,17 @@ export interface SessionStartEvent {
 	type: "session_start";
 }
 
+/**
+ * Target history and model state have been restored; handlers may await runtime attachment.
+ * Emitted on initialization and successful new/resume/fork/branch restoration.
+ * Same-journal tree navigation and compaction keep their existing events, not a new ready event.
+ * Not runtime satisfaction or provider completion; session_switch timing is unchanged.
+ */
+export interface SessionReadyEvent {
+	type: "session_ready";
+	sessionId: string;
+}
+
 /** Fired before switching to another session (can be cancelled) */
 export interface SessionBeforeSwitchEvent {
 	type: "session_before_switch";
@@ -151,6 +162,7 @@ export interface GoalUpdatedEvent {
 
 export type SessionEvent =
 	| SessionStartEvent
+	| SessionReadyEvent
 	| SessionBeforeSwitchEvent
 	| SessionSwitchEvent
 	| SessionBeforeBranchEvent

@@ -7,7 +7,7 @@ describe("ExtensionContext project trust compatibility", () => {
 			[],
 			{} as never,
 			"/project",
-			{ getCwd: () => "/project" } as never,
+			{ getCwd: () => "/project", getSessionId: () => "extension-context-project-trust" } as never,
 			{} as never,
 		);
 

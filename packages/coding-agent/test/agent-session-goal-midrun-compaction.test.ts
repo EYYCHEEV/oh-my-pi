@@ -19,6 +19,10 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionMaintenance } from "@oh-my-pi/pi-coding-agent/session/session-maintenance";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { Tool, ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { ContextNotesTool, NewContextTool } from "@oh-my-pi/pi-coding-agent/tools/context-notes";
+import { GrepTool } from "@oh-my-pi/pi-coding-agent/tools/grep";
+import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -169,6 +173,25 @@ describe("AgentSession mid-run threshold compaction", () => {
 			},
 		};
 
+		const tools: Tool[] = [mockBashTool];
+		if (settings.getGroup("compaction").experimentalContextManagement) {
+			const toolSession: ToolSession = {
+				cwd: tempDir.path(),
+				hasUI: false,
+				getSessionFile: () => null,
+				getSessionId: () => sessionManager.getSessionId(),
+				getSessionSpawns: () => "*",
+				sessionManager,
+				settings,
+			};
+			tools.push(
+				new ReadTool(toolSession),
+				new GrepTool(toolSession),
+				new ContextNotesTool(toolSession),
+				new NewContextTool(toolSession),
+			);
+		}
+
 		let call = 0;
 		const agent = new Agent({
 			getApiKey: () => "test-key",
@@ -176,7 +199,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 			initialState: {
 				model,
 				systemPrompt: ["Test"],
-				tools: [mockBashTool],
+				tools,
 				messages: sessionManager.buildSessionContext().messages,
 			},
 			convertToLlm,
@@ -245,7 +268,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
-			toolRegistry: new Map([[mockBashTool.name, mockBashTool]]),
+			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
 			extensionRunner: options.extensionRunner,
 		});
 
@@ -389,6 +412,42 @@ describe("AgentSession mid-run threshold compaction", () => {
 		expect(observedContexts[1].join("\n")).toContain("PREPARED-BUDGET-RECOVERED");
 		expect(session.getLastAssistantMessage()?.stopReason).toBe("stop");
 		expect(refusalWarnings).toHaveLength(0);
+	});
+
+	it("recovers late prepared growth through notebook rollover without ordinary compaction methods", async () => {
+		let transforms = 0;
+		const { session, sessionManager, observedContexts } = await createHarness(
+			{
+				"compaction.experimentalContextManagement": true,
+				"compaction.methodOrder": [],
+				"compaction.thresholdTokens": -1,
+				"compaction.reserveTokens": 1_000,
+				"compaction.keepRecentTokens": 1,
+			},
+			{
+				withHistory: true,
+				contextWindow: 4_096,
+				firstTurnUsageInput: 100,
+				transformContext: async messages =>
+					transforms++ === 0
+						? [
+								...messages,
+								{ role: "user", content: "temporary prepared growth ".repeat(10_000), timestamp: Date.now() },
+							]
+						: messages,
+			},
+		);
+		const warnings = collectPreparedBudgetWarnings(session);
+		const compactSpy = mockCompaction("ordinary compaction must not run");
+
+		await session.prompt("recover through the notebook mode");
+
+		expect(transforms).toBe(3);
+		expect(observedContexts).toHaveLength(2);
+		expect(sessionManager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(1);
+		expect(compactSpy).not.toHaveBeenCalled();
+		expect(warnings).toHaveLength(0);
+		expect(session.getLastAssistantMessage()?.stopReason).toBe("stop");
 	});
 
 	it("persists one prepared-budget refusal after a real recovery rewrite cannot make the next request fit", async () => {

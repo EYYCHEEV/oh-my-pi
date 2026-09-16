@@ -331,6 +331,12 @@ export interface AgentOptions {
 	afterToolCall?: AgentLoopConfig["afterToolCall"];
 
 	/**
+	 * Synchronously wraps the assistant stream after owned-dialect tool synthesis.
+	 * See {@link AgentLoopConfig.transformAssistantStream}.
+	 */
+	transformAssistantStream?: AgentLoopConfig["transformAssistantStream"];
+
+	/**
 	 * Called once an assistant message is finalized, before it reaches the
 	 * context, the UI, or tool dispatch. May mutate the message in place (text +
 	 * tool-call arguments). See {@link AgentLoopConfig.transformAssistantMessage}.
@@ -461,6 +467,9 @@ export class Agent {
 	 * message emission. Reassign at any time to swap the implementation.
 	 */
 	afterToolCall?: AgentLoopConfig["afterToolCall"];
+	/** Post-dialect assistant stream wrapper. Reassignable for host lifecycle changes. */
+	transformAssistantStream?: AgentLoopConfig["transformAssistantStream"];
+
 	/**
 	 * Hook invoked once an assistant message is finalized, before context append,
 	 * UI emission, and tool dispatch. Reassign at any time to swap the implementation.
@@ -522,6 +531,7 @@ export class Agent {
 		this.#onHarmonyLeak = opts.onHarmonyLeak;
 		this.beforeToolCall = opts.beforeToolCall;
 		this.afterToolCall = opts.afterToolCall;
+		this.transformAssistantStream = opts.transformAssistantStream;
 		this.transformAssistantMessage = opts.transformAssistantMessage;
 		this.#telemetry = opts.telemetry;
 		this.#appendOnlyContext = opts.appendOnlyContext;
@@ -824,7 +834,7 @@ export class Agent {
 
 	/**
 	 * Register an independently removable hook that prepares a claimed Agent
-	 * run before its model and conversation are captured. A hook may return a
+	 * run before input append, continuation recovery, or model capture. A hook may return a
 	 * synchronous commit; commits run only after every hook and model validation
 	 * succeed, so a later preparation failure cannot partially advance host
 	 * lifecycle state.
@@ -1263,6 +1273,7 @@ export class Agent {
 
 		try {
 			const dequeueSignal = this.#continuationDequeueSignal(signal);
+			const preparedRunCommits = await this.#prepareBeforeRunHooks(dequeueSignal);
 			const messages = this.#state.messages;
 			if (messages.length === 0) {
 				// An empty transcript has nothing to resume, but a queued steer/follow-up
@@ -1273,12 +1284,12 @@ export class Agent {
 				// allocation loop until OOM (issue #6344).
 				const queuedSteering = await this.#dequeueSteeringMessagesAfterHooks(dequeueSignal);
 				if (queuedSteering.length > 0) {
-					await this.#runLoop(queuedSteering, { skipInitialSteeringPoll: true }, signal, true);
+					await this.#runLoop(queuedSteering, { skipInitialSteeringPoll: true }, signal, preparedRunCommits);
 					return;
 				}
 				const queuedFollowUp = await this.#dequeueFollowUpMessagesAfterHooks(dequeueSignal);
 				if (queuedFollowUp.length > 0) {
-					await this.#runLoop(queuedFollowUp, undefined, signal, true);
+					await this.#runLoop(queuedFollowUp, undefined, signal, preparedRunCommits);
 					return;
 				}
 				throw new Error("No messages to continue from");
@@ -1290,25 +1301,25 @@ export class Agent {
 				// blocks and their results would break the provider's pairing
 				// invariant. Queued messages drain inside the resumed loop instead.
 				if (unpairedToolCallTail(messages)) {
-					await this.#runLoop(undefined, undefined, signal, true);
+					await this.#runLoop(undefined, undefined, signal, preparedRunCommits);
 					return;
 				}
 				const queuedSteering = await this.#dequeueSteeringMessagesAfterHooks(dequeueSignal);
 				if (queuedSteering.length > 0) {
-					await this.#runLoop(queuedSteering, { skipInitialSteeringPoll: true }, signal, true);
+					await this.#runLoop(queuedSteering, { skipInitialSteeringPoll: true }, signal, preparedRunCommits);
 					return;
 				}
 
 				const queuedFollowUp = await this.#dequeueFollowUpMessagesAfterHooks(dequeueSignal);
 				if (queuedFollowUp.length > 0) {
-					await this.#runLoop(queuedFollowUp, undefined, signal, true);
+					await this.#runLoop(queuedFollowUp, undefined, signal, preparedRunCommits);
 					return;
 				}
 
 				throw new Error("Cannot continue from message role: assistant");
 			}
 
-			await this.#runLoop(undefined, undefined, signal, true);
+			await this.#runLoop(undefined, undefined, signal, preparedRunCommits);
 		} finally {
 			resolve();
 			if (this.#abortController === continuationAbortController) {
@@ -1333,11 +1344,11 @@ export class Agent {
 		messages?: AgentMessage[],
 		options?: AgentPromptOptions & { skipInitialSteeringPoll?: boolean },
 		continuationSignal?: AbortSignal,
-		runStateClaimed = false,
+		preparedRunCommits?: AgentRunCommit[],
 	) {
 		let skipInitialSteeringPoll = options?.skipInitialSteeringPoll === true;
 		using _ = new EventLoopKeepalive();
-		if (!runStateClaimed) {
+		if (!preparedRunCommits) {
 			const { promise, resolve } = Promise.withResolvers<void>();
 			this.#runningPrompt = promise;
 			this.#resolveRunningPrompt = resolve;
@@ -1354,7 +1365,7 @@ export class Agent {
 		this.#state.error = undefined;
 		let model: Model;
 		try {
-			const commits = await this.#prepareBeforeRunHooks(loopSignal);
+			const commits = preparedRunCommits ?? (await this.#prepareBeforeRunHooks(loopSignal));
 			if (!this.#state.model) throw new Error("No model configured");
 			for (const commit of commits) commit();
 			const activeModel = this.#state.model;
@@ -1523,6 +1534,7 @@ export class Agent {
 			appendOnlyContext: this.#appendOnlyContext,
 			beforeToolCall: this.beforeToolCall ? (ctx, signal) => this.beforeToolCall?.(ctx, signal) : undefined,
 			afterToolCall: this.afterToolCall ? (ctx, signal) => this.afterToolCall?.(ctx, signal) : undefined,
+			transformAssistantStream: this.transformAssistantStream,
 			transformAssistantMessage: this.transformAssistantMessage
 				? (message, signal) => this.transformAssistantMessage?.(message, signal)
 				: undefined,

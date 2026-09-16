@@ -403,55 +403,74 @@ describe("Agent", () => {
 		expect(agent.peekFollowUpQueue()).toHaveLength(1);
 	});
 
-	it("runs before-run hooks after claiming busy state and before capturing the request model", async () => {
-		const entered = Promise.withResolvers<void>();
-		const release = Promise.withResolvers<void>();
-		const observedModels: string[] = [];
-		const mock = createMockModel({ responses: [{ content: ["done"] }] });
-		const replacementModel = { ...mock.model, id: "model-selected-by-before-run" };
-		const agent = new Agent({
-			initialState: { model: mock.model, messages: [] },
-			streamFn: (model, context, options) => {
-				observedModels.push(model.id);
-				return mock.stream(model, context, options);
-			},
-		});
-		agent.addBeforeRunHook(async signal => {
-			if (!signal) throw new Error("Expected an active run signal");
-			entered.resolve();
-			await release.promise;
-			agent.setModel(replacementModel);
-		});
+	it.each(["prompt", "continue"] as const)(
+		"%s prepares and commits once before capturing the request model",
+		async entry => {
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const observedModels: string[] = [];
+			const mock = createMockModel({ responses: [{ content: ["done"] }] });
+			const replacementModel = { ...mock.model, id: "model-selected-by-before-run" };
+			let preparations = 0;
+			let commits = 0;
+			const agent = new Agent({
+				initialState: { model: mock.model, messages: [] },
+				streamFn: (model, context, options) => {
+					observedModels.push(model.id);
+					return mock.stream(model, context, options);
+				},
+			});
+			agent.addBeforeRunHook(async signal => {
+				if (!signal) throw new Error("Expected an active run signal");
+				preparations++;
+				entered.resolve();
+				await release.promise;
+				agent.setModel(replacementModel);
+				return () => {
+					commits++;
+				};
+			});
 
-		const running = agent.prompt("start");
-		await entered.promise;
-		expect(agent.state.isStreaming).toBe(true);
-		expect(observedModels).toHaveLength(0);
-		await expect(agent.prompt("must not overlap")).rejects.toBeInstanceOf(AgentBusyError);
+			if (entry === "continue") agent.followUp({ role: "user", content: "start", timestamp: Date.now() });
+			const running = entry === "prompt" ? agent.prompt("start") : agent.continue();
+			await entered.promise;
+			expect(agent.state.isStreaming).toBe(true);
+			expect(observedModels).toHaveLength(0);
+			await expect(agent.prompt("must not overlap")).rejects.toBeInstanceOf(AgentBusyError);
 
-		release.resolve();
-		await running;
-		expect(observedModels).toEqual(["model-selected-by-before-run"]);
-		expect(agent.state.isStreaming).toBe(false);
-	});
+			release.resolve();
+			await running;
+			expect(observedModels).toEqual(["model-selected-by-before-run"]);
+			expect(preparations).toBe(1);
+			expect(commits).toBe(1);
+			expect(agent.state.isStreaming).toBe(false);
+		},
+	);
 
-	it("does not commit prepared run state when a later before-run hook rejects", async () => {
-		const committed: string[] = [];
-		const mock = createMockModel({ responses: [{ content: ["must not run"] }] });
-		const agent = new Agent({
-			initialState: { model: mock.model, messages: [] },
-			streamFn: mock.stream,
-		});
-		agent.addBeforeRunHook(() => () => committed.push("first"));
-		agent.addBeforeRunHook(() => {
-			throw new Error("later preparation failed");
-		});
+	it.each(["prompt", "continue"] as const)(
+		"%s does not commit run state when a later preparation rejects",
+		async entry => {
+			const committed: string[] = [];
+			const mock = createMockModel({ responses: [{ content: ["must not run"] }] });
+			const agent = new Agent({
+				initialState: { model: mock.model, messages: [] },
+				streamFn: mock.stream,
+			});
+			agent.addBeforeRunHook(() => () => committed.push("first"));
+			agent.addBeforeRunHook(() => {
+				throw new Error("later preparation failed");
+			});
 
-		await expect(agent.prompt("start")).rejects.toThrow("later preparation failed");
+			if (entry === "continue") agent.followUp({ role: "user", content: "start", timestamp: Date.now() });
+			await expect(entry === "prompt" ? agent.prompt("start") : agent.continue()).rejects.toThrow(
+				"later preparation failed",
+			);
+			if (entry === "continue") expect(agent.peekFollowUpQueue()).toHaveLength(1);
 
-		expect(committed).toEqual([]);
-		expect(agent.state.isStreaming).toBe(false);
-	});
+			expect(committed).toEqual([]);
+			expect(agent.state.isStreaming).toBe(false);
+		},
+	);
 
 	it("does not clear a successor prompt after continue() releases idle waiters", async () => {
 		const firstStarted = Promise.withResolvers<void>();

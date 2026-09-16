@@ -1,3 +1,4 @@
+import type { RequiredRuntimeExtension } from "./runtime-requirements";
 import type {
 	Agent,
 	AgentMessage,
@@ -128,6 +129,8 @@ export interface AgentSessionConfig {
 	codeModeState?: { namespacesInfo?: unknown };
 	sessionManager: SessionManager;
 	settings: Settings;
+	/** Fail closed until each explicitly configured runtime has declared for this session. */
+	requiredRuntimeExtensions?: readonly RequiredRuntimeExtension[];
 	/**
 	 * Live extension-root policy inherited from the owning session. Subagents use
 	 * this provider so explicit roots, discovery mode, configured roots, and
@@ -311,6 +314,8 @@ export interface AgentSessionConfig {
 	advisorWatchdogPrompt?: string;
 	/** Shared advisor instructions loaded from WATCHDOG.yml. */
 	advisorSharedInstructions?: string;
+	/** Shared advisor max notes per update loaded from WATCHDOG.yml. */
+	advisorSharedMaxNotesPerUpdate?: number;
 	/** Project context rendered for advisor sessions. */
 	advisorContextPrompt?: string;
 	/** Memory backend developer instructions rendered for advisor sessions. */

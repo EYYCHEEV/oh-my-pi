@@ -1,3 +1,9 @@
+import {
+	type RuntimeRequirement,
+	readRuntimeRequirements,
+	sameRuntimeRequirement,
+	RuntimeRequirementError,
+} from "./runtime-requirements";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type {
@@ -373,6 +379,13 @@ class SessionEntryIndex {
 	}
 }
 
+/** Software-crash visibility of a physical journal prefix, not fsync/power-loss durability. */
+export interface SessionPersistenceReceipt {
+	sessionId: string;
+	throughEntryId: string | null;
+	persistence: "flushed" | "memory-only";
+}
+
 export type ReadonlySessionManager = Pick<
 	SessionManager,
 	| "getCwd"
@@ -487,6 +500,7 @@ export class SessionManager {
 	#sessionId = "";
 	#sessionName: string | undefined;
 	#titleSource: SessionTitleSource | undefined;
+	#titleRevision = 0;
 	#sessionFile: string | undefined;
 	#header!: SessionHeader;
 	#titleUpdatedAt = "";
@@ -1525,6 +1539,7 @@ export class SessionManager {
 			additionalDirectories: this.#additionalDirectories.length > 0 ? [...this.#additionalDirectories] : undefined,
 			parentSession: parentSessionId,
 			providerPromptCacheKey: this.#header.providerPromptCacheKey ?? parentSessionId,
+			runtimeRequirements: structuredClone(this.#header.runtimeRequirements),
 		};
 		this.#sessionName = this.#header.title;
 		this.#titleSource = this.#header.titleSource;
@@ -1705,6 +1720,7 @@ export class SessionManager {
 		manager.#titleUpdatedAt = this.#titleUpdatedAt;
 		manager.#header.title = this.#sessionName;
 		manager.#header.titleSource = this.#titleSource;
+		manager.#header.runtimeRequirements = structuredClone(this.#header.runtimeRequirements);
 		manager.#additionalDirectories = [...this.#additionalDirectories];
 		manager.#header.additionalDirectories =
 			manager.#additionalDirectories.length > 0 ? [...manager.#additionalDirectories] : undefined;
@@ -1798,6 +1814,73 @@ export class SessionManager {
 				this.#diskFailure ?? new Error("Authoritative session persistence recovery was requested.");
 			await this.#authoritativelyRewriteCurrentStateLocked(operationError);
 			this.#notifyDurableEntries();
+		});
+	}
+
+	/** Monotonic header declaration. Failed persistence retains the condition in memory, never authority. */
+	requireRuntime(requirement: RuntimeRequirement, expectedSessionId: string): Promise<SessionPersistenceReceipt> {
+		const owner = this.#header;
+		if (this.#released || expectedSessionId !== this.#sessionId) {
+			return Promise.reject(
+				new RuntimeRequirementError(expectedSessionId, "the declaring session is no longer active"),
+			);
+		}
+		const requirements = readRuntimeRequirements(owner.runtimeRequirements, expectedSessionId);
+		if (!requirements.some(saved => sameRuntimeRequirement(saved, requirement))) {
+			owner.runtimeRequirements = [...requirements, Object.freeze({ ...requirement })];
+		}
+		return this.#withAtomicPersistenceLock(async () => {
+			const assertOwner = () => {
+				if (this.#released || this.#header !== owner || this.#sessionId !== expectedSessionId) {
+					throw new RuntimeRequirementError(expectedSessionId, "the session changed during declaration");
+				}
+			};
+			assertOwner();
+			if (!this.#persist)
+				return {
+					sessionId: expectedSessionId,
+					throughEntryId: this.#entries.at(-1)?.id ?? null,
+					persistence: "memory-only",
+				};
+			await this.#rewriteAtomically();
+			assertOwner();
+			await this.flush();
+			assertOwner();
+			if (!this.#fileIsCurrent || this.#rewriteRequired)
+				throw new RuntimeRequirementError(expectedSessionId, "declaration persistence was superseded");
+			return {
+				sessionId: expectedSessionId,
+				throughEntryId: this.#entries.at(-1)?.id ?? null,
+				persistence: "flushed",
+			};
+		});
+	}
+
+	getRuntimeRequirements(): readonly RuntimeRequirement[] {
+		return structuredClone(readRuntimeRequirements(this.#header.runtimeRequirements, this.#sessionId));
+	}
+
+	/** Capture a physical journal cutoff under the atomic batch lock, then drain its backing writes. */
+	flushSession(expectedSessionId = this.#sessionId): Promise<SessionPersistenceReceipt> {
+		const owner = this.#header;
+		return this.#withAtomicPersistenceLock(async () => {
+			const assertOwner = () => {
+				if (this.#released) throw new Error("Session has been disposed.");
+				if (this.#header !== owner || this.#sessionId !== expectedSessionId) {
+					throw new Error("Session changed during persistence barrier.");
+				}
+			};
+			assertOwner();
+			const throughEntryId = this.#entries.at(-1)?.id ?? null;
+			if (!this.#persist) return { sessionId: expectedSessionId, throughEntryId, persistence: "memory-only" };
+			await this.ensureOnDisk();
+			assertOwner();
+			await this.flush();
+			assertOwner();
+			if (!this.#fileIsCurrent || this.#rewriteRequired) {
+				throw new Error("Session persistence barrier was superseded.");
+			}
+			return { sessionId: expectedSessionId, throughEntryId, persistence: "flushed" };
 		});
 	}
 
@@ -2194,6 +2277,16 @@ export class SessionManager {
 		return this.#titleSource;
 	}
 
+	/** Tracks user rename requests; background title updates do not invalidate them. */
+	get titleRevision(): number {
+		return this.#titleRevision;
+	}
+
+	/** Invalidate older generated renames before starting a new request. */
+	reserveTitleRevision(): number {
+		return ++this.#titleRevision;
+	}
+
 	getSessionName(): string | undefined {
 		return this.#sessionName;
 	}
@@ -2229,6 +2322,7 @@ export class SessionManager {
 		const timestamp = nowIso();
 		this.#sessionName = title;
 		this.#titleSource = source;
+		if (source === "user") this.#titleRevision++;
 		this.#titleUpdatedAt = timestamp;
 		this.#header.title = title;
 		this.#header.titleSource = source;
@@ -2400,6 +2494,7 @@ export class SessionManager {
 		spawns?: string;
 		readSummarize?: boolean;
 		advisor?: string;
+		isolated?: boolean;
 	}): string {
 		const entry: SessionInitEntry = { type: "session_init", ...this.#freshEntryFields(), ...init };
 		this.#recordEntry(entry);
@@ -2635,7 +2730,7 @@ export class SessionManager {
 	}
 
 	getHeader(): SessionHeader | null {
-		return this.#header;
+		return structuredClone(this.#header);
 	}
 
 	/** All session entries (excludes header). Returns a shallow copy. */
@@ -2746,6 +2841,7 @@ export class SessionManager {
 			titleSource: this.#titleSource,
 			parentSession: this.#persist ? sourceSessionFile : undefined,
 			additionalDirectories: this.#additionalDirectories.length > 0 ? [...this.#additionalDirectories] : undefined,
+			runtimeRequirements: structuredClone(this.#header.runtimeRequirements),
 		};
 
 		const labels: LabelEntry[] = [];
@@ -2872,6 +2968,7 @@ export class SessionManager {
 		);
 		manager.#header.title = sourceHeader?.title;
 		manager.#header.titleSource = sourceHeader?.titleSource;
+		manager.#header.runtimeRequirements = structuredClone(sourceHeader?.runtimeRequirements);
 		manager.#additionalDirectories = (sourceHeader?.additionalDirectories ?? []).filter(d => d !== path.resolve(cwd));
 		manager.#header.additionalDirectories =
 			manager.#additionalDirectories.length > 0 ? manager.#additionalDirectories : undefined;
@@ -2965,6 +3062,7 @@ export class SessionManager {
 			spawns?: string;
 			readSummarize?: boolean;
 			advisor?: string;
+			isolated?: boolean;
 		} | null;
 	} | null> {
 		let header: SessionHeader | undefined;
@@ -2982,6 +3080,7 @@ export class SessionManager {
 			spawns?: string;
 			readSummarize?: boolean;
 			advisor?: string;
+			isolated?: boolean;
 		} | null = null;
 		const visit = (entry: FileEntry): void => {
 			if (entry.type === "session") {
@@ -3003,6 +3102,7 @@ export class SessionManager {
 					readSummarize: entry.readSummarize,
 					spawns: entry.spawns,
 					advisor: entry.advisor,
+					isolated: entry.isolated,
 				};
 			}
 		};

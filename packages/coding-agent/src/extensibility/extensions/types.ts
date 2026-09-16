@@ -1,3 +1,4 @@
+import type { RuntimeRequirementDeclaration } from "../../session/runtime-requirements";
 /**
  * Extension system types.
  *
@@ -66,8 +67,8 @@ import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { Theme, ThemeColor } from "../../modes/theme/theme";
 import type { AsyncJobSnapshot } from "../../session/agent-session";
 import type { CompactMode } from "../../session/compact-modes";
-import type { CustomMessage, CustomMessagePayload } from "../../session/messages";
-import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
+import type { CustomMessage, CustomMessagePayload, MessageAdmission } from "../../session/messages";
+import type { ReadonlySessionManager, SessionManager, SessionPersistenceReceipt } from "../../session/session-manager";
 import type {
 	BashToolDetails,
 	BashToolInput,
@@ -109,6 +110,7 @@ import type {
 	SessionEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
+	SessionReadyEvent,
 	SessionStopEvent,
 	SessionStopEventResult,
 	SessionSwitchEvent,
@@ -480,6 +482,8 @@ export interface ExtensionContext {
 	cwd: string;
 	/** Session manager (read-only) */
 	sessionManager: ReadonlySessionManager;
+	/** Flush the recorded journal prefix, not pending queues or the current event's unrecorded input. */
+	flushSession(): Promise<SessionPersistenceReceipt>;
 	/** Model registry for API key resolution */
 	modelRegistry: ModelRegistry;
 	/** Calling session's `local://` root mapping for external tool bridges. */
@@ -496,6 +500,14 @@ export interface ExtensionContext {
 	hasPendingMessages(): boolean;
 	/** Gracefully shutdown and exit. */
 	shutdown(): void;
+	/**
+	 * Whether the current project/workspace is trusted. OMP performs no
+	 * project-trust gating — project-level settings and extensions load
+	 * unconditionally — so this always returns `true`. Exposed for
+	 * compatibility with extensions authored against upstream Pi, whose
+	 * `SettingsManager` accepts a `projectTrusted` flag.
+	 */
+	isProjectTrusted(): boolean;
 	/** Get the current effective system prompt. */
 	getSystemPrompt(): string[];
 	/** Structured memory runtime for status/search/save across the configured backend. */
@@ -743,6 +755,7 @@ export type {
 	SessionEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
+	SessionReadyEvent,
 	SessionSwitchEvent,
 	SessionTreeEvent,
 	TreePreparation,
@@ -1262,6 +1275,7 @@ export interface ExtensionAPI {
 
 	on(event: "resources_discover", handler: ExtensionHandler<ResourcesDiscoverEvent, ResourcesDiscoverResult>): void;
 	on(event: "session_start", handler: ExtensionHandler<SessionStartEvent>): void;
+	on(event: "session_ready", handler: ExtensionHandler<SessionReadyEvent>): void;
 	on(
 		event: "session_before_switch",
 		handler: ExtensionHandler<SessionBeforeSwitchEvent, SessionBeforeSwitchResult>,
@@ -1467,6 +1481,15 @@ export interface ExtensionAPI {
 		message: CustomMessagePayload<T>,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" },
 	): void;
+
+	/** Resolve at in-memory admission, without waiting for a provider turn. */
+	sendMessageWithReceipt<T = unknown>(
+		message: CustomMessagePayload<T>,
+		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" },
+	): Promise<MessageAdmission>;
+
+	/** Persist a session-wide requirement owned by this loaded extension before acknowledging. */
+	requireRuntime(declaration: RuntimeRequirementDeclaration): Promise<SessionPersistenceReceipt>;
 
 	/** Send a user prompt: idle starts a turn; streaming queues as steer unless deliverAs is set.
 	 *  `deliverAs: "aside"` injects at the next step boundary without interrupting the in-flight tool
@@ -1735,6 +1758,11 @@ export interface ExtensionRuntimeState {
 /** Action implementations for ExtensionAPI methods. */
 export interface ExtensionActions {
 	sendMessage: SendMessageHandler;
+	sendMessageWithReceipt?: ExtensionAPI["sendMessageWithReceipt"];
+	requireRuntime?: (
+		extension: Extension,
+		declaration: RuntimeRequirementDeclaration,
+	) => Promise<SessionPersistenceReceipt>;
 	sendUserMessage: SendUserMessageHandler;
 	appendEntry: AppendEntryHandler;
 	setLabel: (targetId: string, label: string | undefined) => void;
@@ -1753,6 +1781,7 @@ export interface ExtensionActions {
 
 /** Actions for ExtensionContext (ctx.* in event handlers). */
 export interface ExtensionContextActions {
+	flushSession?: (sessionId: string) => Promise<SessionPersistenceReceipt>;
 	getModel: () => Model | undefined;
 	isIdle: () => boolean;
 	abort: () => void;
@@ -1780,6 +1809,8 @@ export interface ExtensionCommandContextActions {
 
 /** Full runtime = state + actions, including host-compatible service-tier fallbacks. */
 export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionActions {
+	sendMessageWithReceipt: ExtensionAPI["sendMessageWithReceipt"];
+	requireRuntime: NonNullable<ExtensionActions["requireRuntime"]>;
 	getServiceTiers: GetServiceTiersHandler;
 	setServiceTier: SetServiceTierHandler;
 }
