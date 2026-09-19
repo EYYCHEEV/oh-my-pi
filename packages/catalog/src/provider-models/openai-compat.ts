@@ -3416,7 +3416,10 @@ function kimiSupportsReasoning(entry: OpenAICompatibleModelRecord, modelId: stri
 
 function mapKimiApiFormat(protocol: unknown): OpenAICompat["kimiApiFormat"] {
 	if (protocol === "anthropic") return "anthropic";
-	if (protocol === null) return "openai";
+	if (protocol === "openai") return "openai";
+	// Kimi reports `null` for the native K3 protocol. Leave it unset so the
+	// resolved K3 Responses policy supplies the transport; legacy model
+	// families continue to receive the provider's Anthropic default.
 	return undefined;
 }
 

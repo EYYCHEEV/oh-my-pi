@@ -13,6 +13,23 @@ provider "kimi-code" {
 			thinking-format "openai"
 		}
 	}
+	// K3 and K3-256k have a native Responses endpoint. Explicit protocol
+	// metadata and request overrides still win; `protocol: null` leaves the
+	// transport unset so this native policy applies.
+	class "kimi" {
+		family "k3" {
+			kimi-responses #true
+		}
+	}
+	// Bare K3 ids do not carry the `kimi` taxonomy token, so keep the
+	// Responses route and native effort contract as reviewed provider residue.
+	models "k3" "k3-256k" {
+		kimi-responses #true
+		thinking-efforts "low" "high" "max"
+		thinking-requires-effort #true
+		native-kimi-k3-reasoning #true
+		clamp-output-to-model-max #true
+	}
 	// Replaces streamKimi's TS fallback for models whose discovery metadata omits the protocol.
 	kimi-api-format "anthropic"
 	// Kimi Code derives cache routing from top-level `prompt_cache_key` on

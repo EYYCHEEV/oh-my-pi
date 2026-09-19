@@ -500,6 +500,7 @@ function detectOpenAICompat(
 		requiresMistralToolIds: isMistral,
 		thinkingFormat,
 		kimiApiFormat: undefined,
+		kimiResponses: false,
 		reasoningDisableMode: d.isClinePass
 			? "cline-enabled-false"
 			: d.isVenice
@@ -698,15 +699,15 @@ function resolveOpenAIResponsesPolicy(
 	const isOpenAIUrl = hostMatchesUrl(baseUrl, "openai");
 	const isVercelGateway = modelMatchesHost(hostModel, "vercelAIGateway");
 	const isXaiHost = modelMatchesHost(hostModel, "xai");
-	const supportsPromptCacheBreakpoints =
-		isOfficialOpenAIEndpoint(provider, baseUrl) && facts.is("openai") && facts.revGte("5.6");
-	const thinkingFormat: ResolvedOpenAISharedCompat["thinkingFormat"] = isOpenRouter ? "openrouter" : "openai";
-	const reasoningCapable = compatReasoning(spec, axes);
 	const isLocalServingBackend =
 		(PROXY_OPENAI_COMPAT_PROVIDERS[provider] !== true && LOCAL_OPENAI_COMPAT_PROVIDERS[provider] === true) ||
 		hasLocalLoopbackBaseUrl(baseUrl);
+	const supportsPromptCacheBreakpoints =
+		isOfficialOpenAIEndpoint(provider, baseUrl) && facts.is("openai") && facts.revGte("5.6");
+	const thinkingFormat: ResolvedOpenAISharedCompat["thinkingFormat"] = isOpenRouter ? "openrouter" : "openai";
 	const isAnthropicModel = facts.is("anthropic");
 	const isDeepseekFamily = facts.is("deepseek");
+	const reasoningCapable = compatReasoning(spec, axes);
 
 	const compat: ResolvedOpenAIResponsesCompat = {
 		supportsDeveloperRole: isAzure || isOpenAIUrl || hostMatchesUrl(baseUrl, "githubCopilot"),
@@ -735,6 +736,7 @@ function resolveOpenAIResponsesPolicy(
 		supportsSamplingParams: !(facts.is("openai") && (facts.family("o-series") || facts.revGte("5"))),
 		supportsPenaltyAndStopParams: !isXaiHost,
 		thinkingFormat,
+		kimiResponses: false,
 		reasoningDisableMode: resolveReasoningDisableMode(thinkingFormat),
 		omitReasoningEffort: false,
 		includeEncryptedReasoning: true,

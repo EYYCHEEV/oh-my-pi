@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Kimi Code K3 and K3-256k now use the native Responses API for tool-calling turns while preserving explicit Chat Completions and Anthropic overrides.
+
 ## [18.2.1] - 2026-09-15
 
 ### Added

@@ -699,7 +699,7 @@ export interface SimpleStreamOptions extends Omit<StreamOptions, "apiKey"> {
 	/** OpenAI service tier for processing priority/cost control. Ignored by non-OpenAI providers. */
 	serviceTier?: ServiceTier;
 	/** Explicit Kimi Code API format override; omitted uses live per-model protocol metadata. */
-	kimiApiFormat?: "openai" | "anthropic";
+	kimiApiFormat?: "openai" | "anthropic" | "responses";
 	/** API format for Synthetic provider: "openai" or "anthropic" (default: "openai") */
 	syntheticApiFormat?: "openai" | "anthropic";
 	/** Hint that websocket transport should be preferred when supported by the provider implementation. */

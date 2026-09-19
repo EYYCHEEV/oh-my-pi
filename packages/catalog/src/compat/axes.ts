@@ -100,6 +100,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"filter-reasoning-history": wire("filterReasoningHistory", OAI),
 	"include-encrypted-reasoning": wire("includeEncryptedReasoning", OAI),
 	"kimi-api-format": wire("kimiApiFormat", ["openai"], "scalar", ["openai", "anthropic"]),
+	"kimi-responses": wire("kimiResponses", ["openai"]),
 	"max-tokens-field": wire("maxTokensField", ["openai"], "scalar", ["max_completion_tokens", "max_tokens"]),
 	"native-kimi-k3-reasoning": wire("nativeKimiK3Reasoning", ["openai"]),
 	"omit-reasoning-effort": wire("omitReasoningEffort", OAI),

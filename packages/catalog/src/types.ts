@@ -230,6 +230,8 @@ export interface OpenAICompat {
 	thinkingFormat?: OpenAIReasoningFormat;
 	/** Kimi Code transport selected by live per-model protocol metadata. User settings take precedence. */
 	kimiApiFormat?: "openai" | "anthropic";
+	/** Kimi K3 prefers the native OpenAI Responses transport when no explicit protocol is selected. */
+	kimiResponses?: boolean;
 	/** Request-time disable encoding for the selected reasoning/thinking format. Default: derived from `thinkingFormat`. */
 	reasoningDisableMode?: OpenAIReasoningDisableMode;
 	/** Whether the provider rejects `reasoning.effort`/`reasoning_effort` even when the model reasons natively. Default: false unless reasoning effort is unsupported. */
@@ -704,6 +706,8 @@ export interface ResolvedOpenAISharedCompat {
 	thinkingFormat: OpenAIReasoningFormat;
 	/** Kimi Code transport selected by live per-model protocol metadata. */
 	kimiApiFormat?: OpenAICompat["kimiApiFormat"];
+	/** Kimi K3 prefers the native OpenAI Responses transport when no explicit protocol is selected. */
+	kimiResponses?: boolean;
 	reasoningDisableMode: OpenAIReasoningDisableMode;
 	omitReasoningEffort: boolean;
 	includeEncryptedReasoning: boolean;
@@ -784,6 +788,7 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 			| "supportsPenaltyAndStopParams"
 			| "thinkingFormat"
 			| "kimiApiFormat"
+			| "kimiResponses"
 			| "reasoningDisableMode"
 			| "omitReasoningEffort"
 			| "includeEncryptedReasoning"

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Kimi Code K3 and K3-256k now expose their documented low/high/max reasoning contract and native Responses transport without changing legacy Kimi model limits.
+
 ## [18.2.1] - 2026-09-15
 
 ### Added

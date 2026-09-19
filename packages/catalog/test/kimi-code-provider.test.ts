@@ -26,7 +26,7 @@ async function discover(models: readonly Record<string, unknown>[]) {
 }
 
 describe("Kimi Code provider catalog", () => {
-	it("uses live K3 effort, mandatory-thinking, and native-protocol metadata", async () => {
+	it("uses live K3 effort, mandatory-thinking, and native Responses metadata", async () => {
 		const models = await discover([LIVE_K3]);
 		const model = models.find(candidate => candidate.id === "k3");
 
@@ -44,14 +44,17 @@ describe("Kimi Code provider catalog", () => {
 			},
 			compat: {
 				thinkingFormat: "kimi",
-				kimiApiFormat: "openai",
+				kimiApiFormat: "anthropic",
+				kimiResponses: true,
 			},
 		});
+		expect(model?.compatConfig?.kimiApiFormat).toBeUndefined();
 	});
 
-	it("uses server protocol while preserving legacy K2 discovery defaults", async () => {
+	it("uses server protocol overrides while preserving legacy K2 discovery defaults", async () => {
 		const models = await discover([
 			{ ...LIVE_K3, id: "k3-anthropic", protocol: "anthropic" },
+			{ ...LIVE_K3, id: "k3-openai", protocol: "openai" },
 			{
 				id: "kimi-for-coding",
 				display_name: "K2.7 Code",
@@ -60,9 +63,11 @@ describe("Kimi Code provider catalog", () => {
 			},
 		]);
 		const anthropic = models.find(candidate => candidate.id === "k3-anthropic");
+		const openai = models.find(candidate => candidate.id === "k3-openai");
 		const legacy = models.find(candidate => candidate.id === "kimi-for-coding");
 
 		expect(anthropic?.compat.kimiApiFormat).toBe("anthropic");
+		expect(openai?.compat.kimiApiFormat).toBe("openai");
 		expect(legacy?.compat).toMatchObject({ thinkingFormat: "zai" });
 		// Unreported protocol resolves the provider-root KDL default (kimi-api-format "anthropic").
 		expect(legacy?.compat.kimiApiFormat).toBe("anthropic");

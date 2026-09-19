@@ -151,9 +151,10 @@ export interface AgentOptions {
 	interruptMode?: "immediate" | "wait";
 
 	/**
-	 * API format for Kimi Code provider: "openai" or "anthropic" (default: "anthropic")
+	 * API format for Kimi Code provider: "responses" defaults for K3/K3-256k;
+	 * "openai" and "anthropic" remain available as explicit legacy overrides.
 	 */
-	kimiApiFormat?: "openai" | "anthropic";
+	kimiApiFormat?: "openai" | "anthropic" | "responses";
 
 	/** Hint that websocket transport should be preferred when supported by the provider implementation. */
 	preferWebsockets?: boolean;
@@ -450,7 +451,7 @@ export class Agent {
 
 	#runningPrompt?: Promise<void>;
 	#resolveRunningPrompt?: () => void;
-	#kimiApiFormat?: "openai" | "anthropic";
+	#kimiApiFormat?: "openai" | "anthropic" | "responses";
 	#preferWebsockets?: boolean;
 	#transformToolCallArguments?: (args: Record<string, unknown>, toolName: string) => Record<string, unknown>;
 	#speculativeToolExecution?: SpeculativeToolExecutionConfig;
