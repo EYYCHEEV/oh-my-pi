@@ -1,3 +1,4 @@
+import sessionStopBlockedPrompt from "../prompts/system/session-stop-blocked.md" with { type: "text" };
 import {
 	assertEvaluationTool,
 	denyEvaluationIngress,
@@ -4735,7 +4736,7 @@ export class AgentSession {
 			return additionalContext ?? reason;
 		}
 		if (result.decision === "block") {
-			return reason ?? additionalContext;
+			return reason ?? additionalContext ?? sessionStopBlockedPrompt;
 		}
 		return undefined;
 	}
@@ -4779,7 +4780,8 @@ export class AgentSession {
 			this.#resetSessionStopContinuationState();
 			return false;
 		}
-		if (this.#sessionStopContinuationCount >= SESSION_STOP_CONTINUATION_CAP) {
+		const isHardBlock = result?.decision === "block";
+		if (!isHardBlock && this.#sessionStopContinuationCount >= SESSION_STOP_CONTINUATION_CAP) {
 			logger.warn("session_stop continuation cap reached", {
 				sessionId: this.sessionId,
 				cap: SESSION_STOP_CONTINUATION_CAP,
@@ -4787,7 +4789,7 @@ export class AgentSession {
 			this.#resetSessionStopContinuationState();
 			return false;
 		}
-		this.#sessionStopContinuationCount++;
+		if (!isHardBlock) this.#sessionStopContinuationCount++;
 		this.#sessionStopHookActive = true;
 		this.#queueHiddenNextTurnMessage(
 			{

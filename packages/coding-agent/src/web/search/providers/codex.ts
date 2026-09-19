@@ -653,7 +653,9 @@ async function resolveCodexSearchTransport(
 	const url = resolveCodexResponsesUrl(baseUrl);
 	const headers =
 		modelRegistry && registryModel
-			? await modelRegistry.resolveModelHeaders(registryModel)
+			? typeof modelRegistry.resolveModelHeaders === "function"
+				? await modelRegistry.resolveModelHeaders(registryModel)
+				: registryModel.headers
 			: await modelRegistry?.getProviderHeaders("openai-codex");
 	return {
 		baseUrl,
