@@ -184,7 +184,7 @@ import { containsOrchestrate, renderOrchestrateNotice } from "../modes/orchestra
 import { theme } from "../modes/theme/theme";
 import { parseTurnBudget } from "../modes/turn-budget";
 import { containsUltrathink, ULTRATHINK_NOTICE } from "../modes/ultrathink";
-import { computeNonMessageTokens } from "../modes/utils/context-usage";
+import { computeNonMessageTokens } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import { containsWorkflow, renderWorkflowNotice } from "../modes/workflow";
 import { type PlanApprovalDetails, resolveApprovedPlan } from "../plan-mode/approved-plan";
 import { listPlanFiles, readPlanFile } from "../plan-mode/plan-files";
@@ -219,7 +219,7 @@ import {
 	parseConfiguredThinkingLevel,
 	shouldDisableReasoning,
 	toReasoningEffort,
-} from "../thinking";
+} from "@oh-my-pi/pi-tui/thinking";
 import { isLowSignalTitleInput } from "../tiny/text";
 import { shutdownTinyTitleClient } from "../tiny/title-client";
 import type { ImageAttachmentEntry } from "../tools";
@@ -900,6 +900,8 @@ export class AgentSession {
 	// on `agent_end` can fire its next `prompt` before #promptWithMessage's finally
 	#promptGeneration = 0;
 	#inFlightGeneration = 0;
+	// abort() can finish in a message_end listener before queued settle work runs.
+	#activeAgentPromptGeneration = this.#promptGeneration;
 	/** Bumped by newSession()/switchSession() at the same point they clear the pending IRC/aside
 	 *  queue (restored on a rolled-back switchSession()). A message-queueing call that spans an
 	 *  await (image normalization, vision description) captures this before the await and checks
@@ -3337,6 +3339,19 @@ export class AgentSession {
 		return this.#settlePreparedBudgetRefusal(refusal, message, agentRunSequence);
 	}
 
+	/** Re-seed the rate meter from the last completed assistant turn after a conversation swap (resume, branch switch). */
+	#reseedTokenRate(): void {
+		const messages = this.agent.state.messages;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const message = messages[i];
+			if (message?.role !== "assistant") continue;
+			const assistant = message as AssistantMessage;
+			if (assistant.duration === undefined) continue;
+			this.tokenRate.seed(assistant.usage.output, assistant.duration);
+			return;
+		}
+		this.tokenRate.reset();
+	}
 	#processAgentEvent = async (event: AgentEvent, agentEndSnapshot?: AgentEndMaintenanceSnapshot): Promise<void> => {
 		const eventPromptGeneration = this.#promptGeneration;
 		const agentRunSequence = this.#agentRunSequence;
@@ -3344,6 +3359,7 @@ export class AgentSession {
 			// A fresh run supersedes the previously settled (and pruned) refusal
 			// turn: state-based lookups take over again.
 			this.#prunedTerminalRefusal = undefined;
+			this.#activeAgentPromptGeneration = eventPromptGeneration;
 			this.#advisors.onPrimaryAgentStart();
 			this.#emitRunState("running");
 			this.#maintenance.noteTurnStarted();
@@ -4698,7 +4714,11 @@ export class AgentSession {
 		messages: AgentMessage[],
 		lastAssistantMessage = this.getLastAssistantMessage(),
 	): Promise<boolean> {
-		if (this.#abortInProgress || this.#isDisposed) {
+		if (
+			this.#abortInProgress ||
+			this.#isDisposed ||
+			this.#activeAgentPromptGeneration !== this.#promptGeneration
+		) {
 			this.#resetSessionStopContinuationState();
 			return false;
 		}
@@ -9184,6 +9204,7 @@ export class AgentSession {
 				try {
 					this.#releaseQueuedTtsrReservations();
 					this.agent.reset();
+					this.tokenRate.reset();
 					if (options?.drop && previousSessionFile) {
 						try {
 							await this.sessionManager.dropSession(previousSessionFile);
@@ -10485,8 +10506,10 @@ export class AgentSession {
 				}
 
 				this.agent.replaceMessages(sessionContext.messages);
+				this.#reseedTokenRate();
 				this.#advisors.resetSessionState({ preserveCost: true });
 				this.#todo.syncFromBranch();
+				this.#modelMentions.syncFromBranch();
 				if (switchingToDifferentSession) {
 					this.#closeAllProviderSessions("session switch");
 				} else if (didReloadConversationChange) {
@@ -10671,6 +10694,7 @@ export class AgentSession {
 					this.#emit({ type: "model_changed" });
 				}
 				this.#todo.syncFromBranch();
+				this.#modelMentions.syncFromBranch();
 				this.#advisors.resetAllRuntimes();
 				this.#advisors.reattachRecorderFeeds();
 				this.#reconnectToAgent();
@@ -10791,6 +10815,7 @@ export class AgentSession {
 				this.#clearSessionScopedToolState();
 				this.#rehydrateCheckpointRewindState();
 				this.#todo.syncFromBranch();
+				this.#modelMentions.syncFromBranch();
 				this.#freshProviderSessionId = undefined;
 				this.#clearInheritedProviderPromptCacheKey();
 				this.#syncAgentSessionId();
@@ -10939,6 +10964,7 @@ export class AgentSession {
 				});
 				this.sessionManager.appendMessage(sanitizeAssistantForReparentedHistory(assistantMessage));
 				this.#todo.syncFromBranch();
+				this.#modelMentions.syncFromBranch();
 				this.#freshProviderSessionId = undefined;
 				this.#syncAgentSessionId();
 				this.#memory.rekeyForCurrentSessionId();

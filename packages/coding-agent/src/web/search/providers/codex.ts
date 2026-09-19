@@ -24,7 +24,7 @@ import {
 import { $env, readSseJson, USER_AGENT } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import type { ModelRegistry } from "../../../config/model-registry";
-import type { SearchResponse, SearchSource } from "../../../web/search/types";
+import type { SearchResponse, SearchSource } from "@oh-my-pi/pi-tui/tools/web-search";
 import { SearchProviderError } from "../../../web/search/types";
 import { formatQuery, GOOGLE_QUERY_SYNTAX, parseSearchQuery } from "../query";
 import type { SearchParams } from "./base";
@@ -638,7 +638,10 @@ function extractTextSources(text: string): SearchSource[] {
 	return sources;
 }
 
-function resolveCodexSearchTransport(modelRegistry: ModelRegistry | undefined, modelId: string): CodexSearchTransport {
+async function resolveCodexSearchTransport(
+	modelRegistry: ModelRegistry | undefined,
+	modelId: string,
+): Promise<CodexSearchTransport> {
 	const registryModel = modelRegistry?.find("openai-codex", modelId);
 	const bundledModel = getBundledCodexModels().find(model => model.id === modelId);
 	const providerBaseUrl = modelRegistry?.getProviderBaseUrl("openai-codex");
@@ -648,13 +651,14 @@ function resolveCodexSearchTransport(modelRegistry: ModelRegistry | undefined, m
 	}
 
 	const url = resolveCodexResponsesUrl(baseUrl);
+	const headers =
+		modelRegistry && registryModel
+			? await modelRegistry.resolveModelHeaders(registryModel)
+			: await modelRegistry?.getProviderHeaders("openai-codex");
 	return {
 		baseUrl,
 		url,
-		headers: {
-			...modelRegistry?.getProviderHeaders("openai-codex"),
-			...registryModel?.headers,
-		},
+		headers: { ...headers },
 		customEndpoint: url !== resolveCodexResponsesUrl(CODEX_BASE_URL),
 	};
 }
@@ -1367,7 +1371,7 @@ export async function searchCodex(params: SearchParams): Promise<SearchResponse>
 	if (!firstCandidate) {
 		throw new SearchProviderError("codex", "No Codex web search model is configured.");
 	}
-	const transport = resolveCodexSearchTransport(params.modelRegistry, firstCandidate.modelId);
+	const transport = await resolveCodexSearchTransport(params.modelRegistry, firstCandidate.modelId);
 	// The ChatGPT-backend Codex endpoint speaks the undocumented codex-rs
 	// request shape (responses-lite moves tools into an `additional_tools`
 	// developer item), so the documented `web_search.filters.allowed_domains`
@@ -1403,15 +1407,17 @@ export async function searchCodex(params: SearchParams): Promise<SearchResponse>
 			: params.authStorage.resolver("openai-codex", resolverOptions);
 		result = await withAuth(
 			keyOrResolver,
-			accessToken =>
-				runCodexSearchCandidates({
+			async accessToken => {
+				const requestTransport = await resolveCodexSearchTransport(params.modelRegistry, firstCandidate.modelId);
+				return runCodexSearchCandidates({
 					auth: { accessToken },
 					params,
 					query,
 					modelCandidates,
 					modelWasConfigured: configuredModel !== undefined,
-					transport,
-				}),
+					transport: requestTransport,
+				});
+			},
 			{
 				signal: params.signal,
 				missingKeyMessage: 'Codex credentials not found. Configure an API key for provider "openai-codex".',
@@ -1430,17 +1436,18 @@ export async function searchCodex(params: SearchParams): Promise<SearchResponse>
 		result = await withOAuthAccess(
 			params.authStorage,
 			"openai-codex",
-			access => {
+			async access => {
 				// A refreshed/rotated credential can carry a different bearer and
 				// ChatGPT account id than the seed used to select the first attempt.
 				const accountId = access.accountId ?? getCodexAccountId(access.accessToken);
+				const requestTransport = await resolveCodexSearchTransport(params.modelRegistry, firstCandidate.modelId);
 				return runCodexSearchCandidates({
 					auth: { accessToken: access.accessToken, accountId },
 					params,
 					query,
 					modelCandidates,
 					modelWasConfigured: configuredModel !== undefined,
-					transport,
+					transport: requestTransport,
 				});
 			},
 			{ sessionId: params.sessionId, signal: params.signal, seed },

@@ -9,6 +9,22 @@ import type { RuntimeRequirementDeclaration } from "../../session/runtime-requir
  * - Interact with the user via UI primitives
  */
 
+import {
+	type ExtensionUiComponent,
+	type ExtensionUiComponentFactory,
+	type ExtensionWidgetContent,
+	type MessageRenderer,
+	type AssistantThinkingRenderer,
+} from "@oh-my-pi/pi-tui/chat/extension-types";
+export {
+	type ExtensionUiComponent,
+	type ExtensionUiComponentFactory,
+	type ExtensionWidgetContent,
+	type MessageRenderOptions,
+	type MessageRenderer,
+	type AssistantThinkingRenderContext,
+	type AssistantThinkingRenderer,
+} from "@oh-my-pi/pi-tui/chat/extension-types";
 import type { EvaluationAdmission } from "@oh-my-pi/pi-utils";
 import type { type as ArkType } from "@oh-my-pi/omptype";
 import type * as TypeBox from "@oh-my-pi/omptype/typebox";
@@ -22,6 +38,7 @@ import type {
 	ToolLoadMode,
 } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
+import type { ContextUsage } from "@oh-my-pi/pi-tui/status-line/types";
 import type {
 	Api,
 	AssistantMessageEvent,
@@ -30,7 +47,6 @@ import type {
 	ImageContent,
 	Model,
 	ModelSpec,
-	NativeToolMarker,
 	ProviderResponseMetadata,
 	ServiceTier,
 	ServiceTierByFamily,
@@ -41,12 +57,12 @@ import type {
 	TSchema,
 	UsageProvider,
 } from "@oh-my-pi/pi-ai";
+import type { NativeToolMarker } from "@oh-my-pi/pi-ai";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth/types";
 import type {
 	AutocompleteItem,
 	AutocompleteProvider,
 	Component,
-	ComposerStyle,
 	EditorTheme,
 	KeyId,
 	OverlayHandle,
@@ -54,37 +70,32 @@ import type {
 	TUI,
 } from "@oh-my-pi/pi-tui";
 import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
-import type { KeybindingsManager } from "../../config/keybindings";
+import type { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
+import type { ComposerShapeDefinition } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
+export type { ComposerShapeDefinition } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
 import type { ModelRegistry } from "../../config/model-registry";
-import type { EditToolDetails } from "../../edit";
+import type { EditToolDetails } from "@oh-my-pi/pi-tui/tools/edit";
 import type { PythonResult } from "../../eval/py/executor";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type * as PiCodingAgent from "../../index";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
-import type { CustomEditor } from "../../modes/components/custom-editor";
-import type { Theme, ThemeColor } from "../../modes/theme/theme";
+import type { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
+import type { Theme, ThemeColor } from "@oh-my-pi/pi-tui/theme";
 import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
-import type { CompactMode } from "../../session/compact-modes";
-import type { CustomMessage, CustomMessagePayload, MessageAdmission } from "../../session/messages";
+import type { CustomMessagePayload, MessageAdmission } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager, SessionPersistenceReceipt } from "../../session/session-manager";
-import type {
-	BashToolDetails,
-	BashToolInput,
-	GlobToolDetails,
-	GlobToolInput,
-	GrepToolDetails,
-	GrepToolInput,
-	ReadToolDetails,
-	ReadToolInput,
-	WriteToolInput,
-} from "../../tools";
+import type { BashToolInput, GlobToolInput, GrepToolInput, ReadToolInput, WriteToolInput } from "../../tools";
+import type { GlobToolDetails } from "@oh-my-pi/pi-tui/tools/glob";
+import type { GrepToolDetails } from "@oh-my-pi/pi-tui/tools/grep";
+import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
 import type { ApprovalMode } from "../../tools/approval";
+import type { BashToolDetails } from "@oh-my-pi/pi-tui/tools/bash";
 import type { FileDeleteFallbackHandler, FileWriteFallbackHandler } from "../../tools/file-write-fallback";
 import type { EventBus } from "../../utils/event-bus";
+import type { AgentActivityStateEvent, SessionReadyEvent } from "../shared-events";
 import type {
-	AgentActivityStateEvent,
 	AgentEndEvent,
 	AgentStartEvent,
 	AutoCompactionEndEvent,
@@ -110,7 +121,6 @@ import type {
 	SessionEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
-	SessionReadyEvent,
 	SessionStopEvent,
 	SessionStopEventResult,
 	SessionSwitchEvent,
@@ -125,7 +135,7 @@ import type {
 import type { SlashCommandInfo } from "../slash-commands";
 
 export type { OverlayHandle, OverlayOptions } from "@oh-my-pi/pi-tui";
-export type { AppKeybinding, KeybindingsManager } from "../../config/keybindings";
+export type { AppKeybinding, KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 export type { ExecOptions, ExecResult } from "../../exec/exec";
 export type { AgentToolResult, AgentToolUpdateCallback };
 
@@ -140,45 +150,15 @@ export interface ExtensionUISelectOption {
 
 export type ExtensionUISelectItem = string | ExtensionUISelectOption;
 
-export interface ExtensionAskDialogOption {
-	label: string;
-	description?: string;
-	preview?: string;
-}
-
-export interface ExtensionAskDialogQuestion {
-	id: string;
-	question: string;
-	header?: string;
-	options: ExtensionAskDialogOption[];
-	multi?: boolean;
-	recommended?: number;
-}
-
-export interface ExtensionAskDialogResultItem {
-	id: string;
-	question: string;
-	options: string[];
-	multi: boolean;
-	selectedOptions: string[];
-	customInput?: string;
-	note?: string;
-	timedOut?: boolean;
-}
-
-export interface ExtensionAskDialogSubmitResult {
-	kind: "submit";
-	results: ExtensionAskDialogResultItem[];
-}
-
-/** Chat-redirect result: the user chose "Chat about this" instead of
- *  answering. Distinct from `undefined` (cancel) so AskTool can hand off to
- *  the chat loop rather than aborting. */
-export interface ExtensionAskDialogChatResult {
-	kind: "chat";
-}
-
-export type ExtensionAskDialogResult = ExtensionAskDialogSubmitResult | ExtensionAskDialogChatResult;
+import type { ExtensionAskDialogQuestion, ExtensionAskDialogResult } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
+export type {
+	ExtensionAskDialogOption,
+	ExtensionAskDialogQuestion,
+	ExtensionAskDialogResultItem,
+	ExtensionAskDialogSubmitResult,
+	ExtensionAskDialogChatResult,
+	ExtensionAskDialogResult,
+} from "@oh-my-pi/pi-tui/overlays/ask-dialog";
 
 export function getExtensionUISelectOptionLabel(option: ExtensionUISelectItem): string {
 	return typeof option === "string" ? option : option.label;
@@ -229,10 +209,6 @@ export type WidgetPlacement = "aboveEditor" | "belowEditor";
 export interface ExtensionWidgetOptions {
 	placement?: WidgetPlacement;
 }
-
-export type ExtensionUiComponent = Component & { dispose?(): void };
-export type ExtensionUiComponentFactory = (tui: TUI, theme: Theme) => ExtensionUiComponent;
-export type ExtensionWidgetContent = string[] | ExtensionUiComponentFactory | undefined;
 
 /** Options for `ExtensionUIContext.custom()` (overlay rendering of a custom component). */
 export interface ExtensionCustomOptions {
@@ -298,12 +274,12 @@ export interface ExtensionUIContext {
 	/** Set a custom footer component, or undefined to restore the built-in footer. */
 	setFooter(factory: ExtensionUiComponentFactory | undefined): void;
 
-	/** Set a custom header component, or undefined to restore the built-in header. */
-	setHeader(factory: ExtensionUiComponentFactory | undefined): void;
 	/** Request a status-line redraw. A safe no-op when no interactive UI is attached. */
 	requestStatusLineRender?(): void;
 	/** @internal Attach a declaratively registered extension status segment. */
 	registerStatusSegment?(key: string, definition: ExtensionStatusSegmentDefinition): () => void;
+	/** Set a custom header component, or undefined to restore the built-in header. */
+	setHeader(factory: ExtensionUiComponentFactory | undefined): void;
 
 	/** Set the terminal window/tab title. */
 	setTitle(title: string): void;
@@ -379,27 +355,11 @@ export interface ExtensionUIContext {
 	setToolsExpanded(expanded: boolean): void;
 }
 
-/** Visual composer style and selector copy registered by an extension. */
-export interface ComposerShapeDefinition {
-	/** User-facing name shown in composer-shape selectors. */
-	label: string;
-	/** Optional detail shown under the selector label. */
-	description?: string;
-	/** Renderer contract; its id becomes the persisted `composer.shape` value. */
-	style: ComposerStyle;
-}
-
 // ============================================================================
 // Extension Context
 // ============================================================================
 
-export interface ContextUsage {
-	/** Estimated context tokens. */
-	tokens: number;
-	contextWindow: number;
-	/** Context usage as percentage of context window. */
-	percent: number;
-}
+export type { ContextUsage };
 
 export interface CompactOptions {
 	onComplete?: (result: CompactionResult) => void;
@@ -490,9 +450,6 @@ export interface ExtensionContext {
 	/** Whether UI is available (false in print/RPC mode) */
 	hasUI: boolean;
 	/** Current working directory */
-	cwd: string;
-	/** Session manager (read-only) */
-	sessionManager: ReadonlySessionManager;
 	/** Flush the recorded journal prefix, not pending queues or the current event's unrecorded input. */
 	flushSession(): Promise<SessionPersistenceReceipt>;
 	/** Model registry for API key resolution */
@@ -771,10 +728,10 @@ export type {
 	SessionEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
-	SessionReadyEvent,
 	SessionSwitchEvent,
 	SessionTreeEvent,
 	TreePreparation,
+	SessionReadyEvent,
 } from "../shared-events";
 
 // ============================================================================
@@ -805,7 +762,6 @@ export interface BeforeAgentStartEvent {
 }
 
 export type {
-	AgentActivityStateEvent,
 	AgentEndEvent,
 	AgentStartEvent,
 	SessionStopEvent,
@@ -830,6 +786,7 @@ export interface MessageUpdateEvent {
 /**
  * Fired when a message ends. Notification-only: the message is a detached
  * snapshot, so in-place changes do not rewrite agent or provider context.
+ * Persistence and subscriber delivery do not wait for this handler to finish.
  */
 export interface MessageEndEvent {
 	type: "message_end";
@@ -1203,28 +1160,6 @@ export type {
 // Message Rendering
 // ============================================================================
 
-export interface MessageRenderOptions {
-	expanded: boolean;
-}
-
-export type MessageRenderer<T = unknown> = (
-	message: CustomMessage<T>,
-	options: MessageRenderOptions,
-	theme: Theme,
-) => Component | undefined;
-
-export interface AssistantThinkingRenderContext {
-	contentIndex: number;
-	thinkingIndex: number;
-	text: string;
-	requestRender(): void;
-}
-
-export type AssistantThinkingRenderer = (
-	context: AssistantThinkingRenderContext,
-	theme: Theme,
-) => Component | undefined;
-
 // ============================================================================
 // Command Registration
 // ============================================================================
@@ -1248,15 +1183,10 @@ export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContex
 
 export interface ExtensionStatusSegmentDefinition {
 	id: string;
-	placement: {
-		afterBuiltin: string;
-		fallback: "anchor-side-end-else-right";
-	};
-	/** Optional semantic theme color. Unset preserves renderer-provided styling. */
+	placement: { afterBuiltin: string; fallback: "anchor-side-end-else-right" };
 	color?: ThemeColor;
 	render: () => string | undefined;
 }
-
 /** Service tiers accepted by each provider family. */
 export type ExtensionServiceTier<Family extends ServiceTierFamily> = Family extends "anthropic"
 	? "priority"
@@ -1354,14 +1284,6 @@ export interface ExtensionAPI {
 	// =========================================================================
 	// Tool Registration
 	// =========================================================================
-	/**
-	 * Register a status-line segment. Registration is declarative and is hosted
-	 * by the interactive runner when one is attached.
-	 */
-	registerStatusSegment(definition: ExtensionStatusSegmentDefinition): () => void;
-
-	/** Request a status-line redraw. Safe in headless modes. */
-	requestStatusLineRender(): void;
 
 	/** Register a tool that the LLM can call. */
 	registerTool<TParams extends TSchema = TSchema, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void;
@@ -1499,7 +1421,6 @@ export interface ExtensionAPI {
 		message: CustomMessagePayload<T>,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" },
 	): void;
-
 	/** Resolve at in-memory admission, without waiting for a provider turn. */
 	sendMessageWithReceipt<T = unknown>(
 		message: CustomMessagePayload<T>,
@@ -1777,7 +1698,7 @@ export interface ExtensionRuntimeState {
 	unregisterProvider(name: string, sourceId: string): void;
 }
 
-/** Action implementations for ExtensionAPI methods. */
+/** Actions for ExtensionAPI methods. */
 export interface ExtensionActions {
 	sendMessage: SendMessageHandler;
 	sendMessageWithReceipt?: ExtensionAPI["sendMessageWithReceipt"];
@@ -1831,10 +1752,10 @@ export interface ExtensionCommandContextActions {
 
 /** Full runtime = state + actions, including host-compatible service-tier fallbacks. */
 export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionActions {
-	sendMessageWithReceipt: ExtensionAPI["sendMessageWithReceipt"];
-	requireRuntime: NonNullable<ExtensionActions["requireRuntime"]>;
 	getServiceTiers: GetServiceTiersHandler;
 	setServiceTier: SetServiceTierHandler;
+	sendMessageWithReceipt: ExtensionAPI["sendMessageWithReceipt"];
+	requireRuntime: NonNullable<ExtensionActions["requireRuntime"]>;
 }
 
 export interface RegisteredStatusSegment {
@@ -1842,7 +1763,6 @@ export interface RegisteredStatusSegment {
 	definition: ExtensionStatusSegmentDefinition;
 	disposeUI?: () => void;
 }
-
 /** Loaded extension with all registered items. */
 export interface Extension {
 	path: string;

@@ -1860,6 +1860,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
 
 		await withTimeout(reminderDone, 1000, "Todo reminder timed out");
+		// The extension notification and the resume it precedes settle behind the
+		// agent_end handler that waitForIdle drains.
 		await session.waitForIdle();
 
 		expect(getRuntimeSignals()).toContain("todo:1/3");

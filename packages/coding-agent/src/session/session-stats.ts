@@ -14,7 +14,7 @@ import {
 	computeNonMessageBreakdown,
 	computeNonMessageTokens,
 	type NonMessageTokenSource,
-} from "../modes/utils/context-usage";
+} from "@oh-my-pi/pi-tui/status-line/context-usage";
 import type { ContextUsageBreakdown, SessionStats } from "./agent-session-types";
 import { getLatestCompactionEntry } from "./session-context";
 import type { ModelUsageEntry, SessionEntry } from "./session-entries";
@@ -217,9 +217,15 @@ export class SessionStatsTracker {
 		const { skillsTokens, toolsTokens, systemContextTokens, systemPromptTokens } = computeNonMessageBreakdown(
 			this.#host.session,
 			tokenizer,
+			this.#host.session.settings?.revision,
+			this.#host.session.settings?.get("skillful"),
 		);
 		const categoryNonMessageTokens = skillsTokens + toolsTokens + systemContextTokens + systemPromptTokens;
-		const currentNonMessageTokens = computeNonMessageTokens(this.#host.session, tokenizer);
+		const currentNonMessageTokens = computeNonMessageTokens(
+			this.#host.session,
+			tokenizer,
+			this.#host.session.settings?.revision,
+		);
 		const branchEntries = this.#host.sessionManager.getBranch();
 		const latestCompaction = getLatestCompactionEntry(branchEntries);
 		const compactionIndex = latestCompaction ? branchEntries.lastIndexOf(latestCompaction) : -1;
@@ -280,7 +286,8 @@ export class SessionStatsTracker {
 				: !pending || (anchorIndex >= pending.cutoffCount && anchorEpoch >= pending.epoch));
 		if (useAnchor && anchorAssistant) {
 			const nonMessageTokens =
-				anchorAssistant.contextSnapshot?.nonMessageTokens ?? computeNonMessageTokens(this.#host.session, tokenizer);
+				anchorAssistant.contextSnapshot?.nonMessageTokens ??
+				computeNonMessageTokens(this.#host.session, tokenizer, this.#host.session.settings?.revision);
 			anchored = true;
 			usedTokens = this.#anchoredUsedTokens(
 				correctedPromptTokens(anchorAssistant, options?.includeAssistantOutput),
@@ -324,7 +331,7 @@ export class SessionStatsTracker {
 			if (liveAnchor) {
 				const nonMessageTokens =
 					liveAnchor.message.contextSnapshot?.nonMessageTokens ??
-					computeNonMessageTokens(this.#host.session, tokenizer);
+					computeNonMessageTokens(this.#host.session, tokenizer, this.#host.session.settings?.revision);
 				usedTokens = this.#anchoredUsedTokens(
 					correctedPromptTokens(liveAnchor.message, options?.includeAssistantOutput),
 					nonMessageTokens,

@@ -8,6 +8,12 @@
 - Fixed pre-request checks using a different model from the prepared request during asynchronous model switches.
 - Fixed context accounting being lost between pre-request checks and successful tool-loop responses.
 - Fixed in-place context transforms retaining unjournaled messages between requests and causing false budget refusals.
+## [18.2.5] - 2026-09-17
+
+### Fixed
+
+- Improved agent performance by reducing redundant tool-schema processing during repeated model calls and optimizing streamed tool-call argument parsing.
+
 ## [18.2.1] - 2026-09-15
 
 ### Added

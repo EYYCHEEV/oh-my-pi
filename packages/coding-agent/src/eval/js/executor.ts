@@ -1,5 +1,5 @@
 import { denyEvaluationIngress } from "@oh-my-pi/pi-utils";
-import { DEFAULT_MAX_BYTES, type OutputArtifactError, OutputSink } from "../../session/streaming-output";
+import { DEFAULT_MAX_BYTES, type OutputArtifactError, OutputSink } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import type { ToolSession } from "../../tools";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../../tools/output-meta";
 import { isEvalTimeoutControlEvent } from "../bridge-timeout";
@@ -75,7 +75,6 @@ function formatJsTimeoutAnnotation(timeoutMs: number | undefined): string {
 	const secs = Math.max(1, Math.round(timeoutMs / 1000));
 	return `Command timed out after ${secs} seconds. ${reset}`;
 }
-
 export async function executeJs(code: string, options: JsExecutorOptions): Promise<JsResult> {
 	denyEvaluationIngress("JavaScript evaluation");
 	const displayOutputs: JsDisplayOutput[] = [];

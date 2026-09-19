@@ -6,7 +6,7 @@ import { $env, APP_NAME, logger } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import type { ServiceTierOpenAISettingValue } from "../config/service-tier";
 import { RUNTIME_REQUIREMENTS_VERSION } from "../session/runtime-requirements";
-import { CLI_THINKING_LEVELS, type ConfiguredThinkingLevel, parseCliThinkingLevel } from "../thinking";
+import { CLI_THINKING_LEVELS, type ConfiguredThinkingLevel, parseCliThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { normalizeToolNames } from "../tools/builtin-names";
 import {
 	OPTIONAL_FLAGS,
@@ -192,7 +192,6 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 		// value-taking built-in (`--plan`, `--model`, …) that branch would consume
 		// the following token — eating the user's message and setting the wrong
 		// built-in field — so registered flags shadow same-named built-ins here.
-		const extFlag = arg.startsWith("--") ? extensionFlags?.get(arg.slice(2)) : undefined;
 		if (arg === "--require-runtime-contract") {
 			STRING_SETTERS[arg](result, args[++i] ?? "", parseDeps);
 		} else if (extFlag) {

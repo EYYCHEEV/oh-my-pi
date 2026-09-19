@@ -5,10 +5,11 @@
  * showing args and output in JSON tree format similar to task tool.
  */
 import { type Component, Markdown } from "@oh-my-pi/pi-tui";
+import { renderStatusLine, WidthAwareText } from "@oh-my-pi/pi-tui/render";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 import { settings } from "../config/settings";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
-import { getMarkdownTheme, type Theme } from "../modes/theme/theme";
+import { getMarkdownTheme, type Theme } from "@oh-my-pi/pi-tui/theme";
 import {
 	formatArgsInline,
 	JSON_TREE_MAX_DEPTH_COLLAPSED,
@@ -18,11 +19,10 @@ import {
 	JSON_TREE_SCALAR_LEN_COLLAPSED,
 	JSON_TREE_SCALAR_LEN_EXPANDED,
 	renderJsonTreeLines,
-} from "../tools/json-tree";
-import { formatStyledTruncationWarning, stripOutputNotice } from "../tools/output-meta";
-import { formatExpandHint, replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "../tools/render-utils";
-import { renderStatusLine, WidthAwareText } from "../tui";
-import type { MCPToolDetails } from "./tool-bridge";
+} from "@oh-my-pi/pi-tui/tools/json-tree";
+import { formatStyledTruncationWarning, stripOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
+import { formatExpandHint, replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
+import type { MCPToolDetails } from "@oh-my-pi/pi-tui/tools/mcp";
 
 /**
  * Render MCP tool call.

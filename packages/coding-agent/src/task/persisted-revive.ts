@@ -193,6 +193,8 @@ export function createPersistedSubagentReviverFactory(
 					restrictToolNames: restrictToolNames || undefined,
 					requireYieldTool: true,
 					systemPrompt: () => [init.systemPrompt],
+					// Inherit current owner policy, never extension authority from a transcript.
+					extensionRoots: () => ctx.session.effectiveExtensionRoots,
 					// Old files predate persisted spawns: deny re-spawning rather than let
 					// createAgentSession default to wildcard ("*").
 					spawns: init.spawns ?? "",
@@ -208,6 +210,7 @@ export function createPersistedSubagentReviverFactory(
 							}
 						: {
 								requiredExtension: ctx.requiredExtension,
+								preloadedPreparedExtensions: ctx.session.preparedExtensions,
 								preloadedExtensionPaths: ctx.extensionPaths ? [...ctx.extensionPaths] : undefined,
 								enableMCP: !mcpManager,
 								mcpManager,

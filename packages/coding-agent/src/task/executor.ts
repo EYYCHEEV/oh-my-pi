@@ -60,8 +60,13 @@ import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/messages";
 import { hasConversationalHistory, SessionManager } from "../session/session-manager";
-import { truncateTail } from "../session/streaming-output";
-import { type ConfiguredThinkingLevel, prewalkWouldBeNoop, resolveTaskEffortLevel, type TaskEffort } from "../thinking";
+import { truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import {
+	type ConfiguredThinkingLevel,
+	prewalkWouldBeNoop,
+	resolveTaskEffortLevel,
+	type TaskEffort,
+} from "@oh-my-pi/pi-tui/thinking";
 import type { ContextFileEntry, ToolSession } from "../tools";
 import { resolveEvalBackends } from "../tools/eval-backends";
 import { isIrcEnabled } from "../tools/hub";
