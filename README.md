@@ -134,6 +134,7 @@ An upgrade fails before build or installation if the block is stale, any require
 - `handler-scoped-session-context`: Host-selected restricted extension sessions and context budgets
 - `extension-runtime-requirements`: Durable extension admission and runtime requirements
 - `streamed-tool-call-normalization`: Canonical streamed tool-call normalization
+- `kimi-k3-responses-transport`: Kimi K3 Responses transport
 <!-- stronk-omp:fork-contracts:end -->
 
 ## Upstream alignment
