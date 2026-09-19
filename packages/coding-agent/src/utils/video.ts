@@ -8,7 +8,8 @@
  * anything timestamp-shaped is a seek position.
  */
 import * as path from "node:path";
-import { isVideoPath } from "@oh-my-pi/pi-tui/prompt/video";
+import { isVideoPath, videoPreviewSource } from "@oh-my-pi/pi-tui/prompt/video";
+export { videoPreviewSource };
 import { untilAborted } from "@oh-my-pi/pi-utils/abortable";
 import { TempDir } from "@oh-my-pi/pi-utils/temp";
 import { $which } from "@oh-my-pi/pi-utils/which";

@@ -69,11 +69,7 @@ import { formatBytes } from "@oh-my-pi/pi-tui/render/render-utils";
 import { WriteTool } from "../tools/write";
 import { EventBus } from "../utils/event-bus";
 import { convertImageToPng } from "@oh-my-pi/pi-tui/chat/image-loading";
-import {
-	discoverExtensionPaths,
-	getRequiredExtensionAttestation,
-	loadExtensionFromFactory,
-} from "./extensions";
+import { discoverExtensionPaths, getRequiredExtensionAttestation, loadExtensionFromFactory } from "./extensions";
 import { ExtensionRuntime } from "./extensions/loader";
 import type {
 	BashToolResultEvent,
@@ -1168,7 +1164,6 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 	async #loadExtensions(settings: Settings): Promise<LoadExtensionsResult> {
 		const { cwd, noExtensions, additionalExtensionPaths, extensionFactories, eventBus } = this.#state;
-
 
 		const result = await loadSessionExtensions(
 			{

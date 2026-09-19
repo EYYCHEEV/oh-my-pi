@@ -185,6 +185,7 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			args.splice(i + 1, 0, value);
 			equalsValueIndex = i + 1;
 		}
+		const extFlag = arg.startsWith("--") ? extensionFlags?.get(arg.slice(2)) : undefined;
 
 		// Extension-registered flags take precedence over built-ins: a flag an
 		// extension owns (e.g. plan-mode's boolean `--plan`) is parsed with the

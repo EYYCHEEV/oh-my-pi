@@ -27,7 +27,7 @@ import type { ExecOptions } from "../../exec/exec";
 import { execCommand } from "../../exec/exec";
 // Runtime self-reference: dereference this namespace only inside loader functions to keep the index.ts cycle safe.
 import * as PiCodingAgent from "../../index";
-import { ALL_SEGMENT_IDS } from "../../modes/components/status-line/segments";
+import { ALL_SEGMENT_IDS } from "@oh-my-pi/pi-tui/status-line/segments";
 import type { CustomMessagePayload, MessageAdmission } from "../../session/messages";
 import type { RuntimeRequirementDeclaration } from "../../session/runtime-requirements";
 import type { SessionPersistenceReceipt } from "../../session/session-manager";

@@ -522,7 +522,7 @@ describe("overflow: path survives before model", () => {
 
 describe("extension segment overflow integrity", () => {
 	it("drops the timer before protected built-ins without exceeding width", () => {
-		const component = new StatusLineComponent(createStatusLineSession("CORE"));
+		const component = new StatusLineComponent(createStatusLineSession("CORE"), statusLineHost);
 		component.updateSettings({
 			preset: "custom",
 			leftSegments: ["pi"],
@@ -562,7 +562,7 @@ describe("extension segment overflow integrity", () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-overflow-identity-"));
 		setProjectDir(cwd);
 		try {
-			const component = new StatusLineComponent(createStatusLineSession("identity"));
+			const component = new StatusLineComponent(createStatusLineSession("identity"), statusLineHost);
 			component.updateSettings({
 				preset: "custom",
 				leftSegments: ["pi", "path"],

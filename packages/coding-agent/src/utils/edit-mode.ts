@@ -2,6 +2,7 @@ import { classifyModel } from "@oh-my-pi/pi-catalog/identity";
 import { $env, $flag } from "@oh-my-pi/pi-utils";
 
 import type { EditMode } from "@oh-my-pi/pi-tui/tools/edit";
+export type { EditMode };
 
 export const DEFAULT_EDIT_MODE: EditMode = "hashline";
 

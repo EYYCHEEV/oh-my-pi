@@ -6,6 +6,7 @@ import {
 	type TodoCompletionTransition,
 	type TodoToolDetails,
 } from "@oh-my-pi/pi-tui/tools/todo";
+export type { TodoStatus, TodoOperation, TodoItem, TodoPhase, TodoCompletionTransition, TodoToolDetails };
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { ToolExample } from "@oh-my-pi/pi-ai";

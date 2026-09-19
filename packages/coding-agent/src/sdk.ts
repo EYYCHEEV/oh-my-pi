@@ -1061,7 +1061,9 @@ export async function discoverSessionExtensionPaths(
 	const roots = options.extensionRoots?.();
 	const explicit = roots?.explicit ?? options.additionalExtensionPaths ?? [];
 	const explicitOnly = roots ? roots.mode === "explicit-only" : options.disableExtensionDiscovery;
-	const configuredPaths = explicitOnly ? [...explicit] : [...explicit, ...(roots?.configured ?? settings.get("extensions") ?? [])];
+	const configuredPaths = explicitOnly
+		? [...explicit]
+		: [...explicit, ...(roots?.configured ?? settings.get("extensions") ?? [])];
 	const disabledExtensionIds = explicitOnly ? undefined : (settings.get("disabledExtensions") ?? []);
 	const discovered = await discoverExtensionPaths(configuredPaths, cwd, disabledExtensionIds, {
 		ambient: !explicitOnly,
@@ -1772,7 +1774,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				cwd,
 				eventBus,
 			);
-			for (const { path, error } of extensionsResult.errors) logger.error("Failed to bind extension", { path, error });
+			for (const { path, error } of extensionsResult.errors)
+				logger.error("Failed to bind extension", { path, error });
 		} else if (options.preloadedExtensionPaths) {
 			extensionPaths = [...options.preloadedExtensionPaths];
 			extensionsResult = await logger.time(

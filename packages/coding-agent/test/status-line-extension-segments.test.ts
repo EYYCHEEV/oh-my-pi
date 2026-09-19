@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "bun:test";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { StatusLineComponent } from "@oh-my-pi/pi-coding-agent/modes/components/status-line";
-import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { StatusLineComponent } from "@oh-my-pi/pi-tui/status-line";
+import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
+import { statusLineHost } from "@oh-my-pi/pi-coding-agent/modes/status-line-host";
 
 beforeAll(async () => {
 	resetSettingsForTest();
@@ -63,7 +64,7 @@ function component(
 	rightSegments: string[],
 	options: { cost?: number; subscription?: boolean; separator?: "space" | "pipe" } = {},
 ) {
-	const value = new StatusLineComponent(session(options));
+	const value = new StatusLineComponent(session(options), statusLineHost);
 	value.updateSettings({
 		preset: "custom",
 		leftSegments,

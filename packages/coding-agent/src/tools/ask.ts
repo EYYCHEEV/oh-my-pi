@@ -1,4 +1,5 @@
 import type { AskToolDetails, QuestionResult } from "@oh-my-pi/pi-tui/tools/ask";
+export type { AskToolDetails, QuestionResult };
 /**
  * Ask Tool - Interactive user prompting during execution
  *

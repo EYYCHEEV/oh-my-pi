@@ -5,7 +5,7 @@ import { CustomToolAdapter } from "@oh-my-pi/pi-coding-agent/extensibility/custo
 import { renderMCPResult } from "@oh-my-pi/pi-coding-agent/mcp/render";
 import { MCPTool, type MCPToolDetails } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
 import type { MCPContent, MCPToolCallResult, MCPToolDefinition } from "@oh-my-pi/pi-coding-agent/mcp/types";
-import { getThemeByName, initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { getThemeByName, initTheme } from "@oh-my-pi/pi-tui/theme";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { type OutputMeta, wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 import { createMockConnection, createMockTransport } from "./mcp-test-utils";

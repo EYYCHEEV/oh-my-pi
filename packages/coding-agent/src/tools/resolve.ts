@@ -34,6 +34,8 @@ import resolveReminderPrompt from "../prompts/system/resolve-device-reminder.md"
 import type { ToolSession } from ".";
 
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+export { PROPOSE_DEVICE_NAME };
+export { ToolError };
 import type { XdevDispatch } from "./xdev";
 
 /** The plain-text resolution device URLs (`xd://resolve`, …). */

@@ -9,12 +9,13 @@ import {
 import type { AssistantMessage, Model, ProviderResponseMetadata, Usage } from "@oh-my-pi/pi-ai";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
-import type { ContextUsage } from "../extensibility/extensions/types";
+import type { Settings } from "../config/settings";
 import {
 	computeNonMessageBreakdown,
 	computeNonMessageTokens,
 	type NonMessageTokenSource,
 } from "@oh-my-pi/pi-tui/status-line/context-usage";
+import type { ContextUsage } from "@oh-my-pi/pi-tui/status-line/types";
 import type { ContextUsageBreakdown, SessionStats } from "./agent-session-types";
 import { getLatestCompactionEntry } from "./session-context";
 import type { ModelUsageEntry, SessionEntry } from "./session-entries";
@@ -34,7 +35,7 @@ interface PendingContextSnapshot {
 
 /** Capabilities the stats tracker borrows from its owning session. */
 export interface SessionStatsTrackerHost {
-	session: NonMessageTokenSource;
+	session: NonMessageTokenSource & { readonly settings?: Pick<Settings, "revision" | "get"> };
 	agent: Agent;
 	sessionManager: SessionManager;
 	modelRegistry: ModelRegistry;

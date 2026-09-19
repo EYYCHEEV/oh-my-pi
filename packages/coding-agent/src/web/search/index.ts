@@ -31,14 +31,9 @@ import {
 } from "./provider";
 import { CODEX_WEB_RUN_DESCRIPTION, CODEX_WEB_RUN_PARAMETERS, executeCodexWebRun } from "./providers/codex";
 import { applyQueryConstraints, parseSearchQuery } from "./query";
-import { renderSearchCall, renderSearchResult, type SearchRenderDetails } from "./render";
-import {
-	DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS,
-	MAX_WEB_SEARCH_TIMEOUT_SECONDS,
-	SearchProviderError,
-	type SearchProviderId,
-	type SearchResponse,
-} from "./types";
+import { renderSearchCall, renderSearchResult, type SearchRenderDetails } from "@oh-my-pi/pi-tui/tools/web-search";
+import { DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS, MAX_WEB_SEARCH_TIMEOUT_SECONDS, SearchProviderError } from "./types";
+import { type SearchProviderId, type SearchResponse } from "@oh-my-pi/pi-tui/tools/web-search";
 
 /** Web search tool parameters schema */
 export const webSearchSchema = type({

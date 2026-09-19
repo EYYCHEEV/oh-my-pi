@@ -12,6 +12,16 @@ import { $env } from "@oh-my-pi/pi-utils";
 
 import type { AgentSessionEvent } from "../session/agent-session";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+/** Shared task wire/result types live with the TUI renderer; keep this barrel for task internals. */
+export type {
+	AgentProgress,
+	SingleResult,
+	StructuredSubagentOutput,
+	StructuredSubagentSchemaMode,
+	StructuredSubagentSchemaSource,
+	TaskToolDetails,
+	YieldItem,
+} from "@oh-my-pi/pi-tui/tools/task";
 
 const parseNumber = (value: string | undefined, defaultValue: number): number => {
 	if (value) {

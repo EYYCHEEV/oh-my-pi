@@ -39,13 +39,8 @@ import {
 import { generateTaskName } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
 import { resolveSpawnPolicy } from "./spawn-policy";
-import {
-	type AgentDefinition,
-	type AgentProgress,
-	canSpawnAtDepth,
-	type SingleResult,
-	type StructuredSubagentOutput,
-} from "./types";
+import { type AgentDefinition, canSpawnAtDepth } from "./types";
+import type { AgentProgress, SingleResult, StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import type { WorkPoolYieldItem } from "./workpool-yield";
 import { parseIsolationBackend } from "./worktree";
 

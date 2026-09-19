@@ -1,5 +1,7 @@
 /** Discovers array-valued output-schema labels for incremental yield assembly. */
 import { dereferenceJsonSchema } from "@oh-my-pi/pi-ai/utils/schema";
+/** Assembly is implemented beside the task renderer; this adapter preserves the coding-agent import path. */
+export { assembleYieldResult } from "@oh-my-pi/pi-tui/tools/task-yield-assembly";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { buildOutputValidator } from "../tools/output-schema-validator";
 

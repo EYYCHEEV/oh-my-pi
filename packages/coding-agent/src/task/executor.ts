@@ -15,8 +15,8 @@ import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobManager } from "../async";
 import type { Rule } from "../capability/rule";
 import type { EffectiveExtensionRoots } from "../capability/types";
 import { ModelRegistry } from "../config/model-registry";
+import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import {
-	formatModelSelectorValue,
 	formatModelStringWithRouting,
 	resolveAgentAdvisorSelection,
 	resolveAgentPrewalkPattern,
@@ -70,8 +70,7 @@ import {
 import type { ContextFileEntry, ToolSession } from "../tools";
 import { resolveEvalBackends } from "../tools/eval-backends";
 import { isIrcEnabled } from "../tools/hub";
-import { LIST_STATUS_ORDER } from "../tools/hub/messaging";
-import { DEFAULT_HUB_LIST_LIMIT } from "../tools/hub/types";
+import { LIST_STATUS_ORDER, DEFAULT_HUB_LIST_LIMIT } from "@oh-my-pi/pi-tui/tools/hub";
 import { normalizeSchema } from "../tools/jtd-to-json-schema";
 import { buildOutputValidator, summarizeValidationFailure } from "../tools/output-schema-validator";
 import { ToolAbortError } from "../tools/tool-errors";
@@ -89,22 +88,24 @@ import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import type { WorkPoolYieldItem } from "./workpool-yield";
 import {
 	type AgentDefinition,
-	type AgentProgress,
 	MAX_OUTPUT_BYTES,
 	MAX_OUTPUT_LINES,
-	type SingleResult,
-	type StructuredSubagentOutput,
-	type StructuredSubagentSchemaMode,
-	type StructuredSubagentSchemaSource,
 	TASK_SUBAGENT_EVENT_CHANNEL,
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
-	type TaskToolDetails,
-	type YieldItem,
 } from "./types";
+import type {
+	AgentProgress,
+	SingleResult,
+	StructuredSubagentOutput,
+	StructuredSubagentSchemaMode,
+	StructuredSubagentSchemaSource,
+	TaskToolDetails,
+	YieldItem,
+} from "@oh-my-pi/pi-tui/tools/task";
 import { arrayValuedLabels, assembleYieldResult } from "./yield-assembly";
 
-export type { YieldItem } from "./types";
+export type { YieldItem } from "@oh-my-pi/pi-tui/tools/task";
 
 const MCP_CALL_TIMEOUT_MS = 60_000;
 const TASK_ABORT_CLEANUP_GRACE_MS = 10_000;

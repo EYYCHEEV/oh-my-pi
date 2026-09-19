@@ -1,4 +1,5 @@
 import type { MCPContent, MCPImageContent, MCPResourceContent, MCPTextContent } from "@oh-my-pi/pi-tui/tools/mcp";
+export type { MCPContent, MCPImageContent, MCPResourceContent, MCPTextContent } from "@oh-my-pi/pi-tui/tools/mcp";
 /**
  * MCP (Model Context Protocol) type definitions.
  *

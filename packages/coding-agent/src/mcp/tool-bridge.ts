@@ -33,6 +33,7 @@ import type {
 	MCPToolDefinition,
 } from "./types";
 import type { MCPContent } from "@oh-my-pi/pi-tui/tools/mcp";
+export type { MCPContent, MCPToolDetails };
 
 /** Reconnect callback: tears down a stale connection, optionally authorizing first. */
 export type MCPReconnect = (options?: { authChallenge?: MCPAuthChallenge }) => Promise<MCPServerConnection | null>;

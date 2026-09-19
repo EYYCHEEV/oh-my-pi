@@ -1507,16 +1507,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				enableLsp: (this.session.enableLsp ?? true) && this.session.settings.get("task.enableLsp"),
 				enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 				maxRuntimeMs: this.session.settings.get("task.maxRuntimeMs"),
-				signal,
 				onProgress: progress => {
-					latestProgress = { ...progress, recentTools: progress.recentTools.slice() };
+					const nextProgress = { ...progress, recentTools: progress.recentTools.slice() };
+					latestProgress = nextProgress;
 					onUpdate?.({
 						content: [{ type: "text", text: `Running agent ${progress.id}...` }],
 						details: {
 							projectAgentsDir: null,
 							results: [],
 							totalDurationMs: Date.now() - startTime,
-							progress: [latestProgress],
+							progress: [nextProgress],
 						},
 					});
 				},

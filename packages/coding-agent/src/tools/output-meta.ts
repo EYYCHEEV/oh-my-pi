@@ -22,7 +22,15 @@ import {
 	truncateMiddle,
 	truncateTail,
 } from "@oh-my-pi/pi-tui/tools/streaming-output";
-import { formatOutputNotice, type OutputMeta, type TruncationMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
+import {
+	formatArtifactErrorNotice,
+	formatOutputNotice,
+	stripOutputNotice,
+	type OutputMeta,
+	type TruncationMeta,
+} from "@oh-my-pi/pi-tui/tools/output-meta";
+export { formatArtifactErrorNotice, formatOutputNotice, stripOutputNotice };
+export type { OutputMeta, TruncationMeta };
 import { renderError } from "./tool-errors";
 
 /** Input for {@link OutputMetaBuilder.limits}. `columnUnit` defaults to `chars`. */
