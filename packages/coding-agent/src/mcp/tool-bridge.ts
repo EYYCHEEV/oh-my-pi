@@ -24,7 +24,7 @@ import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { schemaDeclaresIntentField } from "../utils/tool-schema";
 import { callTool } from "./client";
 import { formatMCPToolFailure, MCPTransportError } from "./errors";
-import { renderMCPCall, renderMCPResult } from "@oh-my-pi/pi-tui/tools/mcp";
+import { renderMCPCall, renderMCPResult } from "./render";
 import type {
 	MCPAuthChallenge,
 	MCPServerConnection,

@@ -84,6 +84,7 @@ import type { MemoryRuntimeContext } from "../../memory-backend";
 import type { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import type { Theme, ThemeColor } from "@oh-my-pi/pi-tui/theme";
 import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
+import type { CompactMode } from "../../session/compact-modes";
 import type { CustomMessagePayload, MessageAdmission } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager, SessionPersistenceReceipt } from "../../session/session-manager";
 import type { BashToolInput, GlobToolInput, GrepToolInput, ReadToolInput, WriteToolInput } from "../../tools";
@@ -450,6 +451,9 @@ export interface ExtensionContext {
 	/** Whether UI is available (false in print/RPC mode) */
 	hasUI: boolean;
 	/** Current working directory */
+	cwd: string;
+	/** Session manager (read-only) */
+	sessionManager: ReadonlySessionManager;
 	/** Flush the recorded journal prefix, not pending queues or the current event's unrecorded input. */
 	flushSession(): Promise<SessionPersistenceReceipt>;
 	/** Model registry for API key resolution */
@@ -1284,6 +1288,14 @@ export interface ExtensionAPI {
 	// =========================================================================
 	// Tool Registration
 	// =========================================================================
+	/**
+	 * Register a status-line segment. Registration is declarative and is hosted
+	 * by the interactive runner when one is attached.
+	 */
+	registerStatusSegment(definition: ExtensionStatusSegmentDefinition): () => void;
+
+	/** Request a status-line redraw. Safe in headless modes. */
+	requestStatusLineRender(): void;
 
 	/** Register a tool that the LLM can call. */
 	registerTool<TParams extends TSchema = TSchema, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void;

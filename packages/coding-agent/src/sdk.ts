@@ -1740,17 +1740,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	let extensionPaths: string[];
 	let extensionsResult: LoadExtensionsResult;
 	try {
-		if (restrictToolNames && evaluation) {
-			extensionPaths = [];
-			extensionsResult = await logger.time(
-				"loadExtensions",
-				loadExtensionsWithRequiredAttestation,
-				{ paths: extensionPaths },
-				cwd,
-				eventBus,
-				requiredExtensionOptions,
-			);
-		} else if (!restrictToolNames && options.preloadedExtensions) {
+		if (options.preloadedExtensions && (!restrictToolNames || evaluation)) {
 			extensionsResult = await logger.time(
 				"attestPreloadedExtensions",
 				loadExtensionsWithRequiredAttestation,
@@ -1762,6 +1752,16 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			extensionPaths = extensionsResult.extensions
 				.map(extension => extension.resolvedPath)
 				.filter(extensionPath => !extensionPath.startsWith("<inline"));
+		} else if (restrictToolNames && evaluation) {
+			extensionPaths = [];
+			extensionsResult = await logger.time(
+				"loadExtensions",
+				loadExtensionsWithRequiredAttestation,
+				{ paths: extensionPaths },
+				cwd,
+				eventBus,
+				requiredExtensionOptions,
+			);
 		} else if ((restrictToolNames || options.preloadedPreparedExtensions) && !requiredExtension) {
 			const preparedExtensions = options.preloadedPreparedExtensions ?? [];
 			extensionPaths = preparedExtensions.map(prepared => prepared.path);
