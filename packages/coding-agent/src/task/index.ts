@@ -1504,9 +1504,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				acquiredAt: launchTiming?.acquiredAt,
 				...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
 				blockedAgent: this.#blockedAgent,
+				signal,
 				enableLsp: (this.session.enableLsp ?? true) && this.session.settings.get("task.enableLsp"),
 				enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
-				maxRuntimeMs: this.session.settings.get("task.maxRuntimeMs"),
 				onProgress: progress => {
 					const nextProgress = { ...progress, recentTools: progress.recentTools.slice() };
 					latestProgress = nextProgress;
