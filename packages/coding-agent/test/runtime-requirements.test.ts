@@ -589,7 +589,7 @@ describe("session-wide runtime requirements", () => {
 	it("refuses title dispatch if runtime satisfaction changes during provider preparation", async () => {
 		const h = await harness();
 		await h.declaration;
-		h.session.settings.set("providers.tinyModel", "online");
+		h.session.settings.setModelRole("tiny", "anthropic/claude-haiku-4-5");
 		const key = spyOn(h.registry, "getApiKey").mockImplementation(async () => {
 			h.bus.emit("guard-state", "fail");
 			return "test-key";

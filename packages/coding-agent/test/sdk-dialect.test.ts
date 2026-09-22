@@ -414,17 +414,15 @@ describe("normalizeAssistantToolCallStream", () => {
 
 describe("normalizeFinalAssistantMessage", () => {
 	it("recovers an inline edit before removing its punctuation-only remainder", () => {
-		const payload = [
-			'<SM:EDIT path="src/a.ts">',
-			"<SM:FIND>",
-			"const x = 1;",
-			"</SM:FIND>",
-			"<SM:PUT>",
-			"const x = 2;",
-			"</SM:PUT>",
-			"</SM:EDIT>",
-		].join("\n");
-		const message = assistant([{ type: "text", text: `…\n${payload}\n!?` }]);
+		// Sloppy payloads use the header-based `*** SM:` syntax (no closing
+		// delimiter): the region runs from the pathful EDIT header through the
+		// last body line, so trailing prose would join the PUT body. Leading
+		// punctuation-only prose is lifted out by recovery, then stripped by
+		// tool-call content normalization.
+		const payload = ["*** SM:EDIT src/a.ts", "*** SM:FIND", "const x = 1;", "*** SM:PUT", "const x = 2;"].join(
+			"\n",
+		);
+		const message = assistant([{ type: "text", text: `…\n${payload}` }]);
 
 		expect(normalizeFinalAssistantMessage(message, true)).toBe(1);
 		expect(message.content.map(block => block.type)).toEqual(["toolCall"]);

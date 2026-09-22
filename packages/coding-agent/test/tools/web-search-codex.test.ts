@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { AgentMessage, AgentToolContext } from "@oh-my-pi/pi-agent-core";
-import type { AuthStorage, FetchImpl, Message } from "@oh-my-pi/pi-ai";
+import type { Api, AuthStorage, FetchImpl, Message, Model } from "@oh-my-pi/pi-ai";
 import * as catalogModels from "@oh-my-pi/pi-catalog/models";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { customToolToDefinition } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -397,10 +397,20 @@ describe("searchCodex model selection", () => {
 	let capturedRequest: CapturedRequest | null = null;
 
 	function makeSearchParams(query: string, fetch?: FetchImpl): SearchParams {
+		// Upstream widened SearchParams with required model/modelRegistry fields.
+		// The fork's candidate chain ignores `model`, and an empty registry stub
+		// reproduces the pre-merge harness (no registry) so bundled-default
+		// selection stays deterministic per test.
 		return {
 			query,
 			systemPrompt: "Codex test system prompt",
 			authStorage: fakeAuthStorage,
+			model: { id: "gpt-5.5", provider: "openai-codex", api: "openai-codex-responses" } as unknown as Model<Api>,
+			modelRegistry: {
+				find: () => undefined,
+				getProviderBaseUrl: () => undefined,
+				getProviderHeaders: async () => undefined,
+			} as unknown as ModelRegistry,
 			...(fetch ? { fetch } : {}),
 		};
 	}

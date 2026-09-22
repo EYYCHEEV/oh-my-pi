@@ -5,7 +5,7 @@
  * the official ChatGPT backend for OAuth logins.
  */
 import { Tokenizer } from "@oh-my-pi/pi-agent-core";
-import { type AuthStorage, type FetchImpl, type Message, type Model, withAuth, withOAuthAccess } from "@oh-my-pi/pi-ai";
+import { type Api, type AuthStorage, type FetchImpl, type Message, type Model, withAuth, withOAuthAccess } from "@oh-my-pi/pi-ai";
 import { applyCodexResponsesLiteShape } from "@oh-my-pi/pi-ai/providers/openai-codex/request-transformer";
 import {
 	createOpenAICodexCompatibilityMetadata,
@@ -24,7 +24,7 @@ import {
 import { $env, readSseJson, USER_AGENT } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import type { ModelRegistry } from "../../../config/model-registry";
-import type { SearchResponse, SearchSource } from "@oh-my-pi/pi-tui/tools/web-search";
+import type { SearchResponse, SearchSource } from "../types";
 import { SearchProviderError } from "../../../web/search/types";
 import { formatQuery, GOOGLE_QUERY_SYNTAX, parseSearchQuery } from "../query";
 import type { SearchParams } from "./base";
@@ -438,6 +438,14 @@ const CodexResponseSchema = type({
 function parseCodexResponseItem(value: unknown): CodexResponseItem | undefined {
 	const parsed = CodexResponseItemSchema(value);
 	return parsed instanceof type.errors ? undefined : parsed;
+}
+
+/** Codex API response structure */
+interface CodexWebSearchSource {
+	url?: string;
+	source_website_url?: string;
+	title?: string;
+	caption?: string;
 }
 
 function parseCodexResponse(value: unknown): typeof CodexResponseSchema.infer | undefined {
@@ -907,13 +915,13 @@ async function callCodexStandaloneSearch(
 		systemPrompt?: string;
 		searchContextSize?: "low" | "medium" | "high";
 		maxOutputTokens?: number;
-		model: CodexModelCandidate;
+		modelId: string;
 		sessionId?: string;
 		fetch?: FetchImpl;
 		transport: CodexSearchTransport;
 	},
 ): Promise<CodexSearchResult> {
-	const requestedModel = options.model.modelId;
+	const requestedModel = options.modelId;
 	const signal = withHardTimeout(options.signal, CODEX_SEARCH_TIMEOUT_MS);
 	const fetchImpl = options.fetch ?? fetch;
 	const searchSessionId = options.sessionId ?? crypto.randomUUID();
@@ -1123,14 +1131,14 @@ async function callCodexSearch(
 		timeoutMs?: number;
 		systemPrompt?: string;
 		searchContextSize?: "low" | "medium" | "high";
-		model: CodexModelCandidate;
+		modelId: string;
 		fetch?: FetchImpl;
 		transport: CodexSearchTransport;
 	},
 ): Promise<CodexSearchResult> {
 	const headers = buildCodexHeaders(auth.accessToken, auth.accountId, options.transport.headers);
 
-	const requestedModel = options.model.modelId;
+	const requestedModel = options.modelId;
 
 	const body: Record<string, unknown> = {
 		model: requestedModel,
@@ -1336,7 +1344,7 @@ async function runCodexSearchCandidates(options: {
 				systemPrompt: options.params.systemPrompt,
 				searchContextSize: "high" as const,
 				maxOutputTokens: options.params.maxOutputTokens,
-				model: candidate,
+				modelId: candidate.modelId,
 				fetch: options.params.fetch,
 				transport: options.transport,
 			};
@@ -1482,8 +1490,8 @@ export async function searchCodex(params: SearchParams): Promise<SearchResponse>
 /**
  * Checks whether Codex web search has an API key or OAuth credential.
  */
-export async function hasCodexSearch(authStorage: AuthStorage): Promise<boolean> {
-	return authStorage.hasAuth("openai-codex");
+export async function hasCodexSearch(authStorage: AuthStorage, model?: Model<Api>): Promise<boolean> {
+	return authStorage.hasAuth(model?.provider ?? "openai-codex");
 }
 
 /** Search provider for OpenAI Codex web search. */
@@ -1491,8 +1499,8 @@ export class CodexProvider extends SearchProvider {
 	readonly id = "codex";
 	readonly label = "OpenAI";
 
-	isAvailable(authStorage: AuthStorage): Promise<boolean> | boolean {
-		return hasCodexSearch(authStorage);
+	isAvailable(authStorage: AuthStorage, model?: Model<Api>): Promise<boolean> | boolean {
+		return hasCodexSearch(authStorage, model);
 	}
 
 	search(params: SearchParams): Promise<SearchResponse> {

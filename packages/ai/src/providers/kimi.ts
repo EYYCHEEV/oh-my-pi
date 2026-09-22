@@ -13,7 +13,7 @@
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 import { getKimiCommonHeaders } from "../registry/oauth/kimi";
-import type { Api, Context, Model } from "../types";
+import type { Context, Model } from "../types";
 import type { AssistantMessageEventStream } from "../utils/event-stream";
 import {
 	type OpenAIAnthropicApiFormat,
@@ -73,11 +73,4 @@ function streamKimiResponses(
 		toolChoice: context.tools && context.tools.length > 0 ? "auto" : undefined,
 	};
 	return streamOpenAIResponses(responsesModel, context, responseOptions);
-}
-
-/**
- * Check if a model is a Kimi Code model.
- */
-export function isKimiModel(model: Model<Api>): boolean {
-	return model.provider === "kimi-code";
 }
