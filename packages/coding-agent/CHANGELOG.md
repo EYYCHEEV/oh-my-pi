@@ -30,6 +30,15 @@
 - Fixed completed mid-turn compaction replaying a cached copy of the old conversation in the next request.
 - Fixed budget refusals hanging automatic retries or printing an earlier answer as success in text mode.
 - Prevented custom messages from crossing session changes or disposal while image normalization is pending, for every delivery mode.
+### Added
+
+- Added intent descriptions to judgment batching
+- Added live progress tracking for judgment batches in the TUI
+
+### Changed
+
+- Coalesced judgment batch drain operations for better performance under high load
+
 ## [18.2.9] - 2026-09-22
 
 ### Added

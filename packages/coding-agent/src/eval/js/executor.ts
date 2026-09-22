@@ -3,6 +3,7 @@ import { DEFAULT_MAX_BYTES, type OutputArtifactError, OutputSink } from "@oh-my-
 import type { ToolSession } from "../../tools";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../../tools/output-meta";
 import { isEvalTimeoutControlEvent } from "../bridge-timeout";
+import { DisplayOutputCollector } from "../executor-base";
 import { executeInVmContext, type JsDisplayOutput } from "./context-manager";
 import type { JsStatusEvent } from "./shared/types";
 
@@ -77,7 +78,8 @@ function formatJsTimeoutAnnotation(timeoutMs: number | undefined): string {
 }
 export async function executeJs(code: string, options: JsExecutorOptions): Promise<JsResult> {
 	denyEvaluationIngress("JavaScript evaluation");
-	const displayOutputs: JsDisplayOutput[] = [];
+	const display = new DisplayOutputCollector<JsDisplayOutput>();
+	const displayOutputs = display.outputs;
 	const outputSink = new OutputSink({
 		artifactPath: options.artifactPath,
 		artifactId: options.artifactId,
@@ -122,7 +124,7 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 						options.onStatus?.(output.event);
 						if (isEvalTimeoutControlEvent(output.event)) return;
 					}
-					displayOutputs.push(output);
+					display.push(output);
 				},
 			},
 		});
