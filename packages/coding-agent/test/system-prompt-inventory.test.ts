@@ -501,6 +501,23 @@ describe("system prompt tool inventory", () => {
 		expect(text).not.toContain("Reads files from disk.");
 	});
 
+	it("references xd://-only tools by their xd:// URL", async () => {
+		const { systemPrompt } = await buildSystemPrompt({
+			cwd: tempDir,
+			contextFiles: [],
+			skills: [],
+			rules: [],
+			toolNames: ["read", "bash"],
+			tools: TOOLS,
+			xdevTools: [{ name: "lsp", summary: "Language server." }],
+			workspaceTree: { ...EMPTY_TREE, rootPath: tempDir },
+		});
+		const text = systemPrompt.join("\n\n");
+		expect(text).toContain("MUST use `xd://lsp` for definitions");
+		expect(text).toContain("inspect its references with `xd://lsp`");
+		expect(text).not.toContain("`lsp`");
+	});
+
 	it("keeps enabled computer prelude routing and safety explicit", async () => {
 		const { systemPrompt } = await buildSystemPrompt({
 			cwd: tempDir,

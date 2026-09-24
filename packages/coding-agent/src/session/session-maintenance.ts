@@ -477,6 +477,8 @@ export interface SessionMaintenanceHost {
 	resetPlanReference(): void;
 	syncTodoPhasesFromBranch(): void;
 	resetAdvisorRuntimes(reason?: string): void;
+	/** Re-aligns advisors after an in-place prune their own contexts already cover (no re-prime). */
+	rebaseAdvisorPrefix(reason: string): void;
 	rebaseAfterCompaction(): void;
 	recordAnchoredHistoryRewrite(tokensRemoved: number): void;
 	getContextBreakdown(options?: {
@@ -755,7 +757,7 @@ export class SessionMaintenance {
 		await this.#host.sessionManager.rewriteEntries();
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.agent.replaceMessages(sessionContext.messages);
-		this.#host.resetAdvisorRuntimes("prune-tool-outputs");
+		this.#host.rebaseAdvisorPrefix("prune-tool-outputs");
 		this.#host.syncTodoPhasesFromBranch();
 		this.#host.closeCodexProviderSessionsForHistoryRewrite();
 		return result;
@@ -801,7 +803,7 @@ export class SessionMaintenance {
 		await this.#host.sessionManager.rewriteEntries();
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.agent.replaceMessages(sessionContext.messages);
-		this.#host.resetAdvisorRuntimes("prune-stale-tool-results");
+		this.#host.rebaseAdvisorPrefix("prune-stale-tool-results");
 		this.#host.syncTodoPhasesFromBranch();
 		this.#host.closeCodexProviderSessionsForHistoryRewrite();
 		return result;

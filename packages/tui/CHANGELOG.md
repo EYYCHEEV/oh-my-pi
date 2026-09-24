@@ -5,6 +5,20 @@
 ### Added
 
 - Added the `AccountPauseSelectorComponent` overlay for `/login manage`, a `manage` mode for the OAuth provider selector, and `(paused)` marking in the session account selector.
+### Breaking Changes
+
+- Replaced the `CustomEditor` space-hold callbacks and `sttHoldEnabled` option with the `spaceHold.handler` API.
+- Removed `Editor.cursorOverrideWidth`; widths for `cursorOverride` glyphs are now measured automatically.
+
+### Added
+
+- Added push-to-talk dictation to `Input`, including live transcription text and `cursorOverride` support.
+
+### Fixed
+
+- Fixed dimmed blockquote styling being reset after inline code spans.
+- Fixed tool call and result rendering for active top-level extension and MCP tools invoked through `xd://` links.
+- Fixed pending Read and Write cards opening incorrect browser URLs when file paths are clicked; paths now open their local targets, including home-directory, archive, and database paths.
 
 ## [18.3.0] - 2026-09-24
 
