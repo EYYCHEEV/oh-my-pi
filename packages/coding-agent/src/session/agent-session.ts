@@ -2276,7 +2276,8 @@ export class AgentSession {
 		this.#unsubscribeModelRoles = onModelRolesChanged(() => this.#advisors.onModelRolesChanged());
 		// A paused sticky/pinned account reroutes this session once; the store
 		// fires process-wide, so match against the id live at event time.
-		this.#unsubscribeOAuthReroute = this.#modelRegistry.authStorage.sessions.onReroute(event =>
+		// Optional chaining keeps lightweight test registries without auth storage constructible.
+		this.#unsubscribeOAuthReroute = this.#modelRegistry.authStorage?.sessions?.onReroute?.(event =>
 			this.#warnOAuthAccountReroute(event),
 		);
 		// Re-derive the active model's effective context window when the

@@ -108,6 +108,8 @@ export class OAuthAccounts implements OAuthApi {
 		// shadow the new OAuth row, while preserving other active OAuth credentials.
 		const storeAs = def.storeCredentialsAs ?? provider;
 		await this.#deps.pool.upsertOAuth(storeAs, newCredential);
+		// A pause written by another process must be visible before reporting it.
+		await this.#deps.pool.adoptExternalChanges();
 		// Re-login updates a same-identity row in place, so an operator pause survives it.
 		const storedId = this.#deps.pool
 			.entries(storeAs)

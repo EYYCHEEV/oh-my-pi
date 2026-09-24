@@ -4,7 +4,7 @@ import { oauthAccountLabel } from "./session-pin";
 
 /** Shown by every pause surface when the credential store is an auth broker. */
 export const ACCOUNT_PAUSE_BROKER_MESSAGE =
-	"OAuth account pause is not supported with an auth broker. Manage accounts on the broker host.";
+	"OAuth account pause is not supported with an auth broker; broker clients ignore pauses. Log the account out on the broker host to stop its use.";
 
 /** Appended to login success output when the re-logged-in account is still paused. */
 export const LOGIN_PAUSED_NOTICE = "This account is paused; resume it with /login manage.";
