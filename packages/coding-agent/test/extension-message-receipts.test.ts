@@ -202,7 +202,7 @@ describe("extension message receipts", () => {
 		const preflightEntered = Promise.withResolvers<void>();
 		const releasePreflight = Promise.withResolvers<void>();
 		let preflightChecks = 0;
-		const usageHealth = spyOn(h.registry.authStorage, "getModelUsageHealth").mockImplementation(async () => {
+		const usageHealth = spyOn(h.registry.authStorage.health, "model").mockImplementation(async () => {
 			preflightChecks++;
 			if (preflightChecks === 1) {
 				preflightEntered.resolve();

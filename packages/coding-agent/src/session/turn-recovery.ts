@@ -64,6 +64,7 @@ import {
 	type ServingModel,
 	validateRetryFallbackChains,
 } from "./retry-fallback-chains";
+import { describeUsageFallback } from "./retry-fallback-reason";
 import { getLatestCompactionEntry } from "./session-context";
 import { EPHEMERAL_MODEL_CHANGE_ROLE, type SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
@@ -639,7 +640,7 @@ export class TurnRecovery {
 			const parsedRetryAfterMs = this.#parseRetryAfterMsFromError(errorMessage);
 			const retryAfterMs = parsedRetryAfterMs ?? calculateRateLimitBackoffMs(parseRateLimitReason(errorMessage));
 			recorded = (async (): Promise<UsageLimitOutcome> => {
-				const outcome = await this.#host.modelRegistry.authStorage.markUsageLimitReached(
+				const outcome = await this.#host.modelRegistry.authStorage.limits.markReached(
 					activeModel.provider,
 					this.#host.sessionId(),
 					{
@@ -1702,7 +1703,7 @@ export class TurnRecovery {
 		const currentSelector = formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel());
 		let health: ModelUsageHealth;
 		try {
-			health = await this.#host.modelRegistry.authStorage.getModelUsageHealth(currentModel.provider, {
+			health = await this.#host.modelRegistry.authStorage.health.model(currentModel.provider, {
 				modelId: currentModel.id,
 				sessionId: this.#host.sessionId(),
 				baseUrl: currentModel.baseUrl,
@@ -1727,10 +1728,7 @@ export class TurnRecovery {
 				selectedAccount.state !== "healthy" &&
 				health.accounts.some(account => account.state === "healthy")
 			) {
-				this.#host.modelRegistry.authStorage.releaseSessionCredentialForReselection(
-					currentModel.provider,
-					this.#host.sessionId(),
-				);
+				this.#host.modelRegistry.authStorage.sessions.release(currentModel.provider, this.#host.sessionId());
 			}
 			return false;
 		}
@@ -1771,7 +1769,7 @@ export class TurnRecovery {
 				// (issue #8065).
 				if (!this.#host.contextFitsModel(candidateModel)) continue;
 				try {
-					const candidateHealth = await this.#host.modelRegistry.authStorage.getModelUsageHealth(
+					const candidateHealth = await this.#host.modelRegistry.authStorage.health.model(
 						candidateModel.provider,
 						{
 							modelId: candidateModel.id,
@@ -1790,7 +1788,7 @@ export class TurnRecovery {
 							selected.state !== "healthy" &&
 							candidateHealth.accounts.some(account => account.state === "healthy")
 						) {
-							this.#host.modelRegistry.authStorage.releaseSessionCredentialForReselection(
+							this.#host.modelRegistry.authStorage.sessions.release(
 								candidateModel.provider,
 								this.#host.sessionId(),
 							);
@@ -1845,6 +1843,7 @@ export class TurnRecovery {
 			pinFallback: true,
 			apiKey: fallback.apiKey,
 			signal,
+			reason: describeUsageFallback(health, this.#host.settings.get("retry.usageReservePct")),
 		});
 	}
 
@@ -1868,7 +1867,7 @@ export class TurnRecovery {
 		role: string,
 		selector: RetryFallbackSelector,
 		currentSelector: string,
-		options?: { pinFallback?: boolean; apiKey?: string; signal?: AbortSignal },
+		options?: { pinFallback?: boolean; apiKey?: string; signal?: AbortSignal; reason?: string },
 	): Promise<boolean> {
 		const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
 		const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
@@ -1945,6 +1944,7 @@ export class TurnRecovery {
 			from: currentSelector,
 			to: selector.raw,
 			role,
+			reason: options?.reason,
 		});
 		return true;
 	}
@@ -2001,7 +2001,10 @@ export class TurnRecovery {
 				}
 				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
 				if (!apiKey) continue;
-				return this.applyRetryFallbackCandidate(role, selector, currentSelector, options);
+				return this.applyRetryFallbackCandidate(role, selector, currentSelector, {
+					...options,
+					reason: `Request failed: ${failedMessage.errorMessage ?? "provider returned an error without details"}`,
+				});
 			}
 		}
 
@@ -2112,6 +2115,7 @@ export class TurnRecovery {
 			from: currentSelector,
 			to: baseSelector,
 			role: "fireworks-fast",
+			reason: "Request rejected by the Fast tier. Retrying on the Standard tier.",
 		});
 		return true;
 	}
@@ -2356,7 +2360,7 @@ export class TurnRecovery {
 			? formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel())
 			: undefined;
 		if (accountPolicyDenial && currentModel) {
-			switchedCredential = await this.#host.modelRegistry.authStorage.rotateSessionCredential(
+			switchedCredential = await this.#host.modelRegistry.authStorage.limits.rotate(
 				currentModel.provider,
 				this.#host.sessionId(),
 				{ error: errorMessage, modelId: currentModel.id },

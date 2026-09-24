@@ -843,7 +843,7 @@ export async function executeCodexWebRun(options: {
 }): Promise<typeof CodexStandaloneSearchResponseSchema.infer & { sources: SearchSource[] }> {
 	const signal = withHardTimeout(options.signal, CODEX_SEARCH_TIMEOUT_MS);
 	const sessionId = options.sessionId ?? crypto.randomUUID();
-	const seed = await options.authStorage.getOAuthAccess("openai-codex", sessionId, { signal });
+	const seed = await options.authStorage.oauth.access("openai-codex", sessionId, { signal });
 	if (!seed) {
 		throw new Error("No Codex OAuth credentials found. Login with 'omp /login openai-codex' to enable web search.");
 	}
@@ -1398,7 +1398,7 @@ export async function searchCodex(params: SearchParams): Promise<SearchResponse>
 		// its AuthStorage, so a lower-priority OAuth origin is irrelevant when
 		// that command source is configured.
 		const credentialSource = params.modelRegistry?.authStorage ?? params.authStorage;
-		const credentialOrigin = credentialSource.getCredentialOrigin("openai-codex");
+		const credentialOrigin = credentialSource.keys.source("openai-codex");
 		const hasCommandBackedKey = params.modelRegistry?.hasCommandBackedApiKey("openai-codex") === true;
 		if (!hasCommandBackedKey && (credentialOrigin?.kind === "oauth" || credentialOrigin?.kind === "env")) {
 			throw new SearchProviderError(
@@ -1414,7 +1414,7 @@ export async function searchCodex(params: SearchParams): Promise<SearchResponse>
 		};
 		const keyOrResolver = params.modelRegistry
 			? params.modelRegistry.resolver("openai-codex", resolverOptions)
-			: params.authStorage.resolver("openai-codex", resolverOptions);
+			: params.authStorage.keys.resolver("openai-codex", resolverOptions);
 		result = await withAuth(
 			keyOrResolver,
 			async accessToken => {
@@ -1434,7 +1434,7 @@ export async function searchCodex(params: SearchParams): Promise<SearchResponse>
 			},
 		);
 	} else {
-		const seed = await params.authStorage.getOAuthAccess("openai-codex", params.sessionId, {
+		const seed = await params.authStorage.oauth.access("openai-codex", params.sessionId, {
 			signal: params.signal,
 		});
 		if (!seed) {
@@ -1491,7 +1491,7 @@ export async function searchCodex(params: SearchParams): Promise<SearchResponse>
  * Checks whether Codex web search has an API key or OAuth credential.
  */
 export async function hasCodexSearch(authStorage: AuthStorage, model?: Model<Api>): Promise<boolean> {
-	return authStorage.hasAuth(model?.provider ?? "openai-codex");
+	return authStorage.keys.source(model?.provider ?? "openai-codex") !== undefined;
 }
 
 /** Search provider for OpenAI Codex web search. */

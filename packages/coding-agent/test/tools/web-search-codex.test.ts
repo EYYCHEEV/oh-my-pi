@@ -313,42 +313,50 @@ describe("searchCodex model selection", () => {
 	).toString("base64url");
 	const residencyToken = `header.${residencyPayload}.signature`;
 	const fakeAuthStorage = {
-		async getOAuthAccess() {
-			return {
-				accessToken: residencyToken,
-				accountId: "acct-test",
-			};
+		oauth: {
+			async access() {
+				return {
+					accessToken: residencyToken,
+					accountId: "acct-test",
+				};
+			},
 		},
-		hasOAuth() {
-			return true;
+		credentials: {
+			hasOAuth() {
+				return true;
+			},
 		},
 	} as unknown as AuthStorage;
 	const emailOnlyAuthStorage = {
-		async getOAuthAccess() {
-			return {
-				accessToken: "email-only-access-token",
-				email: "user@example.com",
-			};
+		oauth: {
+			async access() {
+				return {
+					accessToken: "email-only-access-token",
+					email: "user@example.com",
+				};
+			},
 		},
-		hasOAuth() {
-			return true;
+		credentials: {
+			hasOAuth() {
+				return true;
+			},
 		},
 	} as unknown as AuthStorage;
-	const proxyAuthStorage = {
-		hasAuth(provider: string) {
-			return provider === "openai-codex";
-		},
-		getCredentialOrigin() {
-			return { kind: "config" as const };
+	const proxyKeys = {
+		source(provider: string) {
+			return provider === "openai-codex" ? { kind: "config" as const, concrete: true } : undefined;
 		},
 		resolver() {
 			return async () => "test-proxy-key";
 		},
-	} as unknown as AuthStorage;
+	};
+	const proxyAuthStorage = { keys: proxyKeys } as unknown as AuthStorage;
 	const oauthOnlyAuthStorage = {
-		...proxyAuthStorage,
-		getCredentialOrigin() {
-			return { kind: "oauth" as const };
+		keys: {
+			...proxyKeys,
+			source() {
+				return { kind: "oauth" as const, concrete: true };
+			},
 		},
 	} as unknown as AuthStorage;
 	const proxyModelRegistry = {

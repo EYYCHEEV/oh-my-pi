@@ -627,7 +627,7 @@ export class SessionAdvisors {
 		for (const [slug, providers] of providersBySlug) {
 			if ((costs.get(slug) ?? 0) <= 0) continue;
 			for (const provider of providers) {
-				if (auth.hasOAuth(provider)) {
+				if (auth.credentials.hasOAuth(provider)) {
 					slugs.add(slug);
 					break;
 				}
@@ -1596,7 +1596,7 @@ export class SessionAdvisors {
 
 		const accountPolicyDenial = AIError.is(errorId, AIError.Flag.AccountPolicy);
 		if (accountPolicyDenial) {
-			const switched = await this.#host.modelRegistry.authStorage.rotateSessionCredential(
+			const switched = await this.#host.modelRegistry.authStorage.limits.rotate(
 				currentModel.provider,
 				advisor.providerSessionId,
 				{ error: message, modelId: currentModel.id, signal },
@@ -1615,7 +1615,7 @@ export class SessionAdvisors {
 		let usagePriorBlockedUntilMs: number | undefined;
 		let usagePriorBlockedUntilTimed: boolean | undefined;
 		if (usageLimit) {
-			const outcome = await this.#host.modelRegistry.authStorage.markUsageLimitReached(
+			const outcome = await this.#host.modelRegistry.authStorage.limits.markReached(
 				currentModel.provider,
 				advisor.providerSessionId,
 				{
@@ -1707,6 +1707,7 @@ export class SessionAdvisors {
 					from: currentSelector,
 					to: selector.raw,
 					role,
+					reason: `Advisor request failed: ${message}`,
 				});
 				return true;
 			}
