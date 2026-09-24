@@ -164,11 +164,15 @@ function renderUsageReports(
  */
 export async function buildUsageReportText(runtime: SlashCommandRuntime): Promise<string> {
 	const provider = runtime.session as SlashCommandRuntime["session"] & {
-		fetchUsageReports?: () => Promise<UsageReport[] | null>;
+		fetchUsageReports?: (
+			signal?: AbortSignal,
+			options?: { includePaused?: boolean },
+		) => Promise<UsageReport[] | null>;
 		getUsageReportingModelSelectors?: (reports: readonly UsageReport[]) => string[];
 	};
 	if (provider.fetchUsageReports) {
-		const reports = await provider.fetchUsageReports();
+		// Explicit `/usage` lists paused accounts too; only automatic readers skip them.
+		const reports = await provider.fetchUsageReports(undefined, { includePaused: true });
 		if (reports && reports.length > 0) {
 			const currentProvider = runtime.session.model?.provider;
 			const activeAccount = currentProvider

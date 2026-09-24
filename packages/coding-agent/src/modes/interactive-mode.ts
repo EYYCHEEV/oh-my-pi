@@ -6869,7 +6869,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#selectorController.handleSessionDeleteCommand();
 	}
 
-	showOAuthSelector(mode: "login" | "logout", providerId?: string): Promise<void> {
+	showOAuthSelector(mode: "login" | "logout" | "manage", providerId?: string): Promise<void> {
 		return this.#selectorController.showOAuthSelector(mode, providerId);
 	}
 

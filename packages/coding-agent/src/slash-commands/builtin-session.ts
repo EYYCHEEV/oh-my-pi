@@ -16,7 +16,7 @@ import { handleMcpAcp } from "./helpers/mcp";
 import { commandConsumed, errorMessage, parseSubcommand, usage } from "./helpers/parse";
 import { describeRedeemOutcome, toResetUsageAccounts } from "./helpers/reset-usage";
 import type { ResetUsageAccount } from "@oh-my-pi/pi-tui/overlays/reset-usage-selector";
-import { matchSessionPinAccounts, toSessionPinAccounts } from "./helpers/session-pin";
+import { matchSessionPinAccounts, pausedPinMessage, toSessionPinAccounts } from "./helpers/session-pin";
 import { launchStatsDashboard, parseStatsDashboardArgs } from "./helpers/stats-dashboard";
 import { handleTodoAcp } from "./helpers/todo";
 import { buildUsageReportText } from "./helpers/usage-report";
@@ -145,7 +145,9 @@ async function handleSessionPinCommand(
 	if (!selector) {
 		const lines = [`OAuth accounts for ${providerName}:`];
 		for (const account of accounts) {
-			lines.push(`${account.position + 1}. ${account.label}${account.active ? " (active)" : ""}`);
+			lines.push(
+				`${account.position + 1}. ${account.label}${account.active ? " (active)" : ""}${account.paused ? " (paused)" : ""}`,
+			);
 		}
 		lines.push("", "Pin one with `/session pin <number|email|account id>`.");
 		await output(lines.join("\n"));
@@ -166,6 +168,10 @@ async function handleSessionPinCommand(
 		return;
 	}
 	const account = matches[0];
+	if (account?.paused) {
+		await output(pausedPinMessage(account.label));
+		return;
+	}
 	if (!account || !session.pinCurrentProviderOAuthAccount(account.credentialId)) {
 		await output(`${account?.label ?? selector} is no longer available to pin.`);
 		return;
@@ -558,7 +564,7 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		name: "login",
 		icon: "signIn",
 		description: "Login with OAuth provider",
-		inlineHint: "[provider|redirect URL]",
+		inlineHint: "[provider|manage [provider]|redirect URL]",
 		allowArgs: true,
 		getTuiAutocompleteDescription: runtime =>
 			runtime.ctx.oauthManualInput.hasPending()
@@ -568,6 +574,14 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			const manualInput = runtime.ctx.oauthManualInput;
 			const args = command.args.trim();
 			if (args.length > 0) {
+				// `manage` is never a provider id or redirect URL; match it before
+				// either so it cannot be consumed as a manual OAuth callback.
+				const manage = /^manage(?:\s+(\S+))?$/.exec(args);
+				if (manage) {
+					void runtime.ctx.showOAuthSelector("manage", manage[1]);
+					runtime.ctx.editor.setText("");
+					return;
+				}
 				const matchedProvider = getOAuthProviders().find(provider => provider.id === args);
 				if (matchedProvider) {
 					if (manualInput.hasPending()) {

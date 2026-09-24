@@ -55,6 +55,23 @@ When a model has no credentials, `omp` tells you to run `/login` or set the prov
 
 For ClinePass, set `CLINE_API_KEY` or run `/login cline-pass` to open the Cline dashboard and validate a newly created API key. OMP refreshes membership from Cline's public recommended-models endpoint and bundles the current sixteen-model roster with Cline-authored limits, subscription pricing, modalities, and per-model reasoning controls for offline startup. New live ids remain selectable before regeneration, using conservative metadata rather than guessed controls. `omp usage` reports five-hour, weekly, and monthly quota windows. Free-tier models are marked `(free)` and work with the same key on any Cline account; subscription models show API-equivalent reference pricing, while streamed gateway cost remains authoritative for actual billed or discounted usage. Requests mirror Cline CLI client headers and a stable per-session task id, Qwen routes use Cline's prompt-cache shape, and Qwen3.7 Plus maps thinking levels to the gateway's token-budget field.
 
+### Pausing stored OAuth accounts
+
+When a provider has several stored OAuth accounts (for example several `openai-codex` logins), you can pause one without logging it out. A paused account keeps its tokens but is skipped by every automatic path: request routing, usage ranking, preflight token refresh, retry rotation, usage polling, saved-reset sweeps, Codex model discovery, and security-scan account picking. The pause is saved in `agent.db`, so every running `omp` process honors it on its next request without a restart. It lasts until you resume the account.
+
+- `/login manage [provider]` opens the account list. Each row reads `label · Active` or `label · Paused since <time>`, the account serving this session is marked, and Enter toggles the account in place. It warns when you pause the account serving this session or the last active account.
+- `omp auth list <provider> [--json]`, `omp auth pause <provider> <credential-id> [--json]`, and `omp auth resume <provider> <credential-id> [--json]` do the same from a script. Accounts are addressed only by their durable credential id (`17` or `#17`), never by list position. `--json` list output is `{provider, accounts: [{credentialId, position, label, fingerprint, state, pausedAt}]}`, where `fingerprint` is an identity hash (or `null` when the account has no email or account id) and `pausedAt` is an ISO timestamp or `null`. Pause and resume print `{ok, provider, credentialId, state, changed}`; errors print `{ok: false, error: {code, message}}` and exit nonzero. No verb ever prints tokens.
+
+If a session was pinned to (or had been routed to) an account that gets paused, its next request moves to another account and the session shows one warning naming both accounts. `/session pin` refuses a paused account. When every account of a provider is paused, requests fail with an error that names the resume command; they never fall back to an API key or environment token. Logging in again as a paused account keeps the pause, and the login message says so.
+
+Paused accounts are not refreshed, so a long pause can let the refresh token expire; after resuming, run `/login` again if the account reports a failed refresh. The explicit `/usage` and `omp usage` views still list paused accounts.
+
+### Restricting one process to one account
+
+`omp --oauth-account <provider>:<credential-id> ...` limits the whole process, including subagents, to exactly that stored account. It never rotates to another account, never falls back to an API key, environment token, or another provider's model, and fails fast on a usage limit instead of waiting for the reset. The restriction overrides a pause, so a paused account can still be probed. Startup exits nonzero before any model call when the value is malformed, the id is missing or disabled, an auth broker is configured, or the same provider also has `--api-key` or a `models.yml` `apiKey`.
+
+Pausing, `omp auth`, and `--oauth-account` are not supported with an auth broker; they stop with a clear message instead.
+
 ### Pinning a key in `models.yml`
 
 A custom provider's `apiKey` is resolved as **environment-variable-name-or-literal**: if the value names an existing environment variable, that variable's value is used; otherwise the string itself is the key. Prefixing the value with `!` runs it as a shell command and uses the trimmed stdout (see [Model and Provider Configuration](./models.md) for the full value syntax).

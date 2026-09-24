@@ -61,10 +61,22 @@ function selectOAuthAccount(
 	sessionId?: string,
 ): SecurityAccountRef | undefined {
 	const accounts = authStorage.oauth.accounts(provider, sessionId);
+	// Automatic picks honor the operator's pool controls: paused accounts and
+	// accounts outside an `--oauth-account` restriction are never chosen.
+	const eligible = accounts.filter(account => !account.excluded);
+	const requested =
+		requestedCredentialId === undefined
+			? undefined
+			: accounts.find(account => account.credentialId === requestedCredentialId);
+	if (requested?.excluded === "restricted") {
+		throw new Error(
+			`Security OAuth credential ${requestedCredentialId} is outside this process's --oauth-account restriction for ${provider}`,
+		);
+	}
 	const selected =
 		requestedCredentialId !== undefined
-			? accounts.find(account => account.credentialId === requestedCredentialId)
-			: (accounts.find(account => account.active) ?? (accounts.length === 1 ? accounts[0] : undefined));
+			? requested
+			: (eligible.find(account => account.active) ?? (eligible.length === 1 ? eligible[0] : undefined));
 	if (selected) {
 		const account: SecurityAccountRef = { provider, credentialId: selected.credentialId };
 		if (selected.accountId !== undefined) account.accountId = selected.accountId;
@@ -76,9 +88,14 @@ function selectOAuthAccount(
 	if (requestedCredentialId !== undefined) {
 		throw new Error(`Security OAuth credential ${requestedCredentialId} is not available for ${provider}`);
 	}
-	if (accounts.length > 0) {
+	if (eligible.length > 0) {
 		throw new Error(
 			`Multiple OAuth accounts are available for ${provider}; supply credentialId to pin one exact account`,
+		);
+	}
+	if (accounts.length > 0) {
+		throw new Error(
+			`Every stored OAuth account for ${provider} is paused; resume one with /login manage or supply credentialId`,
 		);
 	}
 	return undefined;

@@ -3,15 +3,22 @@ import { formatActiveAccountLabel } from "./active-oauth-account";
 
 import type { SessionPinAccount } from "@oh-my-pi/pi-tui/overlays/session-account-selector";
 
+/** Stable user-facing label for one stored OAuth account (shared by `/session pin`, `/login manage`, `omp auth`). */
+export function oauthAccountLabel(account: OAuthAccountSummary): string {
+	return (
+		(formatActiveAccountLabel(account) ?? account.enterpriseUrl?.trim()) ||
+		`OAuth credential #${account.credentialId}`
+	);
+}
+
 /** Add stable user-facing labels to provider account summaries. */
 export function toSessionPinAccounts(accounts: readonly OAuthAccountSummary[]): SessionPinAccount[] {
-	return accounts.map(account => {
-		const enterpriseUrl = account.enterpriseUrl?.trim();
-		return {
-			...account,
-			label: (formatActiveAccountLabel(account) ?? enterpriseUrl) || `OAuth credential #${account.credentialId}`,
-		};
-	});
+	return accounts.map(account => ({ ...account, label: oauthAccountLabel(account) }));
+}
+
+/** The `/session pin` refusal for an account the operator paused. */
+export function pausedPinMessage(label: string): string {
+	return `${label} is paused; resume it with /login manage first.`;
 }
 
 /** Match a `/session pin` selector by 1-based position or exact account identity. */

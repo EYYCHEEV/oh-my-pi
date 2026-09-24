@@ -15,6 +15,7 @@ import { Settings } from "../config/settings";
 import { discoverAuthStorage, loadCliExtensionProviders } from "../sdk";
 import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
 import { formatLoginIdentity, pickOAuthProvider, runTerminalOAuthLogin } from "./oauth-terminal";
+import { LOGIN_PAUSED_NOTICE } from "../slash-commands/helpers/account-pause";
 
 /**
  * Log in to `provider`, or to one picked interactively when omitted.
@@ -51,6 +52,7 @@ export async function runLoginCommand(provider: string | undefined): Promise<voi
 
 		const who = formatLoginIdentity(identity);
 		process.stdout.write(chalk.green(`\nLogged in to ${info.name}${who ? ` as ${who}` : ""}\n`));
+		if (identity.paused) process.stdout.write(chalk.yellow(`${LOGIN_PAUSED_NOTICE}\n`));
 		const broker = await resolveAuthBrokerConfig();
 		process.stdout.write(
 			chalk.dim(

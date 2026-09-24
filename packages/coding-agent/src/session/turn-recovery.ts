@@ -1753,6 +1753,8 @@ export class TurnRecovery {
 			return false;
 		}
 		if (!this.#host.settings.get("retry.modelFallback")) return false;
+		// An `--oauth-account` process stays on its one account: no fallback model.
+		if (this.#host.modelRegistry.authStorage.oauth.restriction(currentModel.provider) !== undefined) return false;
 
 		let fallback: { role: string; selector: RetryFallbackSelector; apiKey: string } | undefined;
 		const ceiling = this.#host.thinkingLevelCeiling();
@@ -2354,8 +2356,29 @@ export class TurnRecovery {
 			}
 		}
 
-		const allowModelFallback = options?.allowModelFallback !== false;
 		const currentModel = this.#host.model();
+		// `--oauth-account` pins this provider to one stored account for the
+		// process: there is no sibling to rotate to, waiting out the reset would
+		// stall a probe, and a model fallback would leave the restricted account.
+		const restrictedCredentialId = currentModel
+			? this.#host.modelRegistry.authStorage.oauth.restriction(currentModel.provider)
+			: undefined;
+		if (restrictedCredentialId !== undefined && recordedUsageLimitOutcome && !switchedCredential) {
+			message.errorMessage = `${errorMessage}\n\n${currentModel?.provider} is restricted to OAuth credential #${restrictedCredentialId} by --oauth-account, so this turn stops instead of waiting for the usage limit to reset or switching accounts.`;
+			await this.persistTerminalEmptyErrorTurn(message);
+			const attempt = this.#retryAttempt;
+			this.#retryAttempt = 0;
+			await this.#host.emitSessionEvent({
+				type: "auto_retry_end",
+				success: false,
+				attempt,
+				finalError: message.errorMessage,
+			});
+			this.#clearPendingRetryErrors();
+			this.resolveRetry();
+			return false;
+		}
+		const allowModelFallback = options?.allowModelFallback !== false && restrictedCredentialId === undefined;
 		const currentSelector = currentModel
 			? formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel())
 			: undefined;

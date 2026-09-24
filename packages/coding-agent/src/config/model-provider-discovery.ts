@@ -150,14 +150,24 @@ export function getOAuthCredentialsForProvider(authStorage: AuthStorage, provide
  * accounts that resolved would cache a partial catalog and hide the failed
  * account's models for the cache TTL. Aborting keeps the previous/bundled
  * catalog instead.
+ *
+ * Only auto-selectable accounts participate: a paused (or launch-restricted
+ * away) account is never refreshed here, so its failure cannot freeze
+ * discovery. Another process's pause is adopted before listing.
  */
 export async function resolveCodexDiscoveryAccounts(
 	authStorage: AuthStorage,
 	resolvedAccessToken: string,
 ): Promise<OpenAICodexAccount[] | null> {
-	const accesses = await authStorage.oauth.accessAll("openai-codex");
+	await authStorage.credentials.poll();
+	const eligible = authStorage.oauth.accounts("openai-codex").filter(account => !account.excluded);
+	const accesses = await Promise.all(
+		eligible.map(account => authStorage.oauth.accessById("openai-codex", account.credentialId)),
+	);
 	const accounts: OpenAICodexAccount[] = [];
 	for (const access of accesses) {
+		// A row removed between listing and access (logout race) contributes nothing.
+		if (!access) continue;
 		if (!access.ok) return null;
 		accounts.push({ accessToken: access.accessToken, accountId: access.accountId });
 	}

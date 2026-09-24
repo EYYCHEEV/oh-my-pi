@@ -105,6 +105,19 @@ function parseMaxTimeSeconds(value: string): number {
 	);
 }
 
+const OAUTH_ACCOUNT_RE = /^([^:\s]+):([1-9]\d*)$/;
+
+function parseOAuthAccount(value: string): { provider: string; credentialId: number } {
+	const match = OAUTH_ACCOUNT_RE.exec(value.trim());
+	const credentialId = match ? Number(match[2]) : Number.NaN;
+	if (!match || !Number.isSafeInteger(credentialId)) {
+		throw new CliUsageError(
+			`Invalid --oauth-account value: ${JSON.stringify(value)}. Expected <provider>:<credential-id>, e.g. openai-codex:17 (see \`omp auth list <provider>\`).`,
+		);
+	}
+	return { provider: match[1]!.toLowerCase(), credentialId };
+}
+
 /**
  * Setters for flags with string values. Most built-ins consume the next argv
  * token even when it starts with `-`; flags listed in
@@ -170,6 +183,9 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 	},
 	"--api-key": (result, value) => {
 		result.apiKey = value;
+	},
+	"--oauth-account": (result, value) => {
+		result.oauthAccount = parseOAuthAccount(value);
 	},
 	"--system-prompt": (result, value) => {
 		result.systemPrompt = value;

@@ -10,6 +10,9 @@
 
 - Added host-selected restricted extension sessions without product-specific tool policies.
 - Extensions can size complete context pages to the current tool execution's output budget.
+- Added `/login manage [provider]` and `omp auth list|pause|resume <provider> [credential-id] [--json]` to pause and resume stored OAuth accounts by durable credential id; paused accounts are skipped by routing, usage polling, reset sweeps, Codex model discovery, and security-scan account picking in every process.
+- Added `--oauth-account <provider>:<credential-id>` to restrict one process to exactly one stored OAuth account, with startup refusals for missing, disabled, broker-backed, or overridden accounts and a fail-fast usage-limit path that never falls back to another account or provider.
+- Sessions rerouted off a paused account show one warning naming both accounts; `/session pin` refuses paused accounts, and re-logging in as a paused account says it is still paused.
 
 ### Fixed
 

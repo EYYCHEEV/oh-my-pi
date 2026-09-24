@@ -627,13 +627,19 @@ export class CommandController {
 	async handleUsageCommand(reports?: UsageReport[] | null): Promise<void> {
 		let usageReports = reports ?? null;
 		if (!usageReports) {
-			const provider = this.ctx.session as { fetchUsageReports?: () => Promise<UsageReport[] | null> };
+			const provider = this.ctx.session as {
+				fetchUsageReports?: (
+					signal?: AbortSignal,
+					options?: { includePaused?: boolean },
+				) => Promise<UsageReport[] | null>;
+			};
 			if (!provider.fetchUsageReports) {
 				this.ctx.showWarning("Usage reporting is not configured for this session.");
 				return;
 			}
 			try {
-				usageReports = await provider.fetchUsageReports();
+				// Explicit `/usage` lists paused accounts too; only automatic readers skip them.
+				usageReports = await provider.fetchUsageReports(undefined, { includePaused: true });
 			} catch (error) {
 				this.ctx.showError(`Failed to fetch usage data: ${error instanceof Error ? error.message : String(error)}`);
 				return;

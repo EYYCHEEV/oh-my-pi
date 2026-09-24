@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added persisted cross-process OAuth account pauses (`credentials.pause/resume/isAutoSelectable`), a process-wide exact-account restriction (`oauth.restrict`), `OAuthAccountPoolError`, and `sessions.onReroute`; every automatic selection path skips paused accounts and fails closed when none remain.
+
 ### Fixed
 
 - Kimi Code K3 and K3-256k now use the native Responses API for tool-calling turns while preserving explicit Chat Completions and Anthropic overrides.

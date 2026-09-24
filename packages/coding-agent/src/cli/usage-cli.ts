@@ -1204,6 +1204,8 @@ export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 		const reports =
 			(await authStorage.usage.reports({
 				baseUrlResolver: provider => modelRegistry.getProviderBaseUrl(provider),
+				// Explicit usage diagnostics list paused accounts too.
+				includePaused: true,
 			})) ?? [];
 		// Reports are always fresh (broker-side fetch) but the account list can
 		// come from a disk-cached snapshot up to an hour old — revalidate so a

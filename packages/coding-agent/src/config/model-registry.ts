@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import type { ApiKeyResolver, FetchImpl, ResolvedApiKey, UsageProvider } from "@oh-my-pi/pi-ai";
 import { registerCustomApi, unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
+import { OAuthAccountPoolError } from "@oh-my-pi/pi-ai/error";
 import { registerOAuthProvider, unregisterOAuthProvider, unregisterOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth/types";
 import { setCodexAttestationProvider } from "@oh-my-pi/pi-ai/providers/openai-codex-attestation";
@@ -2868,7 +2869,15 @@ export class ModelRegistry {
 		if (this.#keylessProviders.has(provider) && this.authStorage.keys.source(provider) === undefined) {
 			return kNoAuth;
 		}
-		return this.authStorage.keys.peek(provider);
+		try {
+			return await this.authStorage.keys.peek(provider);
+		} catch (error) {
+			// Background discovery must not surface the operator's OAuth pool
+			// controls (e.g. a launch restriction overridden by a config key);
+			// the request path reports them with recovery guidance instead.
+			if (error instanceof OAuthAccountPoolError) return undefined;
+			throw error;
+		}
 	}
 
 	/**

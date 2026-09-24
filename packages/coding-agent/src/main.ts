@@ -1810,6 +1810,21 @@ export async function runRootCommand(
 			process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
 			process.exit(1);
 		}
+		if (parsedArgs.oauthAccount) {
+			// Phase 1: process-wide restriction before any model probe, registry
+			// discovery, or subagent can resolve a key. Refuses broker stores and
+			// missing/disabled ids here; overrides are checked after model resolution.
+			const { provider, credentialId } = parsedArgs.oauthAccount;
+			try {
+				authStorage.oauth.restrict(provider, credentialId);
+			} catch (error) {
+				const reason = error instanceof Error ? error.message : String(error);
+				process.stderr.write(
+					`${chalk.red(`Error: --oauth-account ${provider}:${credentialId} cannot be used: ${reason}`)}\n`,
+				);
+				process.exit(1);
+			}
+		}
 
 		const settingsInstance = await settingsPromise;
 		if (evaluation) {
@@ -2161,6 +2176,20 @@ export async function runRootCommand(
 			}
 			if (sessionOptions.model) {
 				authStorage.keys.setRuntime(sessionOptions.model.provider, parsedArgs.apiKey);
+			}
+		}
+
+		if (parsedArgs.oauthAccount) {
+			// Phase 2: `--api-key` and models.yml keys are installed by now; either
+			// would bypass the restricted account, so refuse to start.
+			const { provider, credentialId } = parsedArgs.oauthAccount;
+			const kind = authStorage.keys.source(provider)?.kind;
+			if (kind === "runtime" || kind === "config") {
+				const source = kind === "runtime" ? "--api-key" : "a models.yml apiKey";
+				process.stderr.write(
+					`${chalk.red(`Error: --oauth-account ${provider}:${credentialId} cannot be combined with ${source} for ${provider}.`)}\n`,
+				);
+				process.exit(1);
 			}
 		}
 

@@ -16,6 +16,8 @@ export interface SessionPinAccount {
 	orgId?: string;
 	orgName?: string;
 	active: boolean;
+	/** Paused accounts are listed for context but `/session pin` refuses them. */
+	paused?: boolean;
 	label: string;
 }
 
@@ -36,7 +38,7 @@ export class SessionAccountSelectorComponent extends OverlayPanel {
 			accountsByValue.set(value, account);
 			return {
 				value,
-				label: account.label,
+				label: account.paused ? `${account.label} (paused)` : account.label,
 				description: account.active ? "active for this session" : undefined,
 			};
 		});

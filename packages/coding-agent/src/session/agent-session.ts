@@ -70,6 +70,7 @@ import type {
 	MessageAttribution,
 	Model,
 	OAuthAccountIdentity,
+	OAuthAccountRerouteEvent,
 	ProviderResponseMetadata,
 	ProviderSessionState,
 	ResetCreditAccountStatus,
@@ -179,6 +180,7 @@ import type { CustomCommandContext } from "../extensibility/custom-commands/type
 import { SkillDescriptionCatalog } from "../extensibility/skill-descriptions";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
+import { oauthAccountLabel } from "../slash-commands/helpers/session-pin";
 import { normalizeToolEventInput, resolveToolEventInput } from "../extensibility/tool-event-input";
 import { GoalRuntime } from "../goals/runtime";
 import type { GoalModeState } from "../goals/state";
@@ -697,6 +699,7 @@ export class AgentSession {
 	#unsubscribeExtendedContext?: () => void;
 	#unsubscribeCodeMode?: () => void;
 	#unsubscribeEvalPreludeSettings?: () => void;
+	#unsubscribeOAuthReroute?: () => void;
 	#unsubscribeIdleCloseSetting?: () => void;
 	/** Last (enable, providerId) tuple resolved by `#syncAppendOnlyContext` — used to skip no-op invalidations. */
 	#lastAppendOnlyResolution?: { enable: boolean; providerId: string | undefined };
@@ -2271,6 +2274,11 @@ export class AgentSession {
 		// Re-evaluate append-only context mode when the setting changes at runtime.
 		this.#unsubscribeAppendOnly = onAppendOnlyModeChanged(_value => this.#syncAppendOnlyContext(this.model));
 		this.#unsubscribeModelRoles = onModelRolesChanged(() => this.#advisors.onModelRolesChanged());
+		// A paused sticky/pinned account reroutes this session once; the store
+		// fires process-wide, so match against the id live at event time.
+		this.#unsubscribeOAuthReroute = this.#modelRegistry.authStorage.sessions.onReroute(event =>
+			this.#warnOAuthAccountReroute(event),
+		);
 		// Re-derive the active model's effective context window when the
 		// extended-context setting flips at runtime: the registry re-clamps (or
 		// restores) premium long-context windows, and the live model object must
@@ -5508,6 +5516,8 @@ export class AgentSession {
 			this.#unsubscribeIdleCloseSetting();
 			this.#unsubscribeIdleCloseSetting = undefined;
 		}
+		this.#unsubscribeOAuthReroute?.();
+		this.#unsubscribeOAuthReroute = undefined;
 		this.#eventListeners = [];
 		this.#runStateListeners.clear();
 		this.#sessionChangeCallbacks.clear();
@@ -11781,7 +11791,26 @@ export class AgentSession {
 		return this.#stats.revision;
 	}
 
-	async fetchUsageReports(signal?: AbortSignal): Promise<UsageReport[] | null> {
+	#warnOAuthAccountReroute(event: OAuthAccountRerouteEvent): void {
+		if (event.sessionId !== this.sessionId) return;
+		const accounts = this.#modelRegistry.authStorage.oauth.accounts(event.provider);
+		const label = (credentialId: number): string => {
+			const account = accounts.find(candidate => candidate.credentialId === credentialId);
+			return account ? oauthAccountLabel(account) : `OAuth credential #${credentialId}`;
+		};
+		this.emitNotice(
+			"warning",
+			`${label(event.fromCredentialId)} is paused; this session switched to ${label(event.toCredentialId)} for ${event.provider}. Resume it with /login manage.`,
+			"oauth-account-pause",
+		);
+	}
+
+	/**
+	 * Provider usage reports. Automatic callers (status line, sweeps, quota
+	 * hints) keep the default, which skips paused accounts; explicit `/usage`
+	 * surfaces pass `includePaused`.
+	 */
+	async fetchUsageReports(signal?: AbortSignal, options?: { includePaused?: boolean }): Promise<UsageReport[] | null> {
 		const authStorage = this.#modelRegistry.authStorage;
 		if (!authStorage.usage.reports) return null;
 		const reports = await authStorage.usage.reports({
@@ -11797,6 +11826,7 @@ export class AgentSession {
 				return this.#modelRegistry.getProviderBaseUrl?.(provider);
 			},
 			signal,
+			includePaused: options?.includePaused,
 		});
 		// Every fresh usage snapshot doubles as the salvage-sweep heartbeat: the
 		// status line calls this every 5 minutes while the TUI is open.
@@ -11838,12 +11868,17 @@ export class AgentSession {
 
 	/**
 	 * Pin a stored OAuth account to the current model provider for this session.
-	 * Returns false while streaming or when the credential is no longer available.
+	 * Returns false while streaming, when the credential is no longer available,
+	 * or when the operator paused it (resume it with `/login manage` first).
 	 */
 	pinCurrentProviderOAuthAccount(credentialId: number): boolean {
 		const provider = this.model?.provider;
 		if (!provider || this.isStreaming) return false;
-		return this.#modelRegistry.authStorage.sessions.pin(provider, this.sessionId, credentialId);
+		const authStorage = this.#modelRegistry.authStorage;
+		if (authStorage.oauth.accounts(provider).find(account => account.credentialId === credentialId)?.paused) {
+			return false;
+		}
+		return authStorage.sessions.pin(provider, this.sessionId, credentialId);
 	}
 
 	/**
@@ -11861,12 +11896,19 @@ export class AgentSession {
 	/**
 	 * List live saved-reset eligibility. An explicit provider lists only that
 	 * provider; the public default aggregates Codex and Claude independently.
+	 * Automatic sweeps pass `autoSelectableOnly` so paused accounts are never
+	 * resolved; the explicit `/usage reset` listing does not.
 	 */
-	async listResetCredits(signal?: AbortSignal, provider?: string): Promise<ResetCreditAccountStatus[]> {
+	async listResetCredits(
+		signal?: AbortSignal,
+		provider?: string,
+		listOptions?: { autoSelectableOnly?: boolean },
+	): Promise<ResetCreditAccountStatus[]> {
 		const options = {
 			sessionId: this.sessionId,
 			baseUrlResolver: (candidate: string) => this.#modelRegistry.getProviderBaseUrl?.(candidate),
 			signal,
+			autoSelectableOnly: listOptions?.autoSelectableOnly,
 		};
 		if (provider) {
 			return this.#modelRegistry.authStorage.resets.list({ ...options, provider });
@@ -12135,7 +12177,9 @@ export class AgentSession {
 		const run = (async (): Promise<boolean> => {
 			await authStorage.usage.invalidate(provider);
 			const reports = await this.fetchUsageReports();
-			const statuses = await this.listResetCredits(AbortSignal.timeout(10_000), provider);
+			const statuses = await this.listResetCredits(AbortSignal.timeout(10_000), provider, {
+				autoSelectableOnly: true,
+			});
 			const plan =
 				provider === "anthropic"
 					? this.#planClaudeResets("blocked", reports, statuses, coordinator, activeBlockUnblockAtMs)
@@ -12190,7 +12234,9 @@ export class AgentSession {
 		coordinator.sweepPromise = (async () => {
 			if (codexEnabled) {
 				try {
-					const statuses = await this.listResetCredits(AbortSignal.timeout(10_000), "openai-codex");
+					const statuses = await this.listResetCredits(AbortSignal.timeout(10_000), "openai-codex", {
+						autoSelectableOnly: true,
+					});
 					const effectiveReports = overlayLiveResetCredits(reports, statuses);
 					const identity = this.#modelRegistry.authStorage.oauth.identity("openai-codex", this.sessionId);
 					const plan = this.#planCodexResets("sweep", effectiveReports, identity, coordinator);
@@ -12207,7 +12253,9 @@ export class AgentSession {
 			}
 			if (claudeEnabled) {
 				try {
-					const statuses = await this.listResetCredits(AbortSignal.timeout(10_000), "anthropic");
+					const statuses = await this.listResetCredits(AbortSignal.timeout(10_000), "anthropic", {
+						autoSelectableOnly: true,
+					});
 					const plan = this.#planClaudeResets("sweep", reports, statuses, coordinator);
 					if (
 						plan.actions.length > 0 &&

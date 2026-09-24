@@ -50,7 +50,7 @@ export class OAuthSelectorComponent extends OverlayPanel {
 	#visibleCount = 0;
 	/** Visible list window, shrunk by {@link setMaxHeight} on short screens. */
 	#maxVisible = OAUTH_SELECTOR_MAX_VISIBLE;
-	#mode: "login" | "logout";
+	#mode: "login" | "logout" | "manage";
 	#authStorage: OAuthSelectorAuthSource;
 	#onSelectCallback: (providerId: string) => void;
 	#onCancelCallback: () => void;
@@ -62,7 +62,7 @@ export class OAuthSelectorComponent extends OverlayPanel {
 	#spinnerInterval?: NodeJS.Timeout;
 	#validationGeneration: number = 0;
 	constructor(
-		mode: "login" | "logout",
+		mode: "login" | "logout" | "manage",
 		authStorage: OAuthSelectorAuthSource,
 		onSelect: (providerId: string) => void,
 		onCancel: () => void,
@@ -72,7 +72,13 @@ export class OAuthSelectorComponent extends OverlayPanel {
 			requestRender?: () => void;
 		},
 	) {
-		super(mode === "login" ? "Select provider to login" : "Select provider to logout");
+		super(
+			mode === "login"
+				? "Select provider to login"
+				: mode === "logout"
+					? "Select provider to logout"
+					: "Select provider to manage accounts",
+		);
 		this.#mode = mode;
 		this.#authStorage = authStorage;
 		this.#onSelectCallback = onSelect;
@@ -116,16 +122,17 @@ export class OAuthSelectorComponent extends OverlayPanel {
 		this.#updateList();
 	}
 	#hasSelectableAuth(providerId: string): boolean {
-		return this.#mode === "logout"
+		return this.#mode !== "login"
 			? this.#authStorage.credentials.has(providerId)
 			: this.#authStorage.keys.source(providerId) !== undefined;
 	}
 
 	#loadProviders(disabledProviders: readonly string[] = []): void {
 		const providers = getOAuthProviders();
-		if (this.#mode === "logout") {
-			// Logout stays unfiltered by `disabledProviders`: a now-disabled
-			// provider may still hold stored credentials worth removing.
+		if (this.#mode !== "login") {
+			// Logout and manage stay unfiltered by `disabledProviders`: a
+			// now-disabled provider may still hold stored credentials worth
+			// removing or pausing.
 			this.#menu.setItems(providers.filter(provider => this.#hasSelectableAuth(provider.id)));
 		} else {
 			const disabled = new Set(disabledProviders);
@@ -339,7 +346,9 @@ export class OAuthSelectorComponent extends OverlayPanel {
 				this.#menu.items.length === 0
 					? this.#mode === "login"
 						? "No OAuth providers available"
-						: "No stored provider credentials to log out"
+						: this.#mode === "logout"
+							? "No stored provider credentials to log out"
+							: "No stored provider credentials to manage"
 					: "No matching providers";
 			this.#listContainer.addChild(new TruncatedText(theme.fg("muted", message), 0, 0));
 		}

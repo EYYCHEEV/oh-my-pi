@@ -33,6 +33,10 @@ export const launchHelp = {
 		"plan-yolo-into": Flags.string({ description: 'Target model for plan-yolo execution (default the "smol" role)' }),
 		provider: Flags.string({ description: "Provider to use (legacy; prefer --model)" }),
 		"api-key": Flags.string({ description: "API key (defaults to env vars)" }),
+		"oauth-account": Flags.string({
+			description:
+				"Restrict this process to one stored OAuth account, <provider>:<credential-id> (see `omp auth list`); never rotates or falls back",
+		}),
 		"system-prompt": Flags.string({ description: "System prompt (default: coding assistant prompt)" }),
 		"system-prompt-template": Flags.string({
 			description: "Handlebars system prompt template (mutually exclusive with --system-prompt)",

@@ -69,7 +69,13 @@ import { FileSessionStorage } from "../../session/session-storage";
 import { toLogoutAccounts } from "../../slash-commands/helpers/logout";
 import type { LogoutAccount } from "@oh-my-pi/pi-tui/overlays/logout-account-selector";
 import { describeRedeemOutcome, toResetUsageAccounts } from "../../slash-commands/helpers/reset-usage";
-import { toSessionPinAccounts } from "../../slash-commands/helpers/session-pin";
+import {
+	ACCOUNT_PAUSE_BROKER_MESSAGE,
+	LOGIN_PAUSED_NOTICE,
+	pauseWarnings,
+	toAccountPauseRows,
+} from "../../slash-commands/helpers/account-pause";
+import { pausedPinMessage, toSessionPinAccounts } from "../../slash-commands/helpers/session-pin";
 import { loadDailyActivity } from "../../stats/activity-client";
 import {
 	AUTO_THINKING,
@@ -120,6 +126,7 @@ import { ReadToolGroupComponent } from "@oh-my-pi/pi-tui/chat/read-tool-group";
 import { type ResetUsageAccount, ResetUsageSelectorComponent } from "@oh-my-pi/pi-tui/overlays/reset-usage-selector";
 import { type BranchVariantPath, RewindSelectorComponent } from "@oh-my-pi/pi-tui/overlays/rewind-selector";
 import { renderSegmentTrack } from "@oh-my-pi/pi-tui/chrome/segment-track";
+import { AccountPauseSelectorComponent } from "@oh-my-pi/pi-tui/overlays/account-pause-selector";
 import { SessionAccountSelectorComponent } from "@oh-my-pi/pi-tui/overlays/session-account-selector";
 import { SessionSelectorComponent, type SessionSelectorOptions } from "@oh-my-pi/pi-tui/overlays/session-selector";
 import { SettingsSelectorComponent } from "@oh-my-pi/pi-tui/overlays/settings-selector";
@@ -2154,6 +2161,7 @@ export class SelectorController {
 					0,
 				),
 			);
+			if (identity?.paused) block.addChild(new Text(theme.fg("warning", LOGIN_PAUSED_NOTICE), 1, 0));
 			block.addChild(new Text(theme.fg("dim", `Credentials saved to ${getAgentDbPath()}`), 1, 0));
 			this.ctx.present(block);
 			return true;
@@ -2249,13 +2257,75 @@ export class SelectorController {
 		});
 	}
 
-	async showOAuthSelector(mode: "login" | "logout", providerId?: string): Promise<void> {
+	async #showOAuthAccountManageSelector(providerId: string): Promise<void> {
+		const authStorage = this.ctx.session.modelRegistry.authStorage;
+		if (!authStorage.credentials.supportsPause()) {
+			this.ctx.showError(ACCOUNT_PAUSE_BROKER_MESSAGE);
+			return;
+		}
+		try {
+			await authStorage.credentials.reload();
+		} catch (error: unknown) {
+			this.ctx.showError(
+				`Could not load stored credentials: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return;
+		}
+		const sessionId = this.ctx.session.sessionId;
+		const accounts = authStorage.oauth.accounts(providerId, sessionId);
+		if (accounts.length === 0) {
+			this.ctx.showError(`No stored OAuth accounts for ${providerId} to manage. Use /login to add one.`);
+			return;
+		}
+		const { getOAuthProviders } = loadProviderAuthUi();
+		const providerName = getOAuthProviders().find(candidate => candidate.id === providerId)?.name ?? providerId;
+
+		this.showSelector(done => {
+			const selector = new AccountPauseSelectorComponent(
+				providerName,
+				toAccountPauseRows(accounts),
+				row => {
+					try {
+						if (row.paused) authStorage.credentials.resume(providerId, row.credentialId);
+						else authStorage.credentials.pause(providerId, row.credentialId);
+					} catch (error: unknown) {
+						this.ctx.showError(
+							`Could not ${row.paused ? "resume" : "pause"} ${row.label}: ${error instanceof Error ? error.message : String(error)}`,
+						);
+					}
+					const updated = authStorage.oauth.accounts(providerId, sessionId);
+					selector.setAccounts(toAccountPauseRows(updated));
+					if (!row.paused) {
+						for (const warning of pauseWarnings(providerId, updated, row.credentialId)) {
+							this.ctx.showWarning(warning);
+						}
+					}
+					this.ctx.statusLine.invalidate();
+					this.ctx.ui.requestRender();
+				},
+				() => {
+					done();
+					this.ctx.ui.requestRender();
+				},
+			);
+			return { component: selector, focus: selector };
+		});
+	}
+
+	async showOAuthSelector(mode: "login" | "logout" | "manage", providerId?: string): Promise<void> {
+		const authStorage = this.ctx.session.modelRegistry.authStorage;
+		if (mode === "manage" && !authStorage.credentials.supportsPause()) {
+			this.ctx.showError(ACCOUNT_PAUSE_BROKER_MESSAGE);
+			return;
+		}
+		const openProvider = (selectedProviderId: string): Promise<unknown> =>
+			mode === "login"
+				? this.#handleOAuthLogin(selectedProviderId)
+				: mode === "logout"
+					? this.#showOAuthLogoutAccountSelector(selectedProviderId)
+					: this.#showOAuthAccountManageSelector(selectedProviderId);
 		if (providerId) {
-			if (mode === "login") {
-				await this.#handleOAuthLogin(providerId);
-			} else {
-				await this.#showOAuthLogoutAccountSelector(providerId);
-			}
+			await openProvider(providerId);
 			return;
 		}
 
@@ -2263,11 +2333,22 @@ export class SelectorController {
 		if (mode === "logout") {
 			await this.#refreshOAuthProviderAuthState();
 			const oauthProviders = getOAuthProviders();
-			const loggedInProviders = oauthProviders.filter(provider =>
-				this.ctx.session.modelRegistry.authStorage.credentials.has(provider.id),
-			);
+			const loggedInProviders = oauthProviders.filter(provider => authStorage.credentials.has(provider.id));
 			if (loggedInProviders.length === 0) {
 				this.ctx.showStatus("No stored provider credentials to log out. Remove env or config auth at its source.");
+				return;
+			}
+		} else if (mode === "manage") {
+			try {
+				await authStorage.credentials.reload();
+			} catch (error: unknown) {
+				this.ctx.showError(
+					`Could not load stored credentials: ${error instanceof Error ? error.message : String(error)}`,
+				);
+				return;
+			}
+			if (!getOAuthProviders().some(provider => authStorage.credentials.hasOAuth(provider.id))) {
+				this.ctx.showStatus("No stored OAuth accounts to manage. Use /login to add one.");
 				return;
 			}
 		}
@@ -2275,15 +2356,11 @@ export class SelectorController {
 		this.showSelector(done => {
 			const selector = new OAuthSelectorComponent(
 				mode,
-				this.ctx.session.modelRegistry.authStorage,
+				authStorage,
 				async (selectedProviderId: string) => {
 					selector.stopValidation();
 					done();
-					if (mode === "login") {
-						await this.#handleOAuthLogin(selectedProviderId);
-					} else {
-						await this.#showOAuthLogoutAccountSelector(selectedProviderId);
-					}
+					await openProvider(selectedProviderId);
 				},
 				() => {
 					selector.stopValidation();
@@ -2292,13 +2369,18 @@ export class SelectorController {
 				},
 				{
 					disabledProviders: settings.get("disabledProviders"),
-					validateAuth: async (selectedProviderId: string) => {
-						const apiKey = await this.ctx.session.modelRegistry.getApiKeyForProvider(
-							selectedProviderId,
-							this.ctx.session.sessionId,
-						);
-						return !!apiKey;
-					},
+					// Manage never resolves keys: validation would refresh tokens
+					// (and fail on paused providers) just to decorate the list.
+					validateAuth:
+						mode === "manage"
+							? undefined
+							: async (selectedProviderId: string) => {
+									const apiKey = await this.ctx.session.modelRegistry.getApiKeyForProvider(
+										selectedProviderId,
+										this.ctx.session.sessionId,
+									);
+									return !!apiKey;
+								},
 					requestRender: () => {
 						this.ctx.ui.requestRender();
 					},
@@ -2348,6 +2430,10 @@ export class SelectorController {
 				accounts,
 				account => {
 					done();
+					if (account.paused) {
+						this.ctx.showWarning(pausedPinMessage(account.label));
+						return;
+					}
 					if (!session.pinCurrentProviderOAuthAccount(account.credentialId)) {
 						this.ctx.showWarning(`${account.label} is no longer available to pin.`);
 						return;

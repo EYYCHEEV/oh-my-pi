@@ -43,6 +43,8 @@ export interface Args {
 	planYoloInto?: string;
 	maxTime?: number;
 	apiKey?: string;
+	/** `--oauth-account <provider>:<credential-id>`: restrict this process to one stored OAuth account. */
+	oauthAccount?: { provider: string; credentialId: number };
 	systemPrompt?: string;
 	systemPromptTemplate?: string;
 	appendSystemPrompt?: string;
