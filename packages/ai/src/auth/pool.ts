@@ -1,8 +1,10 @@
 import { logger } from "@oh-my-pi/pi-utils";
+import * as AIError from "../error";
 import { resolveCredentialIdentityKey, serializeCredential } from "./sqlite-credential-store";
 import type { BlockStoreHealth } from "./blocks";
+import { isEligible, oauthAccountRestriction } from "./eligibility";
 import type { AccountPolicies } from "./policy";
-import type { AuthCredentialStore } from "./store";
+import { type AuthCredentialStore, hasCredentialPauses } from "./store";
 import { REMOTE_REFRESH_SENTINEL } from "./types";
 import type {
 	ApiKeyCredential,
@@ -12,6 +14,7 @@ import type {
 	AuthCredentialSnapshotEntry,
 	AuthStorageData,
 	CredentialDisabledEvent,
+	CredentialPauseResult,
 	CredentialsApi,
 	DisabledCredentialSummary,
 	OAuthCredential,
@@ -88,6 +91,8 @@ export class CredentialPool implements CredentialsApi {
 	#generation = 1;
 	#generationListeners: Set<(generation: number) => void> = new Set();
 	#closed = false;
+	/** Credential row id -> pausedAtMs for every paused active row; `undefined` until first loaded. */
+	#paused: Map<number, number> | undefined;
 
 	#store: AuthCredentialStore;
 	#options: CredentialPoolOptions;
@@ -248,6 +253,7 @@ export class CredentialPool implements CredentialsApi {
 	 * Reload credentials from storage.
 	 */
 	async reload(): Promise<void> {
+		if (this.#reloadPauses()) this.bump("pauses");
 		let records: StoredAuthCredential[];
 		try {
 			records = this.#store.listAuthCredentials();
@@ -285,6 +291,84 @@ export class CredentialPool implements CredentialsApi {
 		for (const provider of removedProviders) {
 			this.replace(provider, []);
 		}
+	}
+
+	/**
+	 * Re-read persisted pauses. Returns true when the paused set changed. Stores
+	 * without pause support (auth broker) keep an empty set.
+	 */
+	#reloadPauses(): boolean {
+		const pauses = hasCredentialPauses(this.#store) ? this.#store.listCredentialPauses() : [];
+		const next = new Map(pauses.map(pause => [pause.credentialId, pause.pausedAtMs]));
+		const previous = this.#paused;
+		this.#paused = next;
+		if (!previous || previous.size !== next.size) return previous !== undefined || next.size > 0;
+		for (const [id, pausedAtMs] of next) {
+			if (previous.get(id) !== pausedAtMs) return true;
+		}
+		return false;
+	}
+
+	/** The paused set, loaded lazily for pools that never ran {@link CredentialPool.reload}. */
+	#pausedIds(): Map<number, number> {
+		if (!this.#paused) this.#reloadPauses();
+		return this.#paused!;
+	}
+
+	/** Whether the backing store persists account pauses (false for auth-broker stores). */
+	supportsPause(): boolean {
+		return hasCredentialPauses(this.#store);
+	}
+
+	/** Epoch ms the row was paused, or undefined when it is not paused. */
+	pausedAt(credentialId: number): number | undefined {
+		return this.#pausedIds().get(credentialId);
+	}
+
+	/**
+	 * The single auto-selection policy check (pause + launch restriction).
+	 * Every automatic reader filters stored rows through this.
+	 */
+	isAutoSelectable(provider: string, credentialId: number): boolean {
+		return isEligible(provider, credentialId, this.#pausedIds());
+	}
+
+	/** {@link CredentialPool.isAutoSelectable} for the row at `index` of `entries(provider)`. */
+	isAutoSelectableAt(provider: string, index: number): boolean {
+		const id = this.entries(provider)[index]?.id;
+		return id !== undefined && this.isAutoSelectable(provider, id);
+	}
+
+	/** Launch-restriction check alone, for explicit surfaces that may show paused accounts. */
+	passesRestriction(provider: string, credentialId: number): boolean {
+		const restricted = oauthAccountRestriction(provider);
+		return restricted === undefined || restricted === credentialId;
+	}
+
+	pause(provider: string, credentialId: number): CredentialPauseResult {
+		return this.#setPaused(provider, credentialId, true);
+	}
+
+	resume(provider: string, credentialId: number): CredentialPauseResult {
+		return this.#setPaused(provider, credentialId, false);
+	}
+
+	#setPaused(provider: string, credentialId: number, paused: boolean): CredentialPauseResult {
+		if (!hasCredentialPauses(this.#store)) {
+			throw new AIError.OAuthAccountPoolError(
+				"broker_unsupported",
+				provider,
+				`Pausing ${provider} OAuth accounts is not supported with an auth broker.`,
+				credentialId,
+			);
+		}
+		const target = this.reloadProvider(provider).find(row => row.id === credentialId);
+		if (target?.credential.type !== "oauth") {
+			throw new AIError.ConfigurationError(`No active ${provider} OAuth account #${credentialId}.`);
+		}
+		const changed = this.#store.setCredentialPaused(credentialId, paused, Date.now());
+		if (this.#reloadPauses()) this.bump(paused ? "pause" : "resume");
+		return { changed };
 	}
 
 	/**

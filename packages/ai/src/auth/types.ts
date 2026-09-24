@@ -109,6 +109,32 @@ export interface StoredCredentialBlock {
 	updatedAtMs?: number;
 }
 
+/** One persisted operator pause of an active OAuth credential row. */
+export interface StoredCredentialPause {
+	/** SQLite row id of the credential (auth_credentials.id). */
+	credentialId: number;
+	/** Epoch milliseconds when the pause was recorded. */
+	pausedAtMs: number;
+}
+
+/** Result of {@link CredentialsApi.pause} / {@link CredentialsApi.resume}. */
+export interface CredentialPauseResult {
+	/** False when the account was already in the requested state. */
+	changed: boolean;
+}
+
+/**
+ * A session's sticky or pinned OAuth account was excluded by a pause and the
+ * request was served by another account. Emitted once per switch.
+ */
+export interface OAuthAccountRerouteEvent {
+	provider: string;
+	sessionId: string;
+	fromCredentialId: number;
+	toCredentialId: number;
+	reason: "paused";
+}
+
 /**
  * Identity slice of a disabled (soft-deleted) credential tombstone — cause and
  * account identity only, never token material. Surfaced so auto-disabled
@@ -499,6 +525,8 @@ export interface OAuthLoginIdentity {
 	accountId?: string;
 	orgId?: string;
 	orgName?: string;
+	/** Set when the logged-in account's stored row is paused; the pause survives re-login. */
+	paused?: true;
 }
 
 /** Failure while resolving access to one OAuth account. */
@@ -550,6 +578,12 @@ export interface OAuthAccountSummary {
 	orgName?: string;
 	/** True when this account is the session-sticky OAuth credential requested by `listOAuthAccounts`. */
 	active: boolean;
+	/** True when the operator paused this account (see {@link CredentialsApi.pause}). */
+	paused?: boolean;
+	/** Epoch ms the pause was recorded; present only while paused. */
+	pausedAtMs?: number;
+	/** Why automatic selection skips this account; absent when it is auto-selectable. */
+	excluded?: "paused" | "restricted";
 }
 /** Scope a matching-key invalidation to a session or signal. */
 export interface InvalidateCredentialMatchingOptions {
@@ -697,6 +731,8 @@ export type ListResetCreditsOptions = {
 	sessionId?: string;
 	baseUrlResolver?: (provider: string) => string | undefined;
 	signal?: AbortSignal;
+	/** Skip accounts that automatic selection may not use (paused, or excluded by the launch restriction). */
+	autoSelectableOnly?: boolean;
 };
 
 /** Select a saved reset credit and optional provider endpoint. */
@@ -825,6 +861,18 @@ export interface CredentialsApi {
 	 * (the broker server's HTTP handler does this).
 	 */
 	snapshot(): AuthCredentialSnapshot;
+	/** Whether the backing store persists account pauses (false for auth-broker stores). */
+	supportsPause(): boolean;
+	/**
+	 * Pause one stored OAuth account for every automatic reader in every process
+	 * sharing the store. Never changes token bytes. Idempotent. Throws
+	 * `OAuthAccountPoolError("broker_unsupported")` when the store cannot persist pauses.
+	 */
+	pause(provider: string, credentialId: number): CredentialPauseResult;
+	/** Undo {@link CredentialsApi.pause}. Idempotent; same failure modes. */
+	resume(provider: string, credentialId: number): CredentialPauseResult;
+	/** Whether automatic selection may pick this row (not paused, not excluded by the launch restriction). */
+	isAutoSelectable(provider: string, credentialId: number): boolean;
 }
 
 /** Provider API-key resolution and runtime/configuration overrides. */
@@ -1015,6 +1063,15 @@ export interface OAuthApi {
 		provider: string,
 		options: StoredOAuthRefreshOptions<T>,
 	): Promise<StoredOAuthRefreshResult<T>>;
+	/**
+	 * Restrict every `AuthStorage` in this process to one stored OAuth account for
+	 * `provider`: no sibling rotation and no non-OAuth fallback. Throws
+	 * `OAuthAccountPoolError` with `broker_unsupported`, `restricted_missing` (not an
+	 * active OAuth row), or `restricted_unavailable` (runtime/config key override set).
+	 */
+	restrict(provider: string, credentialId: number): void;
+	/** The credential id `provider` is restricted to in this process, if any. */
+	restriction(provider: string): number | undefined;
 }
 
 /** Session credential affinity operations. */
@@ -1049,6 +1106,10 @@ export interface SessionsApi {
 	 * headroom, before considering a model/provider fallback.
 	 */
 	release(provider: string, sessionId: string): boolean;
+	/**
+	 * Subscribe to {@link OAuthAccountRerouteEvent}s. Returns an unsubscribe function.
+	 */
+	onReroute(listener: (event: OAuthAccountRerouteEvent) => void): () => void;
 }
 
 /** Usage reporting, observation, and provider configuration. */
@@ -1057,6 +1118,8 @@ export interface UsageApi {
 	reports(options?: {
 		baseUrlResolver?: (provider: Provider) => string | undefined;
 		signal?: AbortSignal;
+		/** Include paused accounts (explicit `/usage` surfaces). Never lifts the launch restriction. */
+		includePaused?: boolean;
 	}): Promise<UsageReport[] | null>;
 	/** Ingest provider usage limits from response headers. */
 	ingestHeaders(

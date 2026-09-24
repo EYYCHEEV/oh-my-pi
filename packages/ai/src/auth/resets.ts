@@ -48,7 +48,12 @@ export class ResetCredits implements ResetsApi {
 	async list(options?: ListResetCreditsOptions): Promise<ResetCreditAccountStatus[]> {
 		const provider = options?.provider ?? "openai-codex";
 		if (provider !== "openai-codex" && provider !== "anthropic") return [];
-		const accounts = this.#deps.oauth.accounts(provider, options?.sessionId);
+		// Adopt another process's pause first. Automatic sweeps skip every excluded
+		// account; explicit listings still honor the launch restriction.
+		await this.#deps.pool.adoptExternalChanges();
+		const accounts = this.#deps.oauth
+			.accounts(provider, options?.sessionId)
+			.filter(account => (options?.autoSelectableOnly ? !account.excluded : account.excluded !== "restricted"));
 		const baseUrl = options?.baseUrlResolver?.(provider);
 		return Promise.all(
 			accounts.map(async (account): Promise<ResetCreditAccountStatus> => {

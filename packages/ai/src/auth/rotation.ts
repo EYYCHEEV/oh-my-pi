@@ -174,7 +174,9 @@ export class RateLimits implements LimitsApi {
 			.map((credential, index) => ({ credential, index }))
 			.filter(
 				(entry): entry is { credential: AuthCredential; index: number } =>
-					entry.credential.type === credentialType && entry.index !== targetIndex,
+					entry.credential.type === credentialType &&
+					entry.index !== targetIndex &&
+					this.#deps.pool.isAutoSelectableAt(provider, entry.index),
 			);
 
 		let retryAtMs: number | undefined;
@@ -452,6 +454,7 @@ export class RateLimits implements LimitsApi {
 				(credential, index) =>
 					credential.type === sessionCredential.type &&
 					index !== sessionCredential.index &&
+					this.#deps.pool.isAutoSelectableAt(provider, index) &&
 					!this.#deps.blocks.isBlocked(provider, providerKey, index),
 			);
 		const target = this.#deps.pool.entries(provider)[sessionCredential.index];

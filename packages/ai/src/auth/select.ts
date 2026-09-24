@@ -7,6 +7,7 @@ import type { CredentialRankingContext, CredentialRankingStrategy, PlanGate, Usa
 import type { RankingStrategyResolver } from "../usage/registry";
 import type { SessionAffinity } from "./affinity";
 import { credentialBlockScopesForRequest, DEFAULT_BLOCK_MS, providerTypeKey, type CredentialBlocks } from "./blocks";
+import { oauthAccountRestriction } from "./eligibility";
 import type { AccountPolicies } from "./policy";
 import { authCredentialEquals, type CredentialPool } from "./pool";
 import {
@@ -36,6 +37,12 @@ import {
 /** Temporary block after a transient OAuth refresh failure. */
 export const OAUTH_REFRESH_FAILURE_BACKOFF_MS = 5 * 60 * 1000;
 
+/** Token-free reasons surfaced by a failed launch-restricted resolution. */
+const REFRESH_FAILURE_REASON = {
+	definitive: "token refresh failed definitively and the account was disabled (run /login to restore it)",
+	transient: "token refresh failed transiently",
+} as const;
+
 /** OAuth bearer and credential chosen for a request, with its durable row id when available. */
 export type OAuthResolutionResult = { apiKey: string; credential: OAuthCredential; credentialId?: number };
 
@@ -53,6 +60,8 @@ export type TryOAuthOptions = {
 	blockScopes?: readonly string[];
 	/** When false, a definitive failure of THIS credential returns undefined instead of falling back to the ranked/round-robin selector (target-only resolution). */
 	allowFallback?: boolean;
+	/** Observes a refresh failure of THIS credential (definitive or transient); never receives token bytes. */
+	onRefreshFailure?: (definitive: boolean) => void;
 };
 
 /** Services consulted by CredentialSelector for policy, usage, blocks, refresh, and session affinity. */
@@ -147,6 +156,7 @@ export class CredentialSelector {
 					index: number;
 				} => {
 					if (entry.credential.type !== type) return false;
+					if (!this.#deps.pool.isAutoSelectableAt(provider, entry.index)) return false;
 					return filter?.(entry.credential) ?? true;
 				},
 			);
@@ -501,17 +511,134 @@ export class CredentialSelector {
 		sessionId?: string,
 		options?: AuthApiKeyOptions,
 	): Promise<OAuthResolutionResult | undefined> {
+		return this.#resolveOAuth(provider, sessionId, options, true);
+	}
+
+	/**
+	 * `emitReroute` is false for the definitive-failure re-resolve inside
+	 * {@link CredentialSelector.tryOAuth}: the outermost call already captured
+	 * the paused sticky and reports the final account once.
+	 */
+	async #resolveOAuth(
+		provider: string,
+		sessionId: string | undefined,
+		options: AuthApiKeyOptions | undefined,
+		emitReroute: boolean,
+	): Promise<OAuthResolutionResult | undefined> {
 		await this.#deps.pool.adoptExternalChanges();
-		const credentials = this.#deps.pool
+		const allCredentials = this.#deps.pool
 			.credentials(provider)
 			.map((credential, index) => ({ credential, index }))
 			.filter((entry): entry is { credential: OAuthCredential; index: number } => entry.credential.type === "oauth");
+		// Policies validate against every stored account, so a policy matching a
+		// paused account neither throws nor ranks it.
 		this.#deps.policies.validateFor(
 			provider,
-			credentials.map(entry => entry.credential),
+			allCredentials.map(entry => entry.credential),
 		);
 
-		if (credentials.length === 0) return undefined;
+		const restrictedId = oauthAccountRestriction(provider);
+		if (restrictedId !== undefined) {
+			return this.#resolveRestrictedOAuth(provider, restrictedId, allCredentials, sessionId, options);
+		}
+		if (allCredentials.length === 0) return undefined;
+		const credentials = allCredentials.filter(entry => this.#deps.pool.isAutoSelectableAt(provider, entry.index));
+		if (credentials.length === 0) {
+			throw new AIError.OAuthAccountPoolError(
+				"all_paused",
+				provider,
+				`All ${allCredentials.length} ${provider} OAuth account(s) are paused. Resume one with \`omp auth resume ${provider} <id>\` or /login manage.`,
+			);
+		}
+		const sticky = this.#deps.affinity.get(provider, sessionId);
+		const pausedStickyId =
+			sticky?.type === "oauth" && !credentials.some(entry => entry.index === sticky.index)
+				? sticky.credentialId
+				: undefined;
+		const resolved = await this.#resolveAmong(provider, credentials, sessionId, options, { strictOnly: false });
+		if (
+			emitReroute &&
+			sessionId &&
+			pausedStickyId !== undefined &&
+			resolved?.credentialId !== undefined &&
+			resolved.credentialId !== pausedStickyId
+		) {
+			this.#deps.affinity.emitReroute({
+				provider,
+				sessionId,
+				fromCredentialId: pausedStickyId,
+				toCredentialId: resolved.credentialId,
+				reason: "paused",
+			});
+		}
+		return resolved;
+	}
+
+	/**
+	 * Launch restriction: only the target row, strict pass only (never the
+	 * allow-blocked last resort), no sibling re-resolve. Always returns a
+	 * credential or throws, so callers never fall through to other sources.
+	 */
+	async #resolveRestrictedOAuth(
+		provider: string,
+		targetId: number,
+		allCredentials: OAuthSelection[],
+		sessionId: string | undefined,
+		options: AuthApiKeyOptions | undefined,
+	): Promise<OAuthResolutionResult> {
+		const flag = `--oauth-account ${provider}:${targetId}`;
+		const entries = this.#deps.pool.entries(provider);
+		const target = allCredentials.find(entry => entries[entry.index]?.id === targetId);
+		if (!target) {
+			throw new AIError.OAuthAccountPoolError(
+				"restricted_missing",
+				provider,
+				`OAuth account #${targetId} for ${provider} (${flag}) is missing or disabled. Run \`omp auth list ${provider}\` and relaunch with a stored account id.`,
+				targetId,
+			);
+		}
+		const failures: string[] = [];
+		const resolved = await this.#resolveAmong(provider, [target], sessionId, options, { strictOnly: true, failures });
+		if (resolved) return resolved;
+
+		let reason = failures.at(-1);
+		const index = this.#deps.pool.entries(provider).findIndex(entry => entry.id === targetId);
+		if (index !== -1) {
+			const strategy = this.#deps.strategies(provider);
+			const rankingContext: CredentialRankingContext = { modelId: options?.modelId };
+			const blockScopes = credentialBlockScopesForRequest(
+				provider,
+				strategy,
+				rankingContext,
+				strategy?.blockScope?.(rankingContext),
+			);
+			const blockedUntil = this.#deps.blocks.blockedUntil(
+				provider,
+				providerTypeKey(provider, "oauth"),
+				index,
+				blockScopes,
+			);
+			if (blockedUntil !== undefined) {
+				const blocked = `blocked until ${new Date(blockedUntil).toISOString()}`;
+				reason = reason ? `${blocked} after ${reason}` : blocked;
+			}
+		}
+		throw new AIError.OAuthAccountPoolError(
+			"restricted_unavailable",
+			provider,
+			`OAuth account #${targetId} for ${provider} (${flag}) is unavailable: ${reason ?? "it failed the usage or plan check"}. The launch restriction allows no other account or credential.`,
+			targetId,
+		);
+	}
+
+	/** Rank, refresh, and try `credentials` (already filtered to auto-selectable rows). */
+	async #resolveAmong(
+		provider: string,
+		credentials: OAuthSelection[],
+		sessionId: string | undefined,
+		options: AuthApiKeyOptions | undefined,
+		mode: { strictOnly: boolean; failures?: string[] },
+	): Promise<OAuthResolutionResult | undefined> {
 		this.#deps.policies.validateUsageCapability(provider, this.#deps.usage.canFetchOAuthUsage(provider));
 
 		const providerKey = providerTypeKey(provider, "oauth");
@@ -541,8 +668,13 @@ export class CredentialSelector {
 		const policyReserveEnabled = hasAccountPolicy && canFetchPolicyUsage;
 		const checkUsage =
 			(strategy !== undefined || policyReserveEnabled) && (credentials.length > 1 || hasPlanRequirement);
-		const sessionCredential = this.#deps.affinity.get(provider, sessionId);
-		const sessionPreferredIndex = sessionCredential?.type === "oauth" ? sessionCredential.index : undefined;
+		// A sticky row outside `credentials` (paused or restricted away) is no preference at all.
+		const stickyCredential = this.#deps.affinity.get(provider, sessionId);
+		const sessionCredential =
+			stickyCredential?.type === "oauth" && credentials.some(entry => entry.index === stickyCredential.index)
+				? stickyCredential
+				: undefined;
+		const sessionPreferredIndex = sessionCredential?.index;
 		const sessionPreferredCredential =
 			sessionPreferredIndex !== undefined
 				? credentials.find(entry => entry.index === sessionPreferredIndex)?.credential
@@ -712,6 +844,9 @@ export class CredentialSelector {
 						error: errorMsg,
 						isDefinitiveFailure,
 					});
+					mode.failures?.push(
+						isDefinitiveFailure ? REFRESH_FAILURE_REASON.definitive : REFRESH_FAILURE_REASON.transient,
+					);
 					if (isDefinitiveFailure) {
 						// A dead grant discovered during preflight must be disabled here too —
 						// the final candidate pass below skips every `preflightFailures` entry,
@@ -800,12 +935,18 @@ export class CredentialSelector {
 			allowBlocked: boolean;
 			enforcePlanRequirement: boolean;
 			enforceAccounts: boolean;
-		}> = [
-			{ allowBlocked: false, enforcePlanRequirement, enforceAccounts },
-			{ allowBlocked: true, enforcePlanRequirement, enforceAccounts },
-		];
-		if (enforcePlanRequirement) passes.push({ allowBlocked: true, enforcePlanRequirement: false, enforceAccounts });
-		if (enforceAccounts) passes.push({ allowBlocked: true, enforcePlanRequirement: false, enforceAccounts: false });
+		}> = mode.strictOnly
+			? [{ allowBlocked: false, enforcePlanRequirement, enforceAccounts: false }]
+			: [
+					{ allowBlocked: false, enforcePlanRequirement, enforceAccounts },
+					{ allowBlocked: true, enforcePlanRequirement, enforceAccounts },
+				];
+		if (!mode.strictOnly && enforcePlanRequirement) {
+			passes.push({ allowBlocked: true, enforcePlanRequirement: false, enforceAccounts });
+		}
+		if (!mode.strictOnly && enforceAccounts) {
+			passes.push({ allowBlocked: true, enforcePlanRequirement: false, enforceAccounts: false });
+		}
 
 		for (const pass of passes) {
 			for (const candidate of candidates) {
@@ -824,6 +965,13 @@ export class CredentialSelector {
 					rankingContext,
 					blockScope,
 					blockScopes,
+					allowFallback: !mode.strictOnly,
+					onRefreshFailure: mode.failures
+						? definitive =>
+								mode.failures?.push(
+									definitive ? REFRESH_FAILURE_REASON.definitive : REFRESH_FAILURE_REASON.transient,
+								)
+						: undefined,
 				});
 				if (resolved) return resolved;
 			}
@@ -888,6 +1036,7 @@ export class CredentialSelector {
 			blockScope,
 			blockScopes,
 			allowFallback = true,
+			onRefreshFailure,
 		} = usageOptions;
 		if (
 			!allowBlocked &&
@@ -1019,6 +1168,7 @@ export class CredentialSelector {
 			// Keep credentials for transient errors (network, 5xx) and block temporarily
 			const isDefinitiveFailure = AIError.isDefinitiveOAuthFailure(errorMsg);
 
+			onRefreshFailure?.(isDefinitiveFailure);
 			logger.warn("OAuth token refresh failed", {
 				provider,
 				index: selection.index,
@@ -1035,12 +1185,12 @@ export class CredentialSelector {
 					errorMsg,
 				);
 				if (outcome === "peer-rotated") {
-					if (allowFallback) return this.resolveOAuth(provider, sessionId, options);
+					if (allowFallback) return this.#resolveOAuth(provider, sessionId, options, false);
 					return undefined;
 				}
 				if (outcome === "cas-lost") return undefined;
 				if (this.#deps.pool.credentials(provider).some(credential => credential.type === "oauth")) {
-					if (allowFallback) return this.resolveOAuth(provider, sessionId, options);
+					if (allowFallback) return this.#resolveOAuth(provider, sessionId, options, false);
 				}
 			} else {
 				// Block temporarily for transient failures (5 minutes)

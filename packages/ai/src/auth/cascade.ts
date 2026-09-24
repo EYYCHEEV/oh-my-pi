@@ -6,6 +6,7 @@ import { isUsageLimitOutcome } from "../error/rate-limit";
 import { AUTHENTICATED_SENTINEL } from "../registry/types";
 import { getEnvApiKey, getEnvApiKeyName } from "../stream";
 import type { SessionAffinity } from "./affinity";
+import { oauthAccountRestriction } from "./eligibility";
 import type { CredentialPool } from "./pool";
 import type { CredentialSelector } from "./select";
 import type { AuthApiKeyOptions, AuthCredential, AuthSource, AuthSourceOptions, KeysApi, LimitsApi } from "./types";
@@ -17,6 +18,22 @@ import type { AuthApiKeyOptions, AuthCredential, AuthSource, AuthSourceOptions, 
 async function defaultConfigValueResolver(config: string): Promise<string | undefined> {
 	const envValue = $envExact(config);
 	return envValue || config;
+}
+
+/**
+ * Refuse a runtime (`--api-key`) or config (`models.yml`) key override for a
+ * provider the process is restricted to one OAuth account for. Overrides stay
+ * settable; enforcement lives where keys are read.
+ */
+export function assertNoRestrictedOverride(overrides: KeyOverrides, provider: string): void {
+	const restrictedId = oauthAccountRestriction(provider);
+	if (restrictedId === undefined || !overrides.has(provider)) return;
+	throw new AIError.OAuthAccountPoolError(
+		"restricted_unavailable",
+		provider,
+		`OAuth account #${restrictedId} for ${provider} (--oauth-account ${provider}:${restrictedId}) is unavailable: a runtime --api-key or models.yml apiKey override is set for ${provider}. Remove the override or drop --oauth-account.`,
+		restrictedId,
+	);
 }
 
 /** Runtime (--api-key) and config (models.yml) key overrides plus the config-value resolver. */
@@ -214,6 +231,7 @@ export class KeyCascade implements KeysApi {
 	 * credential to reach the correct host.
 	 */
 	async peek(provider: string): Promise<string | undefined> {
+		assertNoRestrictedOverride(this.#deps.overrides, provider);
 		const runtimeKey = this.#deps.overrides.runtimeKey(provider);
 		if (runtimeKey) {
 			return runtimeKey;
@@ -225,6 +243,11 @@ export class KeyCascade implements KeysApi {
 		}
 
 		await this.#deps.pool.adoptExternalChanges();
+
+		// Pool controls never fall through: a restricted provider peeks only its
+		// target, and a provider whose every OAuth account is paused has no key.
+		const restricted = oauthAccountRestriction(provider) !== undefined;
+		const hasStoredOAuth = this.#deps.pool.hasOAuth(provider);
 
 		// Precedence: a deliberate OAuth/login credential wins, then an explicit env var,
 		// then a stored static api_key (which may be a stale broker-migrated copy) as a last resort.
@@ -242,6 +265,7 @@ export class KeyCascade implements KeysApi {
 				return oauthSelection.credential.access;
 			}
 		}
+		if (restricted || (hasStoredOAuth && !oauthSelection)) return undefined;
 
 		const loginApiKeySelection = this.#deps.selector.selectByType(
 			provider,
@@ -290,6 +314,7 @@ export class KeyCascade implements KeysApi {
 		options?: AuthApiKeyOptions,
 		onCredentialId?: (id: number) => void,
 	): Promise<string | undefined> {
+		assertNoRestrictedOverride(this.#deps.overrides, provider);
 		// Runtime override takes highest priority
 		const runtimeKey = this.#deps.overrides.runtimeKey(provider);
 		if (runtimeKey) {
@@ -308,6 +333,8 @@ export class KeyCascade implements KeysApi {
 
 		// Precedence: a deliberate OAuth/login credential wins, then an explicit env var,
 		// then a stored static api_key (which may be a stale broker-migrated copy) as a last resort.
+		// Selection throws OAuthAccountPoolError when every OAuth account is paused
+		// or the restricted target is unusable, so neither falls through below.
 		const oauthResolved = await this.#deps.selector.resolveOAuth(provider, sessionId, options);
 		if (oauthResolved) {
 			if (oauthResolved.credentialId !== undefined) onCredentialId?.(oauthResolved.credentialId);

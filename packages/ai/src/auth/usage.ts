@@ -23,6 +23,7 @@ import { raceSignal } from "./abort";
 import type { SessionAffinity } from "./affinity";
 import type { CredentialBlocks } from "./blocks";
 import type { KeyOverrides } from "./cascade";
+import { oauthAccountRestriction } from "./eligibility";
 import {
 	buildUsageCredential,
 	oauthUsageRequest,
@@ -533,7 +534,15 @@ export class UsageService implements UsageApi {
 	/** Collect resolved account requests for all configured usage providers. */
 	async #collectUsageRequests(options?: {
 		baseUrlResolver?: (provider: Provider) => string | undefined;
+		includePaused?: boolean;
 	}): Promise<UsageRequestDescriptor[]> {
+		const pool = this.#deps.pool;
+		// Automatic polls skip paused accounts; explicit `/usage` may include them,
+		// but never past the launch restriction.
+		const selectable = (provider: string, credentialId: number): boolean =>
+			options?.includePaused
+				? pool.passesRestriction(provider, credentialId)
+				: pool.isAutoSelectable(provider, credentialId);
 		const requests: UsageRequestDescriptor[] = [];
 		const providers = new Set<string>([
 			...this.#deps.pool.providers(),
@@ -561,15 +570,20 @@ export class UsageService implements UsageApi {
 			const oauthTokenEnv = authPolicyFor(providerId)?.oauthTokenEnv;
 			if (oauthTokenEnv) {
 				let hasUsableStoredOAuthCredential = false;
+				let hasExcludedStoredOAuthCredential = false;
 				for (const entry of entries) {
 					if (entry.credential.type !== "oauth") continue;
+					if (!selectable(providerId, entry.id)) {
+						hasExcludedStoredOAuthCredential = true;
+						continue;
+					}
 					const request = oauthUsageRequest(provider, entry.credential, baseUrl);
 					if (providerImpl.supports && !providerImpl.supports(request)) continue;
 					requests.push(request);
 					hasUsableStoredOAuthCredential = true;
 				}
 				const oauthToken = $pickenv(...oauthTokenEnv);
-				if (!hasUsableStoredOAuthCredential && oauthToken) {
+				if (!hasUsableStoredOAuthCredential && !hasExcludedStoredOAuthCredential && oauthToken) {
 					const request = usageRequest(provider, { type: "oauth", accessToken: oauthToken }, baseUrl);
 					if (!providerImpl.supports || providerImpl.supports(request)) requests.push(request);
 				}
@@ -577,6 +591,7 @@ export class UsageService implements UsageApi {
 			}
 
 			if (entries.length === 0) {
+				if (oauthAccountRestriction(providerId) !== undefined) continue;
 				const runtimeKey = this.#deps.overrides.runtimeKey(providerId);
 				const extensionUsageKeyConfig = this.#runtimeUsageProviderOverrides.get(provider)?.apiKey,
 					extensionUsageKey = extensionUsageKeyConfig
@@ -592,6 +607,7 @@ export class UsageService implements UsageApi {
 			}
 
 			for (const entry of entries) {
+				if (!selectable(providerId, entry.id)) continue;
 				const credential = entry.credential;
 				let request: UsageRequestDescriptor;
 				if (credential.type === "api_key") {
@@ -715,6 +731,8 @@ export class UsageService implements UsageApi {
 		baseUrlResolver?: (provider: Provider) => string | undefined;
 		/** Caller's cancel signal; only rejects this caller, never the shared upstream fetch. */
 		signal?: AbortSignal;
+		/** Include paused accounts (explicit `/usage`); the launch restriction still applies. */
+		includePaused?: boolean;
 	}): Promise<UsageReport[] | null> {
 		// Store-level hook > local per-credential fan-out. `RemoteAuthCredentialStore`
 		// implements the hook so a gateway backed by a broker routes usage to the
@@ -739,6 +757,8 @@ export class UsageService implements UsageApi {
 			if (reports) this.#deps.blocks.reconcileReports(reports);
 			return reports;
 		}
+		// Adopt another process's pause before choosing which accounts to poll.
+		await this.#deps.pool.adoptExternalChanges();
 		const requests = await this.#collectUsageRequests(options);
 		if (requests.length === 0) return [];
 

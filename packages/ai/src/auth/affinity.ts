@@ -1,6 +1,6 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import { getEnvApiKey } from "../stream";
-import type { AuthCredential, OAuthCredential, SessionsApi } from "./types";
+import type { AuthCredential, OAuthAccountRerouteEvent, OAuthCredential, SessionsApi } from "./types";
 import type { AuthCredentialStore } from "./store";
 import type { CredentialPool } from "./pool";
 import type { KeyOverrides } from "./cascade";
@@ -25,6 +25,7 @@ export class SessionAffinity implements SessionsApi {
 	#store: AuthCredentialStore;
 	#pool: CredentialPool;
 	#overrides: KeyOverrides;
+	#rerouteListeners: Set<(event: OAuthAccountRerouteEvent) => void> = new Set();
 
 	constructor(store: AuthCredentialStore, pool: CredentialPool, overrides: KeyOverrides) {
 		this.#store = store;
@@ -171,9 +172,13 @@ export class SessionAffinity implements SessionsApi {
 	}
 
 	activeOAuth(provider: string, sessionId?: string): OAuthCredential | undefined {
-		const allCredentials = this.#pool.credentials(provider);
-		const oauthCredentials = allCredentials.filter((c): c is OAuthCredential => c.type === "oauth");
-		if (oauthCredentials.length === 0) return undefined;
+		const allEntries = this.#pool.entries(provider);
+		// Paused or restricted-away accounts never serve requests, so they never own the identity either.
+		const eligibleOAuth = allEntries.filter(
+			(entry): entry is { id: number; credential: OAuthCredential } =>
+				entry.credential.type === "oauth" && this.#pool.isAutoSelectable(provider, entry.id),
+		);
+		if (eligibleOAuth.length === 0) return undefined;
 
 		// Runtime / config overrides bypass OAuth account_uuid attribution — the
 		// caller is authenticating with an explicit key, not the broker's OAuth.
@@ -196,8 +201,10 @@ export class SessionAffinity implements SessionsApi {
 		// CredentialSelector.tryOAuth), not the OAuth-only subset, so dereferencing it into the
 		// filtered array would be off-by-N when any non-OAuth credential precedes the
 		// OAuth ones (e.g. [api_key, oauth_A, oauth_B] stored order).
-		const stickyCredential = sessionPref?.type === "oauth" ? allCredentials[sessionPref.index] : undefined;
-		return stickyCredential?.type === "oauth" ? stickyCredential : oauthCredentials[0];
+		const stickyEntry = sessionPref?.type === "oauth" ? allEntries[sessionPref.index] : undefined;
+		return stickyEntry?.credential.type === "oauth" && this.#pool.isAutoSelectable(provider, stickyEntry.id)
+			? stickyEntry.credential
+			: eligibleOAuth[0]!.credential;
 	}
 
 	/**
@@ -263,5 +270,24 @@ export class SessionAffinity implements SessionsApi {
 		if (!this.get(provider, sessionId)) return false;
 		this.clear(provider, sessionId);
 		return true;
+	}
+
+	/** Subscribe to paused-account reroutes. Returns an idempotent unsubscribe. */
+	onReroute(listener: (event: OAuthAccountRerouteEvent) => void): () => void {
+		this.#rerouteListeners.add(listener);
+		return () => {
+			this.#rerouteListeners.delete(listener);
+		};
+	}
+
+	/** Notify subscribers that a paused sticky account was replaced; listener failures are isolated. */
+	emitReroute(event: OAuthAccountRerouteEvent): void {
+		for (const listener of Array.from(this.#rerouteListeners)) {
+			try {
+				listener(event);
+			} catch (error) {
+				logger.debug("OAuth reroute listener failed", { provider: event.provider, error: String(error) });
+			}
+		}
 	}
 }

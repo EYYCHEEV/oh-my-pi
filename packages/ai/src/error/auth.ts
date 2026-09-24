@@ -19,6 +19,36 @@ export class MissingApiKeyError extends Error {
 	}
 }
 
+/** Why {@link OAuthAccountPoolError} refused to hand out a stored OAuth account. */
+export type OAuthAccountPoolErrorCode =
+	| "all_paused"
+	| "restricted_unavailable"
+	| "restricted_missing"
+	| "broker_unsupported";
+
+/**
+ * The operator's OAuth account pool controls (pause, exact-account launch
+ * restriction) left no usable account, or the backing store cannot honor them.
+ * Raised from shared credential selection so every caller (key cascade, OAuth
+ * access, auth retry, web search) fails closed instead of falling through to
+ * another credential source. Messages name the provider and the recovery step
+ * and never include token bytes.
+ */
+export class OAuthAccountPoolError extends Error {
+	readonly code: OAuthAccountPoolErrorCode;
+	readonly provider: string;
+	readonly credentialId: number | undefined;
+
+	constructor(code: OAuthAccountPoolErrorCode, provider: string, message: string, credentialId?: number) {
+		super(message);
+		this.name = "OAuthAccountPoolError";
+		this.code = code;
+		this.provider = provider;
+		this.credentialId = credentialId;
+		attach(this, create(Flag.AuthFailed));
+	}
+}
+
 /** A user-facing login flow required an `onPrompt` callback that was not supplied. */
 export class OnPromptRequiredError extends Error {
 	constructor(providerLabel: string) {

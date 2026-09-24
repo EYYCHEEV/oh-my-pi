@@ -15,6 +15,7 @@ import type {
 	OAuthCredential,
 	StoredAuthCredential,
 	StoredCredentialBlock,
+	StoredCredentialPause,
 } from "./types";
 
 /** Owner and timestamp that fence a durable credential refresh lease. */
@@ -117,6 +118,20 @@ export interface CredentialRefreshLeaseStore {
 	getCredentialRefreshLeaseExpiresAt(credentialId: number): number | undefined;
 	releaseCredentialRefreshLease(credentialId: number, owner: string): void;
 	renewCredentialRefreshLease(credentialId: number, owner: string, expiresAtMs: number): boolean;
+}
+
+/**
+ * Durable operator pauses of OAuth credential rows, keyed by row id. Absent on
+ * the auth-broker `RemoteAuthCredentialStore`, which is the fail-closed signal.
+ */
+export interface CredentialPauseStore {
+	/** Pauses of active (not disabled) rows, ordered by credential id. */
+	listCredentialPauses(): StoredCredentialPause[];
+	/**
+	 * Pause (`paused: true`) or resume one active OAuth row. Returns whether the
+	 * pause state changed. Throws for missing, disabled, or non-OAuth rows.
+	 */
+	setCredentialPaused(credentialId: number, paused: boolean, nowMs: number): boolean;
 }
 
 /** Usage history and client-observed request accounting. */
@@ -226,6 +241,7 @@ export interface AuthCredentialStore
 		CredentialCacheStore,
 		Partial<CredentialBlockStore>,
 		Partial<CredentialRefreshLeaseStore>,
+		Partial<CredentialPauseStore>,
 		Partial<UsageLedgerStore>,
 		Partial<CredentialUpstream> {}
 
@@ -239,4 +255,9 @@ export function hasRefreshLeases(
 		typeof store.releaseCredentialRefreshLease === "function" &&
 		typeof store.renewCredentialRefreshLease === "function"
 	);
+}
+
+/** Narrow stores that persist operator account pauses. */
+export function hasCredentialPauses(store: AuthCredentialStore): store is AuthCredentialStore & CredentialPauseStore {
+	return typeof store.listCredentialPauses === "function" && typeof store.setCredentialPaused === "function";
 }

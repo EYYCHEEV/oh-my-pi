@@ -25,6 +25,7 @@ import type {
 	OAuthCredential,
 	StoredAuthCredential,
 	StoredCredentialBlock,
+	StoredCredentialPause,
 } from "./types";
 import type { OAuthCredentials } from "../registry/oauth/types";
 import type { Provider } from "../types";
@@ -624,6 +625,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			this.#createAuthCredentialsTable();
 			this.#createAuthCredentialBlocksTable();
 			this.#createAuthCredentialRefreshLeasesTable();
+			this.#createAuthCredentialPausesTable();
 			this.#createAuthCredentialBlockCompatibilityObjects();
 			this.#createAuthChangeTrackingObjects();
 			this.#writeAuthSchemaVersion(AUTH_SCHEMA_VERSION);
@@ -644,6 +646,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#createAuthCredentialIndexes();
 		this.#createAuthCredentialBlocksTable();
 		this.#createAuthCredentialRefreshLeasesTable();
+		this.#createAuthCredentialPausesTable();
 		if (schemaVersion <= AUTH_SCHEMA_VERSION) {
 			this.#createAuthCredentialBlockCompatibilityObjects();
 		}
@@ -758,7 +761,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			);
 			INSERT OR IGNORE INTO auth_local_change_revision (id, revision) VALUES (1, 0);
 		`);
-		for (const table of ["auth_credentials", "auth_credential_blocks"] as const) {
+		for (const table of ["auth_credentials", "auth_credential_blocks", "auth_credential_pauses"] as const) {
 			for (const event of ["INSERT", "UPDATE", "DELETE"] as const) {
 				this.#db.run(`
 					CREATE TRIGGER IF NOT EXISTS auth_change_revision_${table}_${event.toLowerCase()}
@@ -949,6 +952,20 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 
 	#createAuthCredentialRefreshLeasesTable(): void {
 		SqliteAuthCredentialStore.#ensureAuthCredentialRefreshLeasesTable(this.#db);
+	}
+
+	/**
+	 * Operator account pauses, keyed by credential row id like blocks. Additive
+	 * and idempotent on every boot so the schema version stays unchanged; rows
+	 * of disabled credentials are ignored on read rather than cleaned at boot.
+	 */
+	#createAuthCredentialPausesTable(): void {
+		this.#db.run(`
+			CREATE TABLE IF NOT EXISTS auth_credential_pauses (
+				credential_id INTEGER PRIMARY KEY,
+				paused_at_ms INTEGER NOT NULL
+			) WITHOUT ROWID;
+		`);
 	}
 
 	#migrateAuthSchema(fromVersion: number): void {
@@ -1693,6 +1710,36 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		} catch {
 			// Ignore lease release failures; expired leases are stealable.
 		}
+	}
+
+	listCredentialPauses(): StoredCredentialPause[] {
+		const rows = this.#db
+			.query(
+				`SELECT p.credential_id, p.paused_at_ms
+				FROM auth_credential_pauses p
+				JOIN auth_credentials c ON c.id = p.credential_id
+				WHERE c.disabled_cause IS NULL
+				ORDER BY p.credential_id ASC`,
+			)
+			.all() as Array<{ credential_id: number; paused_at_ms: number }>;
+		return rows.map(row => ({ credentialId: row.credential_id, pausedAtMs: row.paused_at_ms }));
+	}
+
+	setCredentialPaused(credentialId: number, paused: boolean, nowMs: number): boolean {
+		const apply = this.#db.transaction((id: number, pause: boolean, atMs: number): boolean => {
+			const row = this.#db
+				.query("SELECT credential_type FROM auth_credentials WHERE id = ? AND disabled_cause IS NULL")
+				.get(id) as { credential_type?: string } | null;
+			if (!row) throw new Error(`No active credential #${id}`);
+			if (row.credential_type !== "oauth") throw new Error(`Credential #${id} is not an OAuth account`);
+			const result = pause
+				? this.#db
+						.query("INSERT OR IGNORE INTO auth_credential_pauses (credential_id, paused_at_ms) VALUES (?, ?)")
+						.run(id, atMs)
+				: this.#db.query("DELETE FROM auth_credential_pauses WHERE credential_id = ?").run(id);
+			return result.changes > 0;
+		});
+		return apply(credentialId, paused, nowMs);
 	}
 
 	recordUsageSnapshots(entries: UsageHistoryEntry[]): void {

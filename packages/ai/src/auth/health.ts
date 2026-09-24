@@ -102,10 +102,12 @@ export class CredentialHealth implements HealthApi {
 			return { state: "unknown", accounts: [] };
 		}
 
-		const stored = this.#deps.pool.entries(provider).map((entry, index) => ({
-			entry,
-			index,
-		}));
+		// Adopt another process's pause before deciding which accounts form the pool.
+		await this.#deps.pool.adoptExternalChanges();
+		const stored = this.#deps.pool
+			.entries(provider)
+			.map((entry, index) => ({ entry, index }))
+			.filter(({ entry }) => this.#deps.pool.isAutoSelectable(provider, entry.id));
 		const oauthPool = stored.filter(({ entry }) => entry.credential.type === "oauth");
 		const apiKeyPool = stored.filter(({ entry }) => entry.credential.type === "api_key");
 		const loginApiKeyPool = apiKeyPool.filter(

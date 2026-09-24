@@ -5,7 +5,8 @@ import { getOAuthProvider } from "../registry/oauth";
 import type { OAuthProviderId } from "../registry/oauth/types";
 import { providerTypeKey } from "./blocks";
 import type { SessionAffinity } from "./affinity";
-import type { KeyOverrides } from "./cascade";
+import { assertNoRestrictedOverride, type KeyOverrides } from "./cascade";
+import { oauthAccountRestriction, setOAuthAccountRestriction } from "./eligibility";
 import type { AccountPolicies } from "./policy";
 import type { CredentialPool } from "./pool";
 import type { OAuthRefresher } from "./refresh";
@@ -105,13 +106,20 @@ export class OAuthAccounts implements OAuthApi {
 		// Use pool.upsertOAuth to upsert the new credential.
 		// Any legacy api_key rows from older versions will be cleaned up so they do not
 		// shadow the new OAuth row, while preserving other active OAuth credentials.
-		await this.#deps.pool.upsertOAuth(def.storeCredentialsAs ?? provider, newCredential);
+		const storeAs = def.storeCredentialsAs ?? provider;
+		await this.#deps.pool.upsertOAuth(storeAs, newCredential);
+		// Re-login updates a same-identity row in place, so an operator pause survives it.
+		const storedId = this.#deps.pool
+			.entries(storeAs)
+			.find(entry => entry.credential.type === "oauth" && entry.credential.access === newCredential.access)?.id;
+		const paused = storedId !== undefined && this.#deps.pool.pausedAt(storedId) !== undefined;
 		return {
 			type: "oauth",
 			email: newCredential.email,
 			accountId: newCredential.accountId,
 			orgId: newCredential.orgId,
 			orgName: newCredential.orgName,
+			...(paused ? { paused: true as const } : {}),
 		};
 	}
 
@@ -135,6 +143,7 @@ export class OAuthAccounts implements OAuthApi {
 		// user has pinned an API key, they expect the OAuth identity to be
 		// suppressed (same contract as account identity lookup).
 		if (this.#deps.overrides.has(provider)) {
+			assertNoRestrictedOverride(this.#deps.overrides, provider);
 			return undefined;
 		}
 		const resolved = await this.#deps.selector.resolveOAuth(provider, sessionId, options);
@@ -239,17 +248,28 @@ export class OAuthAccounts implements OAuthApi {
 			sessionCredential?.type === "oauth"
 				? this.#deps.pool.entries(provider)[sessionCredential.index]?.id
 				: undefined;
-		return this.#getStoredOAuthSelections(provider).map((selection, position) => ({
-			position,
-			credentialId: selection.credentialId,
-			accountId: selection.credential.accountId,
-			email: selection.credential.email,
-			projectId: selection.credential.projectId,
-			enterpriseUrl: selection.credential.enterpriseUrl,
-			orgId: selection.credential.orgId,
-			orgName: selection.credential.orgName,
-			active: selection.credentialId === activeCredentialId,
-		}));
+		return this.#getStoredOAuthSelections(provider).map((selection, position) => {
+			const pausedAtMs = this.#deps.pool.pausedAt(selection.credentialId);
+			const excluded = this.#deps.pool.isAutoSelectable(provider, selection.credentialId)
+				? undefined
+				: this.#deps.pool.passesRestriction(provider, selection.credentialId)
+					? ("paused" as const)
+					: ("restricted" as const);
+			return {
+				position,
+				credentialId: selection.credentialId,
+				accountId: selection.credential.accountId,
+				email: selection.credential.email,
+				projectId: selection.credential.projectId,
+				enterpriseUrl: selection.credential.enterpriseUrl,
+				orgId: selection.credential.orgId,
+				orgName: selection.credential.orgName,
+				active: selection.credentialId === activeCredentialId,
+				paused: pausedAtMs !== undefined,
+				...(pausedAtMs === undefined ? {} : { pausedAtMs }),
+				...(excluded === undefined ? {} : { excluded }),
+			};
+		});
 	}
 
 	/**
@@ -348,5 +368,44 @@ export class OAuthAccounts implements OAuthApi {
 		options: StoredOAuthRefreshOptions<T>,
 	): Promise<StoredOAuthRefreshResult<T>> {
 		return this.#deps.refresher.refreshStored(provider, options);
+	}
+
+	/**
+	 * Restrict every `AuthStorage` in this process to one stored OAuth row for
+	 * `provider` (launch `--oauth-account`). Validates against the store's
+	 * current rows so a stale in-memory pool cannot accept a disabled id.
+	 */
+	restrict(provider: string, credentialId: number): void {
+		const flag = `--oauth-account ${provider}:${credentialId}`;
+		if (!this.#deps.pool.supportsPause()) {
+			throw new AIError.OAuthAccountPoolError(
+				"broker_unsupported",
+				provider,
+				`${flag} is not supported with an auth broker.`,
+				credentialId,
+			);
+		}
+		const target = this.#deps.pool.reloadProvider(provider).find(row => row.id === credentialId);
+		if (target?.credential.type !== "oauth") {
+			throw new AIError.OAuthAccountPoolError(
+				"restricted_missing",
+				provider,
+				`${flag}: no active ${provider} OAuth account #${credentialId}. Run \`omp auth list ${provider}\` to see stored accounts.`,
+				credentialId,
+			);
+		}
+		if (this.#deps.overrides.has(provider)) {
+			throw new AIError.OAuthAccountPoolError(
+				"restricted_unavailable",
+				provider,
+				`${flag} conflicts with a runtime --api-key or models.yml apiKey override for ${provider}.`,
+				credentialId,
+			);
+		}
+		setOAuthAccountRestriction(provider, credentialId);
+	}
+
+	restriction(provider: string): number | undefined {
+		return oauthAccountRestriction(provider);
 	}
 }
