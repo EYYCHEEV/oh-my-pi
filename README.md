@@ -135,6 +135,7 @@ An upgrade fails before build or installation if the block is stale, any require
 - `extension-runtime-requirements`: Durable extension admission and runtime requirements
 - `streamed-tool-call-normalization`: Canonical streamed tool-call normalization
 - `kimi-k3-responses-transport`: Kimi K3 Responses transport
+- `oauth-account-pool-controls`: OAuth account pause and exact-account launch restriction
 <!-- stronk-omp:fork-contracts:end -->
 
 ## Upstream alignment
