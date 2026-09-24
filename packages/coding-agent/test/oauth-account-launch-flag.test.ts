@@ -117,6 +117,10 @@ describe("--oauth-account startup", () => {
 			stderr += String(chunk);
 			return true;
 		});
+		// Print mode reads a non-TTY stdin to EOF as prompt text; runners that keep
+		// stdin open (CI, agent harnesses) would block startup. Present a TTY.
+		const stdinTty = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+		Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
 		let thrown: unknown;
 		try {
 			await runRootCommand(parsed, args, {
@@ -131,6 +135,8 @@ describe("--oauth-account startup", () => {
 			thrown = error;
 		} finally {
 			vi.restoreAllMocks();
+			if (stdinTty) Object.defineProperty(process.stdin, "isTTY", stdinTty);
+			else Reflect.deleteProperty(process.stdin, "isTTY");
 		}
 		return { exitCodes, stderr, sessionCreated, thrown };
 	}
