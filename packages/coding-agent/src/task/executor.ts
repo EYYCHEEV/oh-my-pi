@@ -10,7 +10,7 @@ import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
 import { AgentBusyError, EventLoopKeepalive, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
-import { logger, popLoopPhase, prompt, pushLoopPhase, untilAborted } from "@oh-my-pi/pi-utils";
+import { isRecord, logger, popLoopPhase, prompt, pushLoopPhase, untilAborted } from "@oh-my-pi/pi-utils";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobError, AsyncJobManager, type AsyncJobRunResult } from "../async";
 import type { Rule } from "../capability/rule";
 import type { EffectiveExtensionRoots } from "../capability/types";
@@ -28,12 +28,14 @@ import {
 import type { PromptTemplate } from "../config/prompt-templates";
 import {
 	buildServiceTierByFamily,
+	isServiceTierForFamily,
 	resolveAgentServiceTierOverride,
 	resolveSubagentServiceTier,
 	type ServiceTierInheritSettingValue,
 } from "../config/service-tier";
+import type { CompactionThresholdPair } from "../config/compaction-threshold";
 import { Settings } from "../config/settings";
-import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
+
 import type { ToolPathWithSource } from "../extensibility/custom-tools";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
@@ -54,7 +56,13 @@ import { AgentLifecycleManager, type AgentReviver } from "../registry/agent-life
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { ensurePersistedRoster, isCurrentSessionRosterRef } from "../registry/persisted-agents";
 import { type CreateAgentSessionOptions, createAgentSession, discoverAuthStorage } from "../sdk";
-import type { AgentSession, AgentSessionEvent, Prewalk } from "../session/agent-session";
+import {
+	type AgentSession,
+	type AgentSessionEvent,
+	type Prewalk,
+	PromptDroppedError,
+	type PromptOptions,
+} from "../session/agent-session";
 import { type ArtifactManager, writeArtifact } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
@@ -104,7 +112,28 @@ import type {
 	TaskToolDetails,
 	YieldItem,
 } from "@oh-my-pi/pi-tui/tools/task";
-import { arrayValuedLabels, assembleYieldResult } from "./yield-assembly";
+import { assembleYieldResult, yieldSectionShapes } from "./yield-assembly";
+import {
+	cfgTaskPrewalk,
+	cfgTaskAgentPrewalk,
+	cfgTaskMaxEffort,
+	cfgTaskSoftRequestBudgetNotice,
+	cfgTaskSoftRequestBudget,
+	cfgTaskAgentIdleTtlMs,
+	cfgTaskMaxRuntimeMs,
+	cfgTaskMaxRecursionDepth,
+	cfgTaskAgentAdvisor,
+} from "./settings";
+import {
+	cfgTierSubagent,
+	cfgTierGoogle,
+	cfgTierAnthropic,
+	cfgTierOpenai,
+	cfgRetryFallbackChains,
+	cfgDefaultThinkingLevel,
+} from "../session/settings";
+import { cfgModelRoles, cfgDisabledProviders } from "../config/model-settings";
+import { cfgCompactionThresholdPercent, cfgCompactionThresholdTokens } from "../session/context-settings";
 
 export type { YieldItem } from "@oh-my-pi/pi-tui/tools/task";
 
@@ -197,7 +226,7 @@ function resolveSubagentRetryFallbackCandidates(
 ): SubagentRetryFallbackCandidate[] {
 	const candidates: SubagentRetryFallbackCandidate[] = [];
 	const seen = new Set<string>();
-	const disabledProviders = new Set(settings.get("disabledProviders"));
+	const disabledProviders = new Set(cfgDisabledProviders.get(settings));
 	for (const pattern of modelPatterns) {
 		const resolved = resolveModelOverride([pattern], modelRegistry, settings);
 		if (!resolved.model) continue;
@@ -233,7 +262,7 @@ function resolveSubagentInheritedRetryFallbackChain(
 	modelRegistry: ModelRegistry,
 	role: string | undefined,
 ): string[] | undefined {
-	const configuredChains = settings.get("retry.fallbackChains");
+	const configuredChains = cfgRetryFallbackChains.get(settings);
 	// An explicitly emptied role chain means "no fallbacks", not "inherit
 	// default" — mirrors expandDefaultRetryFallbackChains.
 	const fallbackChain = (role !== undefined ? configuredChains?.[role] : undefined) ?? configuredChains?.default;
@@ -244,7 +273,7 @@ function resolveSubagentInheritedRetryFallbackChain(
 	) {
 		return undefined;
 	}
-	const disabledProviders = new Set(settings.get("disabledProviders"));
+	const disabledProviders = new Set(cfgDisabledProviders.get(settings));
 	return fallbackChain.filter(entry => {
 		const resolved = resolveModelOverride([entry], modelRegistry, settings);
 		return !resolved.model || !disabledProviders.has(resolved.model.provider);
@@ -267,7 +296,7 @@ function installSubagentRetryFallbackChain(args: {
 	);
 	if (selectedIndex < 0) return undefined;
 	const fallbackSelectors = candidates.slice(selectedIndex + 1).map(candidate => candidate.selector);
-	const existingFallbackChains = settings.get("retry.fallbackChains");
+	const existingFallbackChains = cfgRetryFallbackChains.get(settings);
 	// A single configured model may reuse its role's (or the default) configured chain, but never an implicit parent fallback.
 	const fallbackChain = fallbackSelectors.length > 0 ? fallbackSelectors : inheritedFallbackChain;
 	if (
@@ -288,7 +317,7 @@ function installSubagentRetryFallbackChain(args: {
 		}
 	}
 	modelRoles[role] = candidates[selectedIndex].selector;
-	settings.override("modelRoles", modelRoles);
+	cfgModelRoles.override(settings, modelRoles);
 	// Insert the task-specific role first so another role assigned to the same model cannot capture fallback routing.
 	const fallbackChains: Record<string, string[]> = {
 		[role]: fallbackChain,
@@ -298,7 +327,7 @@ function installSubagentRetryFallbackChain(args: {
 			fallbackChains[existingRole] = existingFallbackChains[existingRole];
 		}
 	}
-	settings.override("retry.fallbackChains", fallbackChains);
+	cfgRetryFallbackChains.override(settings, fallbackChains);
 	return role;
 }
 
@@ -395,11 +424,6 @@ function withAbortTimeout<T>(
 	return wrappedPromise;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	if (!value || typeof value !== "object") return false;
-	return !Array.isArray(value);
-}
-
 /** Options for subagent execution */
 export interface ExecutorOptions {
 	cwd: string;
@@ -446,6 +470,8 @@ export interface ExecutorOptions {
 	thinkingLevel?: ConfiguredThinkingLevel;
 	/** Caller-requested coarse effort (`lo`/`med`/`hi`); maps onto the resolved model's supported thinking range and wins over {@link thinkingLevel}. */
 	effort?: TaskEffort;
+	/** Caller's description of how open-ended the work is; rides the initial prompt into the child's `auto` thinking classifier. */
+	solutionSpace?: string;
 	/** Schema used to validate the final structured completion. */
 	outputSchema?: unknown;
 	/** Enforcement policy for {@link outputSchema}; defaults to legacy permissive behavior. */
@@ -531,6 +557,8 @@ export interface ExecutorOptions {
 	 */
 	preloadedCustomToolPaths?: ToolPathWithSource[];
 	mcpManager?: MCPManager;
+	/** User-authorized model agents available to this child and its descendants. */
+	inheritedSessionAgents?: CreateAgentSessionOptions["inheritedSessionAgents"];
 	authStorage?: AuthStorage;
 	modelRegistry?: ModelRegistry;
 	settings?: Settings;
@@ -547,6 +575,8 @@ export interface ExecutorOptions {
 	 * `tier.subagent` (Vibe workers) omit it.
 	 */
 	serviceTierOverride?: ServiceTierInheritSettingValue;
+	/** Exact-name `task.agentCompactionThresholdOverrides` pair selected by dispatch. */
+	compactionThresholdOverride?: CompactionThresholdPair;
 	/** Override local:// protocol options so subagent shares parent's local:// root */
 	localProtocolOptions?: LocalProtocolOptions;
 	/**
@@ -557,8 +587,6 @@ export interface ExecutorOptions {
 	parentArtifactManager?: ArtifactManager;
 	parentHindsightSessionState?: HindsightSessionState;
 	parentMnemopiSessionState?: MnemopiSessionState;
-	/** Parent agent's eval executor session id. Subagents reuse it so eval state is shared. */
-	parentEvalSessionId?: string;
 	/**
 	 * Parent agent's OpenTelemetry configuration. When defined, the subagent's
 	 * loop is started with the same tracer/hooks but its own agent identity
@@ -717,7 +745,7 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 				rawOutput = `{"aborted":true,"error":"${lastYield.error || "Unknown error"}"}`;
 			}
 		} else {
-			const assembled = assembleYieldResult(yieldItems, lastAssistantText, arrayValuedLabels(outputSchema));
+			const assembled = assembleYieldResult(yieldItems, lastAssistantText, yieldSectionShapes(outputSchema));
 			if (!assembled || assembled.missingData) {
 				rawOutput = rawOutput ? `${SUBAGENT_WARNING_NULL_YIELD}\n\n${rawOutput}` : SUBAGENT_WARNING_NULL_YIELD;
 				if (includeStructuredOutput) {
@@ -969,57 +997,108 @@ export function createMCPProxyTools(mcpManager: MCPManager): CustomTool[] {
 	});
 }
 
+/**
+ * Per-family tiers a subagent inherits: the parent's live tiers when a live session supplied
+ * them, else its configured `tier.*`. Live entries a family can't realize (a resumed session
+ * file may carry `{anthropic: "flex"}`) are dropped — the subagent overlay rejects them.
+ */
 function inheritedSubagentServiceTiers(
 	baseSettings: Settings,
 	inheritedServiceTier?: ServiceTierByFamily | null,
 ): ServiceTierByFamily {
-	return inheritedServiceTier === undefined
-		? buildServiceTierByFamily(
-				baseSettings.get("tier.openai"),
-				baseSettings.get("tier.anthropic"),
-				baseSettings.get("tier.google"),
-			)
-		: (inheritedServiceTier ?? {});
+	if (inheritedServiceTier === undefined) {
+		return buildServiceTierByFamily(
+			cfgTierOpenai.get(baseSettings),
+			cfgTierAnthropic.get(baseSettings),
+			cfgTierGoogle.get(baseSettings),
+		);
+	}
+	const tiers: ServiceTierByFamily = {};
+	for (const family of ["openai", "anthropic", "google"] as const) {
+		const tier = inheritedServiceTier?.[family];
+		if (isServiceTierForFamily(family, tier)) tiers[family] = tier;
+	}
+	return tiers;
+}
+
+/**
+ * Compaction thresholds of the root (non-subagent) settings a subagent chain
+ * started from. Per-agent `task.agentCompactionThresholdOverrides` entries
+ * replace `compaction.threshold*` only for the agent they name; every other
+ * descendant resolves against these root values, not an ancestor's override.
+ */
+const kRootCompactionThresholds = Symbol("task.rootCompactionThresholds");
+
+/** Settings from {@link createSubagentSettings}, tagged with its chain's root compaction thresholds. */
+interface SubagentChainSettings extends Settings {
+	[kRootCompactionThresholds]?: CompactionThresholdPair;
+}
+
+/** Settings overrides applying an exact-name compaction threshold entry to one subagent. */
+export function compactionThresholdSettings(
+	threshold: CompactionThresholdPair | undefined,
+): Readonly<Record<string, unknown>> | undefined {
+	return threshold === undefined
+		? undefined
+		: {
+				"compaction.thresholdPercent": threshold.thresholdPercent,
+				"compaction.thresholdTokens": threshold.thresholdTokens,
+			};
 }
 
 export function createSubagentSettings(
-	baseSettings: Settings,
-	overrides?: Partial<Record<SettingPath, unknown>>,
+	baseSettings: SubagentChainSettings,
+	overrides?: Readonly<Record<string, unknown>>,
 	inheritedServiceTier?: ServiceTierByFamily | null,
 ): Settings {
-	const snapshot: Partial<Record<SettingPath, unknown>> = {};
-	for (const key of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
-		snapshot[key] = baseSettings.get(key);
-	}
 	// Resolve the subagent's per-family tiers from `tier.subagent` ("inherit" =
 	// match the parent's live tiers when a live session supplied them, else the
-	// subagent's own configured tier.* settings). The result is stamped back onto
-	// the snapshot so createAgentSession's tier.* reads pick it up.
+	// subagent's own configured tier.* settings). The result is stamped onto the
+	// overlay so createAgentSession's tier.* reads pick it up.
 	const inheritedTiers = inheritedSubagentServiceTiers(baseSettings, inheritedServiceTier);
-	const subagentTiers = resolveSubagentServiceTier(baseSettings.get("tier.subagent"), inheritedTiers);
-	snapshot["tier.openai"] = subagentTiers.openai ?? "none";
-	snapshot["tier.anthropic"] = subagentTiers.anthropic ?? "none";
-	snapshot["tier.google"] = subagentTiers.google ?? "none";
-	return Settings.isolated(
-		{
-			...snapshot,
-			// Async jobs and bash/eval auto-backgrounding are inherited from the parent:
-			// background jobs are owner-routed to the subagent's own session, and
-			// the run driver's quiescence barrier + teardown reap guarantee no
-			// owner job outlives the run, so worktree capture/cleanup stays
-			// race-free (previously both were force-disabled here).
+	const subagentTiers = resolveSubagentServiceTier(cfgTierSubagent.get(baseSettings), inheritedTiers);
+	// A parent subagent's own per-agent threshold must not leak to its children: descendants
+	// of a subagent pin the root's thresholds. A root parent's children read them through live.
+	const inheritedRootThresholds = baseSettings[kRootCompactionThresholds];
+	const rootThresholds = inheritedRootThresholds ?? {
+		thresholdPercent: cfgCompactionThresholdPercent.get(baseSettings),
+		thresholdTokens: cfgCompactionThresholdTokens.get(baseSettings),
+	};
+	// Every other setting reads through to the parent live; writes on the overlay stay local.
+	const subagentSettings: SubagentChainSettings = baseSettings.overlay({
+		...compactionThresholdSettings(inheritedRootThresholds),
+		// A subagent's thinking level is chosen at spawn (agent definition, `effort`, or this
+		// snapshot of the parent default); a later parent default edit must not re-steer it.
+		defaultThinkingLevel: cfgDefaultThinkingLevel.get(baseSettings),
+		"tier.openai": subagentTiers.openai ?? "none",
+		"tier.anthropic": subagentTiers.anthropic ?? "none",
+		"tier.google": subagentTiers.google ?? "none",
+		// Async jobs and bash/eval auto-backgrounding are inherited from the parent:
+		// background jobs are owner-routed to the subagent's own session, and
+		// the run driver's quiescence barrier + teardown reap guarantee no
+		// owner job outlives the run, so worktree capture/cleanup stays
+		// race-free (previously both were force-disabled here).
 
-			// Subagents run headless — there is no UI to confirm prompts against, so
-			// the parent task approval is the authorization boundary. Use yolo mode
-			// to preserve unattended subagent execution. User `tools.approval` policies still apply.
-			"tools.approvalMode": "yolo",
-			// Subagents run unadvised by default; runSubprocess opts a spawn back in
-			// per agent (frontmatter `advisor` / `task.agentAdvisor`) via overrides.
-			"advisor.enabled": false,
-			...overrides,
-		},
-		{ storage: baseSettings.getStorage() },
-	);
+		// Subagents run headless — there is no UI to confirm prompts against, so
+		// the parent task approval is the authorization boundary. Use yolo mode
+		// to preserve unattended subagent execution. User `tools.approval` policies still apply.
+		"tools.approvalMode": "yolo",
+		// Subagents run unadvised by default; runSubprocess opts a spawn back in
+		// per agent (frontmatter `advisor` / `task.agentAdvisor`) via overrides.
+		"advisor.enabled": false,
+		// A subagent assignment is one turn: its tool loop ends only when the run
+		// yields, so post-turn `checkCompaction` (driven from `agent_end`) fires
+		// after the run is over and `maintainContextMidRun` is the only proactive
+		// compaction the child ever reaches. `compaction.midTurnEnabled` encodes an
+		// interactive preference — keep compaction boundaries on real user turns —
+		// that has no counterpart here, so inheriting `false` left hours-long
+		// worker runs sailing past the configured threshold until the provider
+		// rejected the context (#13211). A per-spawn override still wins.
+		"compaction.midTurnEnabled": true,
+		...overrides,
+	});
+	subagentSettings[kRootCompactionThresholds] = rootThresholds;
+	return subagentSettings;
 }
 
 export type AbortReason = "signal" | "shutdown" | "terminate" | "timeout" | "budget";
@@ -1072,6 +1151,13 @@ interface SubagentRunMonitor {
 	readonly accumulatedUsage: Usage;
 	hasUsage(): boolean;
 	yieldCalled(): boolean;
+	/**
+	 * Latch or clear the reminder ladder's forced final `yield`. While set, the
+	 * next accepted `yield` is terminal even when it carries incremental
+	 * section labels, so a model pinned to `yield` by `toolChoice` cannot
+	 * satisfy the pin forever without ending the run.
+	 */
+	markFinalYieldForced(forced: boolean): void;
 	/** Epoch ms when the run's terminal `yield` was recorded; undefined while none is latched. */
 	yieldAcceptedAt(): number | undefined;
 	runtimeLimitExceeded(): boolean;
@@ -1188,6 +1274,15 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	let activeSession: AgentSession | null = null;
 	let yieldCalled = false;
 	let yieldCallPending = false;
+	/**
+	 * A `yield` awaiting validation suppresses the soft-budget check for its
+	 * own turn (#5006). The check is deferred, not dropped: every turn that
+	 * carries a yield latches {@link yieldCallPending}, so dropping it lets a
+	 * run of yield-only turns bypass the budget entirely.
+	 */
+	let budgetCheckDeferred = false;
+	/** True while the reminder ladder's forced final `yield` is outstanding. */
+	let finalYieldForced = false;
 	let yieldInvalidatedByAsync = false;
 	/** Epoch ms the current terminal yield was recorded; cleared when it is invalidated. */
 	let yieldAcceptedAt: number | undefined;
@@ -1525,7 +1620,11 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		if (toolName === "yield") {
 			const item = isRecord(data) ? data : undefined;
 			const incremental = Array.isArray(item?.type) && item.type.length > 0;
-			yieldCalled = !incremental || item?.complete === true || item?.status === "aborted";
+			// A forced final yield ends the run. Once the reminder ladder has
+			// pinned `toolChoice` to `yield`, an incremental section satisfies
+			// the pin without terminating the run, so re-prompting loops
+			// forever: take the section as the final report it was asked for.
+			yieldCalled = !incremental || finalYieldForced || item?.complete === true || item?.status === "aborted";
 			yieldCallPending = false;
 			if (yieldCalled) {
 				yieldInvalidatedByAsync = false;
@@ -1533,6 +1632,42 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 				args.onYieldAccepted?.();
 			}
 		}
+	};
+
+	/**
+	 * Soft request budget: steer at the budget, stop the free-running turn at
+	 * 1.5x, and hard-abort {@link BUDGET_STOP_GRACE_REQUESTS} requests later if
+	 * the forced final yield never lands.
+	 */
+	const evaluateSoftRequestBudget = () => {
+		if (softRequestBudget <= 0 || abortSent) return;
+		const stopThreshold = softRequestBudget * 1.5;
+		if (budgetStopRequested) {
+			// Grace window after the stop: the forced yield needs a request or
+			// two; a child that keeps burning requests instead of yielding is
+			// hard-aborted.
+			if (progress.requests >= stopThreshold + BUDGET_STOP_GRACE_REQUESTS) {
+				requestAbort("budget");
+			}
+			return;
+		}
+		if (progress.requests >= stopThreshold) {
+			requestBudgetStop();
+			return;
+		}
+		if (!softRequestBudgetNotice || budgetSteerSent || progress.requests < softRequestBudget) return;
+		budgetSteerSent = true;
+		const steerSession = activeSession;
+		if (!steerSession) return;
+		// Send behind an async boundary so a throwing send cannot take down event processing.
+		const notice = buildBudgetNotice(progress.requests, softRequestBudget);
+		void Promise.resolve()
+			.then(() => steerSession.sendUserMessage(notice, { deliverAs: "steer", attribution: "agent" }))
+			.catch(err => {
+				logger.warn("Subagent budget steer failed", {
+					error: err instanceof Error ? err.message : String(err),
+				});
+			});
 	};
 
 	const processEvent = (event: AgentEvent) => {
@@ -1627,18 +1762,24 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 
 					if (event.toolName === "yield") {
 						yieldCallPending = false;
+						if (budgetCheckDeferred) {
+							budgetCheckDeferred = false;
+							// The yield validated without ending the run: its request still counts.
+							if (!yieldCalled) evaluateSoftRequestBudget();
+						}
 					}
 
-					// Check if handler wants to terminate the session
-					if (
+					// A forced final yield terminates too, preventing an endless sequence of sections.
+					const wantsTerminate =
 						handler.shouldTerminate?.({
 							toolName: event.toolName,
 							toolCallId: event.toolCallId,
 							args: eventArgs,
 							result: event.result,
 							isError: event.isError,
-						})
-					) {
+						}) === true;
+					const forcedFinalYield = event.toolName === "yield" && finalYieldForced && yieldCalled;
+					if (wantsTerminate || forcedFinalYield) {
 						if (event.toolName === "yield" && sessionHasPendingAsyncWork()) {
 							// Terminal yield with owner jobs still pending: park the
 							// run behind the quiescence barrier instead of completing
@@ -1761,37 +1902,9 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 						if (startedMoreWork) lastReportTurnText = undefined;
 						else if (text.trim()) lastReportTurnText = text;
 					}
-					if (softRequestBudget > 0 && !abortSent && !yieldCallPending) {
-						const stopThreshold = softRequestBudget * 1.5;
-						if (budgetStopRequested) {
-							// Grace window after the stop: the forced yield needs a
-							// request or two; a child that keeps burning requests
-							// instead of yielding is hard-aborted.
-							if (progress.requests >= stopThreshold + BUDGET_STOP_GRACE_REQUESTS) {
-								requestAbort("budget");
-							}
-						} else if (progress.requests >= stopThreshold) {
-							requestBudgetStop();
-						} else if (softRequestBudgetNotice && !budgetSteerSent && progress.requests >= softRequestBudget) {
-							budgetSteerSent = true;
-							const steerSession = activeSession;
-							if (steerSession) {
-								// Build the notice now (the count at crossing time), but send
-								// behind an async boundary: a synchronously-throwing send must
-								// never take down event processing (which escalates to terminate).
-								const notice = buildBudgetNotice(progress.requests, softRequestBudget);
-								void Promise.resolve()
-									.then(() =>
-										steerSession.sendUserMessage(notice, { deliverAs: "steer", attribution: "agent" }),
-									)
-									.catch(err => {
-										logger.warn("Subagent budget steer failed", {
-											error: err instanceof Error ? err.message : String(err),
-										});
-									});
-							}
-						}
-					}
+					// Defer a pending yield's budget check rather than dropping its request.
+					if (yieldCallPending) budgetCheckDeferred = true;
+					else evaluateSoftRequestBudget();
 				}
 				// Extract and accumulate usage (prefer message.usage, fallback to event.usage)
 				const eventUsage = isRecord(event) && "usage" in event ? event.usage : undefined;
@@ -1872,11 +1985,18 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			const serving = session.servingModel;
 			if (!serving) return;
 			const isFallback = serving.isFallback;
+			// A model swap moves the window the usage gauge divides by. Without
+			// this the Agent Hub kept the startup model's window while labelling
+			// the row with the fallback that replaced it. Models with no declared
+			// window keep the last known one rather than blanking the gauge.
+			const contextWindow =
+				serving.contextWindow && serving.contextWindow > 0 ? serving.contextWindow : progress.contextWindow;
 			if (
 				serving.selector === progress.resolvedModel &&
 				serving.modelIdentity === progress.resolvedModelIdentity &&
 				serving.thinkingLevel === progress.resolvedThinkingLevel &&
-				(progress.resolvedModelIsFallback ?? false) === isFallback
+				(progress.resolvedModelIsFallback ?? false) === isFallback &&
+				contextWindow === progress.contextWindow
 			) {
 				return;
 			}
@@ -1884,6 +2004,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			progress.resolvedModelIdentity = serving.modelIdentity;
 			progress.resolvedThinkingLevel = serving.thinkingLevel;
 			progress.resolvedModelIsFallback = isFallback;
+			progress.contextWindow = contextWindow;
 			scheduleProgress(true);
 		};
 		return session.subscribe(event => {
@@ -1958,6 +2079,9 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		accumulatedUsage,
 		hasUsage: () => hasUsage,
 		yieldCalled: () => yieldCalled,
+		markFinalYieldForced: (forced: boolean) => {
+			finalYieldForced = forced;
+		},
 		yieldAcceptedAt: () => yieldAcceptedAt,
 		runtimeLimitExceeded: () => runtimeLimitExceeded,
 		terminalError: () => terminalError,
@@ -2041,6 +2165,10 @@ interface DriveOutcome {
 }
 
 const MAX_YIELD_RETRIES = 3;
+const MAX_PROMPT_DISPATCH_ATTEMPTS = 4;
+const PROMPT_DISPATCH_IDLE_TIMEOUT_MS = 5_000;
+
+class PromptDispatchError extends Error {}
 
 /**
  * Drive one assignment through a live session: send the prompt, wait for idle,
@@ -2053,11 +2181,18 @@ async function driveSessionToYield(
 	session: AgentSession,
 	monitor: SubagentRunMonitor,
 	task: string,
-	// Invoked when the initial prompt loses a prompt race (AgentBusyError) before
-	// retrying. Lets the caller restore a safe contract and detach its monitor
-	// while backing off. Absent, the busy error keeps the old path.
-	onPromptBusy?: () => Promise<void>,
+	options: {
+		/** Open-endedness description forwarded to the session's `auto` thinking classifier. */
+		solutionSpace?: string;
+		/**
+		 * Invoked when the initial prompt loses a prompt race (AgentBusyError) before
+		 * retrying. Lets the caller restore a safe contract and detach its monitor
+		 * while backing off. Absent, the busy error keeps the old path.
+		 */
+		onPromptBusy?: () => Promise<void>;
+	} = {},
 ): Promise<DriveOutcome> {
+	const { solutionSpace, onPromptBusy } = options;
 	using _keepalive = new EventLoopKeepalive();
 	const abortSignal = monitor.abortSignal;
 	let exitCode = 0;
@@ -2091,6 +2226,44 @@ async function driveSessionToYield(
 			abortSignal.removeEventListener("abort", onAbort);
 		}
 	};
+	/**
+	 * Send a headless prompt, retrying pre-provider drops (`PromptDroppedError`).
+	 * Local slash commands are disabled so an assignment always reaches the
+	 * model. `forceFinalYield` arms the monitor's forced-final latch only while
+	 * an attempt dispatches, so another turn's incremental `yield` during drop
+	 * recovery stays incremental.
+	 */
+	const dispatchPrompt = async (
+		text: string,
+		promptOptions: PromptOptions,
+		label: string,
+		{ forceFinalYield = false }: { forceFinalYield?: boolean } = {},
+	): Promise<void> => {
+		for (let attempt = 1; attempt <= MAX_PROMPT_DISPATCH_ATTEMPTS; attempt++) {
+			if (forceFinalYield) monitor.markFinalYieldForced(true);
+			try {
+				await awaitAbortable(session.prompt(text, { ...promptOptions, runCommands: false, throwOnDrop: true }));
+				return;
+			} catch (err) {
+				if (!(err instanceof PromptDroppedError)) throw err;
+			}
+			if (forceFinalYield) monitor.markFinalYieldForced(false);
+			if (attempt === MAX_PROMPT_DISPATCH_ATTEMPTS) {
+				throw new PromptDispatchError(`${label} dropped before provider dispatch after ${attempt} attempts`);
+			}
+			const deadline = AbortSignal.timeout(PROMPT_DISPATCH_IDLE_TIMEOUT_MS);
+			try {
+				await untilAborted(AbortSignal.any([abortSignal, deadline]), () => session.waitForIdle());
+			} catch (err) {
+				checkAbort();
+				if (deadline.aborted) {
+					throw new PromptDispatchError(`${label} dropped before provider dispatch; session did not become idle`);
+				}
+				throw err;
+			}
+			await untilAborted(abortSignal, () => Bun.sleep(250 * 2 ** (attempt - 1)));
+		}
+	};
 
 	try {
 		try {
@@ -2101,7 +2274,7 @@ async function driveSessionToYield(
 			let promptAttempts = 0;
 			for (;;) {
 				try {
-					await awaitAbortable(session.prompt(task, { attribution: "agent" }));
+					await dispatchPrompt(task, { attribution: "agent", solutionSpace }, "initial prompt");
 					break;
 				} catch (error) {
 					promptAttempts++;
@@ -2118,13 +2291,14 @@ async function driveSessionToYield(
 			// below; real caller/timeout aborts (monitor signal) and genuine
 			// failures keep the old path.
 			const recoverableStop = monitor.budgetStopRequested() || monitor.yieldTurnStopRequested();
-			if (!recoverableStop || abortSignal.aborted) throw err;
+			if (!recoverableStop || abortSignal.aborted || err instanceof PromptDispatchError) throw err;
 		}
 
 		const reminderToolChoice = buildNamedToolChoice("yield", session.model);
 
 		const runYieldLadder = async (): Promise<void> => {
 			let retryCount = 0;
+			let retriesForced = false;
 			while (!monitor.yieldCalled() && retryCount < MAX_YIELD_RETRIES && !abortSignal.aborted) {
 				// A budget stop collapses the reminder ladder to a single forced
 				// final yield: wait for the stop's session abort to settle, then
@@ -2141,6 +2315,9 @@ async function driveSessionToYield(
 				// any chance of producing a yield.
 				const lastBeforeReminder = session.getLastAssistantMessage();
 				if (lastBeforeReminder?.stopReason === "error") break;
+				// A turn waiting on owner work is a scheduling pause. The outer
+				// barrier settles that work before a reminder counts against it.
+				if (!budgetStop && session.hasPendingAsyncWork()) break;
 				try {
 					retryCount++;
 					const reminder = prompt.render(submitReminderTemplate, {
@@ -2150,15 +2327,24 @@ async function driveSessionToYield(
 					});
 
 					const isFinalRetry = retryCount >= MAX_YIELD_RETRIES;
-					await awaitAbortable(
-						session.prompt(reminder, {
+					// Last chance: the next accepted yield ends the run, incremental
+					// or not, so the pinned model cannot answer the pin forever.
+					// Armed for this prompt's turn only — the quiescence barrier's
+					// later notice turn may legitimately submit more sections.
+					retriesForced = isFinalRetry;
+					await dispatchPrompt(
+						reminder,
+						{
 							attribution: "agent",
 							synthetic: true,
 							...(isFinalRetry && reminderToolChoice ? { toolChoice: reminderToolChoice } : {}),
-						}),
+						},
+						"yield reminder",
+						{ forceFinalYield: isFinalRetry },
 					);
 					await awaitAbortable(session.waitForIdle());
 				} catch (err) {
+					if (err instanceof PromptDispatchError) throw err;
 					if (abortSignal.aborted || err instanceof ToolAbortError) {
 						// Benign control-flow exit — user cancel (^C) or compaction aborting
 						// pending operations both surface here as ToolAbortError. The outer
@@ -2170,15 +2356,20 @@ async function driveSessionToYield(
 							error: err instanceof Error ? err.message : String(err),
 						});
 					}
+				} finally {
+					if (retriesForced) {
+						retriesForced = false;
+						monitor.markFinalYieldForced(false);
+					}
 				}
 			}
 		};
 
 		// Yield ladder + quiescence barrier (structured concurrency), one
-		// loop: each iteration first demands a yield — initially, and again
-		// whenever an async-result delivery un-latched the previous one
-		// (including during the notice turn) — then either completes on
-		// quiescence or settles one generation of owner async work.
+		// loop: a turn without a yield first settles pending owner work, then
+		// spends reminders only after there is nothing left to wait for.
+		// A yield also waits for quiescence; each delivered result supersedes
+		// the previous yield and demands a fresh one.
 		//
 		// A final yield with owner background jobs still running or
 		// undelivered is a scheduling pause, not run completion — the monitor
@@ -2193,24 +2384,34 @@ async function driveSessionToYield(
 		// Suppressed (acknowledged / wait-watched) jobs never re-wake the run
 		// and are reaped at teardown.
 		//
-		// Before blocking on running jobs, tell the model ONCE what it is
-		// waiting on so it can stand by or cancel via `write proc://<id>/kill` instead of sitting silent
-		// until the jobs (or the runtime limit) expire. Runs that never yield
-		// (ladder exhausted / terminal model error) skip the barrier — more
-		// injected turns just multiply the failure noise; the teardown reap
-		// still cancels and awaits their jobs before worktree capture.
+		// Before blocking on running jobs after a yield, tell the model ONCE
+		// what it is waiting on so it can stand by or cancel the job. A turn
+		// without a yield settles its pending jobs without an extra notice.
+		// Runs that exhaust the ladder with no pending work, or hit a terminal
+		// model error, skip the barrier; teardown reaps their jobs.
 		let asyncPendingNoticeSent = false;
 		while (!abortSignal.aborted) {
 			if (!monitor.yieldCalled()) {
 				await runYieldLadder();
-				// Ladder exhausted / terminal model error: classified below
-				// (missing yield, or stale yield when one was invalidated).
-				if (!monitor.yieldCalled()) break;
+				if (
+					!monitor.yieldCalled() &&
+					(monitor.budgetStopRequested() ||
+						session.getLastAssistantMessage()?.stopReason === "error" ||
+						!session.hasPendingAsyncWork())
+				)
+					break;
 			}
 			// Let the parked yield's turn-stop session abort settle before
 			// prompting again (mirrors waitForBudgetStop).
 			await awaitAbortable(monitor.waitForYieldTurnStop());
-			if (!session.hasPendingAsyncWork()) break;
+			if (!session.hasPendingAsyncWork()) {
+				if (monitor.yieldCalled()) break;
+				continue;
+			}
+			if (!monitor.yieldCalled()) {
+				await awaitAbortable(session.settleAsyncWork());
+				continue;
+			}
 			if (!asyncPendingNoticeSent) {
 				asyncPendingNoticeSent = true;
 				const running = session.getAsyncJobSnapshot()?.running ?? [];
@@ -2222,12 +2423,12 @@ async function driveSessionToYield(
 						jobs,
 					});
 					try {
-						await awaitAbortable(session.prompt(notice, { attribution: "agent", synthetic: true }));
+						await dispatchPrompt(notice, { attribution: "agent", synthetic: true }, "async-pending notice");
 						await awaitAbortable(session.waitForIdle());
 					} catch (err) {
-						if (abortSignal.aborted || err instanceof ToolAbortError) throw err;
-						// A failed notice turn must not kill the run — fall through
-						// to the passive settle below.
+						if (abortSignal.aborted || err instanceof ToolAbortError || err instanceof PromptDispatchError)
+							throw err;
+						// Other notice-turn failures leave the pending jobs to settle passively.
 						logger.warn("Subagent async-pending notice failed", {
 							error: err instanceof Error ? err.message : String(err),
 						});
@@ -3205,18 +3406,20 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 	// then reinstall and reattach for the retry.
 	let attemptUnsubscribe = monitor.attach(session);
 	try {
-		outcome = await driveSessionToYield(session, monitor, message, async () => {
-			attemptUnsubscribe();
-			logger.debug("Subagent follow-up lost the prompt race to an IRC wake; backing off", { id });
-			await session.setWorkPoolYieldItems([]);
-			if (signal) {
-				await untilAborted(signal, () => session.waitForIdle());
-			} else {
-				await session.waitForIdle();
-			}
-			resetYieldTurnState(session.getToolByName("yield"));
-			await session.setWorkPoolYieldItems(options.workPoolYieldItems ?? []);
-			attemptUnsubscribe = monitor.attach(session);
+		outcome = await driveSessionToYield(session, monitor, message, {
+			onPromptBusy: async () => {
+				attemptUnsubscribe();
+				logger.debug("Subagent follow-up lost the prompt race to an IRC wake; backing off", { id });
+				await session.setWorkPoolYieldItems([]);
+				if (signal) {
+					await untilAborted(signal, () => session.waitForIdle());
+				} else {
+					await session.waitForIdle();
+				}
+				resetYieldTurnState(session.getToolByName("yield"));
+				await session.setWorkPoolYieldItems(options.workPoolYieldItems ?? []);
+				attemptUnsubscribe = monitor.attach(session);
+			},
 		});
 		if (monitor.yieldCalled()) {
 			// A follow-up turn's accepted yield is the run's final result too:
@@ -3324,12 +3527,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	// explicit model pattern lands on the child's `modelRoles.advisor` so role
 	// aliases and `:level` suffixes resolve inside the spawned session.
 	const advisorSelection = resolveAgentAdvisorSelection({
-		settingsOverride: settings.get("task.agentAdvisor")[agent.name],
+		settingsOverride: cfgTaskAgentAdvisor.get(settings)[agent.name],
 		agentAdvisor: agent.advisor,
 	});
 	const subagentSettings = createSubagentSettings(
 		settings,
 		{
+			...compactionThresholdSettings(options.compactionThresholdOverride),
 			...(agent.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
 			// Isolated runs must not expose roots outside the worktree.
 			...(worktree !== undefined ? { "workspace.additionalDirectories": [] } : undefined),
@@ -3340,20 +3544,14 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		},
 		options.parentServiceTier,
 	);
-	const maxRecursionDepth = settings.get("task.maxRecursionDepth") ?? 2;
-	const maxRuntimeMs = Math.max(
-		0,
-		Math.trunc(Number(options.maxRuntimeMs ?? settings.get("task.maxRuntimeMs") ?? 0) || 0),
-	);
+	const maxRecursionDepth = cfgTaskMaxRecursionDepth.get(settings);
+	const maxRuntimeMs = Math.max(0, Math.trunc(Number(options.maxRuntimeMs ?? cfgTaskMaxRuntimeMs.get(settings)) || 0));
 	// TTL before an adopted idle subagent is parked by the lifecycle manager.
 	// <= 0 disables parking (the session stays live until process teardown).
-	const agentIdleTtlMs = Math.trunc(Number(settings.get("task.agentIdleTtlMs") ?? 420_000) || 0);
-	const configuredDefaultBudget = Math.max(
-		0,
-		Math.trunc(Number(settings.get("task.softRequestBudget") ?? SOFT_REQUEST_BUDGET.default) || 0),
-	);
+	const agentIdleTtlMs = Math.trunc(Number(cfgTaskAgentIdleTtlMs.get(settings)) || 0);
+	const configuredDefaultBudget = Math.max(0, Math.trunc(Number(cfgTaskSoftRequestBudget.get(settings)) || 0));
 	const softRequestBudget = resolveSoftRequestBudget(agent.name, configuredDefaultBudget);
-	const softRequestBudgetNotice = settings.get("task.softRequestBudgetNotice") ?? false;
+	const softRequestBudgetNotice = cfgTaskSoftRequestBudgetNotice.get(settings);
 	const parentDepth = options.taskDepth ?? 0;
 	const childDepth = parentDepth + 1;
 	const atMaxDepth = maxRecursionDepth >= 0 && childDepth >= maxRecursionDepth;
@@ -3377,6 +3575,18 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		if (backends.python || backends.js) expanded.push("eval");
 		expanded.push("bash");
 		toolNames = Array.from(new Set(expanded));
+	}
+	// Agents that can start background work (`task`, `bash`) need `wait` to block on it;
+	// without it they `sleep`. Runs after `exec` expansion and the max-depth `task` strip.
+	// `createTools` still drops it when no wake source (async/IRC/services) is enabled.
+	// Restricted sessions own their explicit list and are never widened.
+	if (
+		toolNames &&
+		!options.restrictToolNames &&
+		!toolNames.includes("wait") &&
+		(toolNames.includes("task") || toolNames.includes("bash"))
+	) {
+		toolNames = [...toolNames, "wait"];
 	}
 	// Inbound steering works without messaging; outbound peer coordination requires write.
 	const ircEnabled =
@@ -3422,6 +3632,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	});
 	const progress = monitor.progress;
 	let unsubscribe: (() => void) | null = null;
+	let registryAbortUnsubscribe: (() => void) | null = null;
 	let reviveSession: AgentReviver | null = null;
 	const installIrcWakeTurnMonitor = (target: AgentSession): void => {
 		attachIrcWakeTurnMonitor(target, {
@@ -3584,7 +3795,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// through to the normal selectors below.
 			// The ceiling outlives initial resolution: it rides into the session so
 			// retry-fallback recovery can never clamp effort back up past it.
-			const spawnEffortCeiling = options.effort !== undefined ? settings.get("task.maxEffort") : undefined;
+			const spawnEffortCeiling = options.effort !== undefined ? cfgTaskMaxEffort.get(settings) : undefined;
 			const effortLevel =
 				options.effort !== undefined
 					? resolveTaskEffortLevel(model, options.effort, spawnEffortCeiling)
@@ -3623,8 +3834,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// Resolution failures skip prewalk instead of failing the spawn.
 			let prewalk: Prewalk | undefined;
 			const prewalkPattern = resolveAgentPrewalkPattern({
-				settingsOverride: settings.get("task.agentPrewalk")[agent.name],
-				agentPrewalk: resolveAgentPrewalkDefault(agent, settings.get("task.prewalk")),
+				settingsOverride: cfgTaskAgentPrewalk.get(settings)[agent.name],
+				agentPrewalk: resolveAgentPrewalkDefault(agent, cfgTaskPrewalk.get(settings)),
 			});
 			if (prewalkPattern) {
 				await awaitAbortable(modelRegistry.awaitBackgroundRefresh());
@@ -3714,6 +3925,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				modelRegistry,
 				getApiKey: options.getApiKey,
 				credentialSourceSessionId: options.credentialSourceSessionId,
+				inheritedSessionAgents: options.inheritedSessionAgents,
 				settings: subagentSettings,
 				model,
 				modelPattern: model || modelOverride === undefined ? undefined : modelPatterns,
@@ -3725,6 +3937,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					model || modelOverride === undefined ? undefined : inheritedRetryFallbackChain,
 				thinkingLevel: effectiveThinkingLevel,
 				thinkingLevelCeiling: spawnEffortCeiling,
+				// Subagents are short-lived; never schedule background warm requests.
+				cacheWarming: false,
 				// A revived session restores the tier history it persisted (including
 				// tiers a provider rejected or an extension changed since spawn); only
 				// the fresh spawn resolves the per-agent override.
@@ -3771,9 +3985,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						ircOmittedCount: ircRoster?.omittedCount ?? 0,
 						ircSelfId: ircEnabled ? id : "",
 					});
-					return defaultPrompt.length === 0
-						? [subagentPrompt]
-						: [...defaultPrompt.slice(0, -1), subagentPrompt, defaultPrompt[defaultPrompt.length - 1]];
+					// Per-spawn text (context, worktree, IRC roster) goes after the
+					// trailing `<project-context>` block so spawns of the same agent
+					// share the static prompt prefix as a cache hit.
+					return [...defaultPrompt, subagentPrompt];
 				},
 				sessionManager: sessionManagerForRun,
 				hasUI: false,
@@ -3800,7 +4015,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				customTools: sessionCustomTools.length > 0 ? sessionCustomTools : undefined,
 				localProtocolOptions: options.localProtocolOptions,
 				telemetry: subagentTelemetry,
-				parentEvalSessionId: options.parentEvalSessionId,
 				onFirstChatDispatch: () => {
 					firstChatDispatchAt ??= performance.now();
 				},
@@ -3851,7 +4065,19 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			monitor.setActiveSession(session);
 			// Run-state notifications precede deferrable wire-level `agent_end`,
 			// so adopted keep-alive lifecycle cannot get stuck during prompt unwind.
-			AgentRegistry.global().syncSessionStatus(id, session);
+			const registry = AgentRegistry.global();
+			registry.syncSessionStatus(id, session);
+			const runRef = registry.get(id);
+			if (runRef) {
+				// Hub kills bypass the caller signal. Observe this exact registry generation.
+				registryAbortUnsubscribe = registry.onChange(event => {
+					if (event.type === "status_changed" && event.ref === runRef && event.ref.status === "aborted") {
+						monitor.requestAbort("signal");
+					}
+				});
+				// Close the subscribe-after-read race with a kill during session creation.
+				if (runRef.status === "aborted") monitor.requestAbort("signal");
+			}
 			if (sessionFile !== null) {
 				// Lifecycle reviver: park closed the JSONL writer, so reopening takes
 				// the single-writer lock cleanly and restores the full message history
@@ -3953,6 +4179,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				spawns: spawnsEnv,
 				readSummarize: agent.readSummarize,
 				advisor: advisorSelection ? (advisorSelection.model ?? "on") : undefined,
+				compactionThreshold: options.compactionThresholdOverride,
 				outputSchema,
 				outputSchemaMode: options.outputSchemaMode,
 				restrictToolNames: restrictToolNames || undefined,
@@ -4070,7 +4297,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 
 			readyAt = performance.now();
-			const outcome = await driveSessionToYield(session, monitor, task);
+			const outcome = await driveSessionToYield(session, monitor, task, { solutionSpace: options.solutionSpace });
 			// Acceptance boundary (#11079): the run's final result is settled, so
 			// stamp the lifecycle and terminalize a ref the run-state mirror left
 			// `running` before the (possibly slow) cleanup below.
@@ -4132,6 +4359,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
 					});
 				}
+			}
+			if (registryAbortUnsubscribe) {
+				registryAbortUnsubscribe();
+				registryAbortUnsubscribe = null;
 			}
 			if (unsubscribe) {
 				try {

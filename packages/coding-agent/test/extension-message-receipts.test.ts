@@ -19,6 +19,11 @@ import {
 	MemorySessionStorage,
 	type SessionStorage,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import {
+	cfgRetryModelFallback,
+	cfgRetryUsageAwareFallback,
+	cfgRetryUsageReservePolicy,
+} from "@oh-my-pi/pi-coding-agent/session/settings";
 import * as imageLoading from "@oh-my-pi/pi-coding-agent/utils/image-loading";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
@@ -44,6 +49,8 @@ async function createHarness(
 		? SessionManager.create(path.resolve(dir.path()), path.resolve(dir.path(), "sessions"), options.storage)
 		: SessionManager.inMemory(path.resolve(dir.path()));
 	const model = createMockModel({ provider: "openai", id: "gpt-test" }).model;
+	// Session preflight resolves credentials through the registry before the mocked Agent transport.
+	auth.keys.setRuntime(model.provider, "hermetic-receipt-test-key");
 	const entered = Promise.withResolvers<void>();
 	const release = Promise.withResolvers<void>();
 	const contexts: Context[] = [];
@@ -196,9 +203,9 @@ describe("extension message receipts", () => {
 
 	it("settles a pre-admission failure while an operator turn waits behind its preflight", async () => {
 		const h = await createHarness();
-		h.settings.override("retry.modelFallback", false);
-		h.settings.override("retry.usageAwareFallback", true);
-		h.settings.override("retry.usageReservePolicy", "fail-closed");
+		cfgRetryModelFallback.override(h.settings, false);
+		cfgRetryUsageAwareFallback.override(h.settings, true);
+		cfgRetryUsageReservePolicy.override(h.settings, "fail-closed");
 		const preflightEntered = Promise.withResolvers<void>();
 		const releasePreflight = Promise.withResolvers<void>();
 		let preflightChecks = 0;

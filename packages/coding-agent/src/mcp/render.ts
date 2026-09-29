@@ -8,6 +8,7 @@ import { type Component, Markdown } from "@oh-my-pi/pi-tui";
 import { renderStatusLine, WidthAwareText } from "@oh-my-pi/pi-tui/render";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 import { settings } from "../config/settings";
+import { cfgMcpRenderMarkdownResults } from "./settings";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { getMarkdownTheme, type Theme } from "@oh-my-pi/pi-tui/theme";
 import {
@@ -151,7 +152,7 @@ export function renderMCPResult(
 			// Non-JSON text beginning with a bracket is still eligible for Markdown.
 		}
 	}
-	if (singleTextOutput && settings.get("mcp.renderMarkdownResults") && !isJsonOutput) {
+	if (singleTextOutput && cfgMcpRenderMarkdownResults.get(settings) && !isJsonOutput) {
 		return renderMarkdownMCPResult(result, trimmedOutput, truncationWarning, options, theme, args);
 	}
 	return new WidthAwareText(

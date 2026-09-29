@@ -8,7 +8,7 @@ It explicitly excludes context-overflow recovery via auto-compaction. Overflow i
 
 - [`../packages/coding-agent/src/session/agent-session.ts`](../packages/coding-agent/src/session/agent-session.ts)
 - [`../packages/coding-agent/src/session/turn-recovery.ts`](../packages/coding-agent/src/session/turn-recovery.ts) — retry classification, backoff, credential rotation, and model fallback
-- [`../packages/coding-agent/src/config/settings-schema.ts`](../packages/coding-agent/src/config/settings-schema.ts)
+- [`../packages/coding-agent/src/session/settings.ts`](../packages/coding-agent/src/session/settings.ts) — `retry.*` setting definitions
 - [`../packages/coding-agent/src/modes/controllers/event-controller.ts`](../packages/coding-agent/src/modes/controllers/event-controller.ts)
 - [`../packages/coding-agent/src/modes/controllers/input-controller.ts`](../packages/coding-agent/src/modes/controllers/input-controller.ts)
 - [`../packages/coding-agent/src/modes/rpc/rpc-mode.ts`](../packages/coding-agent/src/modes/rpc/rpc-mode.ts)
@@ -62,7 +62,7 @@ Current retryable categories include:
 
 The normalized classifier recognizes the transient categories above from structured flags/status and provider-aware text patterns. Classifier refusals remain a separate typed `stopDetails` decision.
 
-Beyond `isRetryableError(...)`, empty generic aborts may enter the same retry engine when no user, dispose, or streaming-edit-guard abort is in progress. An interrupted turn whose tool calls already have matching results can also be continued safely: the failed assistant/tool-result sequence is preserved so completed side effects are not replayed. Resolved stream stalls and HTTP/2 stream resets (`NGHTTP2_INTERNAL_ERROR`, `NGHTTP2_REFUSED_STREAM`, `HTTP2StreamReset`) use the same preserve-and-continue path. Cursor idle-stall recovery continues after every emitted tool call has a result; the Connect stream is already closed by the idle abort. An HTTP/2 RST is the same: the stream is already dead.
+Beyond `isRetryableError(...)`, empty generic aborts may enter the same retry engine when no user, dispose, or streaming-edit-guard abort is in progress. An interrupted turn whose tool calls already have matching results can also be continued safely: the failed assistant/tool-result sequence is preserved so completed side effects are not replayed. Resolved stream stalls and HTTP/2 stream resets (`NGHTTP2_INTERNAL_ERROR`, `NGHTTP2_REFUSED_STREAM`, `HTTP2StreamReset`) use the same preserve-and-continue path. Cursor idle-stall recovery continues after every emitted tool call has a result; the Connect stream is already closed by the idle abort. An HTTP/2 RST is the same: the stream is already dead. A text-only turn (no tool calls) that fails mid-stream after its reply text rendered cannot be replayed without duplicating that text, so it keeps the partial turn and continues with a developer reminder (`stream-stall-continue.md`) to resume where it stopped, up to 3 attempts per prompt while auto-retry is enabled (`TurnRecovery.handleCommittedTextStreamStall`).
 
 Retry state is owned by `TurnRecovery`:
 
@@ -175,7 +175,7 @@ This barrier does not await arbitrary asynchronous work started by public subscr
 
 ### Configuration knobs
 
-Defined in settings schema under retry group:
+Defined in `packages/coding-agent/src/session/settings.ts`:
 
 - `retry.enabled`
 - `retry.maxRetries`

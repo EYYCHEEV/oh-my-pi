@@ -189,6 +189,51 @@ describe("exact-account OAuth restriction", () => {
 		expect(apiKeyCalls).not.toContain("acct-a");
 	});
 
+	for (const disabled of [false, true]) {
+		test(`refuses store replacement while a ${disabled ? "disabled" : "live"} launch restriction exists`, async () => {
+			await storage.credentials.set(PROVIDER, [codexCredential("a")]);
+			const { a } = ids();
+			storage.oauth.restrict(PROVIDER, a!);
+			if (disabled) await storage.credentials.disable(a!, "disabled by test");
+			const originalPool = storage.credentials;
+			const oldClose = vi.spyOn(store!, "close");
+			const replacement = await SqliteAuthCredentialStore.open(":memory:");
+			await replacement.upsertAuthCredential(PROVIDER, codexCredential("different-account"));
+			const replacementClose = vi.spyOn(replacement, "close");
+			await expect(storage.replaceStore(replacement)).rejects.toThrow("Relaunch to use a different auth source");
+			expect(replacementClose).toHaveBeenCalledTimes(1);
+			expect(oldClose).not.toHaveBeenCalled();
+			expect(storage.credentials).toBe(originalPool);
+			expect(storage.oauth.restriction(PROVIDER)).toBe(a);
+			if (disabled) {
+				await expectPoolError(storage.keys.get(PROVIDER), "restricted_missing");
+			} else {
+				expect(await storage.keys.get(PROVIDER)).toBe("api-acct-a");
+			}
+		});
+	}
+
+	test("usage never substitutes an environment bearer after the restricted target is disabled", async () => {
+		const provider = "xai-oauth";
+		let probes = 0;
+		storage.usage.setProvider(provider, {
+			id: provider,
+			async fetchUsage() {
+				probes += 1;
+				return null;
+			},
+		});
+		await storage.credentials.set(provider, [codexCredential("restricted")]);
+		const [account] = storage.oauth.accounts(provider);
+		storage.oauth.restrict(provider, account!.credentialId);
+		await storage.credentials.disable(account!.credentialId, "disabled by test");
+		await withEnv({ XAI_OAUTH_TOKEN: "env-token" }, async () => {
+			await storage.usage.reports();
+			await storage.usage.reports({ includePaused: true });
+		});
+		expect(probes).toBe(0);
+	});
+
 	test("runtime and config overrides stay settable but fail closed on use", async () => {
 		await storage.credentials.set(PROVIDER, [codexCredential("a"), codexCredential("b")]);
 		storage.oauth.restrict(PROVIDER, ids().a!);

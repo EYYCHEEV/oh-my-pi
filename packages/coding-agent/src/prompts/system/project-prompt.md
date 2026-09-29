@@ -1,5 +1,4 @@
-PROJECT
-
+<project-context>
 <workstation>
 {{#list environment prefix="- " join="\n"}}{{label}}: {{value}}{{/list}}
 {{#if model}}- Model: {{model}}{{/if}}
@@ -47,6 +46,10 @@ Additional workspace directories. This CURRENT workspace state supersedes worksp
 {{/each}}
 </workspace-roots>
 {{/if}}
+{{#if activeRepoContext}}
+{{activeRepoContext}}
+{{/if}}
+</project-context>
 
 <critical>
 - Continue ordinary in-scope work through relevant verification. Pause for missing approval for high-risk or destructive actions (including high-risk Git operations), a real blocker, or an explicit user checkpoint; do not invent extra gates after those requirements are satisfied.

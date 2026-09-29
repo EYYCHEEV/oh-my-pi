@@ -173,25 +173,6 @@ describe("RPC subagent registry", () => {
 		registry.dispose();
 	});
 
-	test("clears stale snapshots when the active RPC session changes", () => {
-		const eventBus = new EventBus();
-		const registry = new RpcSubagentRegistry(eventBus, () => {});
-		eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
-			id: "SubagentA",
-			index: 0,
-			agent: "task",
-			agentSource: "bundled",
-			status: "started",
-			sessionFile: "/tmp/subagent.jsonl",
-		} satisfies SubagentLifecyclePayload);
-
-		expect(registry.getSubagents()).toHaveLength(1);
-		registry.clear();
-
-		expect(registry.getSubagents()).toHaveLength(0);
-		registry.dispose();
-	});
-
 	test("clears stale snapshots after successful RPC session changes", async () => {
 		const cases: Array<{
 			command: RpcSessionChangeCommand;
@@ -419,6 +400,7 @@ function handle(frame) {
 		write({ type: "subagent_event", payload: { id: "SubagentA", event: { type: "agent_start" } } });
 		write({ type: "agent_activity_state", runId: "root-run", state: "running" });
 		write({ type: "agent_end", messages: [] });
+		write({ type: "prompt_result", id: frame.id, agentInvoked: true, status: "completed" });
 	}
 }
 `,

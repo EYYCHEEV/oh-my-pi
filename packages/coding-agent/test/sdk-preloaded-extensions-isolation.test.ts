@@ -18,6 +18,11 @@ import * as path from "node:path";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
+	cfgRequiredExtensionPath,
+	cfgRequiredExtensionId,
+	cfgRequiredExtensionSha256,
+} from "@oh-my-pi/pi-coding-agent/config/all-settings";
+import {
 	loadExtensionsWithRequiredAttestation,
 	type RequiredExtensionSpec,
 	type RequiredExtensionStartupFailure,
@@ -566,9 +571,9 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 			const revive = await factory(registeredRef);
 			if (!revive) throw new Error("expected cold reviver");
 
-			settings.set("requiredExtension.path", path.join(sharedDir, "wrong.ts"));
-			settings.set("requiredExtension.id", "extension-module:wrong");
-			settings.set("requiredExtension.sha256", "0".repeat(64));
+			cfgRequiredExtensionPath.set(settings, path.join(sharedDir, "wrong.ts"));
+			cfgRequiredExtensionId.set(settings, "extension-module:wrong");
+			cfgRequiredExtensionSha256.set(settings, "0".repeat(64));
 			const revived = await revive(registeredRef);
 			expect(revived).toBeDefined();
 			await revived.dispose();

@@ -43,7 +43,7 @@ export type ModelKind = (typeof MODEL_KINDS)[number];
 export const KIND_API_KINDS = ["image", "tts", "stt", "embedding", "rerank", "video"] as const;
 export type KindApiKind = (typeof KIND_API_KINDS)[number];
 /** Grounding transport available to chat models selected by the web role. */
-export type WebSearchGrounding = "gemini" | "anthropic" | "codex" | "xai" | "openrouter";
+export type WebSearchGrounding = "gemini" | "anthropic" | "codex" | "xai" | "openrouter" | "openai";
 /** Non-chat runner protocols accepted by catalog seeds, outside the chat dispatch union. */
 export const RUNNER_APIS = [
 	"local-inference",
@@ -481,6 +481,13 @@ export interface OpenAICompat {
 	 * sent as the top-level `reasoning.effort`.
 	 */
 	supportsConfigurationUpdate?: boolean;
+	/**
+	 * Whether the Responses WebSocket accepts `response.steer`, which queues user
+	 * input into the in-flight response (GPT-6 family). Default: rule-detected.
+	 * Set `false` for proxies that reject the event; steering then waits for the
+	 * next request boundary.
+	 */
+	supportsSteering?: boolean;
 	/** Whether streamed reasoning deltas for the same field may repeat the full cumulative text snapshot. Default: false. */
 	reasoningDeltasMayBeCumulative?: boolean;
 	/** Strip leaked DeepSeek chat-template special tokens from visible content deltas. Default: auto-detected. */
@@ -556,6 +563,15 @@ export interface AnthropicCompat {
 	 */
 	disableStrictTools?: boolean;
 	/**
+	 * The endpoint is Amazon Bedrock's Anthropic Messages API (`/anthropic` on
+	 * bedrock-runtime or bedrock-mantle). Requests drop tool `strict`, fit
+	 * `metadata.user_id` to Bedrock's request-metadata pattern, and may use
+	 * on-demand compaction. Detected from the model `baseUrl`; set it in
+	 * models.yml `compat` for a route the URL check cannot see (a proxy, an
+	 * `ANTHROPIC_BASE_URL` reroute) or to `false` to opt out.
+	 */
+	bedrockMessagesApi?: boolean;
+	/**
 	 * Map adaptive thinking (`thinking: { type: "adaptive" }`) to
 	 * `{ type: "enabled", budget_tokens }`. Vertex AI rejects the `adaptive`
 	 * tag with `Input tag 'adaptive' ... does not match any of the expected
@@ -582,6 +598,13 @@ export interface AnthropicCompat {
 	 * `input_transformations` under the thinking-binding-controls beta.
 	 */
 	supportsThinkingBindingControls?: boolean;
+	/**
+	 * Whether the model replaces `thinking: { type: "disabled" }` with
+	 * `thinking: { type: "between_tools" }` (Claude Sonnet 5.5). The disabled
+	 * form is rejected with a 400; `between_tools` skips up-front thinking and
+	 * only allows progress updates between tool calls.
+	 */
+	supportsBetweenToolsThinking?: boolean;
 	/**
 	 * Whether the model accepts a forced `tool_choice` (`{ type: "any" }` or
 	 * `{ type: "tool", name }`). Claude Fable/Mythos 5 reject forced tool use
@@ -880,6 +903,7 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 			| "strictResponsesPairing"
 			| "supportsImageDetailOriginal"
 			| "supportsConfigurationUpdate"
+			| "supportsSteering"
 			| "stripImageInput"
 			| "thinkingLoopGuard"
 			| "whenThinking"
@@ -919,6 +943,11 @@ export interface ResolvedOpenAIResponsesCompat extends ResolvedOpenAISharedCompa
 	 * the item type with 400.
 	 */
 	supportsConfigurationUpdate: boolean;
+	/**
+	 * Whether the WebSocket transport may send `response.steer` to deliver user
+	 * input into the in-flight response. Rule-owned: GPT-6 family.
+	 */
+	supportsSteering: boolean;
 	/** Inject the `# Juice: 0 !important` developer item when reasoning is forced off (gpt-5.6+). */
 	requiresReasoningOffJuiceInstruction: boolean;
 	/**
@@ -952,9 +981,17 @@ export interface ResolvedOpenAIResponsesCompat extends ResolvedOpenAISharedCompa
 export type ResolvedOpenRouterCompat = ResolvedOpenAICompat & ResolvedOpenAIResponsesCompat;
 
 /** Fully-resolved anthropic-messages compat view (same contract as `ResolvedOpenAICompat`). */
-export type ResolvedAnthropicCompat = Required<Omit<AnthropicCompat, "streamIdleTimeoutMs" | "thinkingLoopGuard">> & {
+export type ResolvedAnthropicCompat = Required<
+	Omit<AnthropicCompat, "streamIdleTimeoutMs" | "thinkingLoopGuard" | "bedrockMessagesApi">
+> & {
 	/** Thinking-loop watchdog guard family applied to streamed reasoning. */
 	thinkingLoopGuard?: AnthropicCompat["thinkingLoopGuard"];
+	/**
+	 * Bedrock's Anthropic Messages API (see {@link AnthropicCompat.bedrockMessagesApi}).
+	 * `true` when detected or configured; otherwise unset, so rows baked before
+	 * this field keep matching.
+	 */
+	bedrockMessagesApi?: boolean;
 	/**
 	 * Stream-watchdog idle-timeout fallback in ms for slow reasoning hosts; 0 disables the idle watchdog.
 	 * Undefined defers to `PI_STREAM_IDLE_TIMEOUT_MS`, then the legacy
@@ -1145,6 +1182,13 @@ export interface TimeBasedCost {
 	effectiveRates?: readonly EffectiveTokenCost[];
 }
 
+/**
+ * Best-effort prompt-cache entry lifetime in seconds for each retention tier a
+ * request can ask for. A missing tier means the lifetime is unknown; consumers
+ * must not schedule cache warming against unknown lifetimes.
+ */
+export type ModelPromptCache = Partial<Record<"short" | "long", number>>;
+
 /** Base token rates plus optional long-context and time-based pricing. */
 export interface ModelCost extends TokenCost {
 	longContext?: LongContextTokenCost;
@@ -1186,6 +1230,12 @@ export interface Model<TApi extends Api = Api> {
 	kind?: ModelKind;
 	/** Grounding transport supported by this chat model. */
 	webSearch?: WebSearchGrounding;
+	/** Cheaper same-provider model to run hosted web search in this model's place (model id or provider/id). */
+	webSearchModel?: string;
+	/** Whether this chat model can carry the Responses `image_generation` tool itself. */
+	hostedImage?: boolean;
+	/** Same-provider image model to generate images in this model's place (model id or provider/id). */
+	imageModel?: string;
 	/**
 	 * Structured model identity resolved by the compat engine: vendor lineage
 	 * class, product family, and revision. Baked into models.json rows and
@@ -1283,6 +1333,14 @@ export interface Model<TApi extends Api = Api> {
 	 */
 	accountAccess?: Readonly<Record<string, ModelAccountAccess>>;
 	cost: ModelCost;
+	/**
+	 * Prompt-cache entry lifetime per retention tier, in seconds. Populated only
+	 * for providers whose cache-expiry and replay behavior has been validated
+	 * for cache warming (direct Anthropic: 5m / 1h). A missing entry means the
+	 * provider's cache behavior is unknown — such models are never warmed.
+	 * Custom models and provider overrides opt in via models.yml `promptCache`.
+	 */
+	promptCache?: ModelPromptCache;
 	/** Premium Copilot requests charged per user-initiated request (defaults to 1). */
 	premiumMultiplier?: number;
 	contextWindow: number | null;
@@ -1329,6 +1387,12 @@ export interface Model<TApi extends Api = Api> {
 	useResponsesLite?: boolean;
 	/** Codex Code Mode restriction: model expects tools routed through a programmatic exec surface (mirrors codex-rs `tool_mode`). */
 	toolMode?: "code_mode_only";
+	/**
+	 * Service-tier ids the provider advertises for this model (Codex discovery
+	 * `service_tiers[].id`, e.g. `priority`, `ultrafast`). Absent when the
+	 * provider publishes no per-model tier list.
+	 */
+	serviceTiers?: readonly string[];
 	/** Preferred model to switch to when context promotion is triggered (model id or provider/id). */
 	contextPromotionTarget?: string;
 	/** Preferred model to use only for compaction (model id or provider/id); the active session model is unchanged. */

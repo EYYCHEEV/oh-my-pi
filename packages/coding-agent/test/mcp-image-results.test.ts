@@ -166,6 +166,41 @@ describe("MCP image tool results", () => {
 		expect(rendered).not.toContain(TINY_PNG_BASE64);
 	});
 
+	it("preserves image labels and mixed ordering through the native MCP descriptor", async () => {
+		for (const content of [
+			[JPEG_IMAGE],
+			[{ type: "text" as const, text: "before" }, JPEG_IMAGE, { type: "text" as const, text: "after" }],
+		]) {
+			const tool = createTool(content);
+			const result = await tool.execute("native-call", {}, undefined, undefined!);
+			const view = tool.describeResult(result, { expanded: true, isPartial: false });
+			expect(view).toBeDefined();
+			const described = JSON.stringify(view);
+			expect(described).toContain("[Image: image/jpeg]");
+			expect(described).not.toContain("(no output)");
+			expect(described).not.toContain(TINY_PNG_BASE64);
+			if (content.length > 1) {
+				expect(described.indexOf("before")).toBeLessThan(described.indexOf("[Image: image/jpeg]"));
+				expect(described.indexOf("[Image: image/jpeg]")).toBeLessThan(described.indexOf("after"));
+			}
+		}
+	});
+
+	it("sanitizes image MIME labels in native error results without exposing image data", async () => {
+		const tool = createTool(
+			[{ ...JPEG_IMAGE, mimeType: "\u001b]8;;https://evil.invalid\u0007image/evil\nnext\tpart\u0000" }],
+			true,
+		);
+		const result = await tool.execute("native-error", {}, undefined, undefined!);
+		const view = tool.describeResult(result, { expanded: true, isPartial: false });
+		expect(view).toBeDefined();
+		const described = JSON.stringify(view);
+		expect(described).toContain("[Image: image/evil next part]");
+		expect(described).not.toContain("https://evil.invalid");
+		expect(described).not.toContain("\\u0007");
+		expect(described).not.toContain(TINY_PNG_BASE64);
+	});
+
 	it("preserves text/image ordering through the real custom-tool adapter and spill wrapper", async () => {
 		const before = "before\n".repeat(220);
 		const after = "after\n".repeat(220);

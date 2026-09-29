@@ -5,10 +5,18 @@
  * showing args and output in JSON tree format similar to task tool.
  */
 import { type Component, Markdown } from "../index";
+import { sanitizeText } from "@oh-my-pi/pi-utils";
 
-import type { RenderResultOptions } from "./renderer";
+import type { NativeToolHead, NativeToolView, RenderResultOptions } from "./renderer";
+import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
+import { ansi, md } from "../native/describe";
+import type { NativeChild } from "../native/node";
+import { OwnerMemo } from "../native/memo";
+import { plainText } from "../native/spans";
+import { errorText, noteText, truncationNotice } from "./native-view";
 import { getMarkdownTheme, type Theme } from "../theme/theme";
 import {
+	describeJsonTree,
 	formatArgsInline,
 	JSON_TREE_MAX_DEPTH_COLLAPSED,
 	JSON_TREE_MAX_DEPTH_EXPANDED,
@@ -19,7 +27,7 @@ import {
 	renderJsonTreeLines,
 } from "./json-tree";
 import { formatStyledTruncationWarning, stripOutputNotice } from "./output-meta";
-import { formatExpandHint, truncateToWidth } from "../render/render-utils";
+import { formatExpandHint, replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "../render/render-utils";
 import { formatOutputPaneLines, styleToolOutputLine } from "../render/output-pane";
 import type { StatusLineOptions } from "../render/status-line";
 import { plainToolCard, type ToolCardPhase } from "../render/tool-card";
@@ -126,28 +134,49 @@ function renderMarkdownMCPResult(
 	);
 }
 
+type MCPRenderResult = {
+	content: Array<{ type: string; text?: string; mimeType?: string; data?: string }>;
+	details?: MCPToolDetails;
+	isError?: boolean;
+};
+
+/** Preserve result order without exposing image bytes to either renderer. */
+function mcpDisplayOutput(result: MCPRenderResult): string {
+	const displayBlocks: string[] = [];
+	for (const block of result.content ?? []) {
+		if (block.type === "image") {
+			const mimeType = truncateToWidth(
+				replaceTabs(sanitizeText(block.mimeType ?? "")).replace(/\s+/g, " ").trim(),
+				TRUNCATE_LENGTHS.CONTENT,
+			);
+			displayBlocks.push(`[Image: ${mimeType || "unknown"}]`);
+		} else if (block.type === "text") {
+			const text = stripOutputNotice(block.text ?? "", result.details?.meta).trimEnd();
+			if (text) displayBlocks.push(text);
+		}
+	}
+	return displayBlocks.join("\n\n");
+}
+
 /**
  * Render MCP tool result.
  */
 export function renderMCPResult(
-	result: { content: Array<{ type: string; text?: string }>; details?: MCPToolDetails; isError?: boolean },
+	result: MCPRenderResult,
 	options: RenderResultOptions,
 	theme: Theme,
 	args?: Record<string, unknown>,
 ): Component {
 	const { expanded } = options;
-	const textContent = (result.content ?? [])
-		.filter(block => block.type === "text")
-		.map(block => block.text ?? "")
-		.filter(text => text.length > 0)
-		.join("\n\n");
-	const trimmedOutput = stripOutputNotice(textContent, result.details?.meta).trimEnd();
+	const trimmedOutput = mcpDisplayOutput(result);
+	const singleTextOutput =
+		result.content.length === 1 && result.content[0]?.type === "text" ? trimmedOutput : undefined;
 	const truncationWarning = result.details?.meta?.truncation
 		? formatStyledTruncationWarning(result.details.meta, theme)
 		: null;
 	let parsedOutput: unknown;
 	let isJsonOutput = false;
-	if (trimmedOutput.startsWith("{") || trimmedOutput.startsWith("[")) {
+	if (singleTextOutput?.startsWith("{") || singleTextOutput?.startsWith("[")) {
 		try {
 			parsedOutput = JSON.parse(trimmedOutput);
 			isJsonOutput = true;
@@ -155,7 +184,7 @@ export function renderMCPResult(
 			// Non-JSON text beginning with a bracket is still eligible for Markdown.
 		}
 	}
-	if (trimmedOutput && renderMarkdownResults && !isJsonOutput) {
+	if (singleTextOutput && renderMarkdownResults && !isJsonOutput) {
 		return renderMarkdownMCPResult(result, trimmedOutput, truncationWarning, options, theme, args);
 	}
 	return plainToolCard(
@@ -230,6 +259,74 @@ export function renderMCPResult(
 	);
 }
 
+/** Visible MCP argument entries (streaming/intent bookkeeping keys dropped). */
+function visibleMcpArgs(args: Record<string, unknown> | undefined): [string, unknown][] {
+	if (!args || typeof args !== "object") return [];
+	return Object.entries(args).filter(([key]) => key !== INTENT_FIELD && key !== "__partialJson");
+}
+
+/** Inline args summary budget in characters (a data cap, not a width). */
+const MCP_ARGS_SUMMARY_CHARS = 160;
+
+/** Native MCP head: the tool title with a one-line args summary as target. */
+function mcpHead(title: string, args: Record<string, unknown> | undefined): NativeToolHead {
+	const entries = visibleMcpArgs(args);
+	const summary =
+		entries.length > 0
+			? formatArgsInline(Object.fromEntries(entries), MCP_ARGS_SUMMARY_CHARS, { characterBudget: true })
+			: "";
+	return { title, target: summary ? plainText(summary) : undefined, targetKind: "text" };
+}
+
+/** Native MCP call view: the head only, inline while pending. */
+export function describeMCPCall(args: Record<string, unknown>, label: string): NativeToolView {
+	return { tool: mcpHead(label, args), inline: true };
+}
+
+const mcpResultMemo = new OwnerMemo<NativeToolView | undefined>();
+
+/**
+ * Native MCP result view: JSON output as a JSON tree, Markdown when the
+ * preference is on, otherwise the raw text as tool output. The head's args
+ * summary stands in for the ANSI card's Args tree.
+ */
+export function describeMCPResult(
+	result: MCPRenderResult,
+	_options: RenderResultOptions,
+	args?: Record<string, unknown>,
+): NativeToolView | undefined {
+	return mcpResultMemo.get(result, [renderMarkdownResults, JSON.stringify(args ?? null)], () => {
+		const output = mcpDisplayOutput(result);
+		const singleTextOutput = result.content.length === 1 && result.content[0]?.type === "text";
+		const isError = result.isError ?? result.details?.isError ?? false;
+		const title = result.details ? `${result.details.serverName}/${result.details.mcpToolName}` : "MCP";
+		const body: NativeChild[] = [];
+		let parsed: unknown;
+		let isJson = false;
+		if (singleTextOutput && (output.startsWith("{") || output.startsWith("["))) {
+			try {
+				parsed = JSON.parse(output);
+				isJson = true;
+			} catch {
+				// Bracketed non-JSON text falls through to Markdown/raw output.
+			}
+		}
+		if (!output) body.push(noteText("(no output)"));
+		else if (isError) body.push(errorText(output));
+		else if (isJson) body.push(describeJsonTree(parsed));
+		else if (singleTextOutput && renderMarkdownResults) body.push(md(output));
+		else body.push(ansi(output));
+		const warning = truncationNotice(result.details?.meta);
+		if (warning) body.push(warning);
+		return {
+			tool: mcpHead(title, args),
+			tone: isError ? "error" : undefined,
+			body,
+			preview: { lines: 4 },
+		};
+	});
+}
+
 import type { OutputMeta } from "./output-meta";
 
 let renderMarkdownResults = false;
@@ -266,7 +363,7 @@ export interface MCPResourceContent {
 /** Supported MCP result content blocks retained in display metadata. */
 export type MCPContent = MCPTextContent | MCPImageContent | MCPResourceContent;
 
-/** Details included in MCP tool results for rendering */
+/** MCP result details shared by renderers and programmatic tool consumers. */
 export interface MCPToolDetails {
 	/** Server name */
 	serverName: string;
@@ -276,6 +373,8 @@ export interface MCPToolDetails {
 	isError?: boolean;
 	/** Raw content from MCP response */
 	rawContent?: MCPContent[];
+	/** Server-supplied structured data, independent of the model-facing text rendering. */
+	structuredContent?: Record<string, unknown>;
 	/** Structured metadata from the MCP response */
 	mcpMeta?: Record<string, unknown>;
 	/** Provider ID (e.g., "claude", "mcp-json") */

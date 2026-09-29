@@ -13,6 +13,8 @@ import {
 	loadExtensions,
 } from "../src/extensibility/extensions/loader";
 import { ExtensionRunner } from "../src/extensibility/extensions/runner";
+import { cfgDisabledExtensions } from "../src/extensibility/settings";
+import { cfgCompactionKeepRecentTokens } from "../src/session/context-settings";
 import { initializeExtensions } from "../src/modes/runtime-init";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
@@ -104,6 +106,8 @@ async function harness(
 	const runner = new ExtensionRunner(loaded.extensions, loaded.runtime, dir.path(), manager, registry);
 	const mock = createMockModel({ provider: "openai", id: "runtime-test", handler: { content: ["Done."] } });
 	const side = createMockModel({ provider: "openai", id: "runtime-side-test", handler: { content: ["Title"] } });
+	// Session preflight uses registry credentials independently of the mocked Agent transport.
+	auth.keys.setRuntime(mock.model.provider, "hermetic-runtime-test-key");
 	const agent = new Agent({
 		initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
 		getApiKey: () => "test",
@@ -437,7 +441,7 @@ describe("session-wide runtime requirements", () => {
 	it("refuses an extension disabled after declaration", async () => {
 		const h = await harness();
 		await h.declaration;
-		h.session.settings.set("disabledExtensions", ["extension-module:guard"]);
+		cfgDisabledExtensions.set(h.session.settings, ["extension-module:guard"]);
 		await expect(h.session.prompt("REJECTED_DISABLED")).rejects.toThrow("runtime requirement");
 		expect(h.modelCalls()).toBe(0);
 	});
@@ -578,7 +582,7 @@ describe("session-wide runtime requirements", () => {
 	it("rechecks at the auxiliary provider after compaction preparation invalidates runtime satisfaction", async () => {
 		const h = await harness();
 		await h.declaration;
-		h.session.settings.set("compaction.keepRecentTokens", 1);
+		cfgCompactionKeepRecentTokens.set(h.session.settings, 1);
 		await h.session.prompt("First context message with details to summarize");
 		await h.session.prompt("Second context message with further details");
 		h.bus.emit("fail-on-compaction", true);
@@ -681,7 +685,7 @@ describe("session-wide runtime requirements", () => {
 		await h.session.navigateTree(first);
 		expect(h.session.sessionId).toBe(sessionId);
 		expect(ready).toBe(0);
-		h.session.settings.set("compaction.keepRecentTokens", 1);
+		cfgCompactionKeepRecentTokens.set(h.session.settings, 1);
 		await h.session.prompt("Add enough context to retain a recent turn");
 		await h.session.prompt("Add another turn to summarize");
 		await h.session.compact();

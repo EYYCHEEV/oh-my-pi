@@ -28,6 +28,11 @@ export function oauthAccountRestriction(provider: string): number | undefined {
 	return restrictions.get(provider);
 }
 
+/** Whether changing credential stores would reinterpret a launch-restricted row id. */
+export function hasOAuthAccountRestrictions(): boolean {
+	return restrictions.size > 0;
+}
+
 /** Test seam: drop every process-wide restriction. */
 export function resetOAuthAccountRestrictions(): void {
 	restrictions.clear();

@@ -2,8 +2,11 @@ import { afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { OAuthSelectorComponent } from "@oh-my-pi/pi-tui/overlays/oauth-selector";
+import type { NativeNode } from "@oh-my-pi/pi-tui/native/node";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+
+import { cfgDisabledProviders } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 
 beforeAll(async () => {
 	await initTheme();
@@ -109,6 +112,34 @@ describe("OAuthSelectorComponent", () => {
 		expect(selected).toEqual(["opencode-go"]);
 	});
 
+	it("keeps native account management distinct from destructive logout", () => {
+		const selected: string[] = [];
+		const component = new OAuthSelectorComponent(
+			"manage",
+			{
+				credentials: { has: (providerId: string) => providerId === "opencode-go" },
+				keys: { source: () => undefined },
+			} as unknown as AuthStorage,
+			providerId => selected.push(providerId),
+			() => {},
+		);
+		const root = component.describe({
+			cols: 80,
+			reduceMotion: true,
+			dark: true,
+			supports: kind => kind === "picker",
+			feature: () => false,
+		});
+		const picker = root.c?.[0] as NativeNode | undefined;
+		if (picker?.k !== "picker") throw new Error("Missing native provider picker");
+		expect(picker.p?.title).toBe("Manage accounts");
+		const confirm = picker.p?.actions?.find(action => action.id === "confirm");
+		expect(confirm?.label).toBe("Manage accounts");
+		expect(confirm?.danger).not.toBe(true);
+		component.handleNativeEvent({ type: "activate", key: "picker", item: "opencode-go" });
+		expect(selected).toEqual(["opencode-go"]);
+	});
+
 	describe("disabledProviders", () => {
 		afterEach(() => {
 			resetSettingsForTest();
@@ -131,7 +162,7 @@ describe("OAuthSelectorComponent", () => {
 				authStorage,
 				() => {},
 				() => {},
-				{ disabledProviders: settings.get("disabledProviders") },
+				{ disabledProviders: cfgDisabledProviders.get(settings) },
 			);
 			for (const char of victim.id) {
 				component.handleInput(char);
@@ -157,7 +188,7 @@ describe("OAuthSelectorComponent", () => {
 				authStorage,
 				() => {},
 				() => {},
-				{ disabledProviders: settings.get("disabledProviders") },
+				{ disabledProviders: cfgDisabledProviders.get(settings) },
 			);
 			for (const char of alias.id) {
 				component.handleInput(char);
@@ -185,7 +216,7 @@ describe("OAuthSelectorComponent", () => {
 				} as unknown as AuthStorage,
 				providerId => selected.push(providerId),
 				() => {},
-				{ disabledProviders: settings.get("disabledProviders") },
+				{ disabledProviders: cfgDisabledProviders.get(settings) },
 			);
 			for (const char of "opencode-go") {
 				component.handleInput(char);

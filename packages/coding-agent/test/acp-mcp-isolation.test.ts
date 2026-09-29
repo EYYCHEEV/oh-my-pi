@@ -66,7 +66,7 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 				sessionDir: tempDir.join("sessions"),
 				authStorage,
 				modelRegistry,
-				parsedArgs: {},
+				parsedArgs: { invalidFlagValues: [] },
 				rawArgs: [],
 				createSession,
 			});
@@ -99,7 +99,7 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 				sessionDir: tempDir.join("sessions"),
 				authStorage,
 				modelRegistry,
-				parsedArgs: { tools: ["read", "missing"] },
+				parsedArgs: { tools: ["read", "missing"], invalidFlagValues: [] },
 				rawArgs: ["--tools", "read,missing"],
 				createSession: async () => ({ session: fakeSession }) as CreateAgentSessionResult,
 			});
@@ -137,7 +137,7 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 				sessionDir: tempDir.join("sessions"),
 				authStorage,
 				modelRegistry,
-				parsedArgs: { trustedExtensions: [trustedPath] },
+				parsedArgs: { trustedExtensions: [trustedPath], invalidFlagValues: [] },
 				rawArgs: [],
 				createSession: async options => {
 					captured = options;
@@ -178,7 +178,7 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 				sessionDir: tempDir.join("sessions"),
 				authStorage,
 				modelRegistry,
-				parsedArgs: { trustedExtensions: [trustedPath] },
+				parsedArgs: { trustedExtensions: [trustedPath], invalidFlagValues: [] },
 				rawArgs: [],
 				createSession: async () => {
 					createCalls++;
@@ -206,7 +206,7 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 				sessionDir: tempDir.join("sessions"),
 				authStorage,
 				modelRegistry,
-				parsedArgs: {},
+				parsedArgs: { invalidFlagValues: [] },
 				rawArgs: [],
 				createSession: async options => {
 					if (!options.sessionManager) throw new Error("expected factory-owned manager");
@@ -266,7 +266,7 @@ describe("createAcpSessionFactory TITLE_SYSTEM.md per-cwd resolution (PR #3736)"
 				sessionDir: tempDir.join("sessions"),
 				authStorage,
 				modelRegistry,
-				parsedArgs: {},
+				parsedArgs: { invalidFlagValues: [] },
 				rawArgs: [],
 				createSession,
 			});

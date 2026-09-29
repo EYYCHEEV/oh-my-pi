@@ -272,6 +272,11 @@ export class SessionAffinity implements SessionsApi {
 		return true;
 	}
 
+	/** Carry reroute subscribers across a store swap, preserving existing unsubscribe functions. */
+	adoptSubscribers(previous: SessionAffinity): void {
+		this.#rerouteListeners = previous.#rerouteListeners;
+	}
+
 	/** Subscribe to paused-account reroutes. Returns an idempotent unsubscribe. */
 	onReroute(listener: (event: OAuthAccountRerouteEvent) => void): () => void {
 		this.#rerouteListeners.add(listener);

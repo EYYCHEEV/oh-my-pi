@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "bun:test";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { StatusLineComponent } from "@oh-my-pi/pi-tui/status-line";
+import type { NativeNode } from "@oh-my-pi/pi-tui/native/node";
 import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import { statusLineHost } from "@oh-my-pi/pi-coding-agent/modes/status-line-host";
 
@@ -212,5 +213,80 @@ describe("extension status-line segments", () => {
 			}
 		}
 		expect(observed).toContain("FIRST");
+	});
+
+	it("keeps extension identity when embedded context removes its built-in anchor", () => {
+		const status = component(["pi", "context_pct"], ["session_name"]);
+		status.updateSettings({
+			preset: "custom",
+			leftSegments: ["pi", "context_pct"],
+			rightSegments: ["session_name"],
+			contextLine: "embedded",
+			sessionAccent: false,
+		});
+		status.registerExtensionSegment("context-note", {
+			id: "context-note",
+			placement: { afterBuiltin: "context_pct", fallback: "anchor-side-end-else-right" },
+			render: () => "CONTEXT_NOTE",
+		});
+		status.registerExtensionSegment("fallback-note", {
+			id: "fallback-note",
+			placement: { afterBuiltin: "cost", fallback: "anchor-side-end-else-right" },
+			render: () => "FALLBACK_NOTE",
+		});
+		const rendered = plain(status.getTopBorder(120).content);
+		expect(rendered).toContain("CONTEXT_NOTE");
+		expect(rendered).toContain("FALLBACK_NOTE");
+		status.dispose();
+	});
+
+	it("projects placement, color, overflow priority and disposal into native status surfaces", () => {
+		const status = component(["cost"], ["session_name"], { cost: 0.74 });
+		const dispose = status.registerExtensionSegment("first", {
+			id: "first",
+			placement: { afterBuiltin: "cost", fallback: "anchor-side-end-else-right" },
+			color: "statusLineOutput",
+			render: () => "FIRST",
+		});
+		status.registerExtensionSegment("second", {
+			id: "second",
+			placement: { afterBuiltin: "cost", fallback: "anchor-side-end-else-right" },
+			render: () => "SECOND",
+		});
+		status.registerExtensionSegment("fallback", {
+			id: "fallback",
+			placement: { afterBuiltin: "pi", fallback: "anchor-side-end-else-right" },
+			render: () => "FALLBACK",
+		});
+
+		const preview = status.describePreview().c as readonly NativeNode[];
+		expect(preview.map(part => part.key)).toEqual([
+			"cost",
+			"extension:first",
+			"extension:second",
+			"session_name",
+			"extension:fallback",
+		]);
+		const facts = status.describeComposerFacts();
+		const extras = facts.extras.c as readonly NativeNode[];
+		expect(extras.map(part => part.key)).toEqual(["extension:first", "extension:second", "extension:fallback"]);
+		for (const parts of [preview, extras]) {
+			const first = parts.find(part => part.key === "extension:first");
+			const second = parts.find(part => part.key === "extension:second");
+			const fallback = parts.find(part => part.key === "extension:fallback");
+			if (first?.k !== "seg" || second?.k !== "seg" || fallback?.k !== "seg") {
+				throw new Error("Missing native extension segment");
+			}
+			expect(first.p?.side).toBe("left");
+			expect(first.p?.spans).toEqual([{ t: "FIRST", s: "statusLineOutput" }]);
+			expect(fallback.p?.side).toBe("right");
+			expect(second.p?.priority).toBeLessThan(first.p?.priority ?? 0);
+			expect(first.p?.priority).toBeLessThan(0);
+		}
+		dispose();
+		const afterDispose = status.describeComposerFacts();
+		expect(afterDispose).not.toBe(facts);
+		expect((afterDispose.extras.c as readonly NativeNode[]).map(part => part.key)).not.toContain("extension:first");
+		status.dispose();
 	});
 });

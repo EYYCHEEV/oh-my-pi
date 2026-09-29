@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { localDay } from "../dirs";
+import { openCloexecSync } from "../fs-open";
 
 interface AuditEntry {
 	readonly date: number;
@@ -25,6 +26,15 @@ export interface RotatingFileOptions {
 	readonly auditFile: string;
 	readonly maxBytes: number;
 	readonly maxFiles: number;
+	/**
+	 * Called with the new active file path whenever the sink opens a different
+	 * file — construction, local-day rotation, and size rotation alike.
+	 *
+	 * Consumers that hold their own descriptor on the active log (the macOS
+	 * stderr guard dup2s it onto fd 2) use this to follow the sink instead of
+	 * staying pinned to a file the sink later prunes.
+	 */
+	readonly onRotate?: (filePath: string) => void;
 }
 
 function isAuditEntry(value: unknown): value is AuditEntry {
@@ -41,6 +51,7 @@ export class RotatingFileSink {
 	readonly #auditFile: string;
 	readonly #maxBytes: number;
 	readonly #maxFiles: number;
+	readonly #onRotate: ((filePath: string) => void) | undefined;
 	#files: AuditEntry[];
 	#activeDay: string | undefined;
 	#activeIndex = 0;
@@ -61,6 +72,7 @@ export class RotatingFileSink {
 		this.#auditFile = options.auditFile;
 		this.#maxBytes = options.maxBytes;
 		this.#maxFiles = options.maxFiles;
+		this.#onRotate = options.onRotate;
 		this.#files = this.#readAudit();
 		const now = new Date();
 		this.#selectFile(localDay(now));
@@ -73,7 +85,12 @@ export class RotatingFileSink {
 
 	#openFd(filePath: string): void {
 		this.#closeFd();
-		this.#fd = fs.openSync(filePath, "a");
+		this.#fd = openCloexecSync(filePath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND);
+		try {
+			this.#onRotate?.(filePath);
+		} catch {
+			// A rotation observer must never break logging.
+		}
 	}
 
 	#closeFd(): void {

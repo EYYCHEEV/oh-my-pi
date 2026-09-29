@@ -385,7 +385,7 @@ describe("AuthStorage paused OAuth accounts", () => {
 		storage.credentials.pause(PROVIDER, b!);
 		expect(
 			await storage.limits.rotate(PROVIDER, undefined, { credentialId: a, error: new Error("401 Unauthorized") }),
-		).toBe(false);
+		).toEqual({ switched: false });
 	});
 
 	test("keys.peek skips paused accounts", async () => {
@@ -439,6 +439,27 @@ describe("AuthStorage paused OAuth accounts", () => {
 			unsubscribe();
 		});
 	}
+
+	test("a store replacement preserves reroute subscribers and their unsubscribe functions", async () => {
+		const events: OAuthAccountRerouteEvent[] = [];
+		const unsubscribe = storage.sessions.onReroute(event => events.push(event));
+		const replacement = await SqliteAuthCredentialStore.open(":memory:");
+		await storage.replaceStore(replacement);
+		store = replacement;
+		await storage.credentials.set(PROVIDER, [codexCredential("a"), codexCredential("b")]);
+		const { a, b } = ids();
+		expect(storage.sessions.pin(PROVIDER, "replaced", a!)).toBe(true);
+		storage.credentials.pause(PROVIDER, a!);
+		expect(await storage.keys.get(PROVIDER, "replaced")).toBe("api-acct-b");
+		expect(events).toEqual([
+			{ provider: PROVIDER, sessionId: "replaced", fromCredentialId: a!, toCredentialId: b!, reason: "paused" },
+		]);
+		unsubscribe();
+		storage.credentials.resume(PROVIDER, a!);
+		storage.credentials.pause(PROVIDER, b!);
+		expect(await storage.keys.get(PROVIDER, "replaced")).toBe("api-acct-a");
+		expect(events).toHaveLength(1);
+	});
 
 	test("health.model excludes paused accounts", async () => {
 		await storage.credentials.set(PROVIDER, [codexCredential("a"), codexCredential("b")]);

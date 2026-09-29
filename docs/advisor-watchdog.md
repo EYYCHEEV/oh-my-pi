@@ -17,7 +17,7 @@ An advisor does not approve actions or mutate primary session state directly. It
 - [`src/session/session-advisors.ts`](../packages/coding-agent/src/session/session-advisors.ts)
 - [`src/session/agent-session.ts`](../packages/coding-agent/src/session/agent-session.ts)
 - [`src/slash-commands/builtin-registry.ts`](../packages/coding-agent/src/slash-commands/builtin-registry.ts)
-- [`src/config/settings-schema.ts`](../packages/coding-agent/src/config/settings-schema.ts)
+- [`src/advisor/settings.ts`](../packages/coding-agent/src/advisor/settings.ts) — `advisor.*` setting definitions
 
 ---
 
@@ -58,7 +58,7 @@ retry:
 
 This follows the same rules as the primary's fallback: `retry.modelFallback` must be on, candidates still cooling down or without credentials are skipped, and `retry.fallbackRevertPolicy: cooldown-expiry` returns the advisor to its primary model once the cooldown ends.
 
-`tier.advisor` controls service tier for all advisors. It defaults to `none` (standard processing); `inherit` follows the primary's live per-family tier, including `/fast` changes. Concrete values (`auto`, `default`, `flex`, `scale`, `priority`) are applied only when the advisor model's provider family supports them.
+`tier.advisor` controls service tier for all advisors. It defaults to `none` (standard processing); `inherit` follows the primary's live per-family tier, including `/fast` changes. Concrete values (`auto`, `default`, `flex`, `scale`, `priority`, `ultrafast`) are applied only when the advisor model's provider family supports them.
 
 ### Headless runs
 
