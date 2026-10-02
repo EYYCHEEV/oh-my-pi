@@ -1304,6 +1304,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							? nextProgress.resolvedModelIsFallback
 							: undefined;
 						progress.advisor = nextProgress.advisor ?? progress.advisor;
+						progress.completionPercent = nextProgress.completionPercent ?? progress.completionPercent;
 						progress.resolvedModelRoute = nextProgress.resolvedModelRoute ?? progress.resolvedModelRoute;
 						progress.tokens = nextProgress.tokens;
 						progress.requests = nextProgress.requests;
@@ -1312,6 +1313,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						progress.cost = nextProgress.cost;
 						progress.toolCount = nextProgress.toolCount;
 						progress.currentTool = nextProgress.currentTool;
+						progress.currentToolArgs = nextProgress.currentToolArgs;
+						progress.currentToolArgsKey = nextProgress.currentToolArgsKey;
+						progress.currentToolIntent = nextProgress.currentToolIntent;
+						progress.currentToolStartMs = nextProgress.currentToolStartMs;
 						progress.lastIntent = nextProgress.lastIntent;
 						progress.recentTools = nextProgress.recentTools.slice();
 						progress.recentOutput = nextProgress.recentOutput.slice();

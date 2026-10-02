@@ -30,6 +30,21 @@ export interface InitializeExtensionsOptions {
 	markAgentInvokingMessage?: () => void;
 	/** Optional lifecycle hook for extension-originated sends whose success/failure determines turn ownership. */
 	trackAgentInvokingMessage?: (task: Promise<unknown>) => void;
+	/** Optional observer of every extension-originated send, turn-triggering or not. */
+	trackExtensionSend?: (task: Promise<unknown>) => void;
+	/** Optional filter applied to tool names an extension activates. */
+	filterActiveTools?: (toolNames: string[]) => string[];
+	/**
+	 * Optional wrapper around extension-initiated session changes (new, branch,
+	 * navigate, switch, reload), so the host can quiesce and reattach its own per-session
+	 * state exactly as it does for its own session-change commands.
+	 * `detachesRun` is true for changes that stop the running agent (new, switch);
+	 * branch and navigation leave a live run streaming to its normal end.
+	 */
+	wrapSessionChange?: <T extends { cancelled: boolean }>(
+		change: () => Promise<T>,
+		options: { detachesRun: boolean },
+	) => Promise<T>;
 }
 
 /**
@@ -50,9 +65,13 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 		uiContext,
 		markAgentInvokingMessage,
 		trackAgentInvokingMessage,
+		trackExtensionSend,
+		filterActiveTools,
+		wrapSessionChange = change => change(),
 	} = options;
 	const shutdown = onShutdown ?? (() => {});
 	const observeCustomMessage = (sendTask: Promise<boolean>, sendOptions?: CustomMessageOptions) => {
+		trackExtensionSend?.(sendTask);
 		if (sendOptions?.triggerTurn || sendOptions?.deliverAs === "aside") {
 			// Queues, plan-mode folds and deferred turns resolve false: they own no agent turn.
 			const invokingTask = sendTask.then(started => {
@@ -85,6 +104,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			},
 			sendUserMessage: (content, sendOptions) => {
 				const sendTask = session.sendUserMessage(content, sendOptions);
+				trackExtensionSend?.(sendTask);
 				if (trackAgentInvokingMessage) {
 					trackAgentInvokingMessage(sendTask);
 				} else {
@@ -102,7 +122,8 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			},
 			getActiveTools: () => session.getEnabledToolNames(),
 			getAllTools: () => session.getAllToolInfos(),
-			setActiveTools: (toolNames: string[]) => session.setActiveToolsByName(toolNames),
+			setActiveTools: (toolNames: string[]) =>
+				session.setActiveToolsByName(filterActiveTools ? filterActiveTools(toolNames) : toolNames),
 			getCommands: () => getSessionSlashCommands(session),
 			setModel: model => runExtensionSetModel(session, model),
 			getThinkingLevel: () => session.thinkingLevel,
@@ -131,27 +152,54 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 		{
 			getContextUsage: () => session.getContextUsage(),
 			waitForIdle: () => session.agent.waitForIdle(),
-			newSession: async newOptions => {
-				const success = await session.newSession({ parentSession: newOptions?.parentSession });
-				if (success && newOptions?.setup) {
-					await newOptions.setup(session.sessionManager);
-				}
-				return { cancelled: !success };
-			},
-			branch: async entryId => {
-				const result = await session.branch(entryId);
-				return { cancelled: result.cancelled };
-			},
-			navigateTree: async (targetId, navOptions) => {
-				const result = await session.navigateTree(targetId, { summarize: navOptions?.summarize });
-				return { cancelled: result.cancelled };
-			},
-			switchSession: async sessionPath => {
-				const success = await session.switchSession(sessionPath);
-				return { cancelled: !success };
-			},
+			newSession: newOptions =>
+				wrapSessionChange(
+					async () => {
+						const success = await session.newSession({ parentSession: newOptions?.parentSession });
+						if (success && newOptions?.setup) {
+							await newOptions.setup(session.sessionManager);
+						}
+						return { cancelled: !success };
+					},
+					{ detachesRun: true },
+				),
+			branch: entryId =>
+				wrapSessionChange(
+					async () => {
+						const result = await session.branch(entryId);
+						return { cancelled: result.cancelled };
+					},
+					{ detachesRun: false },
+				),
+			navigateTree: (targetId, navOptions) =>
+				wrapSessionChange(
+					async () => {
+						const result = await session.navigateTree(targetId, { summarize: navOptions?.summarize });
+						return { cancelled: result.cancelled };
+					},
+					{ detachesRun: false },
+				),
+			switchSession: sessionPath =>
+				wrapSessionChange(
+					async () => {
+						const success = await session.switchSession(sessionPath);
+						return { cancelled: !success };
+					},
+					{ detachesRun: true },
+				),
+			// Reload reopens the session file (as `session.reload()` does), detaching a live run;
+			// it throws when cancelled, after the wrapper has seen the change as cancelled.
 			reload: async () => {
-				await session.reload();
+				const result = await wrapSessionChange(
+					async () => {
+						// Without a session file reload is a no-op and nothing is detached.
+						const sessionFile = session.sessionFile;
+						if (!sessionFile) return { cancelled: true };
+						return { cancelled: !(await session.switchSession(sessionFile)) };
+					},
+					{ detachesRun: true },
+				);
+				if (result.cancelled && session.sessionFile) throw new Error("Session reload cancelled");
 			},
 			compact: instructionsOrOptions => runExtensionCompact(session, instructionsOrOptions),
 		},

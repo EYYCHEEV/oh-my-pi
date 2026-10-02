@@ -20,19 +20,20 @@ import type {
 	ExtensionUiComponent,
 	ExtensionWidgetContent,
 	ExtensionWidgetOptions,
+	SendMessageHandler,
 	SendUserMessageHandler,
 	TerminalInputHandler,
 } from "../../extensibility/extensions";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
 import {
+	type AskDialogPrompt,
 	type AskDialogPromptValue,
 	AskDialogComponent,
-	boundPromptTitle,
 	normalizeDialogQuestions,
 } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
 import { installExtensionComposerShape } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
 import { EditorTopGap } from "@oh-my-pi/pi-tui/prompt/editor-top-gap";
-import { HookEditorComponent, type HookEditorOptions } from "@oh-my-pi/pi-tui/overlays/hook-editor";
+import { boundPromptTitle, HookEditorComponent, type HookEditorOptions } from "@oh-my-pi/pi-tui/overlays/hook-editor";
 import { HookInputComponent } from "@oh-my-pi/pi-tui/overlays/hook-input";
 import { HookSelectorComponent, type HookSelectorSlider } from "@oh-my-pi/pi-tui/overlays/hook-selector";
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "@oh-my-pi/pi-tui/theme";
@@ -115,6 +116,14 @@ export class ExtensionUiController {
 	constructor(private ctx: InteractiveModeContext) {}
 
 	#sendExtensionMessageWithReceipt: ExtensionAPI["sendMessageWithReceipt"] = async (message, options) => {
+		const startsTurn =
+			options?.triggerTurn === true ||
+			options?.deliverAs === "steer" ||
+			options?.deliverAs === "followUp" ||
+			options?.deliverAs === "aside";
+		if (startsTurn && this.#rejectGuestExtensionTurn()) {
+			return { sessionId: this.ctx.sessionManager.getSessionId(), admitted: false, reason: "turn-not-started" };
+		}
 		const wasStreaming = this.ctx.session.isStreaming;
 		const normalized = normalizeCustomMessagePayload(message);
 		return this.ctx.session.sendCustomMessageWithReceipt(normalized, options, completion => {
@@ -214,18 +223,7 @@ export class ExtensionUiController {
 		const actions: ExtensionActions = {
 			requireRuntime: (extension, declaration) => this.ctx.session.requireRuntime(extension, declaration),
 			sendMessageWithReceipt: this.#sendExtensionMessageWithReceipt,
-			sendMessage: (message, options) => {
-				const wasStreaming = this.ctx.session.isStreaming;
-				const normalized = normalizeCustomMessagePayload(message);
-				this.ctx.session
-					.sendCustomMessage(normalized, options)
-					.then(() => this.#applyCustomMessageDisplay(wasStreaming, normalized.display))
-					.catch((err: unknown) => {
-						this.ctx.showError(
-							`Extension sendMessage failed: ${err instanceof Error ? err.message : String(err)}`,
-						);
-					});
-			},
+			sendMessage: this.#sendExtensionMessage,
 			sendUserMessage: this.#sendExtensionUserMessage,
 			appendEntry: (customType, data) => {
 				this.ctx.sessionManager.appendCustomEntry(customType, data);
@@ -450,17 +448,7 @@ export class ExtensionUiController {
 		const actions: ExtensionActions = {
 			requireRuntime: (extension, declaration) => this.ctx.session.requireRuntime(extension, declaration),
 			sendMessageWithReceipt: this.#sendExtensionMessageWithReceipt,
-			sendMessage: (message, options) => {
-				const wasStreaming = this.ctx.session.isStreaming;
-				const normalized = normalizeCustomMessagePayload(message);
-				this.ctx.session
-					.sendCustomMessage(normalized, options)
-					.then(() => this.#applyCustomMessageDisplay(wasStreaming, normalized.display))
-					.catch((err: unknown) => {
-						const errorText = `Extension sendMessage failed: ${err instanceof Error ? err.message : String(err)}`;
-						this.ctx.showError(errorText);
-					});
-			},
+			sendMessage: this.#sendExtensionMessage,
 			sendUserMessage: this.#sendExtensionUserMessage,
 			appendEntry: (customType, data) => {
 				this.ctx.sessionManager.appendCustomEntry(customType, data);
@@ -742,14 +730,18 @@ export class ExtensionUiController {
 				queueMicrotask(restoreAskDialog);
 			};
 
-			const openPrompt = (title: string, prefill: string | undefined, options: HookEditorOptions): void => {
+			const openPrompt = (
+				prompt: AskDialogPrompt,
+				prefill: string | undefined,
+				options: HookEditorOptions,
+			): void => {
 				promptEditor = new HookEditorComponent(
 					this.ctx.ui,
-					title,
+					prompt.title,
 					prefill,
 					(text, images) => finishPrompt({ text, images }),
 					() => finishPrompt(undefined),
-					{ promptStyle: true, externalEditor: editDialogExternally, ...options },
+					{ promptStyle: true, externalEditor: editDialogExternally, question: prompt.question, ...options },
 				);
 				this.ctx.editorContainer.clear();
 				this.ctx.editorContainer.addChild(promptEditor);
@@ -757,22 +749,22 @@ export class ExtensionUiController {
 				this.ctx.ui.requestRender();
 			};
 
-			const promptForText = (title: string, prefill?: string): Promise<string | undefined> => {
+			const promptForText = (prompt: AskDialogPrompt, prefill?: string): Promise<string | undefined> => {
 				if (closed) return Promise.resolve(undefined);
 				const { promise, resolve } = Promise.withResolvers<string | undefined>();
 				promptResolve = value => resolve(value?.text);
-				openPrompt(title, prefill, {});
+				openPrompt(prompt, prefill, {});
 				return promise;
 			};
 
 			const promptWithImages = (
-				title: string,
+				prompt: AskDialogPrompt,
 				prefill: AskDialogPromptValue | undefined,
 			): Promise<AskDialogPromptValue | undefined> => {
 				if (closed) return Promise.resolve(undefined);
 				const { promise, resolve } = Promise.withResolvers<AskDialogPromptValue | undefined>();
 				promptResolve = resolve;
-				openPrompt(title, prefill?.text, {
+				openPrompt(prompt, prefill?.text, {
 					acceptImages: true,
 					images: prefill?.images,
 					onPasteImage: () => this.ctx.handleImagePaste(),
@@ -1318,7 +1310,39 @@ export class ExtensionUiController {
 		await this.ctx.sessionManager.setSessionName(name, "user");
 	}
 
+	/**
+	 * Collab guest: the replica session only mirrors the host, and mirrored host
+	 * lifecycle events (`agent_end`, `turn_end`, …) reach guest extensions. An
+	 * extension reacting to them must not start or queue a turn on the replica —
+	 * it would run on the guest's local model and diverge from the host. Refuse
+	 * like typed prompts are refused (input-controller); true when dropped.
+	 */
+	#rejectGuestExtensionTurn(): boolean {
+		if (!this.ctx.collabGuest) return false;
+		this.ctx.showStatus("Extension-initiated turns are host-only during a collab session");
+		return true;
+	}
+
+	#sendExtensionMessage: SendMessageHandler = (message, options) => {
+		const startsTurn =
+			options?.triggerTurn === true ||
+			options?.deliverAs === "steer" ||
+			options?.deliverAs === "followUp" ||
+			options?.deliverAs === "aside";
+		if (startsTurn && this.#rejectGuestExtensionTurn()) return;
+		const wasStreaming = this.ctx.session.isStreaming;
+		const normalized = normalizeCustomMessagePayload(message);
+		this.ctx.session
+			.sendCustomMessage(normalized, options)
+			.then(() => this.#applyCustomMessageDisplay(wasStreaming, normalized.display))
+			.catch((err: unknown) => {
+				this.ctx.showError(`Extension sendMessage failed: ${err instanceof Error ? err.message : String(err)}`);
+			});
+	};
+
+	/** Every `sendUserMessage` form prompts or queues a user turn (see `AgentSession.sendUserMessage`). */
 	#sendExtensionUserMessage: SendUserMessageHandler = (content, options) => {
+		if (this.#rejectGuestExtensionTurn()) return;
 		this.ctx.session.sendUserMessage(content, options).catch((err: unknown) => {
 			this.ctx.showError(`Extension sendUserMessage failed: ${err instanceof Error ? err.message : String(err)}`);
 		});

@@ -162,6 +162,8 @@ export class OAuthAccounts implements OAuthApi {
 			apiEndpoint: credential.apiEndpoint,
 			orgId: credential.orgId,
 			orgName: credential.orgName,
+			region: credential.region,
+			inferenceRegion: credential.inferenceRegion,
 		};
 	}
 
@@ -217,6 +219,8 @@ export class OAuthAccounts implements OAuthApi {
 				enterpriseUrl: credential.enterpriseUrl,
 				orgId: credential.orgId,
 				orgName: credential.orgName,
+				region: credential.region,
+				inferenceRegion: credential.inferenceRegion,
 			};
 		} catch (error) {
 			return {
@@ -251,7 +255,9 @@ export class OAuthAccounts implements OAuthApi {
 			sessionCredential?.type === "oauth"
 				? this.#deps.pool.entries(provider)[sessionCredential.index]?.id
 				: undefined;
+		const activeLastUsedAtMs = activeCredentialId !== undefined ? sessionCredential?.lastUsedAtMs : undefined;
 		return this.#getStoredOAuthSelections(provider).map((selection, position) => {
+			const active = selection.credentialId === activeCredentialId;
 			const pausedAtMs = this.#deps.pool.pausedAt(selection.credentialId);
 			const excluded = this.#deps.pool.isAutoSelectable(provider, selection.credentialId)
 				? undefined
@@ -267,7 +273,8 @@ export class OAuthAccounts implements OAuthApi {
 				enterpriseUrl: selection.credential.enterpriseUrl,
 				orgId: selection.credential.orgId,
 				orgName: selection.credential.orgName,
-				active: selection.credentialId === activeCredentialId,
+				active,
+				...(active && activeLastUsedAtMs !== undefined ? { lastUsedAtMs: activeLastUsedAtMs } : {}),
 				paused: pausedAtMs !== undefined,
 				...(pausedAtMs === undefined ? {} : { pausedAtMs }),
 				...(excluded === undefined ? {} : { excluded }),

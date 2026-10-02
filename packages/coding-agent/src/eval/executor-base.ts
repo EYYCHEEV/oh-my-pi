@@ -4,7 +4,11 @@ import { Settings } from "../config/settings";
 import { type OutputArtifactError, OutputSink } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { statusEventKey } from "@oh-my-pi/pi-tui/tools/eval";
 import type { ToolSession } from "../tools";
-import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
+import {
+	resolveOutputMaxColumns,
+	resolveOutputSinkArtifactMaxBytes,
+	resolveOutputSinkHeadBytes,
+} from "../tools/output-meta";
 import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP, isEvalTimeoutControlEvent } from "./bridge-timeout";
 import type { JsStatusEvent } from "./js/shared/types";
 import type { KernelDisplayOutput } from "./py/display";
@@ -83,6 +87,8 @@ export interface KernelExecutionResult {
 	cancelled: boolean;
 	truncated: boolean;
 	artifactId: string | undefined;
+	/** Bytes the artifact cap dropped from the saved file's middle (the artifact is a head/tail sample). */
+	artifactElidedBytes?: number;
 	artifactError?: OutputArtifactError;
 	totalLines: number;
 	totalBytes: number;
@@ -445,6 +451,7 @@ export async function executeWithKernelBase<
 		artifactPath: options?.artifactPath,
 		artifactId: options?.artifactId,
 		headBytes: resolveOutputSinkHeadBytes(settings),
+		artifactMaxBytes: resolveOutputSinkArtifactMaxBytes(settings),
 		maxColumns: resolveOutputMaxColumns(settings),
 	});
 
@@ -534,6 +541,7 @@ export async function executeWithKernelBase<
 				truncated: dumped.truncated,
 				output: dumped.output,
 				artifactId: dumped.artifactId ?? undefined,
+				artifactElidedBytes: dumped.artifactElidedBytes,
 				artifactError: dumped.artifactError,
 				totalLines: dumped.totalLines,
 				totalBytes: dumped.totalBytes,
@@ -552,6 +560,7 @@ export async function executeWithKernelBase<
 				truncated: dumped.truncated,
 				output: dumped.output,
 				artifactId: dumped.artifactId ?? undefined,
+				artifactElidedBytes: dumped.artifactElidedBytes,
 				artifactError: dumped.artifactError,
 				totalLines: dumped.totalLines,
 				totalBytes: dumped.totalBytes,
@@ -570,6 +579,7 @@ export async function executeWithKernelBase<
 			truncated: dumped.truncated,
 			output: dumped.output,
 			artifactId: dumped.artifactId ?? undefined,
+			artifactElidedBytes: dumped.artifactElidedBytes,
 			artifactError: dumped.artifactError,
 			totalLines: dumped.totalLines,
 			totalBytes: dumped.totalBytes,
@@ -590,6 +600,7 @@ export async function executeWithKernelBase<
 				truncated: dumped.truncated,
 				output: dumped.output,
 				artifactId: dumped.artifactId ?? undefined,
+				artifactElidedBytes: dumped.artifactElidedBytes,
 				artifactError: dumped.artifactError,
 				totalLines: dumped.totalLines,
 				totalBytes: dumped.totalBytes,

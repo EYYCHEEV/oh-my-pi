@@ -1,7 +1,11 @@
 import { denyEvaluationIngress } from "@oh-my-pi/pi-utils";
 import { DEFAULT_MAX_BYTES, type OutputArtifactError, OutputSink } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import type { ToolSession } from "../../tools";
-import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../../tools/output-meta";
+import {
+	resolveOutputMaxColumns,
+	resolveOutputSinkArtifactMaxBytes,
+	resolveOutputSinkHeadBytes,
+} from "../../tools/output-meta";
 import { isEvalTimeoutControlEvent, withBridgeTimeoutPause } from "../bridge-timeout";
 import { DisplayOutputCollector } from "../executor-base";
 import { executeInVmContext, type JsDisplayOutput } from "./context-manager";
@@ -48,6 +52,8 @@ export interface JsResult {
 	cancelled: boolean;
 	truncated: boolean;
 	artifactId?: string;
+	/** Bytes the artifact cap dropped from the saved file's middle (the artifact is a head/tail sample). */
+	artifactElidedBytes?: number;
 	artifactError?: OutputArtifactError;
 	totalLines: number;
 	totalBytes: number;
@@ -108,6 +114,7 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 		artifactId: options.artifactId,
 		spillThreshold: DEFAULT_MAX_BYTES,
 		headBytes: resolveOutputSinkHeadBytes(options.session.settings),
+		artifactMaxBytes: resolveOutputSinkArtifactMaxBytes(options.session.settings),
 		maxColumns: resolveOutputMaxColumns(options.session.settings),
 		onChunk: chunk => options.onChunk?.(chunk),
 	});
@@ -189,6 +196,7 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 			cancelled: false,
 			truncated: summary.truncated,
 			artifactId: summary.artifactId,
+			artifactElidedBytes: summary.artifactElidedBytes,
 			artifactError: summary.artifactError,
 			totalLines: summary.totalLines,
 			totalBytes: summary.totalBytes,
@@ -217,6 +225,7 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 				cancelled: true,
 				truncated: summary.truncated,
 				artifactId: summary.artifactId,
+				artifactElidedBytes: summary.artifactElidedBytes,
 				artifactError: summary.artifactError,
 				totalLines: summary.totalLines,
 				totalBytes: summary.totalBytes,
@@ -234,6 +243,7 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 			cancelled: false,
 			truncated: summary.truncated,
 			artifactId: summary.artifactId,
+			artifactElidedBytes: summary.artifactElidedBytes,
 			artifactError: summary.artifactError,
 			totalLines: summary.totalLines,
 			totalBytes: summary.totalBytes,
