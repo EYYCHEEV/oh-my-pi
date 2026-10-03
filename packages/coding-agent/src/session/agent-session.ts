@@ -188,6 +188,7 @@ import type { HindsightSessionState } from "../hindsight/state";
 import { InternalUrlRouter, type LocalProtocolOptions } from "../internal-urls";
 import { hasNativeJudge, journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
+import { DaemonCompletionStaleError } from "../launch/client";
 import type { DaemonCompletionNotification } from "../launch/protocol";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
@@ -1961,8 +1962,7 @@ export class AgentSession implements SettingsScope {
 			},
 		});
 		this.yieldQueue.register<LaunchCompletionEntry>(LAUNCH_COMPLETION_MESSAGE_TYPE, {
-			isStale: entry =>
-				this.#isDisposed || !isLaunchCompletionOwner(entry.owner, this.sessionManager.getSessionId()),
+			isStale: entry => this.#isLaunchCompletionStale(entry.owner),
 			build: buildLaunchCompletionBatchMessage,
 		});
 		// Background-job completions / late diagnostics are pulled into the run at
@@ -8639,14 +8639,27 @@ export class AgentSession implements SettingsScope {
 		this.#queueHiddenNextTurnMessage(message, true);
 	}
 
-	queueLaunchCompletion(notification: DaemonCompletionNotification): Promise<void> {
-		if (this.#isDisposed) return Promise.reject(new Error("Session disposed before launch completion delivery"));
-		const delivered = this.yieldQueue.enqueueWithReceipt<LaunchCompletionEntry>(
-			LAUNCH_COMPLETION_MESSAGE_TYPE,
-			notification,
-		);
-		this.yieldQueue.requestIdleFlush();
-		return delivered;
+	#isLaunchCompletionStale(owner: string): boolean {
+		return this.#isDisposed || !isLaunchCompletionOwner(owner, this.sessionManager.getSessionId());
+	}
+
+	async queueLaunchCompletion(notification: DaemonCompletionNotification): Promise<void> {
+		if (this.#isLaunchCompletionStale(notification.owner)) {
+			throw new DaemonCompletionStaleError(`Yield queue entry became stale: ${LAUNCH_COMPLETION_MESSAGE_TYPE}`);
+		}
+		try {
+			const delivered = this.yieldQueue.enqueueWithReceipt<LaunchCompletionEntry>(
+				LAUNCH_COMPLETION_MESSAGE_TYPE,
+				notification,
+			);
+			this.yieldQueue.requestIdleFlush();
+			await delivered;
+		} catch (error) {
+			if (this.#isLaunchCompletionStale(notification.owner)) {
+				throw new DaemonCompletionStaleError(error instanceof Error ? error.message : String(error));
+			}
+			throw error;
+		}
 	}
 
 	#queueHiddenNextTurnMessage(message: CustomMessage, triggerTurn: boolean): void {

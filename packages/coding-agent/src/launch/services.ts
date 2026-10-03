@@ -2,6 +2,7 @@
 import * as path from "node:path";
 import { TERMINAL_STATES } from "@oh-my-pi/pi-tui/apps/ps-data";
 import type { DaemonSnapshot, DaemonSpec } from "@oh-my-pi/pi-tui/tools/daemon";
+import { MAIN_AGENT_ID } from "@oh-my-pi/pi-tui/overlays/agent-hub-types";
 import { formatDuration, replaceTabs } from "@oh-my-pi/pi-tui/render/render-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { getDaemonRuntimeDir, logger, sanitizeText } from "@oh-my-pi/pi-utils";
@@ -63,7 +64,11 @@ export function waitForOwnedServiceCompletion(session: ToolSession, signal?: Abo
 }
 
 function serviceOwner(session: ToolSession): string | null | undefined {
-	return session.getSessionId?.() ?? session.getAgentId?.();
+	const owner = session.getSessionId?.() ?? session.sessionManager?.getSessionId?.();
+	if (!owner && session.queueLaunchCompletion) {
+		throw new ToolError("Service completion delivery requires a session ID");
+	}
+	return owner;
 }
 
 function track(session: ToolSession, daemon: DaemonSnapshot): void {
@@ -74,12 +79,18 @@ function track(session: ToolSession, daemon: DaemonSnapshot): void {
 	else services.set(daemon.name, { id: daemon.id, startedAt: daemon.startedAt });
 }
 
+/** Acknowledge obsolete IRC-name notifications; no session can consume them. */
+function discardLegacyMainCompletion(): void {}
+
 function subscribe(session: ToolSession, client: DaemonBrokerClient): void {
 	const owner = serviceOwner(session);
 	if (!owner) return;
 	const clients = serviceState(session).subscribed;
 	if (clients.has(client)) return;
 	clients.add(client);
+	// Older clients launched and subscribed as the shared IRC name instead of
+	// their session id. Retire those persisted notifications through normal acks.
+	if (owner !== MAIN_AGENT_ID) client.onCompletion(MAIN_AGENT_ID, discardLegacyMainCompletion);
 	const unsubscribe = client.onCompletion(owner, notification => {
 		const tracked = serviceState(session).owned.get(notification.daemon.name);
 		if (tracked?.id === notification.daemon.id && tracked.startedAt === notification.daemon.startedAt) {

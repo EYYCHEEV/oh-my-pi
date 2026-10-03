@@ -136,6 +136,7 @@ An upgrade fails before build or installation if the block is stale, any require
 - `streamed-tool-call-normalization`: Canonical streamed tool-call normalization
 - `kimi-k3-responses-transport`: Kimi K3 Responses transport
 - `oauth-account-pool-controls`: OAuth account pause and exact-account launch restriction
+- `daemon-completion-delivery-recovery`: Bounded daemon completion delivery recovery
 <!-- stronk-omp:fork-contracts:end -->
 
 ## Upstream alignment

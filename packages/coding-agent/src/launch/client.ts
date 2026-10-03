@@ -22,6 +22,9 @@ import { resolveDaemonSpawnOptions } from "./spawn-options";
 
 const CONNECT_TIMEOUT_MS = 10_000;
 const CONNECT_RETRY_MS = 50;
+const COMPLETION_RETRY_BASE_MS = 1_000;
+const COMPLETION_RETRY_MAX_MS = 30_000;
+const COMPLETION_HISTORY_LIMIT = 512;
 const TOKEN_FILE = "broker.token";
 const BROKER_SPAWN_OPTIONS = resolveDaemonSpawnOptions({
 	platform: process.platform,
@@ -63,6 +66,9 @@ export interface DaemonBrokerClient {
 
 /** A request reached the broker and the broker rejected the operation. */
 export class DaemonBrokerRejectedError extends Error {}
+
+/** This sink cannot consume the owner's notifications; preserve them for another session. */
+export class DaemonCompletionStaleError extends Error {}
 
 async function readOrCreateToken(runtimeDir: string): Promise<string> {
 	await fs.mkdir(runtimeDir, { recursive: true, mode: 0o700 });
@@ -141,6 +147,8 @@ class SocketDaemonClient implements DaemonBrokerClient {
 	readonly #endpoint: string;
 	readonly #token: string;
 	readonly #seenCompletionIds = new Set<string>();
+	readonly #failedCompletionIds = new Set<string>();
+	readonly #completionWarnings = new Map<string, string>();
 	readonly #idleGraceMs: number | undefined;
 	readonly #pending = new Map<string, PendingRequest>();
 	readonly #completionSinks = new Map<string, (notification: DaemonCompletionNotification) => Promise<void> | void>();
@@ -154,6 +162,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 	#buffer = "";
 	#closed = false;
 	#completionReconnectTimer: NodeJS.Timeout | undefined;
+	#completionRetryDelayMs = CONNECT_RETRY_MS;
 
 	constructor(projectDir: string, runtimeDir: string, token: string, options: DaemonBrokerClientOptions) {
 		this.projectDir = projectDir;
@@ -270,7 +279,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 		this.#completionReconnectTimer = setTimeout(() => {
 			this.#completionReconnectTimer = undefined;
 			this.#publishCompletionOwners();
-		}, CONNECT_RETRY_MS);
+		}, this.#completionRetryDelayMs);
 		this.#completionReconnectTimer.unref();
 	}
 
@@ -411,19 +420,60 @@ class SocketDaemonClient implements DaemonBrokerClient {
 		this.#inFlightCompletionIds.add(message.completionId);
 		try {
 			await sink(message);
-			if (this.#seenCompletionIds.size >= 512) {
+			this.#failedCompletionIds.delete(message.completionId);
+			this.#completionWarnings.delete(message.completionId);
+			if (this.#failedCompletionIds.size === 0) this.#completionRetryDelayMs = CONNECT_RETRY_MS;
+			if (this.#seenCompletionIds.size >= COMPLETION_HISTORY_LIMIT) {
 				const oldest = this.#seenCompletionIds.values().next().value;
 				if (oldest !== undefined) this.#seenCompletionIds.delete(oldest);
 			}
 			this.#seenCompletionIds.add(message.completionId);
 			this.#ackCompletion(message.completionId);
 		} catch (error) {
-			logger.warn("Daemon completion sink failed", {
-				owner: message.owner,
-				completionId: message.completionId,
-				error: error instanceof Error ? error.message : String(error),
-			});
-			this.#socket?.destroy();
+			const errorMessage = error instanceof Error ? error.message : String(error);
+			if (this.#completionWarnings.get(message.completionId) !== errorMessage) {
+				if (
+					!this.#completionWarnings.has(message.completionId) &&
+					this.#completionWarnings.size >= COMPLETION_HISTORY_LIMIT
+				) {
+					const oldest = this.#completionWarnings.keys().next().value;
+					if (oldest !== undefined) this.#completionWarnings.delete(oldest);
+				}
+				this.#completionWarnings.set(message.completionId, errorMessage);
+				logger.warn("Daemon completion sink failed", {
+					owner: message.owner,
+					completionId: message.completionId,
+					error: errorMessage,
+				});
+			}
+			if (error instanceof DaemonCompletionStaleError) {
+				this.#failedCompletionIds.delete(message.completionId);
+				if (this.#completionSinks.get(message.owner) === sink) {
+					this.#completionSinks.delete(message.owner);
+					this.#preservedCompletionOwners.add(message.owner);
+				} else if (this.#completionSinks.has(message.owner)) {
+					this.#completionReplays.add(message.owner);
+				}
+				this.#publishCompletionOwners();
+				return;
+			}
+			if (
+				!this.#failedCompletionIds.has(message.completionId) &&
+				this.#failedCompletionIds.size >= COMPLETION_HISTORY_LIMIT
+			) {
+				const oldest = this.#failedCompletionIds.values().next().value;
+				if (oldest !== undefined) this.#failedCompletionIds.delete(oldest);
+			}
+			this.#failedCompletionIds.add(message.completionId);
+			const socket = this.#socket;
+			if (socket && !socket.destroyed) {
+				// One increase per failed connection, not per notification in a replay batch.
+				this.#completionRetryDelayMs = Math.min(
+					Math.max(COMPLETION_RETRY_BASE_MS, this.#completionRetryDelayMs * 2),
+					COMPLETION_RETRY_MAX_MS,
+				);
+				socket.destroy();
+			}
 		} finally {
 			this.#inFlightCompletionIds.delete(message.completionId);
 		}
