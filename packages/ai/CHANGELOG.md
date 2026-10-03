@@ -9,6 +9,12 @@
 ### Fixed
 
 - Kimi Code K3 and K3-256k now use the native Responses API for tool-calling turns while preserving explicit Chat Completions and Anthropic overrides.
+## [18.5.0] - 2026-10-03
+
+### Fixed
+
+- Fixed AWS `credential_process` on Windows stripping backslashes from unquoted paths such as `C:\Users\me\helper.exe`; commands are now split with Windows command-line rules there, matching the AWS CLI.
+
 ## [18.4.12] - 2026-10-02
 
 ### Added
