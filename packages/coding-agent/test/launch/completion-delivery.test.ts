@@ -268,6 +268,54 @@ describe("daemon completion delivery recovery", () => {
 		});
 	}, 10_000);
 
+	it("restores the normal reconnect delay after a transient failure becomes stale", async () => {
+		const sessionManager = SessionManager.inMemory();
+		const notification = completion("retired-retry", "other-session");
+		await withBroker(sessionManager, [notification], async ({ client, session, pending }) => {
+			const warnings = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+			const connections = vi.spyOn(net, "createConnection");
+			let deliveries = 0;
+			vi.useFakeTimers();
+			try {
+				client.onCompletion(notification.owner, value => {
+					deliveries++;
+					if (deliveries === 1) throw new Error("Temporary completion consumer failure");
+					return session.queueLaunchCompletion(value);
+				});
+				client.onCompletion(sessionManager.getSessionId(), value => session.queueLaunchCompletion(value));
+				const initialSocket = connections.mock.results[0]!.value;
+				if (!(initialSocket instanceof net.Socket)) throw new Error("Expected the initial broker socket");
+				const initiallyClosed = once(initialSocket, "close");
+				await client.request({ op: "ping" }).catch(() => undefined);
+				await initiallyClosed;
+				await scheduler.yield();
+
+				vi.advanceTimersByTime(1_000);
+				await waitUntil(() => deliveries === 2 && warnings.mock.calls.length === 2);
+				await client.request({ op: "ping" });
+				const socket = connections.mock.results[1]!.value;
+				if (!(socket instanceof net.Socket)) throw new Error("Expected the reconnected broker socket");
+				const closed = once(socket, "close");
+				socket.destroy();
+				await closed;
+				await scheduler.yield();
+
+				const before = connections.mock.calls.length;
+				vi.advanceTimersByTime(49);
+				expect(connections.mock.calls.length).toBe(before);
+				vi.advanceTimersByTime(1);
+				expect(connections.mock.calls.length).toBe(before + 1);
+				await client.request({ op: "ping" });
+				expect(deliveries).toBe(2);
+				expect((await pending("retired-retry")).map(value => value.completionId)).toEqual([
+					"retired-retry-completion",
+				]);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+	}, 10_000);
+
 	it("preserves an in-flight receipt when its session disposes before dispatch", async () => {
 		const sessionManager = SessionManager.inMemory();
 		const notification = completion("disposed", sessionManager.getSessionId());

@@ -448,6 +448,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 			}
 			if (error instanceof DaemonCompletionStaleError) {
 				this.#failedCompletionIds.delete(message.completionId);
+				if (this.#failedCompletionIds.size === 0) this.#completionRetryDelayMs = CONNECT_RETRY_MS;
 				if (this.#completionSinks.get(message.owner) === sink) {
 					this.#completionSinks.delete(message.owner);
 					this.#preservedCompletionOwners.add(message.owner);
