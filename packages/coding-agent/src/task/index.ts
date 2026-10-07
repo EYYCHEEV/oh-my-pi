@@ -374,12 +374,16 @@ interface MergedSyncPayloads {
 	usage?: Usage;
 	outputPaths?: string[];
 	projectAgentsDir: string | null;
+	/** Some spawn returned an error result. */
+	isError: boolean;
 }
 
 /**
  * Merge per-spawn sync payloads into one result view. `index` is each spawn's
  * position in the original call so batch rows keep stable ordering; a missing
- * payload (cancelled before start) becomes an explanatory content line.
+ * payload (cancelled before start) becomes an explanatory content line. An
+ * error payload from any spawn makes the merged view an error too, the way a
+ * one-spawn call returns that payload as is.
  */
 function mergeSyncPayloads(
 	spawns: SyncSpawnRef[],
@@ -391,6 +395,7 @@ function mergeSyncPayloads(
 	const usageTotals = createUsageTotals();
 	let hasUsage = false;
 	let projectAgentsDir: string | null = null;
+	let isError = false;
 	for (let position = 0; position < spawns.length; position++) {
 		const payload = payloads[position];
 		const { item, index } = spawns[position];
@@ -398,6 +403,7 @@ function mergeSyncPayloads(
 			contentParts.push(`Task ${item.name?.trim() || `#${index + 1}`}: cancelled before start.`);
 			continue;
 		}
+		isError ||= payload.isError === true;
 		projectAgentsDir ??= payload.details?.projectAgentsDir ?? null;
 		const text = payload.content.find(part => part.type === "text")?.text;
 		if (text) contentParts.push(text);
@@ -416,6 +422,7 @@ function mergeSyncPayloads(
 		usage: hasUsage ? usageTotals : undefined,
 		outputPaths: outputPaths.length > 0 ? outputPaths : undefined,
 		projectAgentsDir,
+		isError,
 	};
 }
 
@@ -550,8 +557,8 @@ export async function refreshAgentDiscovery(cwd: string, extensionRoots?: Effect
  * Task tool - Delegate tasks to specialized agents.
  *
  * Each call spawns one subagent — or, with `task.batch`, one per `tasks[]`
- * item. Non-blocking spawns use AsyncJobManager when async execution is
- * enabled; agent definitions marked `blocking` run inline.
+ * item. When `async.enabled` is on, spawns run as AsyncJobManager jobs; when
+ * disabled, the tool blocks until every spawn finishes.
  */
 export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetails, Theme> {
 	readonly name = "task";
@@ -1247,6 +1254,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			.join("\n\n");
 		return withAdvisory({
 			content: [{ type: "text", text: text.length > 0 ? text : "No results." }],
+			...(merged.isError ? { isError: true } : {}),
 			details: buildAsyncDetails(),
 		});
 	}
@@ -1460,10 +1468,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	}
 
 	/**
-	 * Sync fan-out (blocking multi-item batch, async unavailable, or every
-	 * item's agent type is `blocking: true`): run every spawn to completion
-	 * inline and merge the per-spawn payloads into a single tool result. The
-	 * session-scoped semaphore still bounds concurrency across parallel calls.
+	 * Sync fan-out (async unavailable, or every item's agent type is
+	 * `blocking: true`): run every spawn to completion inline and merge the
+	 * per-spawn payloads into a single tool result, an error when any spawn's
+	 * payload is. The session-scoped semaphore still bounds concurrency across
+	 * parallel task calls.
 	 */
 	async #executeSyncFanout(
 		toolCallId: string,
@@ -1521,6 +1530,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const merged = mergeSyncPayloads(spawns, payloads);
 		return {
 			content: [{ type: "text", text: merged.contentParts.join("\n\n") }],
+			...(merged.isError ? { isError: true } : {}),
 			details: {
 				projectAgentsDir: merged.projectAgentsDir,
 				results: merged.results,
@@ -1659,15 +1669,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				maxRuntimeMs: cfgTaskMaxRuntimeMs.get(this.session.settings),
 				signal,
 				onProgress: progress => {
-					const nextProgress = { ...progress, recentTools: progress.recentTools.slice() };
-					latestProgress = nextProgress;
+					latestProgress = { ...progress, recentTools: progress.recentTools.slice() };
 					onUpdate?.({
 						content: [{ type: "text", text: `Running agent ${progress.id}...` }],
 						details: {
 							projectAgentsDir: null,
 							results: [],
 							totalDurationMs: Date.now() - startTime,
-							progress: [nextProgress],
+							progress: [latestProgress],
 						},
 					});
 				},

@@ -792,13 +792,7 @@ describe("ExtensionRunner", () => {
 				new EventBus(),
 				runtime,
 			);
-			const runner = new ExtensionRunner(
-				[extension],
-				runtime,
-				tempDir.path(),
-				sessionManager,
-				modelRegistry,
-			);
+			const runner = new ExtensionRunner([extension], runtime, tempDir.path(), sessionManager, modelRegistry);
 			const controller = new AbortController();
 			const message = createAssistantMessage("original");
 			const emission = runner.emitAssistantMessage(message, controller.signal);

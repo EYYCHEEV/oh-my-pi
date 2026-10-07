@@ -21,6 +21,7 @@ import {
 	compactionThresholdSettings,
 	createMCPProxyTools,
 	createSubagentSettings,
+	followMCPTools,
 	subagentRetryFallbackRole,
 } from "./executor";
 import type { AgentDefinition } from "./types";
@@ -163,6 +164,8 @@ export function createPersistedSubagentReviverFactory(
 			// state: same-name MCP tools are untrusted capability sources.
 			const restrictToolNames = init.restrictToolNames === true;
 			const mcpManager = restrictToolNames ? undefined : MCPManager.instance();
+			// Subscribe before minting proxies so a manager change during startup is replayed on bind.
+			const mcpFollower = mcpManager ? followMCPTools(mcpManager) : undefined;
 			const mcpProxyTools = mcpManager ? createMCPProxyTools(mcpManager) : [];
 			let session: AgentSession;
 			try {
@@ -206,7 +209,7 @@ export function createPersistedSubagentReviverFactory(
 					outputSchemaMode: init.outputSchemaMode,
 					restrictToolNames: restrictToolNames || undefined,
 					requireYieldTool: true,
-					systemPrompt: () => [init.systemPrompt],
+					systemPrompt: () => [...init.systemPrompt],
 					// Inherit current owner policy, never extension authority from a transcript.
 					extensionRoots: () => ctx.session.effectiveExtensionRoots,
 					// Old files predate persisted spawns: deny re-spawning rather than let
@@ -228,17 +231,21 @@ export function createPersistedSubagentReviverFactory(
 								preloadedExtensionPaths: ctx.extensionPaths ? [...ctx.extensionPaths] : undefined,
 								enableMCP: !mcpManager,
 								mcpManager,
-								customTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,
+								mcpTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,
 							}),
 				}));
 			} catch (error) {
+				mcpFollower?.dispose();
 				await reopened.close();
 				throw error;
 			}
+			mcpFollower?.bind(session);
 			// Clamp the active set to the persisted list: createAgentSession's
 			// `alwaysInclude` can re-add non-defaultInactive extension/custom tools
 			// the original run didn't carry. Unknown/missing names are ignored.
 			await session.setActiveToolsByName([...revivedToolNames, ...session.getMountedXdevToolNames()]);
+			// The yield tool's schema carries the last batch's items; the replayed prefix must match it.
+			if (init.workPoolYieldItems) await session.setWorkPoolYieldItems(init.workPoolYieldItems);
 			// Wire the extension runtime exactly as the live executor does. Without
 			// this the runner stays pre-init, every action method throws
 			// `ExtensionRuntimeNotInitializedError`, and a `tool_call` handler that
@@ -260,7 +267,7 @@ export function createPersistedSubagentReviverFactory(
 			const wakeAgent: AgentDefinition = {
 				name: ref.displayName,
 				description: "",
-				systemPrompt: init.systemPrompt,
+				systemPrompt: init.systemPrompt.join("\n\n"),
 				source: "user",
 			};
 			attachIrcWakeTurnMonitor(session, {

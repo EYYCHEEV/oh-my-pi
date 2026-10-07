@@ -10,4 +10,5 @@ await compileCodingAgent({
 	entrypoint: path.resolve(import.meta.dir, "../../src/cli.ts"),
 	outfile,
 	transformersVersion: "0.0.0-test",
+	native: null,
 });

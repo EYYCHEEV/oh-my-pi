@@ -49,7 +49,11 @@ describe("AgentSession cache-warming runtime admission", () => {
 			modelRegistry: new ModelRegistry(authStorage),
 			cacheWarmer: warmer,
 			...(required
-				? { requiredRuntimeExtensions: [{ path: tempDir.join("missing-runtime.ts"), id: "required-runtime", version: 1 }] }
+				? {
+						requiredRuntimeExtensions: [
+							{ path: tempDir.join("missing-runtime.ts"), id: "required-runtime", version: 1 },
+						],
+					}
 				: {}),
 		});
 

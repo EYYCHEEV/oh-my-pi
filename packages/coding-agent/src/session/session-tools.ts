@@ -4,6 +4,7 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { isRecord, logger, prompt, stringProperty, structuredCloneJSON, untilAborted } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../capability";
 import type { EffectiveExtensionRoots } from "../capability/types";
+import { shouldInlineToolDescriptors } from "../config/inline-tool-descriptors-mode";
 import type { ModelRegistry } from "../config/model-registry";
 import { formatModelString } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
@@ -51,6 +52,7 @@ import type { SessionManager } from "./session-manager";
 import { cfgDisabledExtensions, cfgSkills, type SkillsSettings } from "../extensibility/settings";
 import {
 	cfgExternalThinking,
+	cfgInlineToolDescriptors,
 	cfgProvidersOpenaiCodexCodeMode,
 	cfgProvidersOpenaiCodexCodeModeDirectTools,
 	cfgSkillful,
@@ -322,6 +324,8 @@ export class SessionTools {
 	 * drop it before the request. Cleared when the turn ends.
 	 */
 	#turnSystemPromptOverride: string[] | undefined;
+	/** The latest per-turn override and the base its hook was given; kept after the turn ends. */
+	#lastTurnSystemPromptOverride: { prompt: string[]; base: string[] } | undefined;
 	#lastAppliedToolSignature: string | undefined;
 	/** Full enabled set, including tools demoted from the model-visible surface. */
 	#enabledToolNames = new Set<string>();
@@ -478,9 +482,18 @@ export class SessionTools {
 	 * applies it to the agent. Base rebuilds during the turn preserve it until
 	 * {@link clearTurnSystemPromptOverride}.
 	 */
-	setTurnSystemPromptOverride(prompt: string[]): void {
+	setTurnSystemPromptOverride(prompt: string[], base: string[]): void {
 		this.#turnSystemPromptOverride = prompt;
+		this.#lastTurnSystemPromptOverride = { prompt, base };
 		this.#host.agent.setSystemPrompt(prompt);
+	}
+
+	/**
+	 * The base prompt a system prompt the agent sent was built from: the hook's input when it is a
+	 * per-turn override, else the prompt itself, since every other prompt applied to the agent is a base.
+	 */
+	baseOfSystemPrompt(prompt: string[]): string[] {
+		return prompt === this.#lastTurnSystemPromptOverride?.prompt ? this.#lastTurnSystemPromptOverride.base : prompt;
 	}
 
 	/** Drops the active per-turn override; later rebuilds fall back to the base prompt. */
@@ -814,7 +827,15 @@ export class SessionTools {
 
 	#currentPromptModelKey(): string | undefined {
 		const activeModel = this.#host.model();
-		return activeModel ? formatModelString(activeModel) : undefined;
+		if (!activeModel) return undefined;
+		// The inline-descriptor decision is per model and selects both the prompt's
+		// tool catalog and provider-side description pruning (see `sdk.ts`). Every
+		// model change already changes the key; the decision also tracks the setting.
+		const inlineDescriptors = shouldInlineToolDescriptors(
+			cfgInlineToolDescriptors.get(this.#host.settings),
+			activeModel.id,
+		);
+		return `${formatModelString(activeModel)}|inline-descriptors:${inlineDescriptors}`;
 	}
 
 	/** Rebuilds model-dependent tool prompts after a model change. */

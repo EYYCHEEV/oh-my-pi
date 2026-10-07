@@ -238,7 +238,12 @@ describe("AgentSession mid-run threshold compaction", () => {
 							? {
 									role: "assistant" as const,
 									content: [
-										{ type: "toolCall" as const, id: `tc-${index}`, name: tools[0].name, arguments: { cmd: "pwd" } },
+										{
+											type: "toolCall" as const,
+											id: `tc-${index}`,
+											name: tools[0].name,
+											arguments: { cmd: "pwd" },
+										},
 									],
 									api: "anthropic-messages" as const,
 									provider: "anthropic" as const,
@@ -535,7 +540,6 @@ describe("AgentSession mid-run threshold compaction", () => {
 			},
 		);
 		const maintenanceSpy = vi.spyOn(SessionMaintenance.prototype, "runAutoCompaction").mockResolvedValue({
-			deferredHandoff: false,
 			continuationScheduled: false,
 		});
 		const refusalWarnings = collectPreparedBudgetWarnings(session);

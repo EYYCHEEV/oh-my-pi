@@ -533,13 +533,18 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 		const sessionFile = persisted.getSessionFile();
 		if (!sessionFile) throw new Error("Expected a persisted fixture session");
 		persisted.appendSessionInit({
-			systemPrompt: "cold revive",
+			systemPrompt: ["cold revive"],
 			task: "resume",
 			tools: ["read", "yield"],
 			spawns: "",
 			readSummarize: true,
 		});
-		persisted.appendMessage(createAssistantMessage("persisted task progress"));
+		// Cold revive restores the persisted model without UI fallback, so persist a catalog model.
+		persisted.appendMessage({
+			...createAssistantMessage("persisted task progress"),
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+		});
 		await persisted.close();
 		const factory = createPersistedSubagentReviverFactory({
 			session: {

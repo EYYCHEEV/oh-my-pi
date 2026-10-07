@@ -17,7 +17,6 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 }
 
 const emptySchema = type({});
-const codexModel = createHarmonyMitigationModel();
 
 /**
  * Build a host that gates `resolve` as a soft requirement while a preview is
@@ -250,7 +249,7 @@ describe("agentLoop soft tool requirement", () => {
 			responses: [{ content: [leak] }, { content: ["clean retry"] }],
 		});
 		const config: AgentLoopConfig = {
-			model: codexModel,
+			model: createHarmonyMitigationModel(),
 			convertToLlm: identityConverter,
 			getToolChoice: () => queue.shift(),
 		};

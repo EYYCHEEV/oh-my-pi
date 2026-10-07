@@ -27,6 +27,7 @@ pathIgnorePatterns = [
   "**/dist/**",
   "bazel-*/**",
   "python/**",
+  "sdk/**",
   "docs/**",
   "runs/**",
   "python/robomp/data/**",

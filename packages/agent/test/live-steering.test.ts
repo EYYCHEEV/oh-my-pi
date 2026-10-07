@@ -124,6 +124,12 @@ function liveSteeredTexts(transcript: AgentMessage[]): unknown[] {
 	return texts;
 }
 
+function userText(message: AgentMessage): string {
+	if (message.role !== "user") return "";
+	const { content } = message;
+	return typeof content === "string" ? content : content.map(part => (part.type === "text" ? part.text : "")).join("");
+}
+
 describe("agent loop live steering", () => {
 	it("records accepted steering right after the steered response and holds later input for the next boundary", async () => {
 		let claimedView: string[] | undefined;
@@ -193,9 +199,7 @@ describe("agent loop live steering", () => {
 			const steeredContext = ["<user>start</user>", "first", "<user>use tabs</user>"];
 
 			expect(admittedContexts).toEqual([["<user>start</user>"], steeredContext]);
-			expect(contexts).toEqual(
-				refuseSteering ? [["<user>start</user>"]] : [["<user>start</user>"], steeredContext],
-			);
+			expect(contexts).toEqual(refuseSteering ? [["<user>start</user>"]] : [["<user>start</user>"], steeredContext]);
 			expect(liveOffered).toEqual(refuseSteering ? [false] : [false, false]);
 			expect(transcript.filter(message => message === steer)).toHaveLength(1);
 			expect(events.filter(event => event.type === "message_end" && event.message === steer)).toHaveLength(1);
@@ -293,12 +297,68 @@ describe("agent loop live steering", () => {
 		// Esc hands the steer back to the editor: the abort must neither requeue nor record it.
 		const { agent, steer, running } = await startLiveSteeredRun();
 
-		expect(agent.withdrawLiveSteering()).toEqual([steer]);
+		expect(agent.withdrawUndeliveredQueuedMessages()).toEqual({ steering: [steer], followUp: [] });
 		agent.abort();
 		await running;
 
 		expect(agent.peekSteeringQueue()).toEqual([]);
 		expect(agent.peekUndeliveredQueuedMessages()).toEqual([]);
 		expect(agent.state.messages).not.toContain(steer);
+	});
+
+	it("drops the prepared context of withdrawn steering carried into the next turn", async () => {
+		// With an admission hook registered, steering is never taken live: it waits for the next
+		// boundary, where the next turn carries it with its prepared context. Esc before that
+		// turn's model call must withdraw both.
+		const mock = createMockModel({ responses: [{ content: ["first"] }, { content: ["second"] }] });
+		const providerReady = Promise.withResolvers<void>();
+		const steered = Promise.withResolvers<void>();
+		let calls = 0;
+		const liveOffered: boolean[] = [];
+		const agent = new Agent({
+			initialState: { model: mock.model },
+			streamFn: async (model, context, options) => {
+				liveOffered.push(options?.liveSteering !== undefined);
+				if (++calls === 1) {
+					providerReady.resolve();
+					await steered.promise;
+				}
+				return mock.stream(model, context, options);
+			},
+		});
+		agent.prepareQueuedMessages = messages => ({
+			commit: () => messages.map(message => createUserMessage(`context for ${userText(message)}`)),
+		});
+		const held = Promise.withResolvers<void>();
+		let beforeCalls = 0;
+		agent.addBeforeModelCall(async (_context, signal) => {
+			if (++beforeCalls !== 2) return;
+			held.resolve();
+			await new Promise<void>(resolve => signal?.addEventListener("abort", () => resolve(), { once: true }));
+		});
+		const ended: AgentMessage[][] = [];
+		const started: AgentMessage[] = [];
+		agent.subscribe(event => {
+			if (event.type === "agent_end") ended.push(event.messages);
+			if (event.type === "message_start") started.push(event.message);
+		});
+		const running = agent.prompt("start");
+		// Enqueue only after initial boundary polling, while the provider is in flight.
+		await providerReady.promise;
+		const steer = createUserMessage("use tabs");
+		agent.steer(steer);
+		steered.resolve();
+		await held.promise;
+
+		expect(agent.withdrawUndeliveredQueuedMessages()).toEqual({ steering: [steer], followUp: [] });
+		agent.abort();
+		await running;
+
+		const userTexts = (messages: AgentMessage[]) => messages.filter(m => m.role === "user").map(userText);
+		expect(userTexts(agent.state.messages)).toEqual(["start"]);
+		expect(userTexts(started)).toEqual(["start"]);
+		expect(ended.flatMap(userTexts)).toEqual(["start"]);
+		expect(agent.peekSteeringQueue()).toEqual([]);
+		expect(liveOffered).toEqual([false]);
 	});
 });

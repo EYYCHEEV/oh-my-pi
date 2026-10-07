@@ -9,9 +9,9 @@
  *    is disabled, top-level `task` in batch calls, empty/invalid items,
  *    duplicate names, and a missing shared `context`.
  * 3. With `async.enabled=true`, a batch call registers one background job per
- *    non-blocking item; agent definitions marked `blocking` run inline. With
- *    `async.enabled=false`, every batch blocks. All modes forward the shared
- *    `context`.
+ *    item; with `async.enabled=false`, it blocks and returns merged results.
+ *    Both modes forward the shared `context`; the flat form stays accepted at
+ *    runtime for internal callers.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
@@ -525,10 +525,7 @@ describe("task.batch spawning", () => {
 
 		const manager = createManager();
 		const tool = await TaskTool.create(
-			createSession({
-				manager,
-				settings: { "async.enabled": true, "task.batch": true },
-			}),
+			createSession({ manager, settings: { "async.enabled": true, "task.batch": true } }),
 		);
 
 		const result = await tool.execute("tc-single", {

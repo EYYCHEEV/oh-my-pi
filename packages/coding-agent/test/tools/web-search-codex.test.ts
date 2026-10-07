@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { AgentMessage, AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import type { Api, AuthStorage, FetchImpl, Message, Model } from "@oh-my-pi/pi-ai";
 import * as catalogModels from "@oh-my-pi/pi-catalog/models";
@@ -440,6 +440,21 @@ describe("searchCodex model selection", () => {
 			);
 		};
 	}
+
+	// Upstream 18.8.0 dropped gpt-5.5 from the bundled Codex roster. Pin a roster with a
+	// non-Lite hosted-search gpt-5.5 ahead of the Lite GPT-5.6 models so the fallback-order
+	// contract is tested against its preference list, not against catalog churn.
+	const realGetBundledModels = catalogModels.getBundledModels;
+	beforeEach(() => {
+		const bundled = realGetBundledModels("openai-codex");
+		const luna = bundled.find(model => model.id === "gpt-5.6-luna");
+		if (!luna) throw new Error("Expected bundled gpt-5.6-luna");
+		const hostedSearch: Model<Api> = { ...luna, id: "gpt-5.5", name: "GPT-5.5", useResponsesLite: false };
+		const roster = bundled.some(model => model.id === hostedSearch.id) ? bundled : [hostedSearch, ...bundled];
+		vi.spyOn(catalogModels, "getBundledModels").mockImplementation(provider =>
+			provider === "openai-codex" ? roster : realGetBundledModels(provider),
+		);
+	});
 
 	afterEach(() => {
 		vi.restoreAllMocks();

@@ -14,6 +14,7 @@ test("compiled admission enforces host policy without promoting dotenv activatio
 			entrypoint: path.join(import.meta.dir, "helpers/compiled-evaluation-policy.fixture.ts"),
 			outfile: binary,
 			transformersVersion: "0.0.0-test",
+			native: null,
 		});
 		await Bun.write(
 			path.join(root, ".env"),

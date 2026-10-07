@@ -119,7 +119,6 @@ An upgrade fails before build or installation if the block is stale, any require
 - `tool-call-abort-signal`: Tool-call abort signal propagation
 - `mcp-image-forwarding`: MCP image render and spill preservation
 - `task-delegation-gate`: Policy-gated task delegation
-- `task-batch-shape`: Batch task shape and shared context
 - `agent-registry-observation`: Copied read-only agent-registry observation
 - `outcome-first-scope-control`: Outcome-first reviewer and Todo scope control
 - `kimi-usage-account-identity`: Per-account Kimi usage report identity
@@ -628,6 +627,17 @@ Key ideas:
 - Keep interactive terminal-first UX for real coding work
 - Include practical built-ins (tools, sessions, branching, subagents, extensibility)
 - Make advanced behavior configurable rather than hidden
+
+### Project inputs and trust
+
+Opening a repository loads its project inputs by design: settings, extensions, hooks, tools, commands, skills, rules, and project MCP configuration. To exclude project `.mcp.json` for one invocation, pass `--config <file>` pointing at a YAML overlay with nested keys (a flat `mcp.enableProjectConfig: false` line is ignored):
+
+```yaml
+mcp:
+  enableProjectConfig: false
+```
+
+Use `--no-extensions` to skip ambient extension discovery; or use `--trusted-extension /absolute/path/to/file.ts` for an exact extension allowlist. `--no-tools` disables built-in tools, but project tool modules remain a separate discovery surface. These flags narrow inputs without changing the repository-trust model.
 
 ---
 

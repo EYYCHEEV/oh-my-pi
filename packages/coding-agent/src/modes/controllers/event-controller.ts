@@ -140,6 +140,21 @@ interface ApprovalPreviewGate {
 	started: boolean;
 }
 
+/**
+ * Working-line text for a streamed tool intent, or `undefined` when unusable.
+ * Streamed JSON can deliver non-string `i` (object, number, boolean) before
+ * schema validation, so the type is guarded too.
+ */
+function normalizeIntent(intent: unknown): string | undefined {
+	if (typeof intent !== "string") return undefined;
+	return (
+		intent
+			.trim()
+			.replace(/\s*\.+$/, "")
+			.trim() || undefined
+	);
+}
+
 export class EventController {
 	#lastReadGroup: ReadToolGroupComponent | undefined = undefined;
 	/** Timestamp of the current turn's user prompt; drives the usage row's prompt→yield delta. */
@@ -570,6 +585,14 @@ export class EventController {
 			this.#toolTimelineComponents.delete(oldId);
 			this.#toolTimelineComponents.set(newId, timeline);
 		}
+		// A held stream preview is id-keyed and consumed under the card's final id
+		// (message_update creation / tool_execution_start); move it with the card
+		// or the lookup under `newId` misses and the preview is lost.
+		const preview = this.#pendingStreamPreviews.get(oldId);
+		if (preview !== undefined && !this.#pendingStreamPreviews.has(newId)) {
+			this.#pendingStreamPreviews.delete(oldId);
+			this.#pendingStreamPreviews.set(newId, preview);
+		}
 		// The reveal controller is id-keyed; drop the stale target so the loop's
 		// setTarget/bind under the new id owns the paced reveal.
 		this.#toolArgsReveal.finish(oldId);
@@ -593,6 +616,63 @@ export class EventController {
 		// by `oldId`. Consume it now that the card owns the final id; the normal
 		// creation path is skipped on a re-key (Codex review on #6881).
 		if (pending) this.#settleHeldCompletionIfPresent(newId, pending);
+	}
+
+	/**
+	 * Reconcile every tool-call block's live card key with the id its content
+	 * block currently carries (see {@link #streamedToolCallIdByIndex}), moving
+	 * the id-keyed card state via {@link #migrateStreamedToolCallId}. A streamed
+	 * id can change across cumulative `message_update`s (#6879), and the final
+	 * snapshot can carry a per-index id change no delta ever showed — agent-loop
+	 * mints and re-keys tool-call ids at `done`, after the last
+	 * `message_update` — so the `message_end` path replays the same
+	 * reconciliation the delta path runs. Without it the pre-mint card is never
+	 * re-keyed: `tool_execution_start` mounts a second card under the minted id
+	 * and the streamed one ghosts until sealed.
+	 *
+	 * Several indices can share one streamed id (a reused provider id, or
+	 * siblings that all streamed before their ids materialized) and then split
+	 * into distinct ids. The shared card migrates only when the old id is no
+	 * longer referenced by any content index — the last referencer keeps the
+	 * card; the other indices pick up their own card at `tool_execution_start`.
+	 * Migrating unconditionally would move the one shared card to the first
+	 * re-keyed sibling and leave the index that kept the old id with no streamed
+	 * card (a reverse ghost).
+	 */
+	#reconcileStreamedToolCallIds(content: AssistantMessage["content"]): void {
+		const finalIdByIndex = new Map<number, string>();
+		for (let contentIndex = 0; contentIndex < content.length; contentIndex++) {
+			const block = content[contentIndex]!;
+			if (block.type === "toolCall") finalIdByIndex.set(contentIndex, block.id);
+		}
+		for (const [contentIndex, id] of finalIdByIndex) {
+			const priorId = this.#streamedToolCallIdByIndex.get(contentIndex);
+			if (priorId === undefined || priorId === id) {
+				this.#streamedToolCallIdByIndex.set(contentIndex, id);
+				continue;
+			}
+			const oldIdStaysOwned = [...finalIdByIndex].some(([otherIndex, otherId]) => {
+				if (otherIndex === contentIndex) return false;
+				// The other index either already resolved to the old id or still
+				// streams under it and has not been re-keyed yet.
+				return otherId === priorId || this.#streamedToolCallIdByIndex.get(otherIndex) === priorId;
+			});
+			if (oldIdStaysOwned) {
+				// The shared card stays under `priorId` for its remaining
+				// referencer; make it show THAT call's arguments, not the last
+				// cumulative update's (every sibling updated the one shared card
+				// while the id was still shared).
+				const card = this.ctx.pendingTools.get(priorId);
+				for (const [keeperIndex, keeperId] of finalIdByIndex) {
+					if (keeperId !== priorId || keeperIndex === contentIndex) continue;
+					const keeper = content[keeperIndex];
+					if (card && keeper?.type === "toolCall") card.updateArgs(keeper.arguments, priorId);
+				}
+			} else {
+				this.#migrateStreamedToolCallId(priorId, id);
+			}
+			this.#streamedToolCallIdByIndex.set(contentIndex, id);
+		}
 	}
 
 	#inlineReadToolImages(
@@ -651,13 +731,7 @@ export class EventController {
 
 	#updateWorkingMessageFromIntent(intent: unknown): void {
 		if (this.ctx.session.isAborting) return;
-		// Streamed JSON can deliver non-string `i` (object, number, boolean) before
-		// schema validation; `?.` only guards null/undefined, so guard the type too.
-		if (typeof intent !== "string") return;
-		const trimmed = intent
-			.trim()
-			.replace(/\s*\.+$/, "")
-			.trim();
+		const trimmed = normalizeIntent(intent);
 		if (!trimmed || trimmed === this.#lastIntent) return;
 		this.#lastIntent = trimmed;
 		this.ctx.setWorkingMessage(trimmed);
@@ -675,24 +749,31 @@ export class EventController {
 		// the listener's first await, preserving the timing the coalescing
 		// tests assert on. `message_update` enqueue is itself synchronous and
 		// needs no serialization.
-		this.ctx.unsubscribe = this.ctx.session.subscribe(async (event: AgentSessionEvent) => {
-			// Coalesce the cumulative `message_update` deltas of a streaming turn
-			// into at most one handler run per window. `#handleMessageUpdate` is
-			// synchronous, so without this every token re-runs the whole
-			// streaming rebuild (splitAssistantMessageToolTimeline, reveal
-			// setTarget, per-block tool-call reconciliation) even though the TUI
-			// paints at most ~30fps — at 40-100 tps the handler work then
-			// dominates the CPU profile of an idle-looking streaming session
-			// (issue #7443). Only the latest snapshot is meaningful; non-update
-			// events flush the pending snapshot first so ordering is preserved.
-			if (event.type === "message_update") {
-				this.#enqueueMessageUpdate(event);
-				return;
-			}
-			await this.#runSerialized(async () => {
-				await this.#flushPendingMessageUpdate();
-				await this.handleEvent(event);
-			});
+		this.ctx.unsubscribe = this.ctx.session.subscribe(event => this.dispatchSessionEvent(event));
+	}
+
+	/**
+	 * Route one session event through the same pipeline as the live
+	 * subscription: coalesce the cumulative `message_update` deltas of a
+	 * streaming turn into at most one handler run per window, and serialize
+	 * every other event behind any in-flight run.
+	 *
+	 * `#handleMessageUpdate` is synchronous, so without coalescing every token
+	 * re-runs the whole streaming rebuild (splitAssistantMessageToolTimeline,
+	 * reveal setTarget, per-block tool-call reconciliation) even though the TUI
+	 * paints at most ~30fps — at 40-100 tps the handler work then dominates the
+	 * CPU profile of an idle-looking streaming session (issue #7443). Only the
+	 * latest snapshot is meaningful; non-update events flush the pending
+	 * snapshot first so ordering is preserved.
+	 */
+	async dispatchSessionEvent(event: AgentSessionEvent): Promise<void> {
+		if (event.type === "message_update") {
+			this.#enqueueMessageUpdate(event);
+			return;
+		}
+		await this.#runSerialized(async () => {
+			await this.#flushPendingMessageUpdate();
+			await this.handleEvent(event);
 		});
 	}
 
@@ -1395,17 +1476,13 @@ export class EventController {
 				this.ctx.streamingComponent.setLinkTargets(assistantMessageLinkTargets(timeline.beforeTools, linkTargets));
 				this.ctx.streamingComponent.markTranscriptBlockFinalized();
 			}
+			// Re-key live cards when a provider rewrites a block's id across
+			// deltas, so the changed id reuses the existing card instead of
+			// spawning a duplicate (#6879).
+			this.#reconcileStreamedToolCallIds(this.ctx.streamingMessage.content);
 			for (let contentIndex = 0; contentIndex < this.ctx.streamingMessage.content.length; contentIndex++) {
 				const content = this.ctx.streamingMessage.content[contentIndex]!;
 				if (content.type !== "toolCall") continue;
-				// Re-key the live card when a provider rewrites this block's id
-				// across deltas, so the changed id reuses the existing card
-				// instead of spawning a duplicate (#6879).
-				const priorId = this.#streamedToolCallIdByIndex.get(contentIndex);
-				if (priorId !== undefined && priorId !== content.id) {
-					this.#migrateStreamedToolCallId(priorId, content.id);
-				}
-				this.#streamedToolCallIdByIndex.set(contentIndex, content.id);
 				const tool = this.ctx.viewSession.getToolByName(content.name);
 				const renderToolName = toolRenderName(content.name, tool);
 				if (renderToolName === "read") {
@@ -1510,25 +1587,31 @@ export class EventController {
 				if (closed) component?.markTranscriptBlockFinalized();
 			}
 
-			// Update working message with intent from streamed tool arguments
-			for (const content of this.ctx.streamingMessage.content) {
-				if (content.type !== "toolCall") continue;
-				const args = content.arguments;
+			// Update working message with the intent of the LAST intent-bearing
+			// streamed tool call. Scanning in reverse skips the redundant
+			// intermediate setWorkingMessage calls a forward pass would make
+			// (only the last one survives the flush anyway).
+			const blocks = this.ctx.streamingMessage.content;
+			for (let index = blocks.length - 1; index >= 0; index--) {
+				const block = blocks[index];
+				if (block?.type !== "toolCall") continue;
+				const args = block.arguments;
 				if (!args || typeof args !== "object") continue;
+				let intent: string | undefined;
 				if (INTENT_FIELD in args) {
-					this.#updateWorkingMessageFromIntent(args[INTENT_FIELD]);
-					continue;
-				}
-				const tool = this.ctx.viewSession.getToolByName(content.name);
-				if (typeof tool?.intent !== "function") continue;
-				try {
-					const derived = tool.intent(args as never)?.trim();
-					if (derived) {
-						this.#updateWorkingMessageFromIntent(derived);
+					intent = normalizeIntent(args[INTENT_FIELD]);
+				} else {
+					const tool = this.ctx.viewSession.getToolByName(block.name);
+					if (typeof tool?.intent !== "function") continue;
+					try {
+						intent = normalizeIntent(tool.intent(args as never));
+					} catch {
+						// intent function must never break the UI
 					}
-				} catch {
-					// intent function must never break the UI
 				}
+				if (!intent) continue;
+				this.#updateWorkingMessageFromIntent(intent);
+				break;
 			}
 
 			this.ctx.ui.requestRender();
@@ -1612,6 +1695,13 @@ export class EventController {
 					assistantMessageLinkTargets(displayTimeline.beforeTools, linkTargets),
 				);
 			}
+			// The final snapshot can carry a per-index id change no delta ever
+			// showed — agent-loop mints and re-keys tool-call ids at `done`, after
+			// the last `message_update` — so replay the same reconciliation
+			// `#handleMessageUpdate` runs per delta. Without it the pre-mint card
+			// is never re-keyed: tool_execution_start mounts a second card under
+			// the minted id and the streamed one ghosts until sealed.
+			this.#reconcileStreamedToolCallIds(this.ctx.streamingMessage.content);
 			this.ctx.streamingComponent.updateContent(displayTimeline.beforeTools);
 
 			if (this.ctx.streamingMessage.stopReason !== "aborted" && this.ctx.streamingMessage.stopReason !== "error") {

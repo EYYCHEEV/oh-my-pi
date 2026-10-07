@@ -212,11 +212,7 @@ function questionTabLabel(question: ExtensionAskDialogQuestion, index: number): 
 }
 
 function wrapQuestionTitle(question: ExtensionAskDialogQuestion, width: number): string[] {
-	const mdTheme = getMarkdownTheme();
-	const questionText = renderInlineMarkdown(replaceTabs(sanitizeCarriageReturns(question.question)), mdTheme, t =>
-		theme.fg("text", t),
-	);
-	return wrapTextWithAnsi(questionText, Math.max(1, width));
+	return renderPreviewContent(sanitizeCarriageReturns(question.question), Math.max(1, width), "text");
 }
 
 function renderQuestionTitle(question: ExtensionAskDialogQuestion, width: number, maxRows = MAX_HEADER_ROWS): string[] {
@@ -299,10 +295,10 @@ function splitPreviewSegments(preview: string): PreviewSegment[] {
 	return segments;
 }
 
-function renderPreviewContent(preview: string, width: number): string[] {
+function renderPreviewContent(preview: string, width: number, textColor: "muted" | "text" = "muted"): string[] {
 	const out: string[] = [];
 	const mdTheme = getMarkdownTheme();
-	const accentStyle = { color: (text: string) => theme.fg("muted", text) };
+	const accentStyle = { color: (text: string) => theme.fg(textColor, text) };
 	for (const segment of splitPreviewSegments(preview)) {
 		if (segment.kind === "code") {
 			const highlighted = highlightCode(segment.text, segment.language);
@@ -1136,7 +1132,7 @@ export class AskDialogComponent implements Component {
 		const action = question?.multi
 			? `${formatKeyHint("space")} toggle · ${enter} ${enterAction}`
 			: `${enter} select · ${formatKeyHint("n")} note`;
-		const tabs = this.#hasSubmitTab() ? ` · ${formatKeyHints(["tab", "left", "right"])}` : "";
+		const tabs = this.#hasSubmitTab() ? ` · ${formatKeyHints(["tab", "left", "right"])} question` : "";
 		const expand = this.#expandHint();
 		if (this.#questionCanPage && indicator) {
 			const pageKeys = editorKeys("tui.select.pageUp", "tui.select.pageDown");

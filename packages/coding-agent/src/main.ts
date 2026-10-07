@@ -11,6 +11,8 @@ import * as os from "node:os";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core/thinking";
 import { EventLoopKeepalive } from "@oh-my-pi/pi-agent-core/utils/yield";
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
+import { getModelPricingStatus } from "@oh-my-pi/pi-catalog/models";
+import { isEnoent, isEnotdir } from "@oh-my-pi/pi-utils";
 import {
 	APP_NAME,
 	directoryIsMissing,
@@ -1152,7 +1154,7 @@ export function normalizeContinueSessionArgs(parsed: Args, rawArgs?: readonly st
 	parsed.continue = false;
 	parsed.messages.splice(messageIndex, 1);
 }
-const FORK_NOT_FOUND_HINT =
+const SESSION_NOT_FOUND_HINT =
 	"Run `omp --resume` without an argument to pick from recent sessions, or `omp` to start a new one.";
 
 function validateSessionPersistenceArgs(parsed: Pick<Args, "continue" | "noSession" | "resume">): void {
@@ -1187,20 +1189,20 @@ export async function createSessionManager(
 				return await SessionManager.forkFrom(forkSource, cwd, parsed.sessionDir);
 			} catch (err) {
 				if (err instanceof ForkSourceNotFoundError) {
-					throw new SessionResolutionError(err.message, FORK_NOT_FOUND_HINT);
+					throw new SessionResolutionError(err.message, SESSION_NOT_FOUND_HINT);
 				}
 				throw err;
 			}
 		}
 		const match = await resolveResumableSession(forkSource, cwd, parsed.sessionDir);
 		if (!match) {
-			throw new SessionResolutionError(`Session "${forkSource}" not found.`, FORK_NOT_FOUND_HINT);
+			throw new SessionResolutionError(`Session "${forkSource}" not found.`, SESSION_NOT_FOUND_HINT);
 		}
 		try {
 			return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir);
 		} catch (err) {
 			if (err instanceof ForkSourceNotFoundError) {
-				throw new SessionResolutionError(`Session "${forkSource}" not found.`, FORK_NOT_FOUND_HINT);
+				throw new SessionResolutionError(`Session "${forkSource}" not found.`, SESSION_NOT_FOUND_HINT);
 			}
 			throw err;
 		}
@@ -1218,14 +1220,18 @@ export async function createSessionManager(
 	if (typeof parsed.resume === "string") {
 		const sessionArg = parsed.resume;
 		if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
-			return await SessionManager.open(sessionArg, parsed.sessionDir);
+			try {
+				return await SessionManager.open(sessionArg, parsed.sessionDir, undefined, { throwIfMissing: true });
+			} catch (err) {
+				if (isEnoent(err) || isEnotdir(err)) {
+					throw new SessionResolutionError(`Session "${sessionArg}" not found.`, SESSION_NOT_FOUND_HINT);
+				}
+				throw err;
+			}
 		}
 		const match = await resolveResumableSession(sessionArg, cwd, parsed.sessionDir);
 		if (!match) {
-			throw new SessionResolutionError(
-				`Session "${sessionArg}" not found.`,
-				"Run `omp --resume` without an argument to pick from recent sessions, or `omp` to start a new one.",
-			);
+			throw new SessionResolutionError(`Session "${sessionArg}" not found.`, SESSION_NOT_FOUND_HINT);
 		}
 		if (match.scope === "local") {
 			const moveResult = await moveMissingCwdSessionIfNeeded(
@@ -1933,6 +1939,15 @@ export async function runRootCommand(
 			"modelRegistry:init",
 			() => new ModelRegistry(authStorage, undefined, { settings: settingsInstance }),
 		);
+		// Credential-scoped catalogs (e.g. GitHub Copilot) load from their cache
+		// rows only after credentials resolve. `--model` and `enabledModels` below
+		// resolve against the registry before `createAgentSession` hydrates it, so
+		// without this a cached-only model is absent and its selector fuzzy-matches
+		// a bundled sibling (issue #14075). Local-only and never rejects; awaited
+		// right before the first catalog read so its I/O overlaps theme setup.
+		const credentialScopedCacheHydration = logger.time("hydrateCredentialScopedModelCaches", () =>
+			modelRegistry.hydrateCredentialScopedModelCaches(),
+		);
 		if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui") {
 			Bun.env.PI_NO_PTY = "1";
 		}
@@ -2009,7 +2024,7 @@ export async function runRootCommand(
 			},
 		});
 
-
+		await credentialScopedCacheHydration;
 		let scopedModels = await logger.time(
 			"resolveModelScope",
 			resolveScopedModels,
@@ -2240,7 +2255,9 @@ export async function runRootCommand(
 		sessionOptions.authStorage = authStorage;
 		sessionOptions.modelRegistry = modelRegistry;
 		sessionOptions.hasUI = isInteractive || mode === "rpc-ui";
+		sessionOptions.allowSessionModelFallback = isInteractive;
 		sessionOptions.settingsApproval = isInteractive;
+		sessionOptions.tuiTranscript = isInteractive;
 		sessionOptions.settings = settingsInstance;
 		sessionOptions.onPrewalkWarning = warning => {
 			if (isInteractive) notifs.push({ kind: "warn", message: warning });
@@ -2260,7 +2277,12 @@ export async function runRootCommand(
 			);
 		}
 		if (isTelemetryExportEnabled()) {
-			sessionOptions.telemetry = createTelemetryExportConfig(sessionOptions.telemetry);
+			// Chat telemetry reports each request's provider-computed cost. A model
+			// without a known rate card reports an unavailable reason instead of $0.
+			sessionOptions.telemetry = createTelemetryExportConfig(sessionOptions.telemetry, (providerId, modelId) => {
+				const model = modelRegistry.find(providerId, modelId);
+				return model !== undefined && getModelPricingStatus(model) !== "unknown";
+			});
 		}
 		await daemonPresencePromise;
 
