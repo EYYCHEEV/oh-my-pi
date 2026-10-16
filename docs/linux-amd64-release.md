@@ -9,7 +9,7 @@ Keep fork Actions disabled.
 ## Approval and ownership
 
 These scripts do not grant execution approval.
-The operator separately owns approved builder/dependency capacity and cost, public trust enrollment, source/tag signing and pushes, repository immutability settings, and creation/upload/publication of the exact release.
+The operator separately owns approved builder/dependency capacity and cost, public trust enrollment, source/tag signing and pushes, qualification signing-key custody, repository immutability settings, and creation/upload/publication of the exact release.
 No script provisions a builder, changes Docker contexts, creates keys/trust stores, changes GitHub settings, pushes, installs a runtime, contacts a deployment host, or restarts a service.
 Use only the existing approved GitHub credential mechanism; never pass a token in an argument or add broader credentials as a fallback.
 
@@ -39,8 +39,9 @@ Lightweight tags, nested tags, mismatched internal names, untrusted signatures a
 `--allowed-signers` is an explicitly supplied independently enrolled public allowed-signers file.
 Supply the enrolled public revocation file with `--revoked-signers` when one applies.
 Without that input the explicit deny-list is empty; the tools do not inherit a different Git revocation setting.
-No trust file is created or updated and no private signing key is read by the release helpers.
-Signing and remote source/tag publication are separate approved operations.
+No trust file is created or updated, and source-tag verification never reads a private signing key.
+The qualifier alone signs completion evidence using its explicitly supplied key after all checks pass.
+Source signing and remote source/tag publication are separate approved operations.
 
 ## Pinned build inputs and isolation
 
@@ -60,9 +61,10 @@ Do not repair or use the retired source branch to make this build pass.
 Pinned inputs support repeatability; byte-for-byte reproducibility of two completed Bun builds has not been demonstrated.
 
 Build prerequisites are Bash, Git, Python 3.12+, and an existing approved local Docker/buildx installation.
-Both candidate and release builds require `--docker-socket` with an explicit local Unix-socket endpoint and `--builder` naming an already approved builder.
-Ambient Docker/context/buildx/BuildKit overrides are rejected before a daemon is queried.
-The builder must have exactly one running node bound to that same local socket, with the local Docker or Docker-container driver.
+Both candidate and release builds require `--docker-socket` with an explicit local Unix-socket endpoint.
+Ambient Docker/context/buildx/BuildKit overrides are rejected before any daemon-capable subprocess.
+Builds use `docker --host ... --config ... build`, with a fresh empty client configuration and only that daemon's default builder.
+Named/saved builders are unsupported: there is no builder-selection option or saved-builder inspection.
 No remote endpoint inventory is printed or recorded, and no builder/context is created, bootstrapped or changed.
 
 Only committed application data and the selected recipes enter the disposable build context.
@@ -78,15 +80,25 @@ After the applicable build approval, choose a fresh output name and approved loc
 
 ```sh
 SOURCE_COMMIT=dd8d9785aa36b5b072817a089177030b1b3519df
+: "${BUILD_DOCKER_SOCKET:?bind the approved local Unix socket}"
+: "${QUALIFY_DOCKER_SOCKET:?bind the approved native-amd64 local Unix socket}"
+: "${QUALIFICATION_IMAGE:?bind the approved already-present image by digest}"
+: "${ATTESTATION_KEY:?bind the explicitly approved qualification key}"
+: "${QUALIFICATION_SIGNERS:?bind the independently enrolled qualification public signers}"
+: "${CANDIDATE_ATTESTATION:?choose a new private evidence pathname outside dist}"
 bash scripts/build-linux-amd64.sh \
   --commit "$SOURCE_COMMIT" --candidate --receipts \
-  --docker-socket "$BUILD_DOCKER_SOCKET" --builder "$APPROVED_BUILDER" \
+  --docker-socket "$BUILD_DOCKER_SOCKET" \
   --output linux-amd64-candidate
 python3 scripts/linux-amd64-receipt.py verify dist/linux-amd64-candidate \
   --commit "$SOURCE_COMMIT"
 bash scripts/qualify-linux-amd64.sh \
   --commit "$SOURCE_COMMIT" --assets dist/linux-amd64-candidate \
-  --docker-socket "$QUALIFY_DOCKER_SOCKET" --runtime-image "$QUALIFICATION_IMAGE"
+  --docker-socket "$QUALIFY_DOCKER_SOCKET" --runtime-image "$QUALIFICATION_IMAGE" \
+  --attestation-key "$ATTESTATION_KEY" --attestation "$CANDIDATE_ATTESTATION"
+python3 scripts/linux-amd64-receipt.py verify dist/linux-amd64-candidate \
+  --commit "$SOURCE_COMMIT" --attestation "$CANDIDATE_ATTESTATION" \
+  --qualification-signers "$QUALIFICATION_SIGNERS"
 ```
 
 Candidate mode uses the local recipe files and records `recipe_committed=false`, `recipe_commit=null`, with no source tag.
@@ -98,6 +110,8 @@ Without it only the executable is copied out and the qualification/publication t
 Qualification requires an independently approved, already present digest-pinned disposable runtime image and a native amd64 local daemon.
 Mac ARM64 emulation is not accepted as native qualification.
 The image must contain the pinned Bun, frozen dependencies and prebuilt canonical native grep regression; preparing it is a separate approved step.
+The full runtime-image reference is used only for local Docker selection and digest verification.
+Only the verified `sha256:` digest enters the runtime request, result, public manifest or completion attestation; registry and account names never enter uploaded bytes.
 Qualification never pulls an image, installs dependencies, resolves packages or compiles Rust.
 The complete runtime-image layout/attestation contract is enforced by `linux-amd64-qualify.py`.
 Use its fixed image paths and checked source/lock identities, not a host dependency or home mount.
@@ -114,6 +128,7 @@ The prepared image contract is:
 The canonical native grep test is `grep::tests::oversized_prefix_read_returns_stable_snapshot_after_rewrite`.
 The qualifier runs its prepared libtest executable with that exact selector and `--exact`, requiring exactly one passed test instead of invoking Cargo and silently compiling.
 The runtime limits are four CPUs, 12 GiB memory with no additional swap, 1024 processes, and private tmpfs capacities of 8 GiB workspace, 1 GiB runtime, 1 GiB home and 2 GiB temporary state.
+Only `/workspace` and `/runtime` explicitly enable `exec`, allowing application execution and native mappings; all four tmpfs mounts retain `nosuid`, `nodev`, size limits and mode `1777`.
 Individual commands have deadlines and the container smoke has a 3500-second whole-run deadline, bounded by the host's 3600-second client deadline.
 Expiry or any failed assertion leaves qualification unsuccessful and the owned container is forcibly removed.
 
@@ -132,31 +147,50 @@ Optional ML models/packages remain on-demand inputs and are not promised offline
 
 ## Release build and mandatory qualification
 
+Qualification also requires `ssh-keygen`, an explicit noninteractive private `--attestation-key`, and a new private `--attestation` output pathname outside the three-file asset directory.
+There is no default key, key discovery or SSH-agent lookup; the key and signature are never mounted into the container.
+After successful checks and a recheck of the unchanged host tuple, the qualifier finalizes canonical public JSON and signs a canonical local attestation using `ssh-keygen -Y sign -n stronk-omp-qualification`.
+It writes the attestation and adjacent `<attestation>.sig` as new mode-0600 files, never overwriting earlier evidence.
+Signing failure is not qualification success; metadata alone cannot authorize publication.
+
+The exact attestation fields are `schema` (`1`), `binary_sha256`, `source_commit`, `recipe_commit`, `runtime_image_digest`, `mode` (`candidate` or `release`), `checks`, and `manifest_sha256`.
+The manifest digest hashes canonical public manifest bytes, without an embedded attestation: ASCII-escaped JSON with sorted keys, compact separators, no non-finite numbers and one final newline.
+The check map must contain every required check as `passed`.
+Candidates bind `recipe_commit=null` and `mode=candidate`; relabeling one invalidates its evidence.
+Protect the qualification key independently from untrusted asset producers, and enroll its public key separately before use.
+The publisher requires an explicit `--qualification-signers` allowed-signers file for principal `stronk-omp-qualification`, with namespace `stronk-omp-qualification`.
+The attestation and signature are private local publisher inputs, not a fourth or fifth public release asset or an alternative fleet trust root.
+
 After review, trust/signing readiness and separate tag approval, use the full reviewed recipe commit and already signed local source tag:
 
 ```sh
+: "${RECIPE_COMMIT:?bind the full reviewed release-route commit}"
+: "${RELEASE_TAG:?bind the already signed exact source tag}"
+: "${RELEASE_ATTESTATION:?choose a new private evidence pathname outside dist}"
 bash scripts/build-linux-amd64.sh \
   --commit "$SOURCE_COMMIT" --recipe-commit "$RECIPE_COMMIT" --tag "$RELEASE_TAG" \
   --allowed-signers "$ALLOWED_SIGNERS" --revoked-signers "$REVOKED_SIGNERS" \
-  --docker-socket "$BUILD_DOCKER_SOCKET" --builder "$APPROVED_BUILDER" \
+  --docker-socket "$BUILD_DOCKER_SOCKET" \
   --receipts --output linux-amd64-release
 bash scripts/qualify-linux-amd64.sh \
   --commit "$SOURCE_COMMIT" --recipe-commit "$RECIPE_COMMIT" \
   --assets dist/linux-amd64-release \
-  --docker-socket "$QUALIFY_DOCKER_SOCKET" --runtime-image "$QUALIFICATION_IMAGE"
+  --docker-socket "$QUALIFY_DOCKER_SOCKET" --runtime-image "$QUALIFICATION_IMAGE" \
+  --attestation-key "$ATTESTATION_KEY" --attestation "$RELEASE_ATTESTATION"
 python3 scripts/linux-amd64-receipt.py verify dist/linux-amd64-release \
-  --commit "$SOURCE_COMMIT" --recipe-commit "$RECIPE_COMMIT" --tag "$RELEASE_TAG" --release
+  --commit "$SOURCE_COMMIT" --recipe-commit "$RECIPE_COMMIT" --tag "$RELEASE_TAG" --release \
+  --attestation "$RELEASE_ATTESTATION" --qualification-signers "$QUALIFICATION_SIGNERS"
 ```
 
 Building alone leaves runtime/regression checks at `not_run`.
 Only successful qualification of the exact binary/source/recipe tuple finalizes the allowlisted check summary and regenerates both metadata files.
-The release verifier refuses missing or incomplete qualification.
+Release CLI verification and publication refuse missing, incomplete, unauthenticated or mismatched qualification.
 No native/build/publication witness is implied by implementation or offline fixture success.
 
 ## Public manifest schema 2
 
 The manifest's exact top-level fields are `schema`, `repository`, `target`, `version`, `source`, `build_inputs`, `asset`, `runtime`, `checks`, `qualification`.
-Nested objects also reject unknown fields.
+Nested objects reject unknown fields, and one strict JSON decoder rejects repeated keys at every depth in every manifest, qualification result, attestation and other route JSON read.
 `source` records full application/tag/tag-object identities, source timestamp, recipe status and full recipe commit.
 `build_inputs` records fixed image/snapshot/archive pins, tool versions and executable hashes, system-package inventory digest, immutable source-lock digests and all eight recipe digests.
 `asset` records the binary basename, size and SHA-256.
@@ -164,6 +198,7 @@ Nested objects also reject unknown fields.
 `checks` requires all of `elf`, `cli`, `native_runtime`, `resources_workers`, `builtin_smoke`, `offline_session`, `fork_boundaries`, `native_grep`, `coding_agent_typecheck` to be `passed` for release.
 `qualification` binds the actual binary SHA-256, application and recipe commits, the same complete check set, and only `execution`, `cpu`, `glibc`, `loader`, `runtime_image` as environment fields.
 It is `null` before qualification.
+`qualification.environment.runtime_image` is strictly the verified `sha256:` digest, never a registry/repository/account reference.
 
 The manifest hashes the binary, not itself.
 `SHA256SUMS.txt` hashes the binary and finalized manifest, not itself.
@@ -190,11 +225,12 @@ bash scripts/publish-linux-amd64.sh \
   --commit "$SOURCE_COMMIT" --recipe-commit "$RECIPE_COMMIT" --tag "$RELEASE_TAG" \
   --assets dist/linux-amd64-release \
   --allowed-signers "$ALLOWED_SIGNERS" --revoked-signers "$REVOKED_SIGNERS" \
+  --attestation "$RELEASE_ATTESTATION" --qualification-signers "$QUALIFICATION_SIGNERS" \
   --immutability-witness "$IMMUTABILITY_WITNESS" --pins "$NEW_PIN_RECORD" --publish
 ```
 
 Without explicit `--publish` the helper refuses before any mutation, rather than leaving a draft.
-It validates the signed source, committed recipes, complete qualification and public schema before any GitHub call.
+It validates the signed source, committed recipes, complete qualification and public schema, then verifies the exact completion binding with `ssh-keygen -Y verify` against the explicit qualification signers, fixed principal and namespace before any GitHub call.
 It snapshots the exact three approved files privately, refuses an existing release or draft, checks the existing remote annotated tag/direct commit, creates one new draft and uploads exactly three assets without clobber.
 It reads draft identities and downloads by recorded asset IDs, comparing all sizes/hashes with the snapshot before publishing.
 Both creation and publication explicitly set `make_latest=false`; this fleet release does not replace the ordinary Mac release's latest marker.
@@ -227,8 +263,10 @@ python3 -m py_compile scripts/linux-amd64-receipt.py scripts/linux-amd64-qualify
 python3 -m unittest discover -s scripts -p 'test_linux_amd64*.py'
 ```
 
-The regression fixtures use fakes and do not build, pull images, install, sign, create tags, publish, contact deployment machines or run the normal publisher against GitHub.
-They cover immutable input mismatch, tag trust/shape, local endpoint binding, public field/asset allowlists, incomplete qualification, altered bytes, reused release/draft, immutability and read-back identity failures, and absence of install/SSH/service side effects.
+The regression fixtures use fakes for Docker/build/GitHub and generate only throwaway SSH keys inside temporary directories for real local signing and verification.
+They never use real keys, build, pull images, install, create tags, publish, contact deployment machines or run the normal publisher against GitHub.
+They cover duplicate JSON keys with valid checksums/signatures, digest-only runtime privacy, consistent receipt forgery, candidate relabeling, missing/wrong completion signatures and bindings, immutable inputs, tag trust/shape, pre-contact endpoint rejection, exact executable tmpfs options, release reuse and read-back failures.
+Fixture success is not a native execution witness; actual tmpfs execution and prepared-runtime qualification remain separately approved work.
 
 ## References
 

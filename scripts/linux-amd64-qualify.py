@@ -154,11 +154,18 @@ def docker_output(docker, args, timeout=30):
 
 
 def approved_daemon(docker, image):
+    require(receipt.match(receipt.IMAGE, image), "Immutable runtime image is required")
     # No general daemon info, endpoint enumeration, context inspection, or inventory.
     require(docker_output(docker, ["info", "--format", "{{.Architecture}}"]) in ("x86_64", "amd64"),
             "Native amd64 daemon is required")
     require(docker_output(docker, ["image", "inspect", "--format", "{{.Architecture}}", image]) == "amd64",
             "Prepared local amd64 image is required")
+    repository, image_digest = image.rsplit("@", 1)
+    reference = repository.split(":", 1)[0] + "@" + image_digest
+    template = "{{range .RepoDigests}}{{if eq . " + json.dumps(reference) + "}}verified{{end}}{{end}}"
+    require(docker_output(docker, ["image", "inspect", "--format", template, image]) == "verified",
+            "Prepared image digest differs")
+    return image_digest
 
 
 def container_command(docker, image, directory, name):
@@ -170,7 +177,8 @@ def container_command(docker, image, directory, name):
         "--ulimit=fsize=1073741824:1073741824", "--shm-size=256m",
     ]
     for destination, size in (("/workspace", "8g"), ("/runtime", "1g"), ("/home/qualification", "1g"), ("/tmp", "2g")):
-        command += ["--tmpfs", f"{destination}:rw,nosuid,nodev,size={size},mode=1777"]
+        execution = ",exec" if destination in ("/workspace", "/runtime") else ""
+        command += ["--tmpfs", f"{destination}:rw{execution},nosuid,nodev,size={size},mode=1777"]
     for child, destination in (("source", "/input/source"), ("input", "/input/assets"), ("recipe", "/recipe")):
         path = directory / child
         require("," not in str(path), "Unsupported mount path")
@@ -194,7 +202,8 @@ def validate_result(result, manifest, image):
     environment = result["environment"]
     receipt.keys(environment, ("execution", "cpu", "glibc", "loader", "runtime_image"))
     require(environment["execution"] == "native-amd64" and environment["cpu"] == "x86-64-v2" and
-            environment["loader"] == "ld-linux-x86-64.so.2" and environment["runtime_image"] == image and
+            environment["loader"] == "ld-linux-x86-64.so.2" and receipt.match(receipt.DIGEST, image) and
+            environment["runtime_image"] == image and
             receipt.match(r"[0-9]+(?:\.[0-9]+)+", environment["glibc"]), "Invalid qualified baseline")
     for observation in (manifest["runtime"]["binary"], manifest["runtime"]["native_baseline"]["elf"]):
         floor = observation["glibc_required"]
@@ -205,7 +214,32 @@ def version_tuple(value):
     return tuple(map(int, value.split(".")))
 
 
-def finalize(directory, before, result, image, root, commit, recipe_commit):
+def attestation_output(directory, key, output):
+    require(key.is_file() and not key.is_symlink() and key.suffix != ".pub",
+            "An explicit private attestation key is required")
+    require(not output.resolve().is_relative_to(directory.resolve()) and output.parent.is_dir(),
+            "Attestation must stay outside the public asset directory")
+    for path in (output, Path(str(output) + ".sig")):
+        require(not path.exists() and not path.is_symlink(), "Qualification evidence already exists")
+
+
+def sign_attestation(manifest, key, output):
+    data = receipt.attestation_bytes(manifest)
+    environment = os.environ.copy()
+    for name in ("SSH_AUTH_SOCK", "SSH_AGENT_PID", "SSH_ASKPASS"):
+        environment.pop(name, None)
+    environment["SSH_ASKPASS_REQUIRE"] = "never"
+    signed = subprocess.run(
+        ["ssh-keygen", "-Y", "sign", "-f", str(key), "-n", receipt.ATTESTATION_NAMESPACE],
+        input=data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=environment, timeout=60, check=True)
+    require(signed.stdout.startswith(b"-----BEGIN SSH SIGNATURE-----\n"), "Missing qualification signature")
+    for path, content in ((output, data), (Path(str(output) + ".sig"), signed.stdout)):
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+
+
+def finalize(directory, before, result, image, root, commit, recipe_commit, attestation_key, attestation):
     # Recheck the actual host bytes and complete tuple after execution, not just
     # the copied binary or metadata returned by the runtime.
     after = receipt.verify(directory, commit, before["source"]["tag"] or "", False, recipe_commit, root)
@@ -216,6 +250,8 @@ def finalize(directory, before, result, image, root, commit, recipe_commit):
     complete["qualification"] = result
     receipt.save_manifest(directory, complete)
     receipt.verify(directory, commit, before["source"]["tag"] or "", False, recipe_commit, root)
+    attestation_output(directory, attestation_key, attestation)
+    sign_attestation(complete, attestation_key, attestation)
 
 
 def qualify(args, root=None):
@@ -226,7 +262,7 @@ def qualify(args, root=None):
     require(directory.is_dir() and not directory.is_symlink() and
             (directory / receipt.ASSETS[1]).is_file() and not (directory / receipt.ASSETS[1]).is_symlink(),
             "Regular public assets are required")
-    initial = json.loads((directory / receipt.ASSETS[1]).read_text())
+    initial = receipt.strict_json((directory / receipt.ASSETS[1]).read_text())
     tag = initial["source"]["tag"] or ""
     before = receipt.verify(directory, args.commit, tag, False, args.recipe_commit, root)
     for name in receipt.RECIPES:
@@ -237,6 +273,7 @@ def qualify(args, root=None):
         receipt.assert_recipes(root, args.recipe_commit)
     else:
         require(not before["source"]["recipe_committed"], "Candidate recipe identity differs")
+    attestation_output(directory, args.attestation_key, args.attestation)
     # Transport validation runs before any subprocess capable of daemon contact.
     docker = receipt.validate_docker(args.docker_socket)
     with tempfile.TemporaryDirectory(prefix="omp-qualification-") as temporary:
@@ -246,7 +283,7 @@ def qualify(args, root=None):
         client_config = work / "docker-client"
         client_config.mkdir(mode=0o700)
         docker += ["--config", str(client_config)]
-        approved_daemon(docker, args.runtime_image)
+        image_digest = approved_daemon(docker, args.runtime_image)
         export_source(root, args.commit, work / "source")
         boundary_commands(work / "source")
         inputs, recipes = work / "input", work / "recipe"
@@ -255,7 +292,7 @@ def qualify(args, root=None):
         shutil.copyfile(directory / receipt.ASSETS[0], inputs / receipt.ASSETS[0])
         (inputs / receipt.ASSETS[0]).chmod(0o555)
         require(receipt.digest(inputs / receipt.ASSETS[0]) == before["asset"]["sha256"], "Copied binary differs")
-        (inputs / "request.json").write_text(json.dumps({"manifest": before, "runtime_image": args.runtime_image}))
+        (inputs / "request.json").write_text(json.dumps({"manifest": before, "runtime_image": image_digest}))
         (inputs / "request.json").chmod(0o444)
         for name in ("linux-amd64-receipt.py", "linux-amd64-qualify.py", "linux-amd64-smoke.sh"):
             data = receipt.git_bytes(root, args.recipe_commit, f"scripts/{name}") if args.recipe_commit else (root / "scripts" / name).read_bytes()
@@ -267,12 +304,13 @@ def qualify(args, root=None):
             output = subprocess.check_output(container_command(docker, args.runtime_image, work, name),
                                              stderr=subprocess.DEVNULL, timeout=3600)
             require(len(output) <= 8192, "Invalid runtime summary")
-            result = json.loads(output)
+            result = receipt.strict_json(output)
         finally:
             # A client timeout must not leave workers or runtime state alive.
             subprocess.run(docker + ["rm", "--force", name], stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, timeout=30, check=False)
-        finalize(directory, before, result, args.runtime_image, root, args.commit, args.recipe_commit)
+        finalize(directory, before, result, image_digest, root, args.commit, args.recipe_commit,
+                 args.attestation_key, args.attestation)
 
 
 class Runtime:
@@ -325,7 +363,7 @@ def dependency_digest(source):
 
 def prepare_dependencies(source, manifest, runtime):
     prepared_source = PREPARED / "source"
-    metadata = json.loads((PREPARED / "dependencies.json").read_text())
+    metadata = receipt.strict_json((PREPARED / "dependencies.json").read_text())
     receipt.keys(metadata, ("schema", "source_commit", "bun_version", "locks", "dependency_tree_sha256", "native_grep_sha256"))
     require(type(metadata["schema"]) is int and metadata["schema"] == 1 and metadata["source_commit"] == manifest["source"]["commit"] and
             metadata["bun_version"] == "1.4.2" and metadata["locks"] == manifest["build_inputs"]["locks"], "Prepared dependency identity differs")
@@ -407,7 +445,7 @@ def offline_session(runtime, binary, cwd, agent):
     output, error = runtime.run([binary, "--mode", "rpc", "--no-ui", "--no-session", "--model", "offline-smoke/offline",
                                  "--no-extensions", "--no-skills", "--no-rules", "--no-tools", "--no-lsp", "--no-title"],
                                 cwd, 90, b'{"id":"smoke-state","type":"get_available_models"}\n')
-    messages = [json.loads(line) for line in output.splitlines() if line.strip()]
+    messages = [receipt.strict_json(line) for line in output.splitlines() if line.strip()]
     require(any(message.get("type") == "ready" for message in messages), "Session did not initialize")
     responses = [message for message in messages if message.get("id") == "smoke-state"]
     require(len(responses) == 1 and responses[0].get("type") == "response" and
@@ -417,10 +455,10 @@ def offline_session(runtime, binary, cwd, agent):
 
 
 def runtime_main():
-    request = json.loads(Path("/input/assets/request.json").read_text())
+    request = receipt.strict_json(Path("/input/assets/request.json").read_text())
     receipt.keys(request, ("manifest", "runtime_image"))
     manifest, image = request["manifest"], request["runtime_image"]
-    require(manifest["source"]["commit"] == receipt.APPLICATION_COMMIT and receipt.match(receipt.IMAGE, image), "Wrong runtime request")
+    require(manifest["source"]["commit"] == receipt.APPLICATION_COMMIT and receipt.match(receipt.DIGEST, image), "Wrong runtime request")
     # Inspect architecture and CPU flags only, never host/network identity.
     flags = re.findall(r"^flags\s*:\s*(.*)$", Path("/proc/cpuinfo").read_text(), re.MULTILINE)
     require(flags, "CPU baseline is unavailable")
@@ -442,7 +480,7 @@ def runtime_main():
     source = Path("/workspace/source")
     shutil.copytree("/input/source", source, symlinks=True)
     require({name: receipt.digest(source / name) for name in receipt.LOCKS} == manifest["build_inputs"]["locks"], "Runtime source locks differ")
-    require(json.loads((source / "packages/coding-agent/package.json").read_text())["version"] == manifest["version"], "Runtime source version differs")
+    require(receipt.strict_json((source / "packages/coding-agent/package.json").read_text())["version"] == manifest["version"], "Runtime source version differs")
     commands = boundary_commands(source)
     grep = prepare_dependencies(source, manifest, runtime)
     binary = Path("/workspace/omp")
@@ -507,6 +545,8 @@ def main():
         parser.add_argument("--assets", required=True, type=Path)
         parser.add_argument("--runtime-image", required=True)
         parser.add_argument("--docker-socket", required=True)
+        parser.add_argument("--attestation-key", required=True, type=Path)
+        parser.add_argument("--attestation", required=True, type=Path)
         qualify(parser.parse_args())
         print("Linux-amd64 qualification passed; exact public assets finalized.")
     except (ValueError, OSError, KeyError, TypeError, AttributeError, IndexError, subprocess.SubprocessError, tarfile.TarError):

@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import copy
+import hashlib
 import importlib.util
 import io
 import json
@@ -15,13 +16,15 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
+from test_linux_amd64_receipt import REAL_RUN, signing_fixture
 
 
 SPEC = importlib.util.spec_from_file_location("qualify_linux_amd64", Path(__file__).with_name("linux-amd64-qualify.py"))
 qualify = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(qualify)
 receipt = qualify.receipt
-IMAGE = "qualification/runtime@sha256:" + "1" * 64
+IMAGE_DIGEST = "sha256:" + "1" * 64
+IMAGE = "registry.invalid/private-account/runtime@" + IMAGE_DIGEST
 RECIPE = "a" * 40
 TAG = "stronk-omp-s1-2026.10.16.0001"
 
@@ -56,7 +59,7 @@ def success(manifest):
     return {
         "binary_sha256": manifest["asset"]["sha256"], "source_commit": manifest["source"]["commit"],
         "recipe_commit": manifest["source"]["recipe_commit"],
-        "environment": {"execution": "native-amd64", "cpu": "x86-64-v2", "glibc": "2.41", "loader": "ld-linux-x86-64.so.2", "runtime_image": IMAGE},
+        "environment": {"execution": "native-amd64", "cpu": "x86-64-v2", "glibc": "2.41", "loader": "ld-linux-x86-64.so.2", "runtime_image": IMAGE_DIGEST},
         "checks": {check: "passed" for check in receipt.CHECKS},
     }
 
@@ -78,10 +81,23 @@ def source_fixture(source, boundaries=None):
 class DaemonTests(unittest.TestCase):
     def test_native_architecture_only_queries(self):
         docker = ["docker", "--host", "unix:///runtime/docker.sock"]
-        with patch.object(qualify, "docker_output", side_effect=["x86_64", "amd64"]) as output:
-            qualify.approved_daemon(docker, IMAGE)
+        with patch.object(qualify, "docker_output", side_effect=["x86_64", "amd64", "verified"]) as output:
+            self.assertEqual(qualify.approved_daemon(docker, IMAGE), IMAGE_DIGEST)
         self.assertEqual(output.call_args_list[0].args[1], ["info", "--format", "{{.Architecture}}"])
         self.assertEqual(output.call_args_list[1].args[1], ["image", "inspect", "--format", "{{.Architecture}}", IMAGE])
+
+    def test_tagged_digest_selection_matches_untagged_cached_repo_digest(self):
+        tagged = IMAGE.replace("@", ":approved@")
+
+        def output(_docker, args):
+            if args[0] == "info" or args[3] == "{{.Architecture}}":
+                return "amd64"
+            self.assertEqual(args[-1], tagged)
+            # Docker's RepoDigests entries have repository@digest, without tags.
+            return "verified" if json.dumps(IMAGE) in args[3] else ""
+
+        with patch.object(qualify, "docker_output", side_effect=output):
+            self.assertEqual(qualify.approved_daemon(["docker"], tagged), IMAGE_DIGEST)
 
     def test_arm_daemon_rejected_before_image_or_container(self):
         for architecture in ("arm64", "aarch64", "", "x86_64\nextra"):
@@ -92,6 +108,11 @@ class DaemonTests(unittest.TestCase):
 
     def test_arm_image_on_amd64_daemon_rejected(self):
         with patch.object(qualify, "docker_output", side_effect=["amd64", "arm64"]):
+            with self.assertRaises(ValueError):
+                qualify.approved_daemon(["docker"], IMAGE)
+
+    def test_unverified_image_digest_is_rejected(self):
+        with patch.object(qualify, "docker_output", side_effect=["amd64", "amd64", ""]):
             with self.assertRaises(ValueError):
                 qualify.approved_daemon(["docker"], IMAGE)
 
@@ -120,6 +141,13 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual(len(mounts), 3)
         self.assertTrue(all(item.endswith(",readonly") for item in mounts))
         self.assertFalse(any("docker.sock" in item or ".ssh" in item or "sign" in item or "/home" in item for item in mounts))
+        tmpfs = [command[index + 1] for index, item in enumerate(command) if item == "--tmpfs"]
+        self.assertEqual(tmpfs, [
+            "/workspace:rw,exec,nosuid,nodev,size=8g,mode=1777",
+            "/runtime:rw,exec,nosuid,nodev,size=1g,mode=1777",
+            "/home/qualification:rw,nosuid,nodev,size=1g,mode=1777",
+            "/tmp:rw,nosuid,nodev,size=2g,mode=1777",
+        ])
         self.assertNotIn("--platform", command)
         self.assertNotIn("--privileged", command)
         self.assertEqual(command[-3:], ["--entrypoint=/bin/sh", IMAGE, "/recipe/linux-amd64-smoke.sh"])
@@ -283,11 +311,21 @@ class PreparedRuntimeTests(unittest.TestCase):
 
 
 class CompletionTests(unittest.TestCase):
+    def setUp(self):
+        self.evidence = tempfile.TemporaryDirectory()
+        self.addCleanup(self.evidence.cleanup)
+        directory = Path(self.evidence.name)
+        self.key, self.signers = signing_fixture(directory)
+        self.attestation = directory / "qualification.json"
+
+    def finalize(self, *args):
+        qualify.finalize(*args, self.key, self.attestation)
+
     def test_candidate_can_qualify_but_can_never_publish(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             manifest = fixture(directory)
-            qualify.finalize(directory, manifest, success(manifest), IMAGE, False, receipt.APPLICATION_COMMIT, "")
+            self.finalize(directory, manifest, success(manifest), IMAGE_DIGEST, False, receipt.APPLICATION_COMMIT, "")
             completed = receipt.verify(directory, receipt.APPLICATION_COMMIT, "", False, root=False)
             self.assertIs(completed["source"]["recipe_committed"], False)
             self.assertIsNone(completed["source"]["recipe_commit"])
@@ -295,13 +333,28 @@ class CompletionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 receipt.verify(directory, receipt.APPLICATION_COMMIT, "", True, root=False)
             self.assertEqual({item.name for item in directory.iterdir()}, set(receipt.ASSETS))
+            receipt.verify_attestation(completed, self.attestation, self.signers)
+            evidence = receipt.strict_json(self.attestation.read_bytes())
+            self.assertEqual(evidence["mode"], "candidate")
+            self.assertIsNone(evidence["recipe_commit"])
+            self.assertEqual(evidence["manifest_sha256"], hashlib.sha256((directory / receipt.ASSETS[1]).read_bytes()).hexdigest())
+            self.assertEqual(self.attestation.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(Path(str(self.attestation) + ".sig").stat().st_mode & 0o777, 0o600)
 
     def test_committed_tuple_qualifies_exactly(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             manifest = fixture(directory, committed=True)
-            qualify.finalize(directory, manifest, success(manifest), IMAGE, False, receipt.APPLICATION_COMMIT, RECIPE)
-            self.assertEqual(receipt.verify(directory, receipt.APPLICATION_COMMIT, TAG, True, RECIPE, root=False)["qualification"], success(manifest))
+            self.finalize(directory, manifest, success(manifest), IMAGE_DIGEST, False, receipt.APPLICATION_COMMIT, RECIPE)
+            completed = receipt.verify(directory, receipt.APPLICATION_COMMIT, TAG, True, RECIPE, root=False)
+            receipt.verify_attestation(completed, self.attestation, self.signers)
+            self.assertEqual(receipt.strict_json(self.attestation.read_bytes()), {
+                "schema": 1, "binary_sha256": receipt.digest(directory / receipt.ASSETS[0]),
+                "source_commit": receipt.APPLICATION_COMMIT, "recipe_commit": RECIPE,
+                "runtime_image_digest": IMAGE_DIGEST, "mode": "release",
+                "checks": {check: "passed" for check in receipt.CHECKS},
+                "manifest_sha256": hashlib.sha256((directory / receipt.ASSETS[1]).read_bytes()).hexdigest(),
+            })
 
     def test_incomplete_failed_extra_or_metadata_only_result_never_finalizes(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -321,8 +374,10 @@ class CompletionTests(unittest.TestCase):
             original = (directory / receipt.ASSETS[1]).read_bytes()
             for result in bad_results:
                 with self.assertRaises(ValueError):
-                    qualify.finalize(directory, manifest, result, IMAGE, False, receipt.APPLICATION_COMMIT, "")
+                    self.finalize(directory, manifest, result, IMAGE_DIGEST, False, receipt.APPLICATION_COMMIT, "")
                 self.assertEqual((directory / receipt.ASSETS[1]).read_bytes(), original)
+                self.assertFalse(self.attestation.exists())
+                self.assertFalse(Path(str(self.attestation) + ".sig").exists())
 
     def test_altered_binary_or_manifest_never_finalizes(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -331,13 +386,13 @@ class CompletionTests(unittest.TestCase):
             with (directory / receipt.ASSETS[0]).open("ab") as binary:
                 binary.write(b"changed")
             with self.assertRaises(ValueError):
-                qualify.finalize(directory, manifest, success(manifest), IMAGE, False, receipt.APPLICATION_COMMIT, "")
+                self.finalize(directory, manifest, success(manifest), IMAGE_DIGEST, False, receipt.APPLICATION_COMMIT, "")
             manifest = fixture(directory)
             other = copy.deepcopy(manifest)
             other["source"]["source_date_epoch"] = 2
             receipt.save_manifest(directory, other)
             with self.assertRaises(ValueError):
-                qualify.finalize(directory, manifest, success(manifest), IMAGE, False, receipt.APPLICATION_COMMIT, "")
+                self.finalize(directory, manifest, success(manifest), IMAGE_DIGEST, False, receipt.APPLICATION_COMMIT, "")
 
     def test_wrong_tuple_or_environment_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -346,17 +401,17 @@ class CompletionTests(unittest.TestCase):
                 result = success(manifest)
                 result[field] = replacement
                 with self.assertRaises(ValueError):
-                    qualify.validate_result(result, manifest, IMAGE)
+                    qualify.validate_result(result, manifest, IMAGE_DIGEST)
             for field, replacement in (("execution", "emulated"), ("cpu", "x86-64-v3"), ("glibc", "2.17"),
                                        ("loader", "other.so"), ("runtime_image", "qualification/runtime:mutable")):
                 result = success(manifest)
                 result["environment"][field] = replacement
                 with self.assertRaises(ValueError):
-                    qualify.validate_result(result, manifest, IMAGE)
+                    qualify.validate_result(result, manifest, IMAGE_DIGEST)
 
 
 class HostFlowTests(unittest.TestCase):
-    def run_fixture(self, directory, *, committed=False, fail=False, changed=False):
+    def run_fixture(self, directory, *, committed=False, fail=False, changed=False, duplicate=False):
         assets, root = directory / "assets", directory / "root"
         assets.mkdir()
         (root / "scripts").mkdir(parents=True)
@@ -367,6 +422,20 @@ class HostFlowTests(unittest.TestCase):
         receipt.save_manifest(assets, manifest)
         args = argparse.Namespace(commit=receipt.APPLICATION_COMMIT, recipe_commit=RECIPE if committed else "", assets=assets,
                                   runtime_image=IMAGE, docker_socket="unix:///runtime/docker.sock")
+        args.attestation_key, signers = signing_fixture(directory)
+        args.attestation = directory / "qualification.json"
+        cleanup = Mock()
+
+        def execute(command, **kwargs):
+            if command[0] == "ssh-keygen":
+                if "sign" in command:
+                    self.assertEqual(command[command.index("-f") + 1], str(args.attestation_key))
+                    self.assertNotIn("SSH_AUTH_SOCK", kwargs["env"])
+                    self.assertNotIn("SSH_AGENT_PID", kwargs["env"])
+                    self.assertNotIn("SSH_ASKPASS", kwargs["env"])
+                return REAL_RUN(command, **kwargs)
+            self.assertEqual(command[0], "docker")
+            return cleanup(command, **kwargs)
         real_verify = receipt.verify
         calls = []
 
@@ -375,14 +444,24 @@ class HostFlowTests(unittest.TestCase):
             if "info" in command:
                 return b"x86_64\n"
             if "image" in command:
+                if command[command.index("--format") + 1] != "{{.Architecture}}":
+                    return b"verified\n"
                 return b"amd64\n"
             self.assertIn("run", command)
             self.assertIn("--config", command)
+            request = receipt.strict_json((Path(command[command.index("--config") + 1]).parent / "input/request.json").read_bytes())
+            self.assertEqual(request["runtime_image"], IMAGE_DIGEST)
+            self.assertNotIn(b"private-account", json.dumps(request).encode())
             if fail:
                 raise subprocess.CalledProcessError(1, command, output=b"private fixture diagnostics")
             if changed:
                 with (assets / receipt.ASSETS[0]).open("ab") as binary:
                     binary.write(b"changed")
+            if duplicate:
+                raw = json.dumps(success(manifest))
+                if duplicate == "nested":
+                    return raw.replace('"cli":', '"cli":"failed","cli":', 1).encode()
+                return ('{"checks":{"cli":"failed"},' + raw[1:]).encode()
             return json.dumps(success(manifest)).encode()
 
         def archive(_root, _commit, destination):
@@ -395,18 +474,23 @@ class HostFlowTests(unittest.TestCase):
              patch.object(receipt, "git_bytes", side_effect=lambda _root, _rev, name: (root / name).read_bytes()), \
              patch.object(qualify, "export_source", side_effect=archive), \
              patch.object(subprocess, "check_output", side_effect=fake_output), \
-             patch.object(subprocess, "run") as cleanup:
-            if fail or changed:
+             patch.object(subprocess, "run", side_effect=execute):
+            if fail or changed or duplicate:
                 with self.assertRaises((ValueError, subprocess.SubprocessError)):
                     qualify.qualify(args, root)
-                self.assertIsNone(json.loads((assets / receipt.ASSETS[1]).read_text())["qualification"])
+                self.assertIsNone(receipt.strict_json((assets / receipt.ASSETS[1]).read_text())["qualification"])
+                self.assertFalse(args.attestation.exists())
             else:
                 qualify.qualify(args, root)
-                self.assertEqual(json.loads((assets / receipt.ASSETS[1]).read_text())["qualification"], success(manifest))
+                completed = receipt.strict_json((assets / receipt.ASSETS[1]).read_text())
+                self.assertEqual(completed["qualification"], success(manifest))
+                receipt.verify_attestation(completed, args.attestation, signers)
+                for name in receipt.ASSETS:
+                    self.assertNotIn(b"private-account", (assets / name).read_bytes())
             self.assertEqual(assert_recipes.call_count, int(committed))
             cleanup.assert_called_once()
             self.assertEqual(cleanup.call_args.args[0][-3:-1], ["rm", "--force"])
-            self.assertEqual(len(calls), 3)
+            self.assertEqual(len(calls), 4)
 
     def test_normal_candidate_and_committed_flows_with_fake_daemon(self):
         for committed in (False, True):
@@ -414,13 +498,14 @@ class HostFlowTests(unittest.TestCase):
                 self.run_fixture(Path(temporary), committed=committed)
 
     def test_runtime_failure_or_host_binary_change_does_not_mark_success(self):
-        for options in ({"fail": True}, {"changed": True}):
+        for options in ({"fail": True}, {"changed": True}, {"duplicate": True}, {"duplicate": "nested"}):
             with self.subTest(options=options), tempfile.TemporaryDirectory() as temporary:
                 self.run_fixture(Path(temporary), **options)
 
     def test_cli_sanitizes_subprocess_failures(self):
         arguments = ["qualify", "--commit", receipt.APPLICATION_COMMIT, "--assets", "/fixture/assets", "--runtime-image", IMAGE,
-                     "--docker-socket", "unix:///runtime/docker.sock"]
+                     "--docker-socket", "unix:///runtime/docker.sock",
+                     "--attestation-key", "fixture-key", "--attestation", "fixture-attestation"]
         output = io.StringIO()
         with patch.object(qualify.sys, "argv", arguments), patch.object(qualify, "qualify", side_effect=subprocess.CalledProcessError(1, "fixture", output=b"private diagnostics")), \
              contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):

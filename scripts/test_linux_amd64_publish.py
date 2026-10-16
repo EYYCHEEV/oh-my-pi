@@ -1,7 +1,8 @@
-"""Offline publisher boundary tests. No subprocess, network, or trust store is used."""
+"""Offline publisher fixtures, using only throwaway SSH keys and a fake GitHub."""
 import argparse
 from datetime import datetime, timedelta, timezone
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -15,6 +16,9 @@ SPEC.loader.exec_module(publisher)
 FIXTURE_SPEC = importlib.util.spec_from_file_location("publish_receipt_fixture", Path(__file__).with_name("test_linux_amd64_receipt.py"))
 fixture = importlib.util.module_from_spec(FIXTURE_SPEC)
 FIXTURE_SPEC.loader.exec_module(fixture)
+QUALIFY_SPEC = importlib.util.spec_from_file_location("publish_qualifier", Path(__file__).with_name("linux-amd64-qualify.py"))
+qualifier = importlib.util.module_from_spec(QUALIFY_SPEC)
+QUALIFY_SPEC.loader.exec_module(qualifier)
 VERIFY_RECEIPT = publisher.receipt.verify
 COMMIT = "dd8d9785aa36b5b072817a089177030b1b3519df"
 RECIPE = "a" * 40
@@ -69,7 +73,7 @@ class FakeGH:
         assert kwargs["stderr"] == subprocess.PIPE
         assert kwargs["env"]["GH_HOST"] == "github.com"
         assert self.fixture.args.pins.exists(), "Pin destination must be reserved before remote access"
-        assert self.events[:3] == ["recipes", "signature", "receipt"], "Local trust and qualification must precede remote access"
+        assert self.events[:4] == ["recipes", "signature", "receipt", "attestation"], "Local trust and qualification must precede remote access"
         if arguments[1:3] == ["release", "upload"]:
             self.events.append("upload")
             assert self.created and not self.uploaded and not self.published
@@ -80,6 +84,7 @@ class FakeGH:
             assert [Path(path).name for path in paths] == list(publisher.receipt.ASSETS)
             for path in paths:
                 assert Path(path).read_bytes() == self.fixture.contents[Path(path).name]
+                assert b"private-account" not in Path(path).read_bytes()
             self.uploaded = True
             return subprocess.CompletedProcess(arguments, 0, b"", b"")
         assert arguments[1:4] == ["api", "--hostname", "github.com"]
@@ -164,7 +169,7 @@ class PublisherTests(unittest.TestCase):
         assets = self.directory / "assets"
         assets.mkdir()
         self.events = []
-        fixture.make_assets(assets)
+        manifest = fixture.make_assets(assets)
         self.contents = {name: (assets / name).read_bytes() for name in publisher.receipt.ASSETS}
         witness = self.directory / "witness.json"
         witness.write_text(json.dumps({"repository": publisher.REPOSITORY, "enabled": True,
@@ -173,6 +178,9 @@ class PublisherTests(unittest.TestCase):
                                        assets=assets, allowed_signers=self.directory / "public-signers",
                                        revoked_signers=None, immutability_witness=witness,
                                        pins=self.directory / "pins.json", publish=True)
+        self.args.attestation = self.directory / "qualification.json"
+        self.key, self.args.qualification_signers = fixture.signing_fixture(self.directory)
+        fixture.sign_fixture(manifest, self.key, self.args.attestation)
 
     def write_assets(self):
         for name, data in self.contents.items():
@@ -197,13 +205,19 @@ class PublisherTests(unittest.TestCase):
     def invoke(self, failure=None):
         fake = FakeGH(self, failure)
         self.fake = fake
+        def execute(arguments, **kwargs):
+            if arguments[0] == "ssh-keygen":
+                self.events.append("attestation")
+                return fixture.REAL_RUN(arguments, **kwargs)
+            return fake(arguments, **kwargs)
+
         with patch.object(publisher.receipt, "assert_recipes", self.local_recipes), \
              patch.object(publisher.receipt, "validate_tag", self.local_signature), \
              patch.object(publisher.receipt, "verify", self.local_receipt), \
              patch.object(publisher.receipt, "git_bytes", side_effect=fixture.tree_bytes), \
              patch.object(publisher.receipt, "commit_exists"), \
              patch.object(publisher.receipt, "capture", return_value=str(fixture.EPOCH)), \
-             patch.object(publisher.subprocess, "run", fake):
+             patch.object(publisher.subprocess, "run", side_effect=execute):
             return publisher.publish(self.args)
 
     def rejected(self, failure=None):
@@ -216,7 +230,7 @@ class PublisherTests(unittest.TestCase):
     def test_success_order_and_allowlisted_pins(self):
         result = self.invoke()
         self.assertEqual(set(result), {"schema", "repository", "tag", "tag_object", "commit", "recipe_commit", "target", "release_id", "assets"})
-        self.assertEqual(json.loads(self.args.pins.read_text()), result)
+        self.assertEqual(publisher.receipt.strict_json(self.args.pins.read_text()), result)
         self.assertEqual(result["release_id"], 41)
         self.assertEqual(self.fake.downloads, 6)
         self.assertEqual(self.fake.tag_reads, 3)
@@ -237,6 +251,130 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(self.events, [])
         self.assertEqual(self.fake.calls, [])
         self.assertFalse(self.args.pins.exists())
+
+    def test_missing_attestation_before_gh(self):
+        self.args.attestation.unlink()
+        self.rejected()
+        self.assertEqual(self.fake.calls, [])
+        self.assertFalse(self.args.pins.exists())
+
+    def test_missing_signature_or_signers_before_gh(self):
+        for path in (Path(str(self.args.attestation) + ".sig"), self.args.qualification_signers):
+            with self.subTest(input=path.name):
+                content = path.read_bytes()
+                path.unlink()
+                self.rejected()
+                self.assertEqual(self.fake.calls, [])
+                path.write_bytes(content)
+                self.events.clear()
+
+    def test_wrong_namespace_before_gh(self):
+        manifest = publisher.receipt.strict_json(self.contents[publisher.receipt.ASSETS[1]])
+        fixture.sign_fixture(manifest, self.key, self.args.attestation, namespace="wrong-qualification")
+        self.rejected()
+        self.assertEqual(self.fake.calls, [])
+        self.assertIn("attestation", self.events)
+
+    def test_wrong_signer_or_principal_before_gh(self):
+        manifest = publisher.receipt.strict_json(self.contents[publisher.receipt.ASSETS[1]])
+        other = self.directory / "other"
+        other.mkdir()
+        other_key, _signers = fixture.signing_fixture(other)
+        fixture.sign_fixture(manifest, other_key, self.args.attestation)
+        self.rejected()
+        self.assertEqual(self.fake.calls, [])
+        self.events.clear()
+        fixture.sign_fixture(manifest, self.key, self.args.attestation)
+        signers = self.args.qualification_signers
+        signers.write_text(signers.read_text().replace("stronk-omp-qualification ", "other-principal ", 1))
+        self.rejected()
+        self.assertEqual(self.fake.calls, [])
+
+    def test_each_signed_binding_must_match_before_gh(self):
+        manifest = publisher.receipt.strict_json(self.contents[publisher.receipt.ASSETS[1]])
+        for field, value in (("binary_sha256", "0" * 64), ("source_commit", "c" * 40),
+                             ("recipe_commit", None), ("runtime_image_digest", "sha256:" + "0" * 64),
+                             ("mode", "candidate"), ("checks", {"elf": "passed"}), ("manifest_sha256", "0" * 64)):
+            with self.subTest(field=field):
+                fixture.sign_fixture(manifest, self.key, self.args.attestation, changes={field: value})
+                self.rejected()
+                self.assertEqual(self.fake.calls, [])
+                self.events.clear()
+
+    def test_private_image_selection_cannot_reach_uploaded_bytes(self):
+        result = publisher.receipt.strict_json(self.contents[publisher.receipt.ASSETS[1]])["qualification"]
+        fixture.make_assets(self.args.assets, qualified=False)
+        self.args.attestation.unlink()
+        Path(str(self.args.attestation) + ".sig").unlink()
+        root = self.directory / "root"
+        (root / "scripts").mkdir(parents=True)
+        for name, data in fixture.RECIPE_TREE.items():
+            (root / name).write_bytes(data)
+        args = argparse.Namespace(commit=COMMIT, recipe_commit=RECIPE, assets=self.args.assets,
+                                  runtime_image="registry.invalid/private-account/runtime@" + result["environment"]["runtime_image"],
+                                  docker_socket="unix:///fixture.sock", attestation_key=self.key, attestation=self.args.attestation)
+        verify = qualifier.receipt.verify
+
+        def execute(command, **kwargs):
+            if command[0] == "ssh-keygen":
+                return fixture.REAL_RUN(command, **kwargs)
+            self.assertEqual(command[:4], ["docker", "--host", args.docker_socket, "--config"])
+            self.assertIn("rm", command)
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch.object(qualifier.receipt, "verify", side_effect=lambda path, commit, tag, release, recipe_commit="", root=None:
+                          verify(path, commit, tag, release, recipe_commit, root=False)), \
+             patch.object(qualifier.receipt, "assert_recipes"), \
+             patch.object(qualifier.receipt, "git_bytes", side_effect=fixture.tree_bytes), \
+             patch.object(qualifier.receipt, "validate_docker", return_value=["docker", "--host", args.docker_socket]), \
+             patch.object(qualifier, "docker_output", side_effect=["amd64", "amd64", "verified"]), \
+             patch.object(qualifier, "export_source", side_effect=lambda _root, _commit, path: path.mkdir()), \
+             patch.object(qualifier, "boundary_commands"), \
+             patch.object(qualifier.subprocess, "check_output", return_value=json.dumps(result).encode()), \
+             patch.object(qualifier.subprocess, "run", side_effect=execute):
+            qualifier.qualify(args, root)
+        self.contents = {name: (self.args.assets / name).read_bytes() for name in publisher.receipt.ASSETS}
+        self.invoke()
+        self.assertEqual(self.events.count("upload"), 1)
+        for data in (*self.contents.values(), self.args.attestation.read_bytes(), self.args.pins.read_bytes()):
+            self.assertNotIn(b"registry.invalid", data)
+            self.assertNotIn(b"private-account", data)
+
+    def test_consistent_forgery_with_valid_checksums_and_matching_attestation_cannot_publish(self):
+        manifest = publisher.receipt.strict_json(self.contents[publisher.receipt.ASSETS[1]])
+        binary = self.args.assets / publisher.receipt.ASSETS[0]
+        binary.write_bytes(binary.read_bytes() + b"unqualified-forgery")
+        manifest["asset"].update(size=binary.stat().st_size, sha256=publisher.receipt.digest(binary))
+        manifest["qualification"]["binary_sha256"] = manifest["asset"]["sha256"]
+        publisher.receipt.save_manifest(self.args.assets, manifest)
+        # All public fields and attestation bindings agree, but no trusted signer
+        # authenticated these new bytes. Keep the old, now invalid signature.
+        self.args.attestation.write_bytes(publisher.receipt.attestation_bytes(manifest))
+        self.rejected()
+        self.assertEqual(self.fake.calls, [])
+        self.assertIn("attestation", self.events)
+
+    def test_signed_candidate_cannot_be_relabeled_as_release(self):
+        original = publisher.receipt.strict_json(self.contents[publisher.receipt.ASSETS[1]])
+        candidate = fixture.make_assets(self.args.assets, candidate=True)
+        fixture.sign_fixture(candidate, self.key, self.args.attestation)
+        candidate["source"] = original["source"]
+        candidate["qualification"]["recipe_commit"] = RECIPE
+        publisher.receipt.save_manifest(self.args.assets, candidate)
+        self.rejected()
+        self.assertEqual(self.fake.calls, [])
+        self.assertNotIn("attestation", self.events)
+
+    def test_duplicate_attestation_keys_rejected_even_with_valid_signatures(self):
+        manifest = publisher.receipt.strict_json(self.contents[publisher.receipt.ASSETS[1]])
+        original = self.args.attestation.read_text()
+        for raw in ('{"mode":"candidate",' + original[1:],
+                    original.replace('"cli":', '"cli":"failed","cli":', 1)):
+            with self.subTest(nested='"cli":"failed"' in raw):
+                fixture.sign_fixture(manifest, self.key, self.args.attestation, raw=raw.encode())
+                self.rejected()
+                self.assertEqual(self.fake.calls, [])
+                self.events.clear()
 
     def test_missing_qualification_before_gh(self):
         manifest = json.loads(self.contents[publisher.receipt.ASSETS[1]])
@@ -268,6 +406,28 @@ class PublisherTests(unittest.TestCase):
         publisher.receipt.save_manifest(self.args.assets, manifest)
         self.rejected()
         self.assertEqual(self.fake.calls, [])
+
+    def test_private_runtime_image_name_rejected_before_gh(self):
+        manifest = publisher.receipt.strict_json(self.contents[publisher.receipt.ASSETS[1]])
+        manifest["qualification"]["environment"]["runtime_image"] = "registry.invalid/private-account/runtime@sha256:" + "c" * 64
+        publisher.receipt.save_manifest(self.args.assets, manifest)
+        self.contents = {name: (self.args.assets / name).read_bytes() for name in publisher.receipt.ASSETS}
+        self.rejected()
+        self.assertEqual(self.fake.calls, [])
+
+    def test_duplicate_manifest_keys_rejected_before_gh_with_valid_checksums(self):
+        original = self.contents[publisher.receipt.ASSETS[1]].decode()
+        for text in ('{"qualification":{"raw_log":"synthetic-private"},' + original[1:],
+                     original.replace('"execution":', '"execution":"synthetic-private","execution":', 1)):
+            with self.subTest(nested='"raw_log"' not in text):
+                self.contents[publisher.receipt.ASSETS[1]] = text.encode()
+                self.contents[publisher.receipt.ASSETS[2]] = "".join(
+                    f"{hashlib.sha256(self.contents[name]).hexdigest()}  {name}\n"
+                    for name in publisher.receipt.ASSETS[:2]).encode()
+                self.write_assets()
+                self.rejected()
+                self.assertEqual(self.fake.calls, [])
+                self.assertFalse(self.args.pins.exists())
 
     def test_false_immutability_witness_before_gh(self):
         value = json.loads(self.args.immutability_witness.read_text())
@@ -357,7 +517,9 @@ class PublisherTests(unittest.TestCase):
         with patch.object(publisher, "publish", side_effect=ValueError("private failure details")), \
              patch("sys.argv", ["publisher", "--commit", COMMIT, "--recipe-commit", RECIPE, "--tag", TAG,
                                 "--assets", "fixture-assets", "--allowed-signers", "fixture-signers",
-                                "--immutability-witness", "fixture-witness", "--pins", "fixture-pins", "--publish"]):
+                                "--immutability-witness", "fixture-witness", "--pins", "fixture-pins",
+                                "--attestation", "fixture-attestation", "--qualification-signers", "fixture-qualification-signers",
+                                "--publish"]):
             with self.assertRaises(SystemExit) as caught:
                 publisher.main()
         self.assertNotIn("private failure details", str(caught.exception))

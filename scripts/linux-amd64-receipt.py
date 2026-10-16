@@ -27,15 +27,32 @@ CHECKS = ("elf", "cli", "native_runtime", "resources_workers", "builtin_smoke", 
 HEX = r"[0-9a-f]{64}"
 OID = r"[0-9a-f]{40}"
 TAG = r"stronk-omp-s1-[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]{4}"
+DIGEST = r"sha256:" + HEX
 IMAGE = r"[a-z0-9][a-z0-9._/-]*(?::[A-Za-z0-9_.-]+)?@sha256:" + HEX
 BASE_IMAGE = "rustlang/rust:nightly-2026-08-12@sha256:51dc497bff0c24777d2ec6a1fc12ddf7ab0483de3ee537f4ec10816b9e1eff6c"
 BUN_SHA256 = "c678040f14fe0440eb839d37cbd0ce4c051a32da72806ac97de6a6aab6bf728f"
 BAZEL_SHA256 = "7668a95db1250f12c40407251e4e203b4ec8bf39bc495d2f485b2d8c99048694"
+ATTESTATION_NAMESPACE = "stronk-omp-qualification"
+ATTESTATION_IDENTITY = "stronk-omp-qualification"
 
 
 def require(condition, message):
     if not condition:
         raise ValueError(message)
+
+
+def strict_json(data):
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            require(key not in value, "Repeated JSON key")
+            value[key] = item
+        return value
+    return json.loads(data, object_pairs_hook=unique_object)
+
+
+def canonical_json(value):
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n").encode()
 
 
 def digest(path):
@@ -93,8 +110,8 @@ def validate_tag(root, commit, tag, allowed_signers, revoked_signers=None):
     return oid
 
 
-def validate_docker(endpoint, builder=None):
-    # Reject overrides before even querying buildx. Never enumerate endpoint inventories.
+def validate_docker(endpoint):
+    # Reject overrides before any daemon-capable subprocess. Never inspect saved builders.
     overrides = ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH",
                  "DOCKER_API_VERSION", "BUILDX_BUILDER", "BUILDX_CONFIG", "BUILDKIT_HOST", "BUILDX_HOST")
     require(not any(os.environ.get(name) for name in overrides), "Ambient Docker overrides are forbidden")
@@ -102,16 +119,7 @@ def validate_docker(endpoint, builder=None):
     path = endpoint[len("unix://"):]
     require(not any(char in path for char in ("\n", "\r", "\x00", "?", "#", '"', "\\")) and
             stat.S_ISSOCK(Path(path).stat().st_mode), "The local Docker socket is unavailable")
-    command = ["docker", "--host", endpoint]
-    if builder is not None:
-        require(match(r"[A-Za-z0-9][A-Za-z0-9_.-]*", builder), "An explicit approved builder is required")
-        # Only render equality, driver and status, never another node's endpoint/address.
-        template = ('{{.Driver}}|{{len .Nodes}}|{{range .Nodes}}{{if eq .Endpoint ' + json.dumps(endpoint) +
-                    '}}local{{else}}rejected{{end}}|{{.Status}}{{end}}')
-        result = capture(*command, "buildx", "inspect", builder, "--format", template).strip()
-        require(result in ("docker|1|local|running", "docker-container|1|local|running"),
-                "Builder must have one running node bound to the approved local socket")
-    return command
+    return ["docker", "--host", endpoint]
 
 
 def elf(path):
@@ -130,10 +138,10 @@ def elf(path):
 
 
 def save_manifest(directory, manifest):
-    text = json.dumps(manifest, sort_keys=True, indent=2) + "\n"
+    data = canonical_json(manifest)
     # A partial metadata replacement fails checksum verification and cannot publish.
-    with tempfile.NamedTemporaryFile(dir=directory, mode="w", delete=False) as stream:
-        stream.write(text)
+    with tempfile.NamedTemporaryFile(dir=directory, mode="wb", delete=False) as stream:
+        stream.write(data)
         temporary = Path(stream.name)
     temporary.replace(directory / ASSETS[1])
     checksums = "".join(f"{digest(directory / name)}  {name}\n" for name in ASSETS[:2])
@@ -154,7 +162,7 @@ def create(directory):
                   for tool in TOOLS}
     manifest = {
         "schema": 2, "repository": REPOSITORY, "target": "linux-amd64",
-        "version": json.loads((root / "packages/coding-agent/package.json").read_text())["version"],
+        "version": strict_json((root / "packages/coding-agent/package.json").read_text())["version"],
         "source": {"commit": os.environ["SOURCE_COMMIT"], "tag": os.environ["SOURCE_TAG"] or None,
                    "tag_object": os.environ["SOURCE_TAG_OBJECT"] or None,
                    "source_date_epoch": int(os.environ["SOURCE_DATE_EPOCH"]),
@@ -197,7 +205,7 @@ def verify(directory, commit, tag, release, recipe_commit="", root=None):
     require(not directory.is_symlink() and directory.is_dir(), "A regular asset directory is required")
     require({entry.name for entry in directory.iterdir()} == set(ASSETS), "Only the exact three public assets are permitted")
     require(all((directory / name).is_file() and not (directory / name).is_symlink() for name in ASSETS), "Assets must be regular files")
-    manifest = json.loads((directory / ASSETS[1]).read_text())
+    manifest = strict_json((directory / ASSETS[1]).read_text())
     keys(manifest, ("schema", "repository", "target", "version", "source", "build_inputs", "asset", "runtime", "checks", "qualification"))
     require(type(manifest["schema"]) is int and manifest["schema"] == 2 and manifest["repository"] == REPOSITORY and
             manifest["target"] == "linux-amd64", "Wrong release identity")
@@ -226,7 +234,7 @@ def verify(directory, commit, tag, release, recipe_commit="", root=None):
         commit_exists(root, commit)
         require(inputs["locks"] == {name: hashlib.sha256(git_bytes(root, commit, name)).hexdigest() for name in LOCKS},
                 "Immutable application locks differ from provenance")
-        require(manifest["version"] == json.loads(git_bytes(root, commit, "packages/coding-agent/package.json"))["version"],
+        require(manifest["version"] == strict_json(git_bytes(root, commit, "packages/coding-agent/package.json"))["version"],
                 "Immutable application version differs from provenance")
         epoch = int(capture("git", "-C", str(root), "show", "-s", "--format=%ct", commit).strip())
         require(source["source_date_epoch"] == epoch, "Immutable source timestamp differs")
@@ -270,7 +278,7 @@ def verify(directory, commit, tag, release, recipe_commit="", root=None):
         keys(environment, ("execution", "cpu", "glibc", "loader", "runtime_image"))
         require(environment["execution"] == "native-amd64" and environment["cpu"] == "x86-64-v2" and
                 environment["loader"] == "ld-linux-x86-64.so.2" and match(r"[0-9]+(?:\.[0-9]+)+", environment["glibc"]) and
-                match(IMAGE, environment["runtime_image"]), "Invalid qualified runtime baseline")
+                match(DIGEST, environment["runtime_image"]), "Invalid qualified runtime baseline")
         for observation in (runtime["binary"], runtime["native_baseline"]["elf"]):
             floor = observation["glibc_required"]
             require(floor is not None and tuple(map(int, environment["glibc"].split("."))) >= tuple(map(int, floor.split("."))),
@@ -278,6 +286,35 @@ def verify(directory, commit, tag, release, recipe_commit="", root=None):
     expected = "".join(f"{digest(directory / name)}  {name}\n" for name in ASSETS[:2])
     require((directory / ASSETS[2]).read_text() == expected, "Checksum list differs from exact asset set")
     return manifest
+
+
+def attestation_bytes(manifest):
+    qualification = manifest["qualification"]
+    require(qualification is not None and
+            manifest["checks"] == qualification["checks"] == {name: "passed" for name in CHECKS},
+            "Completed qualification is required")
+    return canonical_json({
+        "schema": 1, "binary_sha256": manifest["asset"]["sha256"],
+        "source_commit": manifest["source"]["commit"], "recipe_commit": manifest["source"]["recipe_commit"],
+        "runtime_image_digest": qualification["environment"]["runtime_image"],
+        "mode": "release" if manifest["source"]["recipe_committed"] else "candidate",
+        "checks": manifest["checks"], "manifest_sha256": hashlib.sha256(canonical_json(manifest)).hexdigest(),
+    })
+
+
+def verify_attestation(manifest, attestation, signers):
+    signature = Path(str(attestation) + ".sig")
+    require(all(path.is_file() and not path.is_symlink() and path.stat().st_size > 0
+                for path in (attestation, signature, signers)), "Explicit qualification evidence and public signers are required")
+    data = attestation.read_bytes()
+    value = strict_json(data)
+    expected = attestation_bytes(manifest)
+    require(canonical_json(value) == data == expected, "Qualification attestation binding differs")
+    result = subprocess.run(
+        ["ssh-keygen", "-Y", "verify", "-f", str(signers), "-I", ATTESTATION_IDENTITY,
+         "-n", ATTESTATION_NAMESPACE, "-s", str(signature)],
+        input=data, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=False)
+    require(result.returncode == 0, "Qualification attestation is not trusted")
 
 
 def build(args):
@@ -291,8 +328,7 @@ def build(args):
     else:
         assert_recipes(root, args.recipe_commit)
         tag_object = validate_tag(root, args.commit, args.tag, args.allowed_signers, args.revoked_signers)
-    docker = validate_docker(args.docker_socket, args.builder)
-    require(args.builder is not None, "An approved local builder is required")
+    docker = validate_docker(args.docker_socket)
     dist = root / "dist"
     require(not dist.is_symlink(), "A symlinked dist is forbidden")
     dist.mkdir(exist_ok=True)
@@ -300,6 +336,8 @@ def build(args):
     require(not destination.exists() and not destination.is_symlink(), "Output already exists")
     with tempfile.TemporaryDirectory(prefix=".linux-amd64-build.", dir=dist) as temporary:
         context = Path(temporary)
+        client_config = context / "docker-client"
+        client_config.mkdir(mode=0o700)
         source = context / "source"
         source.mkdir()
         with subprocess.Popen(["git", "-C", str(root), "archive", "--format=tar", args.commit],
@@ -313,7 +351,8 @@ def build(args):
             data = (root / "scripts" / name).read_bytes() if args.candidate else git_bytes(root, args.recipe_commit, f"scripts/{name}")
             (recipe / name).write_bytes(data)
         epoch = capture("git", "-C", str(root), "show", "-s", "--format=%ct", args.commit).strip()
-        command = docker + ["buildx", "build", "--builder", args.builder, "--platform", "linux/amd64", "--file", str(recipe / "linux-amd64.Dockerfile")]
+        command = docker + ["--config", str(client_config), "build", "--platform", "linux/amd64",
+                            "--file", str(recipe / "linux-amd64.Dockerfile")]
         for name, value in {"SOURCE_COMMIT": args.commit, "SOURCE_TAG": args.tag, "SOURCE_TAG_OBJECT": tag_object,
                             "SOURCE_DATE_EPOCH": epoch, "RECIPE_COMMITTED": "0" if args.candidate else "1",
                             "RECIPE_COMMIT": args.recipe_commit}.items():
@@ -357,8 +396,9 @@ def main():
     parser.add_argument("--release", action="store_true")
     parser.add_argument("--allowed-signers", type=Path)
     parser.add_argument("--revoked-signers", type=Path)
+    parser.add_argument("--attestation", type=Path)
+    parser.add_argument("--qualification-signers", type=Path)
     parser.add_argument("--docker-socket", default="")
-    parser.add_argument("--builder")
     parser.add_argument("--candidate", action="store_true")
     parser.add_argument("--receipts", action="store_true")
     parser.add_argument("--output", default="linux-amd64")
@@ -369,7 +409,11 @@ def main():
         elif args.mode == "create":
             create(args.directory)
         else:
-            verify(args.directory, args.commit, args.tag, args.release, args.recipe_commit)
+            manifest = verify(args.directory, args.commit, args.tag, args.release, args.recipe_commit)
+            if args.release or args.attestation is not None or args.qualification_signers is not None:
+                require(args.attestation is not None and args.qualification_signers is not None,
+                        "Explicit qualification evidence and public signers are required")
+                verify_attestation(manifest, args.attestation, args.qualification_signers)
         print("Public linux-amd64 receipt verified.")
     except (ValueError, OSError, KeyError, TypeError, AttributeError, subprocess.SubprocessError, tarfile.TarError):
         raise SystemExit("Public linux-amd64 route rejected; no asset publication is permitted.") from None

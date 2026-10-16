@@ -1,15 +1,19 @@
 """Offline fixtures for the public receipt, immutable trees and trust boundaries."""
+import contextlib
 import copy
 import hashlib
 import importlib.util
+import io
+import json
 import os
 from pathlib import Path
 import socket
 import struct
 import subprocess
+import tarfile
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 SPEC = importlib.util.spec_from_file_location("receipt", Path(__file__).with_name("linux-amd64-receipt.py"))
 receipt = importlib.util.module_from_spec(SPEC)
@@ -22,6 +26,35 @@ EPOCH = 1792108800
 TREE = {name: b"immutable-application-input\n" for name in receipt.LOCKS}
 TREE["packages/coding-agent/package.json"] = b'{"version":"18.8.0"}'
 RECIPE_TREE = {"scripts/" + name: ("reviewed-recipe:" + name).encode() for name in receipt.RECIPES}
+REAL_RUN = subprocess.run
+
+
+def signing_fixture(directory):
+    key = directory / "fixture-key"
+    REAL_RUN(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "qualification-fixture", "-f", str(key)],
+             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=30,
+             env={"PATH": os.defpath, "SSH_ASKPASS_REQUIRE": "never"})
+    signers = directory / "qualification-signers"
+    signers.write_text('stronk-omp-qualification namespaces="stronk-omp-qualification" ' +
+                       Path(str(key) + ".pub").read_text())
+    return key, signers
+
+
+def sign_fixture(manifest, key, path, namespace="stronk-omp-qualification", changes=None, raw=None):
+    def canonical(value):
+        return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    value = {"schema": 1, "binary_sha256": manifest["asset"]["sha256"],
+             "source_commit": manifest["source"]["commit"], "recipe_commit": manifest["source"]["recipe_commit"],
+             "runtime_image_digest": manifest["qualification"]["environment"]["runtime_image"],
+             "mode": "release" if manifest["source"]["recipe_committed"] else "candidate",
+             "checks": manifest["checks"], "manifest_sha256": hashlib.sha256(canonical(manifest)).hexdigest()}
+    value.update(changes or {})
+    data = canonical(value) if raw is None else raw
+    signature = REAL_RUN(["ssh-keygen", "-Y", "sign", "-f", str(key), "-n", namespace],
+                         input=data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True, timeout=30,
+                         env={"PATH": os.defpath, "SSH_ASKPASS_REQUIRE": "never"}).stdout
+    path.write_bytes(data)
+    Path(str(path) + ".sig").write_bytes(signature)
 
 
 def tree_bytes(_root, rev, name):
@@ -58,7 +91,7 @@ def make_assets(directory, qualified=True, candidate=False):
         manifest["qualification"] = {"binary_sha256": manifest["asset"]["sha256"], "source_commit": COMMIT,
                                      "recipe_commit": manifest["source"]["recipe_commit"],
                                      "environment": {"execution": "native-amd64", "cpu": "x86-64-v2", "glibc": "2.41",
-                                                     "loader": "ld-linux-x86-64.so.2", "runtime_image": "qualification@sha256:" + "c" * 64},
+                                                     "loader": "ld-linux-x86-64.so.2", "runtime_image": "sha256:" + "c" * 64},
                                      "checks": dict(manifest["checks"])}
     receipt.save_manifest(directory, manifest)
     return manifest
@@ -84,6 +117,24 @@ class ReceiptTests(unittest.TestCase):
 
     def test_qualified_exact_tuple_is_accepted(self):
         self.assertEqual(self.verify()["source"]["recipe_commit"], RECIPE)
+
+    def test_release_cli_requires_real_verified_completion_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence = Path(temporary)
+            key, signers = signing_fixture(evidence)
+            attestation = evidence / "qualification.json"
+            sign_fixture(self.manifest, key, attestation)
+            command = ["receipt", "verify", str(self.directory), "--commit", COMMIT,
+                       "--recipe-commit", RECIPE, "--tag", TAG, "--release"]
+            with patch("sys.argv", command), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    receipt.main()
+            command += ["--attestation", str(attestation), "--qualification-signers", str(signers)]
+            with patch("sys.argv", command), contextlib.redirect_stdout(io.StringIO()):
+                receipt.main()
+                Path(str(attestation) + ".sig").write_text("not a signature")
+                with self.assertRaises(SystemExit):
+                    receipt.main()
 
     def test_application_and_recipe_are_verified_against_separate_trees(self):
         # No working-tree package or lock files exist here. Only immutable inputs count.
@@ -174,25 +225,79 @@ class LocalBoundaryTests(unittest.TestCase):
             with patch.dict(os.environ, {}, clear=True):
                 for endpoint in ("ssh://unapproved", "tcp://unapproved", "default", ""):
                     with self.assertRaises(ValueError):
-                        receipt.validate_docker(endpoint, "approved")
+                        receipt.validate_docker(endpoint)
             with patch.dict(os.environ, {"DOCKER_CONTEXT": "unapproved"}, clear=True):
                 with self.assertRaises(ValueError):
-                    receipt.validate_docker("unix:///fixture.sock", "approved")
+                    receipt.validate_docker("unix:///fixture.sock")
             query.assert_not_called()
 
-    def test_builder_must_match_single_running_local_node(self):
-        with tempfile.TemporaryDirectory() as temporary:
+    def test_local_socket_preflight_never_inspects_saved_builders(self):
+        with tempfile.TemporaryDirectory() as temporary, socket.socket(socket.AF_UNIX) as engine:
             endpoint = "unix://" + str(Path(temporary) / "engine.sock")
-            engine = socket.socket(socket.AF_UNIX)
-            self.addCleanup(engine.close)
             engine.bind(endpoint[len("unix://"):])
-            with patch.dict(os.environ, {}, clear=True):
-                with patch.object(receipt, "capture", return_value="docker-container|1|local|running") as query:
-                    self.assertEqual(receipt.validate_docker(endpoint, "approved"), ["docker", "--host", endpoint])
-                    self.assertNotIn("--bootstrap", query.call_args.args)
-                for result in ("docker-container|1|rejected|running", "remote|1|local|running", "docker|2|local|running", "docker|1|local|stopped"):
-                    with patch.object(receipt, "capture", return_value=result), self.assertRaises(ValueError):
-                        receipt.validate_docker(endpoint, "approved")
+            with patch.dict(os.environ, {}, clear=True), patch.object(receipt.subprocess, "check_output") as query, \
+                 patch.object(receipt.subprocess, "Popen") as process, patch.object(receipt.subprocess, "run") as run:
+                self.assertEqual(receipt.validate_docker(endpoint), ["docker", "--host", endpoint])
+                query.assert_not_called()
+                process.assert_not_called()
+                run.assert_not_called()
+
+    def test_build_uses_only_selected_daemons_default_builder(self):
+        from argparse import Namespace
+        with tempfile.TemporaryDirectory() as temporary, socket.socket(socket.AF_UNIX) as engine:
+            root = Path(temporary)
+            (root / "scripts").mkdir()
+            for name in receipt.RECIPES:
+                (root / "scripts" / name).write_text("fixture recipe\n")
+            endpoint = "unix://" + str(root / "engine.sock")
+            engine.bind(endpoint[len("unix://"):])
+            archive = io.BytesIO()
+            with tarfile.open(fileobj=archive, mode="w"):
+                pass
+            commands = []
+
+            def execute(command, **kwargs):
+                commands.append(command)
+                process = Mock()
+                process.__enter__ = Mock(return_value=process)
+                process.__exit__ = Mock(return_value=False)
+                process.wait.return_value = 0
+                if command[0] == "git":
+                    process.stdout = io.BytesIO(archive.getvalue())
+                else:
+                    self.assertEqual(command[:3], ["docker", "--host", endpoint])
+                    self.assertEqual(command[3], "--config")
+                    self.assertEqual(list(Path(command[4]).iterdir()), [])
+                    self.assertEqual(command[5:8], ["build", "--platform", "linux/amd64"])
+                    self.assertNotIn("--builder", command)
+                    self.assertNotIn("buildx", command)
+                    artifacts = Path(command[-1]) / "artifacts"
+                    artifacts.mkdir()
+                    for name in receipt.ASSETS:
+                        (artifacts / name).write_bytes(b"synthetic build output")
+                    process.stdout = io.BytesIO()
+                return process
+
+            args = Namespace(commit=COMMIT, output="fixture", candidate=True, recipe_commit="", tag="",
+                             docker_socket=endpoint, receipts=True)
+            with patch.dict(os.environ, {}, clear=True), patch.object(receipt, "__file__", str(root / "scripts/receipt.py")), \
+                 patch.object(receipt, "commit_exists"), patch.object(receipt, "capture", return_value=str(EPOCH)), \
+                 patch.object(receipt, "verify"), patch.object(receipt.subprocess, "Popen", side_effect=execute):
+                receipt.build(args)
+            self.assertEqual([command[0] for command in commands], ["git", "docker"])
+
+    def test_build_rejects_invalid_endpoint_before_daemon_capable_subprocess(self):
+        from argparse import Namespace
+        args = Namespace(commit=COMMIT, output="fixture", candidate=True, recipe_commit="", tag="",
+                         docker_socket="ssh://unapproved")
+        with patch.dict(os.environ, {}, clear=True), patch.object(receipt, "commit_exists"), \
+             patch.object(receipt.subprocess, "check_output") as query, patch.object(receipt.subprocess, "Popen") as process, \
+             patch.object(receipt.subprocess, "run") as run:
+            with self.assertRaises(ValueError):
+                receipt.build(args)
+            query.assert_not_called()
+            process.assert_not_called()
+            run.assert_not_called()
 
     def test_lightweight_nested_misnamed_unsigned_wrong_signer_tags_rejected(self):
         def run_tag(kind="tag", direct_type="commit", internal_tag=TAG, signed=True, trusted=True):

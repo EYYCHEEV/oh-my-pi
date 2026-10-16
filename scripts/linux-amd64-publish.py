@@ -59,7 +59,7 @@ def api(endpoint, *, method="GET", body=None, absent=False):
     status_match = re.fullmatch(rb"HTTP/[0-9.]+ ([0-9]{3})(?: [^\r\n]*)?", first)
     require(separator and status_match, "Unrecognized API response")
     status_code = int(status_match[1])
-    value = json.loads(payload)
+    value = receipt.strict_json(payload)
     if absent and status_code == 404 and result.returncode != 0:
         require(isinstance(value, dict) and value.get("message") == "Not Found", "Unrecognized missing release response")
         return None
@@ -69,7 +69,7 @@ def api(endpoint, *, method="GET", body=None, absent=False):
 
 def witness(path, now=None):
     require(path.is_file() and not path.is_symlink(), "A public immutability witness is required")
-    value = json.loads(path.read_text())
+    value = receipt.strict_json(path.read_text())
     receipt.keys(value, ("repository", "enabled", "observed_at"))
     require(value["repository"] == REPOSITORY and value["enabled"] is True, "Repository immutability must be approved and enabled")
     observed = value["observed_at"]
@@ -175,6 +175,7 @@ def publish(args):
         snapshot(args.assets, assets_dir)
         manifest = receipt.verify(assets_dir, args.commit, args.tag, True, recipe_commit=args.recipe_commit, root=ROOT)
         require(manifest["source"]["tag_object"] == tag_object, "Receipt signed tag differs")
+        receipt.verify_attestation(manifest, args.attestation, args.qualification_signers)
         expected = {name: {"size": (assets_dir / name).stat().st_size, "sha256": receipt.digest(assets_dir / name)}
                     for name in receipt.ASSETS}
         # Reserve before any remote mutation, never replace an existing pin file.
@@ -226,7 +227,7 @@ def main():
         parser = Parser(description=__doc__)
         for name in ("commit", "recipe-commit", "tag"):
             parser.add_argument("--" + name, required=True)
-        for name in ("assets", "allowed-signers", "immutability-witness", "pins"):
+        for name in ("assets", "allowed-signers", "immutability-witness", "pins", "attestation", "qualification-signers"):
             parser.add_argument("--" + name, type=Path, required=True)
         parser.add_argument("--revoked-signers", type=Path)
         parser.add_argument("--publish", action="store_true")
