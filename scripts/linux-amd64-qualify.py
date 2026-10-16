@@ -154,12 +154,17 @@ def docker_output(docker, args, timeout=30):
 
 
 def approved_daemon(docker, image):
-    require(receipt.match(receipt.IMAGE, image), "Immutable runtime image is required")
+    require(receipt.match(receipt.IMAGE, image) or receipt.match(receipt.DIGEST, image),
+            "Immutable runtime image is required")
     # No general daemon info, endpoint enumeration, context inspection, or inventory.
     require(docker_output(docker, ["info", "--format", "{{.Architecture}}"]) in ("x86_64", "amd64"),
             "Native amd64 daemon is required")
     require(docker_output(docker, ["image", "inspect", "--format", "{{.Architecture}}", image]) == "amd64",
             "Prepared local amd64 image is required")
+    if receipt.match(receipt.DIGEST, image):
+        require(docker_output(docker, ["image", "inspect", "--format", "{{.Id}}", image]) == image,
+                "Prepared local image ID differs")
+        return image
     repository, image_digest = image.rsplit("@", 1)
     reference = repository.split(":", 1)[0] + "@" + image_digest
     template = "{{range .RepoDigests}}{{if eq . " + json.dumps(reference) + "}}verified{{end}}{{end}}"
@@ -168,7 +173,7 @@ def approved_daemon(docker, image):
     return image_digest
 
 
-def container_command(docker, image, directory, name):
+def container_command(docker, image, directory, name, witness_run_id=""):
     command = docker + [
         "run", "--rm", "--name", name, "--pull=never", "--network=none", "--read-only",
         "--cap-drop=ALL", "--security-opt=no-new-privileges", "--pids-limit=1024",
@@ -176,6 +181,7 @@ def container_command(docker, image, directory, name):
         "--hostname=qualification", "--workdir=/workspace", "--log-driver=none", "--ulimit=nofile=4096:4096",
         "--ulimit=fsize=1073741824:1073741824", "--shm-size=256m",
     ]
+    command += receipt.witness_label(witness_run_id)
     for destination, size in (("/workspace", "8g"), ("/runtime", "1g"), ("/home/qualification", "1g"), ("/tmp", "2g")):
         execution = ",exec" if destination in ("/workspace", "/runtime") else ""
         command += ["--tmpfs", f"{destination}:rw{execution},nosuid,nodev,size={size},mode=1777"]
@@ -191,6 +197,7 @@ def export_source(root, commit, destination):
     destination.mkdir()
     with tarfile.open(fileobj=io.BytesIO(archive)) as stream:
         stream.extractall(destination, filter="data")
+    destination.chmod(0o755)
 
 
 def validate_result(result, manifest, image):
@@ -257,7 +264,9 @@ def finalize(directory, before, result, image, root, commit, recipe_commit, atte
 def qualify(args, root=None):
     root = root or Path(__file__).resolve().parent.parent
     require(args.commit == receipt.APPLICATION_COMMIT, "Wrong application source")
-    require(receipt.match(receipt.IMAGE, args.runtime_image), "Immutable runtime image is required")
+    require(receipt.match(receipt.IMAGE, args.runtime_image) or receipt.match(receipt.DIGEST, args.runtime_image),
+            "Immutable runtime image is required")
+    receipt.witness_label(getattr(args, "witness_run_id", ""))
     directory = args.assets
     require(directory.is_dir() and not directory.is_symlink() and
             (directory / receipt.ASSETS[1]).is_file() and not (directory / receipt.ASSETS[1]).is_symlink(),
@@ -289,6 +298,8 @@ def qualify(args, root=None):
         inputs, recipes = work / "input", work / "recipe"
         inputs.mkdir(mode=0o755)
         recipes.mkdir(mode=0o755)
+        inputs.chmod(0o755)
+        recipes.chmod(0o755)
         shutil.copyfile(directory / receipt.ASSETS[0], inputs / receipt.ASSETS[0])
         (inputs / receipt.ASSETS[0]).chmod(0o555)
         require(receipt.digest(inputs / receipt.ASSETS[0]) == before["asset"]["sha256"], "Copied binary differs")
@@ -301,8 +312,8 @@ def qualify(args, root=None):
             (recipes / name).chmod(0o444)
         name = "omp-qualification-" + uuid.uuid4().hex
         try:
-            output = subprocess.check_output(container_command(docker, args.runtime_image, work, name),
-                                             stderr=subprocess.DEVNULL, timeout=3600)
+            command = container_command(docker, args.runtime_image, work, name, getattr(args, "witness_run_id", ""))
+            output = subprocess.check_output(command, stderr=subprocess.DEVNULL, timeout=3600)
             require(len(output) <= 8192, "Invalid runtime summary")
             result = receipt.strict_json(output)
         finally:
@@ -547,6 +558,7 @@ def main():
         parser.add_argument("--docker-socket", required=True)
         parser.add_argument("--attestation-key", required=True, type=Path)
         parser.add_argument("--attestation", required=True, type=Path)
+        parser.add_argument("--witness-run-id", default="")
         qualify(parser.parse_args())
         print("Linux-amd64 qualification passed; exact public assets finalized.")
     except (ValueError, OSError, KeyError, TypeError, AttributeError, IndexError, subprocess.SubprocessError, tarfile.TarError):

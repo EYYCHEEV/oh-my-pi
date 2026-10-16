@@ -28,7 +28,7 @@ The application pin remains `dd8d9785aa36b5b072817a089177030b1b3519df`, version 
 It does not contain the new release tools.
 `--recipe-commit` therefore binds a separate reviewed full Git commit containing the release route.
 The builder exports application bytes only from `--commit` and recipe bytes only from `--recipe-commit`.
-All eight route files, including qualification and publishing code, must match the invoked local copies byte for byte.
+All route files named by `linux-amd64-receipt.py:RECIPES`, including preparation, qualification and publishing code, must match the invoked local copies byte for byte.
 The manifest records both full commits and every recipe digest.
 Application version, timestamp and lock digests are checked against the immutable application tree, not the current checkout.
 Recipe digests are checked against the immutable recipe tree.
@@ -107,10 +107,11 @@ Qualification preserves this distinction: even a fully passing candidate is neve
 `--receipts` exports exactly `omp-linux-amd64`, `RELEASE_MANIFEST.json` and `SHA256SUMS.txt`.
 Without it only the executable is copied out and the qualification/publication three-file interface is unavailable.
 
-Qualification requires an independently approved, already present digest-pinned disposable runtime image and a native amd64 local daemon.
+Qualification requires an independently approved, already present digest-pinned disposable runtime image or full local `sha256:` image ID, and a native amd64 local daemon.
 Mac ARM64 emulation is not accepted as native qualification.
 The image must contain the pinned Bun, frozen dependencies and prebuilt canonical native grep regression; preparing it is a separate approved step.
 The full runtime-image reference is used only for local Docker selection and digest verification.
+A registry digest is checked against the image's repository digests; a locally prepared image ID is checked against Docker's exact `.Id`, without inventing a repository digest or tag.
 Only the verified `sha256:` digest enters the runtime request, result, public manifest or completion attestation; registry and account names never enter uploaded bytes.
 Qualification never pulls an image, installs dependencies, resolves packages or compiles Rust.
 The complete runtime-image layout/attestation contract is enforced by `linux-amd64-qualify.py`.
@@ -144,6 +145,45 @@ Both the executable and extracted addon require compatible GNU libc, its loader 
 The native floor is x86-64-v2, not AVX2; the runtime records the actual qualified libc/loader baseline.
 A writable executable extraction cache is required.
 Optional ML models/packages remain on-demand inputs and are not promised offline.
+
+### Preparing a bounded, one-time native witness
+
+This is a separately approved preparation step, not permission to execute it on any shared host.
+`linux-amd64-runtime.py` uses the same exact application archive, pinned base, signed Debian snapshot, Bun archive checksum and Bazel/Rust graph as the ordinary candidate recipe.
+Supply the full reviewed preparation commit with `--recipe-commit`; this checks the invoked route files but does not turn the resulting candidate into a release.
+All generated workspace/runtime images and build/qualification containers carry `org.stronk.omp-witness=<run-id>`.
+The downloaded immutable parent base is not relabeled or deleted.
+
+```sh
+python3 scripts/linux-amd64-runtime.py \
+  --commit dd8d9785aa36b5b072817a089177030b1b3519df \
+  --recipe-commit "$RECIPE_COMMIT" \
+  --docker-socket unix:///var/run/docker.sock \
+  --witness-run-id "$RUN_ID" --output witness-candidate \
+  --image-id-file "$PRIVATE_SCRATCH/runtime-image-id"
+```
+
+The default builder only assembles a workspace image without executing `RUN` instructions.
+All dependency installation, downloads and compilation run in a dedicated container limited to four CPUs, 24 GiB memory with no additional swap, and 1024 processes.
+This avoids pretending that BuildKit honors legacy `docker build --memory` flags.
+No host directory, signing key, Docker socket, credential, or home is mounted into that container.
+The shared build script builds candidate assets and the canonical Bazel `//crates/pi-natives:pi_natives_test` for `//bazel/platforms:linux-x64-baseline`, preserving the application's pinned shipping toolchain.
+The preparation image retains the pinned base's GNU library closure and validates the exact standalone libtest selector.
+A pristine application tree is captured before build-generated files can change it, then populated only with the frozen dependency trees.
+The dependency metadata uses the qualifier's own tree digest and verifies the Bun executable against the candidate receipt.
+The resulting stopped-container snapshot is a local image ID, not a fabricated registry digest.
+Its normal user is `65532:65532`, and it is consumed by the existing offline qualifier with `--witness-run-id "$RUN_ID"`.
+
+`linux-amd64-witness.py preflight` records only allowlisted Docker product facts, image IDs, disk/cache usage and the approved source-host prerequisites in a new private scratch evidence file.
+It refuses fact drift, an existing run label, insufficient disk, less than 32 GiB available host memory (leaving 8 GiB beyond the build cap), host Bun/Node, remote transport and ambient Docker overrides.
+`cleanup` requires the Mac verification acknowledgment, rechecks labels and the initial image inventory, and removes only this run's containers and images, children first and never forced image deletion.
+It never deletes a separately registered pinned base or the pre-existing image, and does not require BuildKit's cached base to be registered as a Docker image.
+Default-builder cache is pruned only when the preflight proved it was initially empty and no unexpected Docker state appeared; otherwise it is preserved and its remaining size recorded.
+Use an exclusive Docker maintenance window for this batch because the shared default-builder cache has no per-witness ownership boundary.
+Neither helper contacts a remote machine, provisions a builder, changes daemon settings/networks, creates tags, publishes, or installs Bun/Node on the host.
+The private operator batch owns bundle transfer, dedicated one-time key generation outside containers, public-key return, local attestation verification and final scratch-directory removal.
+Any non-zero status stops the batch; preserve failed-run state for a separately scoped cleanup decision rather than changing inputs or retrying around a download failure.
+
 
 ## Release build and mandatory qualification
 

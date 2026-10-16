@@ -19,7 +19,8 @@ APPLICATION_COMMIT = "dd8d9785aa36b5b072817a089177030b1b3519df"
 ASSETS = ("omp-linux-amd64", "RELEASE_MANIFEST.json", "SHA256SUMS.txt")
 RECIPES = ("build-linux-amd64.sh", "linux-amd64.Dockerfile", "linux-amd64-receipt.py",
            "qualify-linux-amd64.sh", "linux-amd64-qualify.py", "linux-amd64-smoke.sh",
-           "publish-linux-amd64.sh", "linux-amd64-publish.py")
+           "publish-linux-amd64.sh", "linux-amd64-publish.py",
+           "linux-amd64-build.sh", "linux-amd64-runtime.py")
 LOCKS = ("bun.lock", "Cargo.lock", "MODULE.bazel", "MODULE.bazel.lock", "rust-toolchain.toml", ".bazelversion")
 TOOLS = ("bun", "bazel", "rustc", "cargo", "cmake", "ninja")
 CHECKS = ("elf", "cli", "native_runtime", "resources_workers", "builtin_smoke", "offline_session",
@@ -113,13 +114,19 @@ def validate_tag(root, commit, tag, allowed_signers, revoked_signers=None):
 def validate_docker(endpoint):
     # Reject overrides before any daemon-capable subprocess. Never inspect saved builders.
     overrides = ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH",
-                 "DOCKER_API_VERSION", "BUILDX_BUILDER", "BUILDX_CONFIG", "BUILDKIT_HOST", "BUILDX_HOST")
+                 "DOCKER_API_VERSION", "DOCKER_CONFIG", "DOCKER_BUILDKIT", "DOCKER_DEFAULT_PLATFORM",
+                 "BUILDX_BUILDER", "BUILDX_CONFIG", "BUILDKIT_HOST", "BUILDX_HOST")
     require(not any(os.environ.get(name) for name in overrides), "Ambient Docker overrides are forbidden")
     require(isinstance(endpoint, str) and endpoint.startswith("unix:///"), "An explicit local Unix socket is required")
     path = endpoint[len("unix://"):]
     require(not any(char in path for char in ("\n", "\r", "\x00", "?", "#", '"', "\\")) and
             stat.S_ISSOCK(Path(path).stat().st_mode), "The local Docker socket is unavailable")
     return ["docker", "--host", endpoint]
+
+
+def witness_label(run_id):
+    require(not run_id or match(r"[a-z0-9][a-z0-9-]{0,47}", run_id), "Invalid witness run identifier")
+    return ["--label", "org.stronk.omp-witness=" + run_id] if run_id else []
 
 
 def elf(path):
@@ -330,6 +337,7 @@ def build(args):
     else:
         assert_recipes(root, args.recipe_commit)
         tag_object = validate_tag(root, args.commit, args.tag, args.allowed_signers, args.revoked_signers)
+    witness_label(getattr(args, "witness_run_id", ""))
     docker = validate_docker(args.docker_socket)
     dist = root / "dist"
     require(not dist.is_symlink(), "A symlinked dist is forbidden")
@@ -355,6 +363,10 @@ def build(args):
         epoch = capture("git", "-C", str(root), "show", "-s", "--format=%ct", args.commit).strip()
         command = docker + ["--config", str(client_config), "build", "--platform", "linux/amd64",
                             "--file", str(recipe / "linux-amd64.Dockerfile")]
+        run_id = getattr(args, "witness_run_id", "")
+        command += witness_label(run_id)
+        if run_id:
+            command += ["--build-arg", "WITNESS_RUN_ID=" + run_id]
         for name, value in {"SOURCE_COMMIT": args.commit, "SOURCE_TAG": args.tag, "SOURCE_TAG_OBJECT": tag_object,
                             "SOURCE_DATE_EPOCH": epoch, "RECIPE_COMMITTED": "0" if args.candidate else "1",
                             "RECIPE_COMMIT": args.recipe_commit}.items():
@@ -404,6 +416,7 @@ def main():
     parser.add_argument("--candidate", action="store_true")
     parser.add_argument("--receipts", action="store_true")
     parser.add_argument("--output", default="linux-amd64")
+    parser.add_argument("--witness-run-id", default="")
     args = parser.parse_args()
     try:
         if args.mode == "build":

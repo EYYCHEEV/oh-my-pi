@@ -14,6 +14,7 @@ import socket
 import struct
 import subprocess
 import tempfile
+import tarfile
 import unittest
 from unittest.mock import Mock, patch
 from test_linux_amd64_receipt import REAL_RUN, signing_fixture
@@ -115,6 +116,35 @@ class DaemonTests(unittest.TestCase):
         with patch.object(qualify, "docker_output", side_effect=["amd64", "amd64", ""]):
             with self.assertRaises(ValueError):
                 qualify.approved_daemon(["docker"], IMAGE)
+
+    def test_local_image_id_is_verified_without_registry_metadata(self):
+        with patch.object(qualify, "docker_output", side_effect=["amd64", "amd64", IMAGE_DIGEST]) as output:
+            self.assertEqual(qualify.approved_daemon(["docker"], IMAGE_DIGEST), IMAGE_DIGEST)
+        self.assertEqual(output.call_args_list[-1].args[1],
+                         ["image", "inspect", "--format", "{{.Id}}", IMAGE_DIGEST])
+        with patch.object(qualify, "docker_output", side_effect=["amd64", "amd64", "sha256:" + "2" * 64]):
+            with self.assertRaises(ValueError):
+                qualify.approved_daemon(["docker"], IMAGE_DIGEST)
+
+    def test_witness_container_has_exact_run_label(self):
+        command = qualify.container_command(["docker"], IMAGE_DIGEST, Path("/fixture"), "fixture", "fixture-run")
+        self.assertIn("org.stronk.omp-witness=fixture-run", command)
+        with self.assertRaises(ValueError):
+            qualify.container_command(["docker"], IMAGE_DIGEST, Path("/fixture"), "fixture", "bad label")
+
+    def test_exported_source_root_is_readable_under_private_umask(self):
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w"):
+            pass
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+                qualify.subprocess, "check_output", return_value=archive.getvalue()):
+            old = os.umask(0o077)
+            try:
+                destination = Path(temporary) / "source"
+                qualify.export_source(Path("/fixture"), receipt.APPLICATION_COMMIT, destination)
+                self.assertEqual(destination.stat().st_mode & 0o777, 0o755)
+            finally:
+                os.umask(old)
 
     def test_explicit_local_transport_and_ambient_override_rejection(self):
         with tempfile.TemporaryDirectory() as temporary, socket.socket(socket.AF_UNIX) as server:
@@ -449,6 +479,9 @@ class HostFlowTests(unittest.TestCase):
                 return b"amd64\n"
             self.assertIn("run", command)
             self.assertIn("--config", command)
+            work = Path(command[command.index("--config") + 1]).parent
+            for child in ("input", "recipe"):
+                self.assertEqual((work / child).stat().st_mode & 0o777, 0o755)
             request = receipt.strict_json((Path(command[command.index("--config") + 1]).parent / "input/request.json").read_bytes())
             self.assertEqual(request["runtime_image"], IMAGE_DIGEST)
             self.assertNotIn(b"private-account", json.dumps(request).encode())
@@ -493,9 +526,13 @@ class HostFlowTests(unittest.TestCase):
             self.assertEqual(len(calls), 4)
 
     def test_normal_candidate_and_committed_flows_with_fake_daemon(self):
-        for committed in (False, True):
-            with self.subTest(committed=committed), tempfile.TemporaryDirectory() as temporary:
-                self.run_fixture(Path(temporary), committed=committed)
+        old = os.umask(0o077)
+        try:
+            for committed in (False, True):
+                with self.subTest(committed=committed), tempfile.TemporaryDirectory() as temporary:
+                    self.run_fixture(Path(temporary), committed=committed)
+        finally:
+            os.umask(old)
 
     def test_runtime_failure_or_host_binary_change_does_not_mark_success(self):
         for options in ({"fail": True}, {"changed": True}, {"duplicate": True}, {"duplicate": "nested"}):
