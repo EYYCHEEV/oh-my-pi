@@ -144,6 +144,9 @@ The run is offline, read-only except private disposable tmpfs state, without cap
 The runtime home and all caches start empty and credential-free.
 It exercises version/help, baseline-only native extraction/loading, native digest/ELF compatibility, embedded resource/worker operations through the built-in smoke, an initialized offline RPC session, every active fork-boundary command, the canonical native grep regression and coding-agent typecheck.
 The active regression snapshot is recipe-authenticated, tied to its canonical registry digest, and compared with the immutable application's README contract IDs.
+Every boundary Bun test keeps its registry argv and filters, with `--timeout=30000` appended.
+After the binary smoke and offline session checks, source tests use `PI_TEST_RUNTIME=1`, `BUN_JSC_useConcurrentGC=0` and `BUN_JSC_numberOfGCMarkers=1`.
+These match the pinned application's ordinary runner in `scripts/ci-test-ts.ts:444-468,575-601`; the registry snapshot, 240-second command ceiling and passing-test/failure checks remain unchanged.
 Missing, stale, failed or timed-out checks cannot become successful metadata.
 Qualification regenerates the HTML tool-view bundle from the immutable source and verified frozen dependencies before running source tests.
 The pristine source export deliberately excludes build-generated files; the active compiled-CLI boundary test needs this local JavaScript bundle.

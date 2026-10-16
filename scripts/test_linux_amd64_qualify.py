@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import socket
 import struct
 import subprocess
@@ -228,7 +229,7 @@ class BoundaryTests(unittest.TestCase):
             source = Path(temporary)
             source_fixture(source)
             commands = qualify.boundary_commands(source)
-            expected = [shlex.split(command) for group in qualify.BOUNDARIES.values() for command in group]
+            expected = [[*shlex.split(command), "--timeout=30000"] for group in qualify.BOUNDARIES.values() for command in group]
             self.assertEqual(commands, expected)
             self.assertEqual(len(qualify.BOUNDARIES), 27)
             self.assertEqual(len(commands), 41)
@@ -265,7 +266,10 @@ class BoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary, patch.object(qualify, "BOUNDARIES", boundaries):
             source = Path(temporary)
             source_fixture(source, boundaries)
-            self.assertEqual([command[-1] for command in qualify.boundary_commands(source)], ["first filter", "second filter"])
+            self.assertEqual(qualify.boundary_commands(source), [
+                ["bun", "test", "fixture.test.ts", "--test-name-pattern", "first filter", "--timeout=30000"],
+                ["bun", "test", "fixture.test.ts", "--test-name-pattern", "second filter", "--timeout=30000"],
+            ])
             boundaries["fixture"] = ["bun install"]
             with self.assertRaises(ValueError):
                 qualify.boundary_commands(source)
@@ -653,6 +657,77 @@ class RuntimeStartupTests(unittest.TestCase):
                     qualify.runtime_main()
             self.assertEqual(start.call_args.args[0]["XDG_DATA_HOME"], str(runtime / "data"))
             self.assertTrue((runtime / "data/omp").is_dir())
+
+    def test_every_boundary_uses_ordinary_test_controls_after_binary_smoke(self):
+        calls = []
+
+        class FakeRuntime:
+            def __init__(self, environment):
+                self.environment = environment
+
+            def run(self, command, _cwd, seconds=240):
+                args = list(map(str, command))
+                calls.append((args, dict(self.environment), seconds))
+                if args == ["getconf", "GNU_LIBC_VERSION"]:
+                    return b"glibc 2.41\n", b""
+                if args[-1] == "--version":
+                    return b"omp/18.8.0\n", b""
+                if args[-1] == "--smoke-test":
+                    return b"smoke-test: ok\n", b""
+                return b"1 pass\n", b""
+
+        def stage(name, **_kwargs):
+            if name == "qualify-native-grep":
+                raise RuntimeError("boundary fixture complete")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            assets = root / "assets"
+            assets.mkdir()
+            manifest = fixture(assets)
+            source = root / "source"
+            source_fixture(source)
+            (source / "packages/coding-agent/package.json").write_text('{"version":"18.8.0"}')
+            for name in receipt.LOCKS:
+                (source / name).write_text("fixture lock")
+                manifest["build_inputs"]["locks"][name] = receipt.digest(source / name)
+            request = root / "request.json"
+            request.write_text(json.dumps({"manifest": manifest, "runtime_image": IMAGE_DIGEST}))
+            cpu = root / "cpuinfo"
+            cpu.write_text("flags: ssse3 sse4_1 sse4_2 popcnt cx16 lahf_lm pni\n")
+            native = root / "native.node"
+            native.write_bytes(b"fixture native")
+            paths = {"/input/assets/request.json": request, "/proc/cpuinfo": cpu,
+                     "/runtime": root / "runtime", "/workspace/source": source,
+                     "/workspace/omp": root / "omp", "/input/assets/omp-linux-amd64": assets / receipt.ASSETS[0]}
+            real_copyfile = shutil.copyfile
+
+            def copyfile(source, destination):
+                return real_copyfile(paths.get(str(source), source), destination)
+
+            with patch.object(qualify, "Path", side_effect=lambda value: paths.get(str(value), Path(value))), \
+                 patch.object(qualify.os, "uname", return_value=type("Uname", (), {"machine": "x86_64"})()), \
+                 patch.object(qualify, "Runtime", FakeRuntime), \
+                 patch.object(qualify, "prepare_dependencies", return_value=root / "grep"), \
+                 patch.object(qualify.shutil, "copytree"), patch.object(qualify.shutil, "copyfile", side_effect=copyfile), \
+                 patch.object(receipt, "elf", return_value=manifest["runtime"]["binary"]), \
+                 patch.object(qualify, "native_help", return_value=native), \
+                 patch.object(qualify, "offline_session"), patch.object(qualify, "require_markers"), \
+                 patch.object(qualify, "announce_stage", side_effect=stage):
+                with self.assertRaisesRegex(RuntimeError, "boundary fixture complete"):
+                    qualify.runtime_main()
+            boundaries = [call for call in calls if call[0][:2] == ["bun", "test"]]
+            self.assertEqual([call[0] for call in boundaries], [
+                [*shlex.split(command), "--timeout=30000"]
+                for group in qualify.BOUNDARIES.values() for command in group
+            ])
+            self.assertEqual(len(boundaries), 41)
+            controls = {"PI_TEST_RUNTIME": "1", "BUN_JSC_useConcurrentGC": "0", "BUN_JSC_numberOfGCMarkers": "1"}
+            for _command, environment, seconds in boundaries:
+                self.assertEqual({key: environment.get(key) for key in controls}, controls)
+                self.assertEqual(seconds, 240)
+            smoke = next(call for call in calls if call[0][-1] == "--smoke-test")
+            self.assertTrue(all(key not in smoke[1] for key in controls))
 
 
 class StageTests(unittest.TestCase):

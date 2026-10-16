@@ -176,6 +176,7 @@ def boundary_commands(source, *, with_stages=False):
                 index += 1
             require(paths, "Boundary command has no tests")
             # Preserve every registry command, including repeated files with distinct filters.
+            args.append("--timeout=30000")
             commands.append((f"qualify-boundary-{contract}-{number}", args) if with_stages else args)
     return commands
 
@@ -584,6 +585,10 @@ def runtime_main():
     native_destination.parent.mkdir(parents=True, exist_ok=True)
     require(not native_destination.exists() and not native_destination.is_symlink(), "Source contains unexpected native addon")
     shutil.copyfile(native, native_destination)
+    # Match the pinned application's scripts/ci-test-ts.ts child-test environment.
+    runtime.environment.update({
+        "PI_TEST_RUNTIME": "1", "BUN_JSC_useConcurrentGC": "0", "BUN_JSC_numberOfGCMarkers": "1",
+    })
     for stage, command in commands:
         announce_stage(stage, inside=True)
         output, error = runtime.run(command, source)
