@@ -539,13 +539,15 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 			spawns: "",
 			readSummarize: true,
 		});
-		// Cold revive restores the persisted model without UI fallback, so persist a catalog model.
+		// Cold revive requires a catalog model with configured auth, without UI fallback.
 		persisted.appendMessage({
 			...createAssistantMessage("persisted task progress"),
 			provider: "anthropic",
 			model: "claude-sonnet-4-5",
 		});
 		await persisted.close();
+		const reviveAuthStorage = createInMemoryAuthStorage();
+		reviveAuthStorage.keys.setRuntime("anthropic", "test-fixture-key");
 		const factory = createPersistedSubagentReviverFactory({
 			session: {
 				sessionManager: {
@@ -553,8 +555,8 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 					getArtifactManager: () => undefined,
 				},
 			} as unknown as AgentSession,
-			authStorage,
-			modelRegistry,
+			authStorage: reviveAuthStorage,
+			modelRegistry: new ModelRegistry(reviveAuthStorage, path.join(sharedDir, "cold-revive-models.yml")),
 			settings,
 			enableLsp: false,
 			requiredExtension: required,
@@ -590,6 +592,7 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 			await expect(mismatchedRevive(registeredRef)).rejects.toMatchObject({ code: "hash-mismatch" });
 		} finally {
 			AgentRegistry.global().unregister(ref.id, registeredRef);
+			reviveAuthStorage.close();
 		}
 	});
 });
