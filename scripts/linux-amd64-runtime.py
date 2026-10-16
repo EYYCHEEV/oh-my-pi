@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare an untagged local amd64 runtime and exact unqualified candidate assets."""
+"""Prepare an untagged local amd64 runtime and exact unqualified assets."""
 import argparse
 import importlib.util
 import os
@@ -110,14 +110,13 @@ def export_inputs(root, commit, recipe_commit, context):
         (recipe / name).write_bytes(receipt.git_bytes(root, recipe_commit, "scripts/" + name))
 
 
-def build_command(context, image_file, commit, epoch, run_id):
+def build_command(context, image_file, commit, epoch, run_id, tag="", tag_object="", recipe_commit=""):
     command = ["build", "--platform=linux/amd64", "--target=workspace", "--file", str(context / "recipe/linux-amd64.Dockerfile"),
                "--iidfile", str(image_file), "--provenance=false", "--sbom=false", "--progress=plain", "--output=type=docker"]
     command += receipt.witness_label(run_id)
-    # The runtime recipe is reviewed/committed, but its assets deliberately
-    # remain candidates, with no signed tag or release recipe identity claim.
-    for name, value in {"SOURCE_COMMIT": commit, "SOURCE_TAG": "", "SOURCE_TAG_OBJECT": "", "SOURCE_DATE_EPOCH": epoch,
-                        "RECIPE_COMMITTED": "0", "RECIPE_COMMIT": "", "WITNESS_RUN_ID": run_id}.items():
+    # Only explicit, validated release inputs may claim committed recipe identity.
+    for name, value in {"SOURCE_COMMIT": commit, "SOURCE_TAG": tag, "SOURCE_TAG_OBJECT": tag_object, "SOURCE_DATE_EPOCH": epoch,
+                        "RECIPE_COMMITTED": "1" if tag else "0", "RECIPE_COMMIT": recipe_commit, "WITNESS_RUN_ID": run_id}.items():
         command += ["--build-arg", name + "=" + value]
     return command + [str(context)]
 
@@ -133,6 +132,14 @@ def prepare(args, root=None):
     require(receipt.capture("git", "-C", str(root), "rev-parse", "HEAD").strip() == args.recipe_commit,
             "The reviewed recipe must be the checked out commit")
     receipt.assert_recipes(root, args.recipe_commit)
+    tag = getattr(args, "tag", "")
+    allowed, revoked = getattr(args, "allowed_signers", None), getattr(args, "revoked_signers", None)
+    tag_object = ""
+    if tag:
+        require(revoked is not None, "An explicit public revocation file is required")
+        tag_object = receipt.validate_tag(root, args.commit, tag, allowed, revoked)
+    else:
+        require(allowed is None and revoked is None, "Source signers require release mode")
     # Validate transport and overrides before even an architecture query.
     docker = receipt.validate_docker(args.docker_socket)
     dist = root / "dist"
@@ -155,7 +162,8 @@ def prepare(args, root=None):
             "A native amd64 daemon is required")
     print("Phase: exporting a no-RUN workspace to the local daemon.", flush=True)
     workspace_file = scratch / "workspace-image-id"
-    client.call(build_command(context, workspace_file, args.commit, epoch, args.witness_run_id), progress=True)
+    client.call(build_command(context, workspace_file, args.commit, epoch, args.witness_run_id,
+                              tag, tag_object, args.recipe_commit if tag else ""), progress=True)
     image = workspace_file.read_text().strip()
     require(receipt.match(receipt.DIGEST, image), "Invalid local workspace image ID")
     require(client.call(["image", "inspect", "--format", "{{.Id}}", image], capture=True) == image and
@@ -164,7 +172,7 @@ def prepare(args, root=None):
     container = client.call(create_command(image, args.witness_run_id), capture=True)
     require(receipt.match(receipt.HEX, container), "Invalid local container ID")
     try:
-        return finish_container(client, container, scratch, context, root, args, image_file, destination)
+        return finish_container(client, container, scratch, context, root, args, image_file, destination, tag_object)
     except (Exception, KeyboardInterrupt):
         # Preserve the known labeled container, stopped, for explicit cleanup.
         try:
@@ -174,7 +182,7 @@ def prepare(args, root=None):
         raise
 
 
-def finish_container(client, container, scratch, context, root, args, image_file, destination):
+def finish_container(client, container, scratch, context, root, args, image_file, destination, tag_object=""):
     print("Phase: preparing runtime under hard CPU and memory limits.", flush=True)
     client.call(["start", "--attach", container], progress=True)
     # Docker start --attach alone is not evidence that the process succeeded.
@@ -187,9 +195,11 @@ def finish_container(client, container, scratch, context, root, args, image_file
     assets.mkdir()
     for name in receipt.ASSETS:
         client.call(["cp", container + ":/out/" + name, str(assets / name)])
-    manifest = receipt.verify(assets, args.commit, "", False, "", root)
+    tag = getattr(args, "tag", "")
+    manifest = receipt.verify(assets, args.commit, tag, False, args.recipe_commit if tag else "", root)
+    require(not tag or manifest["source"]["tag_object"] == tag_object, "Exported source tag object differs")
     require(manifest["build_inputs"]["recipe"] == {
-        name: receipt.digest(context / "recipe" / name) for name in receipt.RECIPES}, "Exported candidate recipe bytes differ")
+        name: receipt.digest(context / "recipe" / name) for name in receipt.RECIPES}, "Exported recipe bytes differ")
     runtime_image = client.call(["commit", "--change", "USER 65532:65532", "--change", "WORKDIR /",
                                  "--change", "ENV PATH=" + TOOL_PATH, "--change", "ENV HOME=/home/qualification",
                                  "--change", "LABEL org.stronk.omp-witness=" + args.witness_run_id, container], capture=True)
@@ -207,7 +217,8 @@ def finish_container(client, container, scratch, context, root, args, image_file
     (destination / receipt.ASSETS[0]).chmod(0o755)
     # Only this known stopped container, after both copy and commit succeeded.
     client.call(["rm", container])
-    print("Phase: unqualified candidate assets and prepared local image exported.", flush=True)
+    print("Phase: prepared runtime complete." if tag else
+          "Phase: unqualified candidate assets and prepared local image exported.", flush=True)
     print(runtime_image, flush=True)
     return runtime_image
 
@@ -280,6 +291,9 @@ def main():
         parser = Parser(description=__doc__)
         parser.add_argument("--commit", required=True)
         parser.add_argument("--recipe-commit", required=True)
+        parser.add_argument("--tag", default="")
+        parser.add_argument("--allowed-signers", type=Path)
+        parser.add_argument("--revoked-signers", type=Path)
         parser.add_argument("--docker-socket", required=True)
         parser.add_argument("--witness-run-id", required=True)
         parser.add_argument("--output", required=True)

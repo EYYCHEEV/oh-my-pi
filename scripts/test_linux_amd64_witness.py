@@ -380,6 +380,12 @@ class JobTests(unittest.TestCase):
         self.assertEqual(command[command.index("--") + 1:command.index("--") + 3], ["/usr/bin/env", "-i"])
         self.assertIn("worker", command)
         self.assertEqual(command[-2:], ["--recipe-commit", "a" * 40])
+        boundary = command.index("--")
+        self.assertEqual(command[boundary + 3:boundary + 13], [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "LANG=C", "LC_ALL=C", "SYSTEMD_COLORS=0", "HOME=" + str(self.scratch),
+            "TMPDIR=" + str(self.scratch / "tmp"), "GIT_CONFIG_NOSYSTEM=1",
+            "GIT_CONFIG_GLOBAL=/dev/null", "PYTHONDONTWRITEBYTECODE=1", witness.sys.executable])
         self.assertEqual(self.run.call_args.kwargs["cwd"], self.scratch)
         self.assertNotIn("--collect", command)
         self.assertNotIn("SSH_AUTH_SOCK", " ".join(command))
@@ -437,6 +443,87 @@ class JobTests(unittest.TestCase):
                          ["Phase: prepare.", "Phase: verify-candidate.", "Phase: qualify.", "Phase: verify."])
         stop.assert_not_called()
         self.assertFalse((self.scratch / "job-failure.json").exists())
+        python, evidence = witness.sys.executable, self.scratch / "evidence"
+        source = "5e43891a87140fb0972c982f3027f0228c4f6378"
+        self.assertEqual([command for command, _ in calls], [
+            [python, "scripts/linux-amd64-runtime.py", "--commit", source, "--recipe-commit", "a" * 40,
+             "--docker-socket", "unix:///var/run/docker.sock", "--witness-run-id", "fixture-run",
+             "--output", "witness-candidate", "--image-id-file", str(evidence / "runtime-image-id")],
+            [python, "scripts/linux-amd64-receipt.py", "verify", "dist/witness-candidate", "--commit", source],
+            ["bash", "scripts/qualify-linux-amd64.sh", "--commit", source, "--assets", "dist/witness-candidate",
+             "--docker-socket", "unix:///var/run/docker.sock", "--runtime-image", "sha256:" + "d" * 64,
+             "--witness-run-id", "fixture-run", "--attestation-key", str(evidence / "qualification-key"),
+             "--attestation", str(evidence / "qualification.json")],
+            [python, "scripts/linux-amd64-receipt.py", "verify", "dist/witness-candidate", "--commit", source,
+             "--attestation", str(evidence / "qualification.json"),
+             "--qualification-signers", str(evidence / "qualification-signers")]])
+
+    def test_release_start_validates_fixed_public_signers_and_forwards_only_tag(self):
+        self.query.side_effect = None
+        self.query.return_value = "a" * 40
+        allowed, revoked = self.scratch / "source-allowed-signers", self.scratch / "source-revoked-signers"
+        allowed.write_text("fixture public enrollment")
+        revoked.write_bytes(b"")
+        with patch.object(witness.receipt, "validate_tag", return_value="b" * 40) as validate, \
+             contextlib.redirect_stdout(io.StringIO()):
+            witness.start(self.scratch, RUN, "a" * 40, "stronk-omp-s1-2026.10.16.0001")
+        validate.assert_called_once_with(self.repo, "5e43891a87140fb0972c982f3027f0228c4f6378",
+                                         "stronk-omp-s1-2026.10.16.0001", allowed, revoked)
+        self.assertEqual(self.run.call_args.args[0][-4:],
+                         ["--recipe-commit", "a" * 40, "--tag", "stronk-omp-s1-2026.10.16.0001"])
+
+    def test_release_start_refuses_missing_symlinked_or_untrusted_signers_without_submission(self):
+        self.query.side_effect = None
+        self.query.return_value = "a" * 40
+        allowed, revoked = self.scratch / "source-allowed-signers", self.scratch / "source-revoked-signers"
+        with self.assertRaises(ValueError):
+            witness.start(self.scratch, RUN, "a" * 40, "stronk-omp-s1-2026.10.16.0001")
+        allowed.write_text("fixture public enrollment")
+        revoked.symlink_to(allowed)
+        with self.assertRaises(ValueError):
+            witness.start(self.scratch, RUN, "a" * 40, "stronk-omp-s1-2026.10.16.0001")
+        revoked.unlink()
+        revoked.write_bytes(b"")
+        with patch.object(witness.receipt, "validate_tag", side_effect=ValueError("untrusted tag")):
+            with self.assertRaises(ValueError):
+                witness.start(self.scratch, RUN, "a" * 40, "stronk-omp-s1-2026.10.16.0001")
+        self.assertFalse(any(call.args[0][0] == "systemd-run" for call in self.run.call_args_list))
+        self.assertIsNone(witness.terminal(self.scratch, RUN))
+
+    def test_release_worker_argv_is_bound_to_recipe_and_release_verification(self):
+        calls = []
+        for name in ("source-allowed-signers", "source-revoked-signers"):
+            (self.scratch / name).write_bytes(b"public fixture")
+
+        def run(command, repo, scratch, seconds, **kwargs):
+            calls.append((command, seconds))
+            if "--image-id-file" in command:
+                (scratch / "evidence/runtime-image-id").write_text(RUNTIME + "\n")
+            return 0
+
+        with patch.object(witness, "run_phase", side_effect=run):
+            self.assertEqual(witness.worker(["docker"], self.scratch, RUN, "a" * 40,
+                                            "stronk-omp-s1-2026.10.16.0001"), 0)
+        python, evidence = witness.sys.executable, self.scratch / "evidence"
+        source = "5e43891a87140fb0972c982f3027f0228c4f6378"
+        self.assertEqual(calls, [
+            ([python, "scripts/linux-amd64-runtime.py", "--commit", source, "--recipe-commit", "a" * 40,
+              "--docker-socket", "unix:///var/run/docker.sock", "--witness-run-id", "fixture-run",
+              "--output", "witness-release", "--image-id-file", str(evidence / "runtime-image-id"),
+              "--tag", "stronk-omp-s1-2026.10.16.0001", "--allowed-signers", str(self.scratch / "source-allowed-signers"),
+              "--revoked-signers", str(self.scratch / "source-revoked-signers")], 21600),
+            ([python, "scripts/linux-amd64-receipt.py", "verify", "dist/witness-release", "--commit", source,
+              "--tag", "stronk-omp-s1-2026.10.16.0001", "--recipe-commit", "a" * 40], 900),
+            (["bash", "scripts/qualify-linux-amd64.sh", "--commit", source, "--assets", "dist/witness-release",
+              "--docker-socket", "unix:///var/run/docker.sock", "--runtime-image", "sha256:" + "d" * 64,
+              "--witness-run-id", "fixture-run", "--attestation-key", str(evidence / "qualification-key"),
+              "--attestation", str(evidence / "qualification.json"), "--recipe-commit", "a" * 40], 5400),
+            ([python, "scripts/linux-amd64-receipt.py", "verify", "dist/witness-release", "--commit", source,
+              "--tag", "stronk-omp-s1-2026.10.16.0001", "--recipe-commit", "a" * 40,
+              "--attestation", str(evidence / "qualification.json"),
+              "--qualification-signers", str(evidence / "qualification-signers"), "--release"], 900)])
+        self.assertEqual(self.milestones(),
+                         ["Phase: prepare.", "Phase: verify-candidate.", "Phase: qualify.", "Phase: verify."])
 
     def test_sigterm_stops_owned_containers_before_terminal_failure(self):
         def terminate(*args):
@@ -660,6 +747,18 @@ class JobTests(unittest.TestCase):
              patch.object(witness, "worker", return_value=17) as worker:
             self.assertEqual(witness.main(), 17)
         worker.assert_called_once_with(["docker"], self.scratch, RUN, "a" * 40)
+
+    def test_release_cli_forwards_tag_to_start_and_worker(self):
+        for action in ("start", "worker"):
+            arguments = ["witness", action, "--scratch", str(self.scratch), "--run-id", RUN,
+                         "--docker-socket", "unix:///var/run/docker.sock", "--recipe-commit", "a" * 40,
+                         "--tag", "stronk-omp-s1-2026.10.16.0001"]
+            with self.subTest(action=action), patch.object(witness.sys, "argv", arguments), \
+                 patch.object(witness, "scratch_path"), \
+                 patch.object(witness.receipt, "validate_docker", return_value=["docker"]), \
+                 patch.object(witness, action, return_value=0) as execute:
+                self.assertEqual(witness.main(), 0)
+            self.assertEqual(execute.call_args.kwargs, {"tag": "stronk-omp-s1-2026.10.16.0001"})
 
     def test_explicit_retirement_requires_abort_or_verified_cleanup_record(self):
         with patch.object(witness.shutil, "rmtree") as remove, patch.object(os, "chdir"):

@@ -138,6 +138,57 @@ class PreparationTests(unittest.TestCase):
         self.assertIn("ENV PATH=/usr/local/bin:/usr/bin:/bin", commit)
         self.assertIn("LABEL org.stronk.omp-witness=offline-fixture", commit)
 
+    def test_release_preparation_uses_one_validated_tuple_and_one_build(self):
+        self.args.tag = "stronk-omp-s1-2026.10.16.0001"
+        self.args.allowed_signers = self.root / "source-allowed-signers"
+        self.args.revoked_signers = self.root / "source-revoked-signers"
+        self.args.allowed_signers.write_text("fixture public enrollment")
+        self.args.revoked_signers.write_bytes(b"")
+        self.manifest["source"] = {"tag_object": "b" * 40}
+        with patch.object(receipt, "validate_tag", return_value="b" * 40) as validate:
+            self.run_preparation()
+        validate.assert_called_once_with(self.root, self.args.commit, self.args.tag,
+                                         self.args.allowed_signers, self.args.revoked_signers)
+        builds = [command for command in self.client.commands if command[0] == "build"]
+        self.assertEqual(len(builds), 1)
+        build = builds[0]
+        self.assertEqual([build[index + 1] for index, value in enumerate(build) if value == "--build-arg"], [
+            "SOURCE_COMMIT=5e43891a87140fb0972c982f3027f0228c4f6378",
+            "SOURCE_TAG=stronk-omp-s1-2026.10.16.0001", "SOURCE_TAG_OBJECT=" + "b" * 40,
+            "SOURCE_DATE_EPOCH=1", "RECIPE_COMMITTED=1", "RECIPE_COMMIT=" + "a" * 40,
+            "WITNESS_RUN_ID=offline-fixture"])
+        self.assertEqual(self.verify.call_args.args[1:],
+                         (self.args.commit, self.args.tag, False, RECIPE, self.root))
+
+    def test_invalid_release_tag_is_rejected_before_docker(self):
+        self.args.tag = "stronk-omp-s1-2026.10.16.0001"
+        self.args.allowed_signers = self.root / "source-allowed-signers"
+        self.args.revoked_signers = self.root / "source-revoked-signers"
+        with patch.object(receipt, "validate_tag", side_effect=ValueError("untrusted tag")):
+            with self.assertRaises(ValueError):
+                self.run_preparation()
+        self.transport.assert_not_called()
+        self.factory.assert_not_called()
+
+    def test_release_tag_object_mismatch_never_snapshots_or_exports(self):
+        self.args.tag = "stronk-omp-s1-2026.10.16.0001"
+        self.args.allowed_signers = self.root / "source-allowed-signers"
+        self.args.revoked_signers = self.root / "source-revoked-signers"
+        self.manifest["source"] = {"tag_object": "c" * 40}
+        with patch.object(receipt, "validate_tag", return_value="b" * 40):
+            with self.assertRaisesRegex(ValueError, "source tag object differs"):
+                self.run_preparation()
+        self.assertNotIn("commit", [command[0] for command in self.client.commands])
+        self.assertFalse(self.args.image_id_file.exists())
+        self.assertFalse((self.root / "dist/candidate").exists())
+
+    def test_candidate_rejects_ignored_source_signer_options(self):
+        self.args.allowed_signers = self.root / "source-allowed-signers"
+        with self.assertRaises(ValueError):
+            self.run_preparation()
+        self.transport.assert_not_called()
+        self.factory.assert_not_called()
+
     def test_early_input_rejections_never_construct_client(self):
         cases = ({"commit": "e" * 40}, {"recipe_commit": "short"}, {"witness_run_id": ""},
                  {"witness_run_id": "bad label"}, {"witness_run_id": "a" * 49},
@@ -231,6 +282,18 @@ class PreparationTests(unittest.TestCase):
 
 
 class ContractTests(unittest.TestCase):
+    def test_candidate_build_argv_snapshot(self):
+        self.assertEqual(runtime.build_command(Path("/fixture/context"), Path("/fixture/image-id"),
+                                              "5e43891a87140fb0972c982f3027f0228c4f6378", "1", "fixture-run"), [
+            "build", "--platform=linux/amd64", "--target=workspace", "--file",
+            "/fixture/context/recipe/linux-amd64.Dockerfile", "--iidfile", "/fixture/image-id",
+            "--provenance=false", "--sbom=false", "--progress=plain", "--output=type=docker",
+            "--label", "org.stronk.omp-witness=fixture-run",
+            "--build-arg", "SOURCE_COMMIT=5e43891a87140fb0972c982f3027f0228c4f6378",
+            "--build-arg", "SOURCE_TAG=", "--build-arg", "SOURCE_TAG_OBJECT=",
+            "--build-arg", "SOURCE_DATE_EPOCH=1", "--build-arg", "RECIPE_COMMITTED=0",
+            "--build-arg", "RECIPE_COMMIT=", "--build-arg", "WITNESS_RUN_ID=fixture-run", "/fixture/context"])
+
     def test_hard_limits_and_no_host_mounts_or_tags(self):
         command = runtime.create_command(WORKSPACE, "fixture-run")
         for value in ("--cpus=4", "--memory=24g", "--memory-swap=24g", "--pids-limit=1024", "--log-driver=none",
@@ -242,9 +305,11 @@ class ContractTests(unittest.TestCase):
             runtime.create_command(WORKSPACE, "invalid label")
 
     def test_empty_client_configuration_and_environment(self):
-        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"SECRET_TOKEN": "not-forwarded", "BUILDX_BUILDER": "not-forwarded"}):
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {
+                "PATH": "/fixture/bin", "SECRET_TOKEN": "not-forwarded", "BUILDX_BUILDER": "not-forwarded"}, clear=True):
             client = runtime.Client(["docker", "--host", "unix:///fixture/docker.sock"], Path(temporary))
-            self.assertEqual(set(client.environment), {"PATH", "HOME", "LANG", "LC_ALL", "DOCKER_BUILDKIT"})
+            self.assertEqual(client.environment, {"PATH": "/fixture/bin", "HOME": str(Path(temporary) / "client-home"),
+                                                  "LANG": "C", "LC_ALL": "C", "DOCKER_BUILDKIT": "1"})
             config = Path(client.command[-1])
             self.assertEqual(list(config.iterdir()), [])
             self.assertEqual(config.stat().st_mode & 0o777, 0o700)

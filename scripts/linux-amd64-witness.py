@@ -240,7 +240,16 @@ def progress(scratch, text):
         write_new(path, value)
 
 
-def start(scratch, run_id, recipe_commit):
+def source_signers(scratch, tag):
+    require(receipt.match(receipt.TAG, tag), "Wrong source tag namespace")
+    files = (scratch / "source-allowed-signers", scratch / "source-revoked-signers")
+    require(all(path.is_file() and not path.is_symlink() and
+                path.stat().st_uid == scratch.stat().st_uid for path in files),
+            "Explicit scratch-owned public signer files are required")
+    return files
+
+
+def start(scratch, run_id, recipe_commit, tag=""):
     baseline(scratch, run_id)
     require(receipt.match(receipt.OID, recipe_commit), "A reviewed recipe commit is required")
     require(unit_state(run_id) is None, "Witness unit already exists")
@@ -251,6 +260,8 @@ def start(scratch, run_id, recipe_commit):
     require(query([], "git", "-C", str(repo), "rev-parse", "HEAD") == recipe_commit, "Recipe checkout differs")
     for name in ("linux-amd64-witness.py", "linux-amd64-receipt.py"):
         require((scratch / name).read_bytes() == (repo / "scripts" / name).read_bytes(), "Scratch helper differs")
+    if tag:
+        receipt.validate_tag(repo, receipt.APPLICATION_COMMIT, tag, *source_signers(scratch, tag))
     environment = dict(CONTROL_ENV, HOME=str(scratch), TMPDIR=str(scratch / "tmp"),
                        GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null", PYTHONDONTWRITEBYTECODE="1")
     command = ["systemd-run", "--system", "--quiet", "--unit=" + unit_name(run_id), "--service-type=exec"]
@@ -263,6 +274,8 @@ def start(scratch, run_id, recipe_commit):
     command += [sys.executable, str(scratch / "linux-amd64-witness.py"), "worker", "--scratch", str(scratch),
                 "--run-id", run_id, "--docker-socket", "unix:///var/run/docker.sock",
                 "--recipe-commit", recipe_commit]
+    if tag:
+        command += ["--tag", tag]
     subprocess.run(command, cwd=scratch, env=CONTROL_ENV, stdin=subprocess.DEVNULL,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=True)
     print("Witness unit submitted. Poll status; never restart after a disconnect.")
@@ -305,7 +318,7 @@ def run_phase(command, repo, scratch, seconds, *, stages=None):
         return process.wait()
 
 
-def worker(docker, scratch, run_id, recipe_commit):
+def worker(docker, scratch, run_id, recipe_commit, tag=""):
     cancelled = {"code": 0}
 
     def terminate(_signal, _frame):
@@ -325,16 +338,25 @@ def worker(docker, scratch, run_id, recipe_commit):
                 repo, evidence = scratch / "repo", scratch / "evidence"
                 python = sys.executable
                 source = receipt.APPLICATION_COMMIT
-                assets = "dist/witness-candidate"
+                output = "witness-release" if tag else "witness-candidate"
+                assets = "dist/" + output
                 common_verify = [python, "scripts/linux-amd64-receipt.py", "verify", assets, "--commit", source]
                 prepare = [python, "scripts/linux-amd64-runtime.py", "--commit", source,
                            "--recipe-commit", recipe_commit, "--docker-socket", "unix:///var/run/docker.sock",
-                           "--witness-run-id", run_id, "--output", "witness-candidate",
+                           "--witness-run-id", run_id, "--output", output,
                            "--image-id-file", str(evidence / "runtime-image-id")]
+                if tag:
+                    allowed, revoked = source_signers(scratch, tag)
+                    prepare += ["--tag", tag, "--allowed-signers", str(allowed), "--revoked-signers", str(revoked)]
+                    identity = ["--tag", tag, "--recipe-commit", recipe_commit]
+                    common_verify += identity
+                final_verify = common_verify + [
+                    "--attestation", str(evidence / "qualification.json"),
+                    "--qualification-signers", str(evidence / "qualification-signers")]
+                if tag:
+                    final_verify += ["--release"]
                 for phase, command, seconds in (("prepare", prepare, 21600), ("verify-candidate", common_verify, 900),
-                                                ("qualify", None, 5400), ("verify", common_verify + [
-                                                    "--attestation", str(evidence / "qualification.json"),
-                                                    "--qualification-signers", str(evidence / "qualification-signers")], 900)):
+                                                ("qualify", None, 5400), ("verify", final_verify, 900)):
                     if cancelled["code"]:
                         break
                     progress(scratch, "Phase: " + phase + ".")
@@ -345,6 +367,8 @@ def worker(docker, scratch, run_id, recipe_commit):
                                    "--docker-socket", "unix:///var/run/docker.sock", "--runtime-image", image,
                                    "--witness-run-id", run_id, "--attestation-key", str(evidence / "qualification-key"),
                                    "--attestation", str(evidence / "qualification.json")]
+                        if tag:
+                            command += ["--recipe-commit", recipe_commit]
                     if phase == "qualify":
                         code = run_phase(command, repo, scratch, seconds, stages=stages)
                     else:
@@ -485,7 +509,9 @@ def main():
         parser.add_argument("--run-id", required=True)
         parser.add_argument("--docker-socket", required=True)
         parser.add_argument("--recipe-commit", default="")
+        parser.add_argument("--tag", default="")
         args = parser.parse_args()
+        require(not args.tag or args.phase in ("start", "worker"), "A tag requires start or worker")
         scratch_path(args.scratch, args.run_id)
         require(args.docker_socket == "unix:///var/run/docker.sock", "Witness socket differs")
         if args.phase == "status":
@@ -497,11 +523,12 @@ def main():
             stop(args.scratch, args.run_id)
             return 0
         docker = receipt.validate_docker(args.docker_socket)
+        release = {"tag": args.tag} if args.tag else {}
         if args.phase == "start":
-            start(args.scratch, args.run_id, args.recipe_commit)
+            start(args.scratch, args.run_id, args.recipe_commit, **release)
             return 0
         if args.phase == "worker":
-            return worker(docker, args.scratch, args.run_id, args.recipe_commit)
+            return worker(docker, args.scratch, args.run_id, args.recipe_commit, **release)
         with tempfile.TemporaryDirectory(prefix="docker-client-", dir=args.scratch) as config:
             docker += ["--config", config]
             if args.phase == "preflight":
