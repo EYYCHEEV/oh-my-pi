@@ -175,14 +175,38 @@ The resulting stopped-container snapshot is a local image ID, not a fabricated r
 Its normal user is `65532:65532`, and it is consumed by the existing offline qualifier with `--witness-run-id "$RUN_ID"`.
 
 `linux-amd64-witness.py preflight` records only allowlisted Docker product facts, image IDs, disk/cache usage and the approved source-host prerequisites in a new private scratch evidence file.
-It refuses fact drift, an existing run label, insufficient disk, less than 32 GiB available host memory (leaving 8 GiB beyond the build cap), host Bun/Node, remote transport and ambient Docker overrides.
-`cleanup` requires the Mac verification acknowledgment, rechecks labels and the initial image inventory, and removes only this run's containers and images, children first and never forced image deletion.
-It never deletes a separately registered pinned base or the pre-existing image, and does not require BuildKit's cached base to be registered as a Docker image.
-Default-builder cache is pruned only when the preflight proved it was initially empty and no unexpected Docker state appeared; otherwise it is preserved and its remaining size recorded.
-Use an exclusive Docker maintenance window for this batch because the shared default-builder cache has no per-witness ownership boundary.
-Neither helper contacts a remote machine, provisions a builder, changes daemon settings/networks, creates tags, publishes, or installs Bun/Node on the host.
-The private operator batch owns bundle transfer, dedicated one-time key generation outside containers, public-key return, local attestation verification and final scratch-directory removal.
-Any non-zero status stops the batch; preserve failed-run state for a separately scoped cleanup decision rather than changing inputs or retrying around a download failure.
+It refuses fact drift, an existing run label, less than 884 decimal GB free on `/`, less than 200 GiB free on Docker storage, less than 32 GiB available host memory (leaving 8 GiB beyond the build cap), host Bun/Node, remote transport and ambient Docker overrides.
+The Docker reserve exceeds the 120-GiB upper disk estimate by 80 GiB; the estimate is not a writable-layer quota.
+
+The phase-1 scratch copies of `linux-amd64-witness.py` and `linux-amd64-receipt.py` own recovery even if the repository checkout is incomplete.
+With the standard `--scratch`, `--run-id` and explicit local `--docker-socket` inputs, the witness commands are:
+
+| Command | Contract |
+| --- | --- |
+| `start --recipe-commit "$RECIPE_COMMIT"` | Reserves one launch, invokes `setsid` through Python's `start_new_session`, and detaches the entire prepare, candidate-verify, qualify and signed-verify chain. Stdin, raw stdout and raw stderr go to `/dev/null`, never journald or a raw log. |
+| `status` | Read-only, path-free allowlisted progress and terminal status. Exit zero means only terminal `success`; running, missing or failed terminal evidence never authorizes artifact handoff or another build. |
+| `stop` | Checks the saved PID, process group, session and process start time, sends SIGTERM to that group and waits for its terminal record. The worker stops independently label-checked run containers before recording controlled failure. A dead driver without a terminal result can be marked stopped only after its group is absent and its owned containers have been stopped. |
+| `cleanup` | Requires terminal success and the Mac verification acknowledgment before any Docker query or removal. |
+| `abort` | Requires the preflight baseline and a terminal/stopped job, or no job launch at all. Never needs or creates a Mac acknowledgment, never prunes cache, and preserves scratch, evidence and key. |
+| `retire` | Explicitly deletes only the validated private scratch directory after a valid cleanup or abort record. Preserve that record and required evidence on the Mac first; abort itself does not authorize retirement. |
+
+Fixed private scratch files are `job-request.json`, `job.json` (PID/process-group/start-time identity), `job-progress` (allowlisted lines only), and `job-terminal.json`.
+The terminal record is exactly one `success` with exit code zero, or `failed:<phase>` with a nonzero exit code.
+Only the detached supervisor writes it, except explicit `stop` may record `failed:stop` for an already dead, fully stopped job.
+Existing workspace-export, four-hour preparation, snapshot and qualification deadlines and container resource limits remain intact.
+Additional supervisor ceilings bound each child phase, and their expiry terminates the owned job group.
+An SSH drop changes none of this state: reconnect and poll `status`, never restart the build.
+
+Both cleanup branches recheck every container/image label and preserve the initial image inventory.
+Image removal is newest-first, never forced, and always uses `docker image rm --no-prune` so no unchecked parent is removed implicitly.
+They never delete a separately registered pinned base or require BuildKit's cached base to be registered as a Docker image.
+Only successful `cleanup` may prune default-builder cache, and only when preflight proved it was initially empty and no unexpected Docker state appeared.
+Otherwise cache is preserved and its remaining size recorded; abort always preserves it.
+Use an exclusive Docker maintenance window for this batch because shared default-builder cache has no per-witness ownership boundary.
+The helpers never contact a remote machine, provision a builder, change daemon settings/networks, create tags, publish, or install Bun/Node on the host.
+The private operator batch owns bundle transfer, dedicated one-time key generation outside containers, public-key return, local attestation verification and separate scratch retirement.
+Mac-side path-bearing commands discard both streams and preserve exit status, including shell redirection errors; comparisons use `cmp -s`, and only fixed path-free messages escape.
+Any failed phase stops the success path; use the explicit approved abort branch to recover without changing inputs, fabricating verification, rebuilding or working around a download failure.
 
 
 ## Release build and mandatory qualification
