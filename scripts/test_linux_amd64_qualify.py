@@ -132,17 +132,56 @@ class DaemonTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             qualify.container_command(["docker"], IMAGE_DIGEST, Path("/fixture"), "fixture", "bad label")
 
-    def test_exported_source_root_is_readable_under_private_umask(self):
+    def test_exported_source_tree_is_readable_under_private_umask(self):
         archive = io.BytesIO()
-        with tarfile.open(fileobj=archive, mode="w"):
-            pass
+        with tarfile.open(fileobj=archive, mode="w") as stream:
+            for name in ("nested", "nested/deeper"):
+                member = tarfile.TarInfo(name)
+                member.type = tarfile.DIRTYPE
+                member.mode = 0o700
+                stream.addfile(member)
+            for name, mode in (("nested/deeper/private.txt", 0o600), ("nested/tool", 0o755),
+                               ("nested/writable.txt", 0o666), ("implicit/parents/data.txt", 0o644)):
+                member = tarfile.TarInfo(name)
+                member.mode = mode
+                member.size = len(b"fixture\n")
+                stream.addfile(member, io.BytesIO(b"fixture\n"))
+            for name, target in (("file-link", "nested/deeper/private.txt"), ("directory-link", "nested"),
+                                 ("dangling-link", "missing")):
+                member = tarfile.TarInfo(name)
+                member.type = tarfile.SYMTYPE
+                member.linkname = target
+                stream.addfile(member)
         with tempfile.TemporaryDirectory() as temporary, patch.object(
                 qualify.subprocess, "check_output", return_value=archive.getvalue()):
             old = os.umask(0o077)
             try:
+                reference_link = Path(temporary) / "reference-link"
+                reference_link.symlink_to("missing")
+                symlink_mode = reference_link.lstat().st_mode & 0o777
                 destination = Path(temporary) / "source"
                 qualify.export_source(Path("/fixture"), receipt.APPLICATION_COMMIT, destination)
                 self.assertEqual(destination.stat().st_mode & 0o777, 0o755)
+                for path in (destination / "nested", destination / "nested/deeper",
+                             destination / "implicit", destination / "implicit/parents"):
+                    with self.subTest(directory=path.relative_to(destination)):
+                        self.assertEqual(path.stat().st_mode & 0o777, 0o755)
+                for name in ("nested/deeper/private.txt", "nested/tool", "nested/writable.txt", "implicit/parents/data.txt"):
+                    path = destination / name
+                    mode = path.stat().st_mode
+                    with self.subTest(file=name):
+                        self.assertTrue(mode & 0o004)
+                        self.assertEqual(mode & 0o022, 0)
+                        self.assertEqual(path.read_bytes(), b"fixture\n")
+                self.assertEqual((destination / "nested/tool").stat().st_mode & 0o111, 0o111)
+                self.assertEqual((destination / "nested/deeper/private.txt").stat().st_mode & 0o111, 0)
+                for name, target in (("file-link", "nested/deeper/private.txt"), ("directory-link", "nested"),
+                                     ("dangling-link", "missing")):
+                    path = destination / name
+                    self.assertTrue(path.is_symlink())
+                    self.assertEqual(path.readlink(), Path(target))
+                    self.assertEqual(path.lstat().st_mode & 0o777, symlink_mode)
+                self.assertFalse((destination / "dangling-link").exists())
             finally:
                 os.umask(old)
 

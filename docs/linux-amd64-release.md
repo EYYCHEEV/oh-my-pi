@@ -117,6 +117,10 @@ Qualification never pulls an image, installs dependencies, resolves packages or 
 The complete runtime-image layout/attestation contract is enforced by `linux-amd64-qualify.py`.
 Use its fixed image paths and checked source/lock identities, not a host dependency or home mount.
 
+Fresh qualification source exports and runtime-preparation source contexts are normalized after extraction: real directories are `0755`, and regular files are readable by all users without group/other write permission.
+Existing executable bits are preserved, and the permission walk neither follows nor changes symlinks.
+The host umask and private Docker client directories remain unchanged.
+
 The prepared image contract is:
 
 - Tools on `/usr/local/bin:/usr/bin:/bin`: Python 3.12+, GNU `timeout`/`getconf`, `readelf`, `/bin/sh`, and Bun `1.4.2` with executable SHA-256 equal to `build_inputs.host_tools.bun.sha256`.

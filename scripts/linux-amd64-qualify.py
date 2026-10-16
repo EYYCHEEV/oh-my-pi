@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -227,7 +228,19 @@ def export_source(root, commit, destination):
     destination.mkdir()
     with tarfile.open(fileobj=io.BytesIO(archive)) as stream:
         stream.extractall(destination, filter="data")
+    # The data filter leaves directory modes to the host's potentially private umask.
     destination.chmod(0o755)
+    for directory, directories, files in os.walk(destination, followlinks=False):
+        parent = Path(directory)
+        for name in directories:
+            child = parent / name
+            if stat.S_ISDIR(child.lstat().st_mode):
+                child.chmod(0o755, follow_symlinks=False)
+        for name in files:
+            child = parent / name
+            mode = child.lstat().st_mode
+            if stat.S_ISREG(mode):
+                child.chmod((stat.S_IMODE(mode) | 0o444) & ~0o022, follow_symlinks=False)
 
 
 def validate_result(result, manifest, image):
