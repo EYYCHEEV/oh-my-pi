@@ -205,7 +205,9 @@ def verify(directory, commit, tag, release, recipe_commit="", root=None):
     require(not directory.is_symlink() and directory.is_dir(), "A regular asset directory is required")
     require({entry.name for entry in directory.iterdir()} == set(ASSETS), "Only the exact three public assets are permitted")
     require(all((directory / name).is_file() and not (directory / name).is_symlink() for name in ASSETS), "Assets must be regular files")
-    manifest = strict_json((directory / ASSETS[1]).read_text())
+    manifest_data = (directory / ASSETS[1]).read_bytes()
+    manifest = strict_json(manifest_data)
+    require(manifest_data == canonical_json(manifest), "Manifest bytes differ from canonical JSON")
     keys(manifest, ("schema", "repository", "target", "version", "source", "build_inputs", "asset", "runtime", "checks", "qualification"))
     require(type(manifest["schema"]) is int and manifest["schema"] == 2 and manifest["repository"] == REPOSITORY and
             manifest["target"] == "linux-amd64", "Wrong release identity")

@@ -301,6 +301,20 @@ class PublisherTests(unittest.TestCase):
                 self.assertEqual(self.fake.calls, [])
                 self.events.clear()
 
+    def test_manifest_serialization_change_rejected_before_gh_with_valid_checksums(self):
+        manifest_name = publisher.receipt.ASSETS[1]
+        manifest = publisher.receipt.strict_json(self.contents[manifest_name])
+        publisher.receipt.verify_attestation(manifest, self.args.attestation, self.args.qualification_signers)
+        self.contents[manifest_name] = (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode()
+        self.assertEqual(publisher.receipt.strict_json(self.contents[manifest_name]), manifest)
+        self.contents[publisher.receipt.ASSETS[2]] = "".join(
+            f"{hashlib.sha256(self.contents[name]).hexdigest()}  {name}\n"
+            for name in publisher.receipt.ASSETS[:2]).encode()
+        self.write_assets()
+        self.rejected()
+        self.assertEqual(self.fake.calls, [])
+        self.assertFalse(self.args.pins.exists())
+
     def test_private_image_selection_cannot_reach_uploaded_bytes(self):
         result = publisher.receipt.strict_json(self.contents[publisher.receipt.ASSETS[1]])["qualification"]
         fixture.make_assets(self.args.assets, qualified=False)

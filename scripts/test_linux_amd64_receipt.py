@@ -118,6 +118,23 @@ class ReceiptTests(unittest.TestCase):
     def test_qualified_exact_tuple_is_accepted(self):
         self.assertEqual(self.verify()["source"]["recipe_commit"], RECIPE)
 
+    def test_manifest_bytes_must_be_canonical_with_valid_checksums(self):
+        path = self.directory / receipt.ASSETS[1]
+        original = path.read_bytes()
+        variants = {
+            "indented": (json.dumps(self.manifest, sort_keys=True, indent=2) + "\n").encode(),
+            "crlf": original.replace(b"\n", b"\r\n"),
+            "no_final_newline": original.removesuffix(b"\n"),
+        }
+        for serialization, data in variants.items():
+            with self.subTest(serialization=serialization):
+                self.assertEqual(receipt.strict_json(data), self.manifest)
+                path.write_bytes(data)
+                (self.directory / receipt.ASSETS[2]).write_text("".join(
+                    f"{receipt.digest(self.directory / name)}  {name}\n" for name in receipt.ASSETS[:2]))
+                with self.assertRaisesRegex(ValueError, "Manifest bytes differ from canonical JSON"):
+                    self.verify()
+
     def test_release_cli_requires_real_verified_completion_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             evidence = Path(temporary)
