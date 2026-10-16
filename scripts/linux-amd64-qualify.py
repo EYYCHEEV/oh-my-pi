@@ -28,7 +28,7 @@ def load_receipt():
 receipt = load_receipt()
 require = receipt.require
 PREPARED = Path("/opt/omp-qualification")
-REGISTRY_SHA256 = "786394dfae20d8fa01848b5127097cfd60b65c593328fe42b65b5daac7a889b1"
+REGISTRY_SHA256 = "40d36904b1bc31a09381c2fa2b523ea481aa8691801abf80344af18e6227f943"
 # Reviewed active verification snapshot of the workstation-owned fork registry.
 # The recipe commit authenticates this snapshot. Immutable application README IDs
 # and every referenced source file must agree before any command can run.
@@ -395,6 +395,8 @@ def prepare_dependencies(source, manifest, runtime):
     # Relative workspace links now resolve into the immutable exported source,
     # not into a possibly different source tree prepared inside the image.
     require(dependency_digest(source) == metadata["dependency_tree_sha256"], "Copied dependency bytes differ")
+    # The pristine export excludes this generated input required by CLI compile tests.
+    runtime.run(["bun", "run", "--cwd", "packages/collab-web", "gen:tool-views"], source, 120)
     return grep
 
 

@@ -67,9 +67,12 @@ install -m 755 packages/coding-agent/dist/omp-linux-x64 /out/omp-linux-amd64
 quiet python3 /recipe/linux-amd64-receipt.py create /out
 if [[ "$mode" == prepare-runtime ]]; then
   phase 'compiling canonical native regression.'
-  native_args=(--lockfile_mode=error --platforms=//bazel/platforms:linux-x64-baseline -c opt
+  # Qualification-only harness: GNU 2.27 for memfd_create; shipping stays GNU 2.17.
+  native_args=(--lockfile_mode=error --platforms=@zig_sdk//platform:linux_amd64 -c opt
+    --extra_toolchains=@zig_sdk//toolchain:linux_amd64_gnu.2.27
+    '--extra_execution_platforms=@bazel_tools//tools:host_platform,@zig_sdk//platform:linux_amd64'
     --@rules_rust//rust/settings:lto=thin
-    '--@rules_rust//rust/settings:extra_rustc_flags=-Ccodegen-units=16,-Cstrip=symbols')
+    '--@rules_rust//rust/settings:extra_rustc_flags=-Ccodegen-units=16,-Cstrip=symbols,-Ctarget-cpu=x86-64-v2')
   native_target=//crates/pi-natives:pi_natives_test
   quiet bazel build "${native_args[@]}" "$native_target"
   bazel cquery "${native_args[@]}" --output=files "$native_target" > /tmp/native-output 2>/dev/null

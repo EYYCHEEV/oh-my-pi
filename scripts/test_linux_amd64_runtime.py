@@ -376,12 +376,18 @@ class ContractTests(unittest.TestCase):
 
     def test_native_recipe_and_no_run_workspace_are_explicit(self):
         script = Path(__file__).with_name("linux-amd64-build.sh").read_text()
-        for value in ("//crates/pi-natives:pi_natives_test", "--lockfile_mode=error", "--platforms=//bazel/platforms:linux-x64-baseline",
-                      "--@rules_rust//rust/settings:lto=thin", "--@rules_rust//rust/settings:extra_rustc_flags=-Ccodegen-units=16,-Cstrip=symbols",
+        for value in ("//crates/pi-natives:pi_natives_test", "--lockfile_mode=error",
+                      "--platforms=@zig_sdk//platform:linux_amd64",
+                      "--extra_toolchains=@zig_sdk//toolchain:linux_amd64_gnu.2.27",
+                      "--extra_execution_platforms=@bazel_tools//tools:host_platform,@zig_sdk//platform:linux_amd64",
+                      "--@rules_rust//rust/settings:lto=thin",
+                      "--@rules_rust//rust/settings:extra_rustc_flags=-Ccodegen-units=16,-Cstrip=symbols,-Ctarget-cpu=x86-64-v2",
+                      'quiet bazel build "${native_args[@]}" "$native_target"',
                       'bazel cquery "${native_args[@]}" --output=files', 'cp -a /src /opt/omp-qualification/source'):
             self.assertIn(value, script)
         self.assertLess(script.index("cp -a /src"), script.index("quiet bun install"))
         self.assertLess(script.index("--inside-dependencies"), script.index("quiet bun scripts/bazel-natives.ts"))
+        self.assertIn("bun scripts/bazel-natives.ts linux-x64-baseline", script)
         dockerfile = Path(__file__).with_name("linux-amd64.Dockerfile").read_text()
         workspace = dockerfile.split("FROM workspace AS build", 1)[0]
         self.assertFalse(any(line.startswith("RUN ") for line in workspace.splitlines()))

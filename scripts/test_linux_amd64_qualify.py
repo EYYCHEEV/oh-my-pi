@@ -324,7 +324,8 @@ class PreparedRuntimeTests(unittest.TestCase):
             with patch.object(qualify, "PREPARED", prepared), patch.object(qualify.shutil, "which", return_value=str(bun)), \
                  patch.object(receipt, "elf", return_value={"interpreter": "ld-linux-x86-64.so.2"}):
                 self.assertEqual(qualify.prepare_dependencies(source, manifest, runtime), prepared / "native-grep-regression")
-            self.assertEqual(runtime.calls, [["bun", "--version"]])
+            self.assertEqual(runtime.calls, [["bun", "--version"],
+                                            ["bun", "run", "--cwd", "packages/collab-web", "gen:tool-views"]])
             self.assertEqual((source / "node_modules/dependency.js").read_text(), "frozen dependency")
 
     def test_lock_or_dependency_changes_fail_before_any_command(self):
