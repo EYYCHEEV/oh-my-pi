@@ -289,6 +289,9 @@ class JobTests(unittest.TestCase):
         for name in ("linux-amd64-witness.py", "linux-amd64-receipt.py"):
             (self.scratch / name).write_bytes(b"fixture helper")
             (self.repo / "scripts" / name).write_bytes(b"fixture helper")
+        for name in ("linux-amd64-qualify.py", "linux-amd64-receipt.py"):
+            (self.repo / "scripts" / name).write_bytes(Path(__file__).with_name(name).read_bytes())
+        (self.scratch / "linux-amd64-receipt.py").write_bytes((self.repo / "scripts/linux-amd64-receipt.py").read_bytes())
         witness.write_new(self.scratch / "preflight.json",
                           {"schema": 1, "run_id": RUN, "images": [ORIGINAL], "cache_was_empty": True})
         self.stack = contextlib.ExitStack()
@@ -415,7 +418,7 @@ class JobTests(unittest.TestCase):
     def test_worker_runs_entire_chain_and_binds_exact_image_then_records_success(self):
         calls = []
 
-        def run(command, repo, scratch, seconds):
+        def run(command, repo, scratch, seconds, **kwargs):
             calls.append((command, seconds))
             self.assertEqual(repo, self.repo)
             if "--image-id-file" in command:
@@ -433,6 +436,7 @@ class JobTests(unittest.TestCase):
         self.assertEqual(self.milestones(),
                          ["Phase: prepare.", "Phase: verify-candidate.", "Phase: qualify.", "Phase: verify."])
         stop.assert_not_called()
+        self.assertFalse((self.scratch / "job-failure.json").exists())
 
     def test_sigterm_stops_owned_containers_before_terminal_failure(self):
         def terminate(*args):
@@ -490,6 +494,45 @@ class JobTests(unittest.TestCase):
         self.assertEqual(self.popen.call_args.kwargs["stderr"], subprocess.DEVNULL)
         self.assertEqual(self.popen.call_args.args[0],
                          ["timeout", "--signal=TERM", "--kill-after=30s", "900s", "fixture"])
+
+    def test_qualification_failure_records_only_the_last_allowlisted_stage_privately(self):
+        real_run_phase = witness.run_phase
+        process = MagicMock()
+        process.__enter__.return_value = process
+        process.stdout = io.BytesIO(b"qualify-help\nqualify-smoke\nprivate diagnostic\n")
+        process.wait.return_value = 1
+        self.popen.side_effect = None
+        self.popen.return_value = process
+
+        def run(command, repo, scratch, seconds, **kwargs):
+            if "--image-id-file" in command:
+                (scratch / "evidence/runtime-image-id").write_text(RUNTIME + "\n")
+            if "--attestation-key" in command:
+                return real_run_phase(command, repo, scratch, seconds, **kwargs)
+            return 0
+
+        with patch.object(witness, "run_phase", side_effect=run), patch.object(witness, "stop_containers"), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(witness.worker(["docker"], self.scratch, RUN, "a" * 40), 1)
+        failure = self.scratch / "job-failure.json"
+        self.assertEqual(witness.receipt.strict_json(failure.read_bytes()),
+                         {"schema": 1, "run_id": RUN, "stage": "qualify-smoke"})
+        self.assertEqual(stat.S_IMODE(failure.stat().st_mode), 0o600)
+        self.assertEqual(output.getvalue(), "")
+
+    def test_unknown_or_decorated_stage_text_is_rejected_without_output(self):
+        for text in (b"qualify-unknown\n", b"qualify-smoke private diagnostic\n", b"qualify-smoke \n"):
+            process = MagicMock()
+            process.__enter__.return_value = process
+            process.stdout = io.BytesIO(text)
+            process.wait.return_value = 0
+            self.popen.side_effect = None
+            self.popen.return_value = process
+            with self.subTest(text=text), contextlib.redirect_stdout(io.StringIO()) as output:
+                with self.assertRaises(ValueError):
+                    witness.run_phase(["fixture"], self.repo, self.scratch, 900, stages=[])
+                self.assertEqual(output.getvalue(), "")
+            self.assertFalse((self.scratch / "job-failure.json").exists())
 
     def test_status_is_read_only_path_free_and_zero_only_for_stopped_success(self):
         self.state = self.fields()

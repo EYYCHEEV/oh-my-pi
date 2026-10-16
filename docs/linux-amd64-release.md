@@ -130,6 +130,9 @@ The canonical native grep test is `grep::tests::oversized_prefix_read_returns_st
 The qualifier runs its prepared libtest executable with that exact selector and `--exact`, requiring exactly one passed test instead of invoking Cargo and silently compiling.
 The runtime limits are four CPUs, 12 GiB memory with no additional swap, 1024 processes, and private tmpfs capacities of 8 GiB workspace, 1 GiB runtime, 1 GiB home and 2 GiB temporary state.
 Only `/workspace` and `/runtime` explicitly enable `exec`, allowing application execution and native mappings; all four tmpfs mounts retain `nosuid`, `nodev`, size limits and mode `1777`.
+Before launching the CLI, qualification creates the `omp` namespace beneath its XDG data directory on the executable runtime tmpfs.
+The native loader selects that directory only when the namespace already exists; otherwise it falls back to the non-executable home mount and Linux refuses to map the extracted addon.
+The home and general temporary mounts remain non-executable; no broader mount permission is needed.
 Individual commands have deadlines and the container smoke has a 3500-second whole-run deadline, bounded by the host's 3600-second client deadline.
 Expiry or any failed assertion leaves qualification unsuccessful and the owned container is forcibly removed.
 
@@ -141,7 +144,9 @@ Missing, stale, failed or timed-out checks cannot become successful metadata.
 Qualification regenerates the HTML tool-view bundle from the immutable source and verified frozen dependencies before running source tests.
 The pristine source export deliberately excludes build-generated files; the active compiled-CLI boundary test needs this local JavaScript bundle.
 This step and that test's temporary Bun compilation run offline with the pinned Bun; neither invokes Cargo or resolves packages.
-Raw runtime/test logs stay inside the disposable environment; only the allowlisted result is returned.
+Raw runtime/test logs stay inside the disposable environment; only the allowlisted result and fixed qualification stage IDs are returned.
+Each step announces one `qualify-...` ID from the qualifier's closed stage list, including the boundary ID and one-based command number for source tests.
+The runtime stage channel accepts only exact allowlisted IDs, not error messages, paths or command output; malformed or unknown text fails closed.
 
 This is a standalone distribution layout, not a fully statically linked executable.
 Both the executable and extracted addon require compatible GNU libc, its loader and system libraries.
@@ -199,10 +204,15 @@ With the standard `--scratch`, `--run-id` and explicit local `--docker-socket` i
 
 Systemd is the sole lifecycle owner: Type=exec, Restart=no, KillMode=control-group, TimeoutStopSec=180s, RuntimeMaxSec=9h and UMask=0077.
 No detached session, PID file, process-group identity or job-request record is used.
-Fixed private scratch records are immutable allowlisted milestones under `job-progress/` and `job-terminal.json`.
+Fixed private scratch records are immutable allowlisted milestones under `job-progress/`, `job-terminal.json`, and, only on failure, `job-failure.json`.
 The terminal record is exactly one `success` with exit code zero, or `failed:<phase>` with a nonzero exit code; only the job itself writes it as its last lifecycle step.
 Every helper JSON record is written to a private temporary file, flushed and fsynced, then published atomically by a no-overwrite hard link and directory fsync.
 Pollers therefore never see an incomplete final record.
+The failure record is mode `0600` inside the existing root-owned mode-`0700` scratch directory and contains exactly `{schema, run_id, stage}` with schema `1`.
+Its stage is the last validated qualification ID, or the fixed lifecycle phase if qualification had not announced one.
+The witness validates qualification IDs against the checked-out recipe's own allowlist; raw diagnostics are never persisted or echoed.
+Successful jobs write no failure record, and `status` and existing progress lines are unchanged.
+Preserve the failure record before separately approved scratch retirement when investigating a failed witness.
 Status selects only LoadState, ActiveState, SubState, Result and ExecMainStatus, validates the fields and prints no paths.
 Successful transient units unload normally; cleanup/abort reset only the exact failed unit with `systemctl reset-failed` and confirm that no unit remains.
 No unit is enabled, persisted or written by the helper.

@@ -117,8 +117,38 @@ qwen-portal sakana siliconflow siliconflow-cn singularityapi-dev singularityapi-
 together typesafe umans venice vercel-ai-gateway vllm wafer-serverless web xai xai-oauth xiaomi
 xiaomi-token-plan-ams xiaomi-token-plan-cn xiaomi-token-plan-sgp yolo-auto zai zenmux zhipu-coding-plan""".split()
 
+STAGES = (
+    "qualify-host-inputs", "qualify-host-runtime", "qualify-host-source",
+    "qualify-host-execute", "qualify-host-finalize",
+    "qualify-request", "qualify-cpu", "qualify-source", "qualify-dependencies",
+    "qualify-bun", "qualify-tool-views", "qualify-binary", "qualify-libc",
+    "qualify-version", "qualify-help", "qualify-smoke", "qualify-offline-session",
+    "qualify-markers", "qualify-native-addon", "qualify-native-grep",
+    "qualify-typecheck", "qualify-integrity", "qualify-result",
+) + tuple(f"qualify-boundary-{boundary}-{index}"
+          for boundary, commands in BOUNDARIES.items() for index in range(1, len(commands) + 1))
 
-def boundary_commands(source):
+
+def valid_stage(value):
+    return isinstance(value, str) and receipt.match(r"qualify-[a-z0-9]+(?:-[a-z0-9]+)*", value) and value in STAGES
+
+
+def announce_stage(value, *, inside=False):
+    require(valid_stage(value), "Invalid qualification stage")
+    print(value, file=sys.stderr if inside else sys.stdout, flush=True)
+
+
+def forward_stages(stream):
+    stream.seek(0)
+    data = stream.read(8193)
+    require(len(data) <= 8192, "Invalid qualification stages")
+    lines = data.decode("ascii").splitlines(keepends=True)
+    require(all(line.endswith("\n") and valid_stage(line[:-1]) for line in lines), "Invalid qualification stage")
+    for line in lines:
+        announce_stage(line[:-1])
+
+
+def boundary_commands(source, *, with_stages=False):
     text = (source / "README.md").read_text()
     start, end = "<!-- stronk-omp:fork-contracts:start -->", "<!-- stronk-omp:fork-contracts:end -->"
     require(text.count(start) == text.count(end) == 1, "Missing immutable boundary map")
@@ -128,7 +158,7 @@ def boundary_commands(source):
     commands = []
     for contract in ids:
         require(bool(BOUNDARIES[contract]), "Active verification is missing")
-        for command in BOUNDARIES[contract]:
+        for number, command in enumerate(BOUNDARIES[contract], 1):
             args = shlex.split(command)
             require(args[:2] == ["bun", "test"], "Unsupported boundary command")
             paths = []
@@ -145,7 +175,7 @@ def boundary_commands(source):
                 index += 1
             require(paths, "Boundary command has no tests")
             # Preserve every registry command, including repeated files with distinct filters.
-            commands.append(args)
+            commands.append((f"qualify-boundary-{contract}-{number}", args) if with_stages else args)
     return commands
 
 
@@ -262,6 +292,7 @@ def finalize(directory, before, result, image, root, commit, recipe_commit, atte
 
 
 def qualify(args, root=None):
+    announce_stage("qualify-host-inputs")
     root = root or Path(__file__).resolve().parent.parent
     require(args.commit == receipt.APPLICATION_COMMIT, "Wrong application source")
     require(receipt.match(receipt.IMAGE, args.runtime_image) or receipt.match(receipt.DIGEST, args.runtime_image),
@@ -292,7 +323,9 @@ def qualify(args, root=None):
         client_config = work / "docker-client"
         client_config.mkdir(mode=0o700)
         docker += ["--config", str(client_config)]
+        announce_stage("qualify-host-runtime")
         image_digest = approved_daemon(docker, args.runtime_image)
+        announce_stage("qualify-host-source")
         export_source(root, args.commit, work / "source")
         boundary_commands(work / "source")
         inputs, recipes = work / "input", work / "recipe"
@@ -313,13 +346,19 @@ def qualify(args, root=None):
         name = "omp-qualification-" + uuid.uuid4().hex
         try:
             command = container_command(docker, args.runtime_image, work, name, getattr(args, "witness_run_id", ""))
-            output = subprocess.check_output(command, stderr=subprocess.DEVNULL, timeout=3600)
+            announce_stage("qualify-host-execute")
+            with tempfile.TemporaryFile() as stages:
+                try:
+                    output = subprocess.check_output(command, stderr=stages, timeout=3600)
+                finally:
+                    forward_stages(stages)
             require(len(output) <= 8192, "Invalid runtime summary")
             result = receipt.strict_json(output)
         finally:
             # A client timeout must not leave workers or runtime state alive.
             subprocess.run(docker + ["rm", "--force", name], stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, timeout=30, check=False)
+        announce_stage("qualify-host-finalize")
         finalize(directory, before, result, image_digest, root, args.commit, args.recipe_commit,
                  args.attestation_key, args.attestation)
 
@@ -373,6 +412,7 @@ def dependency_digest(source):
 
 
 def prepare_dependencies(source, manifest, runtime):
+    announce_stage("qualify-dependencies", inside=True)
     prepared_source = PREPARED / "source"
     metadata = receipt.strict_json((PREPARED / "dependencies.json").read_text())
     receipt.keys(metadata, ("schema", "source_commit", "bun_version", "locks", "dependency_tree_sha256", "native_grep_sha256"))
@@ -386,6 +426,7 @@ def prepare_dependencies(source, manifest, runtime):
     bun = shutil.which("bun", path=runtime.environment["PATH"])
     require(bun is not None and receipt.digest(Path(bun).resolve()) == manifest["build_inputs"]["host_tools"]["bun"]["sha256"],
             "Prepared Bun bytes differ from the pinned build runtime")
+    announce_stage("qualify-bun", inside=True)
     version, _ = runtime.run(["bun", "--version"], source, 30)
     require(version == b"1.4.2\n", "Pinned Bun runtime is required")
     for root in dependency_roots(prepared_source):
@@ -396,6 +437,7 @@ def prepare_dependencies(source, manifest, runtime):
     # not into a possibly different source tree prepared inside the image.
     require(dependency_digest(source) == metadata["dependency_tree_sha256"], "Copied dependency bytes differ")
     # The pristine export excludes this generated input required by CLI compile tests.
+    announce_stage("qualify-tool-views", inside=True)
     runtime.run(["bun", "run", "--cwd", "packages/collab-web", "gen:tool-views"], source, 120)
     return grep
 
@@ -468,17 +510,20 @@ def offline_session(runtime, binary, cwd, agent):
 
 
 def runtime_main():
+    announce_stage("qualify-request", inside=True)
     request = receipt.strict_json(Path("/input/assets/request.json").read_text())
     receipt.keys(request, ("manifest", "runtime_image"))
     manifest, image = request["manifest"], request["runtime_image"]
     require(manifest["source"]["commit"] == receipt.APPLICATION_COMMIT and receipt.match(receipt.DIGEST, image), "Wrong runtime request")
+    announce_stage("qualify-cpu", inside=True)
     # Inspect architecture and CPU flags only, never host/network identity.
     flags = re.findall(r"^flags\s*:\s*(.*)$", Path("/proc/cpuinfo").read_text(), re.MULTILINE)
     require(flags, "CPU baseline is unavailable")
     for value in flags:
         baseline_cpu(os.uname().machine, set(value.split()))
     base = Path("/runtime")
-    for child in ("agent", "data", "state", "cache/bun", "config", "run", "tmp", "session/cwd", "session/.git/objects", "session/.git/refs/heads", "session/.jj/repo"):
+    # The native loader honors XDG only when its omp namespace already exists.
+    for child in ("agent", "data/omp", "state", "cache/bun", "config", "run", "tmp", "session/cwd", "session/.git/objects", "session/.git/refs/heads", "session/.jj/repo"):
         (base / child).mkdir(parents=True, exist_ok=True)
     (base / "session/.git/HEAD").write_text("ref: refs/heads/offline-smoke\n")
     environment = {
@@ -490,47 +535,61 @@ def runtime_main():
         "USER": "qualification", "LOGNAME": "qualification", "SHELL": "/bin/sh", "TERM": "dumb", "NO_COLOR": "1", "PI_DEBUG_STARTUP": "1",
     }
     runtime = Runtime(environment)
+    announce_stage("qualify-source", inside=True)
     source = Path("/workspace/source")
     shutil.copytree("/input/source", source, symlinks=True)
     require({name: receipt.digest(source / name) for name in receipt.LOCKS} == manifest["build_inputs"]["locks"], "Runtime source locks differ")
     require(receipt.strict_json((source / "packages/coding-agent/package.json").read_text())["version"] == manifest["version"], "Runtime source version differs")
-    commands = boundary_commands(source)
+    commands = boundary_commands(source, with_stages=True)
     grep = prepare_dependencies(source, manifest, runtime)
+    announce_stage("qualify-binary", inside=True)
     binary = Path("/workspace/omp")
     shutil.copyfile("/input/assets/omp-linux-amd64", binary)
     binary.chmod(0o500)
     require(receipt.digest(binary) == manifest["asset"]["sha256"] and receipt.elf(binary) == manifest["runtime"]["binary"], "Runtime binary bytes or ABI differ")
+    announce_stage("qualify-libc", inside=True)
     libc_out, _ = runtime.run(["getconf", "GNU_LIBC_VERSION"], source, 30)
     libc_match = re.fullmatch(rb"glibc ([0-9]+(?:\.[0-9]+)+)\n", libc_out)
     require(libc_match is not None, "GNU libc is required")
     libc = libc_match[1].decode()
     cwd = base / "session/cwd"
+    announce_stage("qualify-version", inside=True)
     output, _ = runtime.run([binary, "--version"], cwd, 30)
     require(output == f"omp/{manifest['version']}\n".encode(), "Binary version behavior differs")
+    announce_stage("qualify-help", inside=True)
     output, error = runtime.run([binary, "--help"], cwd, 60)
     native = native_help(output, error, base / "data/omp/natives" / manifest["version"], manifest)
+    announce_stage("qualify-smoke", inside=True)
     output, _ = runtime.run([binary, "--smoke-test"], cwd, 180)
     require(output == b"smoke-test: ok\n", "Native resource and worker smoke failed")
+    announce_stage("qualify-offline-session", inside=True)
     offline_session(runtime, binary, cwd, base / "agent")
+    announce_stage("qualify-markers", inside=True)
     require_markers(binary)
+    announce_stage("qualify-native-addon", inside=True)
     native_destination = source / "packages/natives/native/pi_natives.linux-x64-baseline.node"
     native_destination.parent.mkdir(parents=True, exist_ok=True)
     require(not native_destination.exists() and not native_destination.is_symlink(), "Source contains unexpected native addon")
     shutil.copyfile(native, native_destination)
-    for command in commands:
+    for stage, command in commands:
+        announce_stage(stage, inside=True)
         output, error = runtime.run(command, source)
         combined = output + b"\n" + error
         require(re.search(rb"\b[1-9][0-9]* pass\b", combined) is not None and
                 re.search(rb"\b[1-9][0-9]* fail\b", combined) is None, "Boundary command ran no passing tests")
+    announce_stage("qualify-native-grep", inside=True)
     grep_source = (source / "crates/pi-natives/src/grep.rs").read_text()
     require(re.search(r"(?m)^\s*fn\s+" + NATIVE_GREP_TEST.rsplit("::", 1)[1] + r"\s*\(", grep_source), "Canonical native regression is missing")
     output, _ = runtime.run([grep, NATIVE_GREP_TEST, "--exact"], source)
     require(re.search(rb"(?m)^running 1 test$", output) and
             re.search(rb"test result: ok\. 1 passed; 0 failed;", output), "Canonical native regression failed or was filtered out")
+    announce_stage("qualify-typecheck", inside=True)
     runtime.run(TYPECHECK, source, 300)
+    announce_stage("qualify-integrity", inside=True)
     require(receipt.digest(binary) == manifest["asset"]["sha256"] and
             receipt.digest(native) == manifest["runtime"]["native_baseline"]["sha256"] and
             receipt.digest(native_destination) == manifest["runtime"]["native_baseline"]["sha256"], "Qualified runtime bytes changed")
+    announce_stage("qualify-result", inside=True)
     result = {
         "binary_sha256": receipt.digest(binary), "source_commit": manifest["source"]["commit"],
         "recipe_commit": manifest["source"]["recipe_commit"],
@@ -564,6 +623,8 @@ def main():
         qualify(parser.parse_args())
         print("Linux-amd64 qualification passed; exact public assets finalized.")
     except (ValueError, OSError, KeyError, TypeError, AttributeError, IndexError, subprocess.SubprocessError, tarfile.TarError):
+        if sys.argv[1:] == ["--inside"]:
+            raise SystemExit(1) from None
         # No paths, command output, environment values, or input documents escape.
         raise SystemExit("Linux-amd64 qualification rejected; publication is not permitted.") from None
 

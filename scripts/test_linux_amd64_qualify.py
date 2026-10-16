@@ -442,7 +442,7 @@ class CompletionTests(unittest.TestCase):
 
 
 class HostFlowTests(unittest.TestCase):
-    def run_fixture(self, directory, *, committed=False, fail=False, changed=False, duplicate=False):
+    def run_fixture(self, directory, *, committed=False, fail=False, changed=False, duplicate=False, stages=b"", invalid_stages=False):
         assets, root = directory / "assets", directory / "root"
         assets.mkdir()
         (root / "scripts").mkdir(parents=True)
@@ -486,6 +486,7 @@ class HostFlowTests(unittest.TestCase):
             request = receipt.strict_json((Path(command[command.index("--config") + 1]).parent / "input/request.json").read_bytes())
             self.assertEqual(request["runtime_image"], IMAGE_DIGEST)
             self.assertNotIn(b"private-account", json.dumps(request).encode())
+            kwargs["stderr"].write(stages)
             if fail:
                 raise subprocess.CalledProcessError(1, command, output=b"private fixture diagnostics")
             if changed:
@@ -509,7 +510,7 @@ class HostFlowTests(unittest.TestCase):
              patch.object(qualify, "export_source", side_effect=archive), \
              patch.object(subprocess, "check_output", side_effect=fake_output), \
              patch.object(subprocess, "run", side_effect=execute):
-            if fail or changed or duplicate:
+            if fail or changed or duplicate or invalid_stages:
                 with self.assertRaises((ValueError, subprocess.SubprocessError)):
                     qualify.qualify(args, root)
                 self.assertIsNone(receipt.strict_json((assets / receipt.ASSETS[1]).read_text())["qualification"])
@@ -540,6 +541,19 @@ class HostFlowTests(unittest.TestCase):
             with self.subTest(options=options), tempfile.TemporaryDirectory() as temporary:
                 self.run_fixture(Path(temporary), **options)
 
+    def test_runtime_failure_forwards_only_allowlisted_stage_ids(self):
+        with tempfile.TemporaryDirectory() as temporary, contextlib.redirect_stdout(io.StringIO()) as output:
+            self.run_fixture(Path(temporary), fail=True, stages=b"qualify-help\nqualify-smoke\n")
+        self.assertEqual(output.getvalue().splitlines(), [
+            "qualify-host-inputs", "qualify-host-runtime", "qualify-host-source",
+            "qualify-host-execute", "qualify-help", "qualify-smoke"])
+
+    def test_unknown_runtime_stage_fails_without_forwarding_untrusted_text(self):
+        with tempfile.TemporaryDirectory() as temporary, contextlib.redirect_stdout(io.StringIO()) as output:
+            self.run_fixture(Path(temporary), stages=b"qualify-smoke\nqualify-unknown private diagnostic\n", invalid_stages=True)
+        self.assertEqual(output.getvalue().splitlines(), [
+            "qualify-host-inputs", "qualify-host-runtime", "qualify-host-source", "qualify-host-execute"])
+
     def test_cli_sanitizes_subprocess_failures(self):
         arguments = ["qualify", "--commit", receipt.APPLICATION_COMMIT, "--assets", "/fixture/assets", "--runtime-image", IMAGE,
                      "--docker-socket", "unix:///runtime/docker.sock",
@@ -560,6 +574,68 @@ class HostFlowTests(unittest.TestCase):
                 qualify.main()
         self.assertEqual(str(failure.exception), "Linux-amd64 qualification rejected; publication is not permitted.")
         self.assertEqual(output.getvalue(), "")
+
+
+    def test_inside_failure_emits_only_the_stage_id(self):
+        def failing_runtime():
+            qualify.announce_stage("qualify-smoke", inside=True)
+            raise ValueError("private diagnostic")
+
+        with patch.object(qualify.sys, "argv", ["qualify", "--inside"]), \
+             patch.object(qualify, "runtime_main", side_effect=failing_runtime), \
+             contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()) as error:
+            with self.assertRaises(SystemExit) as failure:
+                qualify.main()
+        self.assertEqual(failure.exception.code, 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(error.getvalue(), "qualify-smoke\n")
+
+
+class RuntimeStartupTests(unittest.TestCase):
+    def test_initializes_native_xdg_namespace_on_executable_runtime_before_launch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            request = root / "request.json"
+            request.write_text(json.dumps({"manifest": {"source": {"commit": receipt.APPLICATION_COMMIT}},
+                                           "runtime_image": IMAGE_DIGEST}))
+            cpu = root / "cpuinfo"
+            cpu.write_text("flags: ssse3 sse4_1 sse4_2 popcnt cx16 lahf_lm pni\n")
+            runtime = root / "runtime"
+            paths = {"/input/assets/request.json": request, "/proc/cpuinfo": cpu, "/runtime": runtime}
+
+            def path(value):
+                return paths.get(str(value), Path(value))
+
+            with patch.object(qualify, "Path", side_effect=path), \
+                 patch.object(qualify.os, "uname", return_value=type("Uname", (), {"machine": "x86_64"})()), \
+                 patch.object(qualify, "Runtime", side_effect=RuntimeError("fixture stop")) as start, \
+                 contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, "fixture stop"):
+                    qualify.runtime_main()
+            self.assertEqual(start.call_args.args[0]["XDG_DATA_HOME"], str(runtime / "data"))
+            self.assertTrue((runtime / "data/omp").is_dir())
+
+
+class StageTests(unittest.TestCase):
+    def test_stage_channel_contains_only_allowlisted_ids_and_rejects_unknown_text(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            qualify.announce_stage("qualify-smoke")
+            for invalid in ("qualify-unknown", "qualify-smoke private diagnostic", "qualify-smoke\n", "private diagnostic"):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    qualify.announce_stage(invalid)
+        self.assertEqual(output.getvalue(), "qualify-smoke\n")
+
+    def test_runtime_stage_forwarding_validates_all_bytes_before_emitting_anything(self):
+        for payload in (b"qualify-smoke\nqualify-unknown\n", b"qualify-smoke\nprivate diagnostic\n",
+                        b"qualify-smoke \n", b"\xff\n", b"x" * 8193):
+            with self.subTest(payload=payload), contextlib.redirect_stdout(io.StringIO()) as output:
+                with self.assertRaises(ValueError):
+                    qualify.forward_stages(io.BytesIO(payload))
+                self.assertEqual(output.getvalue(), "")
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            qualify.forward_stages(io.BytesIO(b"qualify-help\nqualify-smoke\n"))
+        self.assertEqual(output.getvalue(), "qualify-help\nqualify-smoke\n")
 
 
 if __name__ == "__main__":

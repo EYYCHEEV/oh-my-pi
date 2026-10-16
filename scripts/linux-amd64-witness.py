@@ -245,7 +245,7 @@ def start(scratch, run_id, recipe_commit):
     require(receipt.match(receipt.OID, recipe_commit), "A reviewed recipe commit is required")
     require(unit_state(run_id) is None, "Witness unit already exists")
     require(not any((scratch / name).exists() for name in
-                    ("job-progress", "job-terminal.json", "abort.json", "cleanup.json")),
+                    ("job-progress", "job-terminal.json", "job-failure.json", "abort.json", "cleanup.json")),
             "Witness job state already exists")
     repo = scratch / "repo"
     require(query([], "git", "-C", str(repo), "rev-parse", "HEAD") == recipe_commit, "Recipe checkout differs")
@@ -277,13 +277,29 @@ def stop_containers(docker, run_id):
         query(docker, "container", "stop", "--time=30", container)
 
 
-def run_phase(command, repo, scratch, seconds):
+def load_qualifier(repo):
+    # The worker already binds this checkout to the reviewed recipe commit.
+    spec = importlib.util.spec_from_file_location("witness_qualifier", repo / "scripts/linux-amd64-qualify.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def run_phase(command, repo, scratch, seconds, *, stages=None):
     # GNU timeout owns each child deadline; systemd owns cancellation of the unit.
     command = ["timeout", "--signal=TERM", "--kill-after=30s", str(seconds) + "s"] + command
+    qualifier = load_qualifier(repo) if stages is not None else None
     with subprocess.Popen(command, cwd=repo, stdin=subprocess.DEVNULL,
                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
         for line in iter(lambda: process.stdout.readline(65536), b""):
-            text = line.decode("utf-8", errors="replace").strip()
+            raw = line.decode("utf-8", errors="replace")
+            if raw.startswith("qualify-"):
+                if qualifier is None or not raw.endswith("\n") or not qualifier.valid_stage(raw[:-1]):
+                    process.terminate()
+                    raise ValueError("Invalid qualification stage")
+                stages[:] = [raw[:-1]]
+                continue
+            text = raw.strip()
             if text in PROGRESS:
                 progress(scratch, text)
         return process.wait()
@@ -298,6 +314,7 @@ def worker(docker, scratch, run_id, recipe_commit):
 
     previous = signal.signal(signal.SIGTERM, terminate)
     phase, code = "launch", 1
+    stages = []
     try:
         with tempfile.TemporaryDirectory(prefix="docker-client-", dir=scratch) as config:
             docker = docker + ["--config", config]
@@ -328,7 +345,10 @@ def worker(docker, scratch, run_id, recipe_commit):
                                    "--docker-socket", "unix:///var/run/docker.sock", "--runtime-image", image,
                                    "--witness-run-id", run_id, "--attestation-key", str(evidence / "qualification-key"),
                                    "--attestation", str(evidence / "qualification.json")]
-                    code = run_phase(command, repo, scratch, seconds)
+                    if phase == "qualify":
+                        code = run_phase(command, repo, scratch, seconds, stages=stages)
+                    else:
+                        code = run_phase(command, repo, scratch, seconds)
                     if code or cancelled["code"]:
                         break
             except (ValueError, OSError, KeyError, IndexError, TypeError, subprocess.SubprocessError):
@@ -345,6 +365,11 @@ def worker(docker, scratch, run_id, recipe_commit):
     finally:
         signal.signal(signal.SIGTERM, previous)
         # Client cleanup and owned-container stopping precede the last publication.
+        if code:
+            stage = stages[-1] if phase == "qualify" and stages else phase
+            require(receipt.match(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", stage) and
+                    (stage in JOB_PHASES or load_qualifier(scratch / "repo").valid_stage(stage)), "Invalid failure stage")
+            write_new(scratch / "job-failure.json", {"schema": 1, "run_id": run_id, "stage": stage})
         write_new(scratch / "job-terminal.json", {"schema": 1, "run_id": run_id,
                   "status": "failed:" + phase if code else "success", "exit_code": min(code, 255)})
     return min(code, 255)
