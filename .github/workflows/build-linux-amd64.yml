@@ -1,0 +1,14 @@
+name: Fleet Linux release route (dormant)
+
+# Fleet releases are owned exclusively by the Mac-local scripts. This retained
+# workflow is deliberately incapable of building or publishing, even if Actions
+# are enabled elsewhere. No tag trigger, credentials, runner steps or write scope.
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  local-route-only:
+    if: ${{ false }}
+    runs-on: ubuntu-24.04
+    steps:
+      - run: 'false'

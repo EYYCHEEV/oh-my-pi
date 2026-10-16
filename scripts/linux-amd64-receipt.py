@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""Allowlisted Linux release provenance and shared local trust boundaries."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+from shutil import which
+import stat
+import struct
+import subprocess
+import tarfile
+import tempfile
+
+REPOSITORY = "EYYCHEEV/oh-my-pi"
+APPLICATION_COMMIT = "dd8d9785aa36b5b072817a089177030b1b3519df"
+ASSETS = ("omp-linux-amd64", "RELEASE_MANIFEST.json", "SHA256SUMS.txt")
+RECIPES = ("build-linux-amd64.sh", "linux-amd64.Dockerfile", "linux-amd64-receipt.py",
+           "qualify-linux-amd64.sh", "linux-amd64-qualify.py", "linux-amd64-smoke.sh",
+           "publish-linux-amd64.sh", "linux-amd64-publish.py")
+LOCKS = ("bun.lock", "Cargo.lock", "MODULE.bazel", "MODULE.bazel.lock", "rust-toolchain.toml", ".bazelversion")
+TOOLS = ("bun", "bazel", "rustc", "cargo", "cmake", "ninja")
+CHECKS = ("elf", "cli", "native_runtime", "resources_workers", "builtin_smoke", "offline_session",
+          "fork_boundaries", "native_grep", "coding_agent_typecheck")
+HEX = r"[0-9a-f]{64}"
+OID = r"[0-9a-f]{40}"
+TAG = r"stronk-omp-s1-[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]{4}"
+IMAGE = r"[a-z0-9][a-z0-9._/-]*(?::[A-Za-z0-9_.-]+)?@sha256:" + HEX
+BASE_IMAGE = "rustlang/rust:nightly-2026-08-12@sha256:51dc497bff0c24777d2ec6a1fc12ddf7ab0483de3ee537f4ec10816b9e1eff6c"
+BUN_SHA256 = "c678040f14fe0440eb839d37cbd0ce4c051a32da72806ac97de6a6aab6bf728f"
+BAZEL_SHA256 = "7668a95db1250f12c40407251e4e203b4ec8bf39bc495d2f485b2d8c99048694"
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def digest(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def capture(*args):
+    return subprocess.check_output(args, stderr=subprocess.DEVNULL, text=True, timeout=60)
+
+
+def git_bytes(root, rev, path):
+    require(match(OID, rev), "A full immutable Git object is required")
+    return subprocess.check_output(["git", "-C", str(root), "show", f"{rev}:{path}"],
+                                   stderr=subprocess.DEVNULL, timeout=60)
+
+
+def commit_exists(root, commit):
+    require(match(OID, commit), "A full commit is required")
+    require(capture("git", "-C", str(root), "rev-parse", "--verify", f"{commit}^{{commit}}").strip() == commit,
+            "Wrong commit object")
+
+
+def assert_recipes(root, recipe_commit):
+    commit_exists(root, recipe_commit)
+    for name in RECIPES:
+        path = root / "scripts" / name
+        require(path.is_file() and not path.is_symlink() and
+                path.read_bytes() == git_bytes(root, recipe_commit, f"scripts/{name}"),
+                "Invoked route differs from the reviewed recipe commit")
+
+
+def validate_tag(root, commit, tag, allowed_signers, revoked_signers=None):
+    require(commit == APPLICATION_COMMIT and match(TAG, tag), "Wrong fleet source or namespace")
+    commit_exists(root, commit)
+    require(allowed_signers is not None and Path(allowed_signers).is_file() and
+            Path(allowed_signers).stat().st_size > 0, "Explicit enrolled public signers are required")
+    if revoked_signers is not None:
+        require(Path(revoked_signers).is_file(), "Explicit public revocations are required")
+    oid = capture("git", "-C", str(root), "rev-parse", "--verify", f"refs/tags/{tag}").strip()
+    require(match(OID, oid) and capture("git", "-C", str(root), "cat-file", "-t", oid).strip() == "tag",
+            "A signed annotated tag is required")
+    raw = capture("git", "-C", str(root), "cat-file", "tag", oid)
+    header = dict(line.split(" ", 1) for line in raw.split("\n\n", 1)[0].splitlines() if " " in line)
+    require(header.get("type") == "commit" and header.get("tag") == tag and header.get("object") == commit,
+            "The tag must name the direct exact application commit")
+    require("-----BEGIN SSH SIGNATURE-----" in raw, "An SSH-signed tag is required")
+    # An omitted revocation input means an explicitly empty public deny-list.
+    # /dev/null avoids creating a trust store or inheriting unrelated Git config.
+    command = ["git", "-C", str(root), "-c", "gpg.format=ssh", "-c", "gpg.ssh.program=ssh-keygen",
+               "-c", f"gpg.ssh.allowedSignersFile={Path(allowed_signers).resolve()}",
+               "-c", f"gpg.ssh.revocationFile={Path(revoked_signers).resolve() if revoked_signers else '/dev/null'}",
+               "verify-tag", oid]
+    subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+    return oid
+
+
+def validate_docker(endpoint, builder=None):
+    # Reject overrides before even querying buildx. Never enumerate endpoint inventories.
+    overrides = ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH",
+                 "DOCKER_API_VERSION", "BUILDX_BUILDER", "BUILDX_CONFIG", "BUILDKIT_HOST", "BUILDX_HOST")
+    require(not any(os.environ.get(name) for name in overrides), "Ambient Docker overrides are forbidden")
+    require(isinstance(endpoint, str) and endpoint.startswith("unix:///"), "An explicit local Unix socket is required")
+    path = endpoint[len("unix://"):]
+    require(not any(char in path for char in ("\n", "\r", "\x00", "?", "#", '"', "\\")) and
+            stat.S_ISSOCK(Path(path).stat().st_mode), "The local Docker socket is unavailable")
+    command = ["docker", "--host", endpoint]
+    if builder is not None:
+        require(match(r"[A-Za-z0-9][A-Za-z0-9_.-]*", builder), "An explicit approved builder is required")
+        # Only render equality, driver and status, never another node's endpoint/address.
+        template = ('{{.Driver}}|{{len .Nodes}}|{{range .Nodes}}{{if eq .Endpoint ' + json.dumps(endpoint) +
+                    '}}local{{else}}rejected{{end}}|{{.Status}}{{end}}')
+        result = capture(*command, "buildx", "inspect", builder, "--format", template).strip()
+        require(result in ("docker|1|local|running", "docker-container|1|local|running"),
+                "Builder must have one running node bound to the approved local socket")
+    return command
+
+
+def elf(path):
+    with path.open("rb") as stream:
+        header = stream.read(20)
+    require(len(header) == 20 and header[:6] == b"\x7fELF\x02\x01" and struct.unpack_from("<H", header, 18)[0] == 62,
+            "Expected ELF64 little-endian x86-64 bytes")
+    programs = capture("readelf", "--program-headers", "--wide", str(path))
+    loader = re.search(r"Requesting program interpreter: ([^\]]+)\]", programs)
+    versions = capture("readelf", "--version-info", "--wide", str(path))
+    glibc = sorted(set(re.findall(r"\bGLIBC_([0-9]+(?:\.[0-9]+)+)\b", versions)),
+                   key=lambda value: tuple(map(int, value.split("."))))
+    libraries = re.findall(r"Shared library: \[([^\]]+)\]", capture("readelf", "--dynamic", "--wide", str(path)))
+    return {"format": "ELF64-x86-64", "interpreter": Path(loader[1]).name if loader else None,
+            "glibc_required": glibc[-1] if glibc else None, "needed_libraries": sorted(set(libraries))}
+
+
+def save_manifest(directory, manifest):
+    text = json.dumps(manifest, sort_keys=True, indent=2) + "\n"
+    # A partial metadata replacement fails checksum verification and cannot publish.
+    with tempfile.NamedTemporaryFile(dir=directory, mode="w", delete=False) as stream:
+        stream.write(text)
+        temporary = Path(stream.name)
+    temporary.replace(directory / ASSETS[1])
+    checksums = "".join(f"{digest(directory / name)}  {name}\n" for name in ASSETS[:2])
+    with tempfile.NamedTemporaryFile(dir=directory, mode="w", delete=False) as stream:
+        stream.write(checksums)
+        temporary = Path(stream.name)
+    temporary.replace(directory / ASSETS[2])
+
+
+def create(directory):
+    root = Path("/src")
+    binary = directory / ASSETS[0]
+    native = root / "packages/natives/native/pi_natives.linux-x64-baseline.node"
+    versions = {"bun": capture("bun", "--version").strip(), "bazel": capture("bazel", "--version").strip(),
+                "rustc": capture("rustc", "--version").strip(), "cargo": capture("cargo", "--version").strip(),
+                "cmake": capture("cmake", "--version").splitlines()[0], "ninja": capture("ninja", "--version").strip()}
+    tool_paths = {tool: Path(capture("rustup", "which", tool).strip() if tool in ("rustc", "cargo") else which(tool)).resolve()
+                  for tool in TOOLS}
+    manifest = {
+        "schema": 2, "repository": REPOSITORY, "target": "linux-amd64",
+        "version": json.loads((root / "packages/coding-agent/package.json").read_text())["version"],
+        "source": {"commit": os.environ["SOURCE_COMMIT"], "tag": os.environ["SOURCE_TAG"] or None,
+                   "tag_object": os.environ["SOURCE_TAG_OBJECT"] or None,
+                   "source_date_epoch": int(os.environ["SOURCE_DATE_EPOCH"]),
+                   "recipe_committed": os.environ["RECIPE_COMMITTED"] == "1",
+                   "recipe_commit": os.environ["RECIPE_COMMIT"] or None},
+        "build_inputs": {"base_image": os.environ["BASE_IMAGE"], "debian_snapshot": os.environ["DEBIAN_SNAPSHOT"],
+                         "bun_archive_sha256": os.environ["BUN_SHA256"], "bazel_download_sha256": os.environ["BAZEL_SHA256"],
+                         "host_tools": {tool: {"version": versions[tool], "sha256": digest(tool_paths[tool])} for tool in TOOLS},
+                         "system_packages_sha256": hashlib.sha256(capture("dpkg-query", "-W", "-f=${Package}=${Version}\n").encode()).hexdigest(),
+                         "locks": {name: digest(root / name) for name in LOCKS},
+                         "recipe": {name: digest(Path("/recipe") / name) for name in RECIPES}},
+        "asset": {"name": ASSETS[0], "size": binary.stat().st_size, "sha256": digest(binary)},
+        "runtime": {"binary": elf(binary), "native_baseline": {"sha256": digest(native), "elf": elf(native)},
+                    "cpu": "x86-64-v2", "native_variant": "baseline", "fully_static": False},
+        "checks": {name: "passed" if name == "elf" else "not_run" for name in CHECKS}, "qualification": None}
+    save_manifest(directory, manifest)
+    # Tree verification occurs on the Mac; Git metadata never enters the build container.
+    verify(directory, manifest["source"]["commit"], manifest["source"]["tag"] or "", False,
+           manifest["source"]["recipe_commit"] or "", root=False)
+
+
+def keys(value, expected):
+    require(isinstance(value, dict) and set(value) == set(expected), "Unexpected public fields")
+
+
+def match(pattern, value):
+    return isinstance(value, str) and re.fullmatch(pattern, value) is not None
+
+
+def verify_elf(value):
+    keys(value, ("format", "interpreter", "glibc_required", "needed_libraries"))
+    require(value["format"] == "ELF64-x86-64", "Wrong ELF target")
+    require(value["interpreter"] is None or match(r"[A-Za-z0-9_.+-]+", value["interpreter"]), "Invalid loader identity")
+    require(value["glibc_required"] is None or match(r"[0-9]+(?:\.[0-9]+)+", value["glibc_required"]), "Invalid libc floor")
+    require(isinstance(value["needed_libraries"], list) and
+            all(match(r"[A-Za-z0-9_.+-]+", item) for item in value["needed_libraries"]), "Invalid library identity")
+
+
+def verify(directory, commit, tag, release, recipe_commit="", root=None):
+    require(not directory.is_symlink() and directory.is_dir(), "A regular asset directory is required")
+    require({entry.name for entry in directory.iterdir()} == set(ASSETS), "Only the exact three public assets are permitted")
+    require(all((directory / name).is_file() and not (directory / name).is_symlink() for name in ASSETS), "Assets must be regular files")
+    manifest = json.loads((directory / ASSETS[1]).read_text())
+    keys(manifest, ("schema", "repository", "target", "version", "source", "build_inputs", "asset", "runtime", "checks", "qualification"))
+    require(type(manifest["schema"]) is int and manifest["schema"] == 2 and manifest["repository"] == REPOSITORY and
+            manifest["target"] == "linux-amd64", "Wrong release identity")
+    require(match(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?", manifest["version"]), "Invalid version")
+    source = manifest["source"]
+    keys(source, ("commit", "tag", "tag_object", "source_date_epoch", "recipe_committed", "recipe_commit"))
+    require(commit == APPLICATION_COMMIT and source["commit"] == commit, "Wrong exact application commit")
+    require(source["tag"] == (tag or None) and (not tag or match(TAG, tag)), "Wrong exact source tag")
+    require((source["tag_object"] is None and not tag) or (bool(tag) and match(OID, source["tag_object"])), "Invalid tag object")
+    require(type(source["recipe_committed"]) is bool and type(source["source_date_epoch"]) is int and source["source_date_epoch"] > 0,
+            "Invalid source metadata")
+    require((source["recipe_committed"] and match(OID, recipe_commit) and source["recipe_commit"] == recipe_commit) or
+            (not source["recipe_committed"] and not recipe_commit and source["recipe_commit"] is None), "Wrong exact recipe commit")
+    require(not release or (source["recipe_committed"] and tag), "Candidate recipes cannot be published")
+    inputs = manifest["build_inputs"]
+    keys(inputs, ("base_image", "debian_snapshot", "bun_archive_sha256", "bazel_download_sha256", "host_tools", "system_packages_sha256", "locks", "recipe"))
+    require(inputs["base_image"] == BASE_IMAGE and inputs["debian_snapshot"] == "20260813T000000Z" and
+            inputs["bun_archive_sha256"] == BUN_SHA256 and inputs["bazel_download_sha256"] == BAZEL_SHA256,
+            "Build pins differ from the reviewed recipe")
+    require(match(HEX, inputs["system_packages_sha256"]), "Invalid system digest")
+    for field, names in (("locks", LOCKS), ("recipe", RECIPES)):
+        keys(inputs[field], names)
+        require(all(match(HEX, value) for value in inputs[field].values()), "Invalid input digest")
+    if root is not False:
+        root = root or Path(__file__).resolve().parent.parent
+        commit_exists(root, commit)
+        require(inputs["locks"] == {name: hashlib.sha256(git_bytes(root, commit, name)).hexdigest() for name in LOCKS},
+                "Immutable application locks differ from provenance")
+        require(manifest["version"] == json.loads(git_bytes(root, commit, "packages/coding-agent/package.json"))["version"],
+                "Immutable application version differs from provenance")
+        epoch = int(capture("git", "-C", str(root), "show", "-s", "--format=%ct", commit).strip())
+        require(source["source_date_epoch"] == epoch, "Immutable source timestamp differs")
+        if source["recipe_committed"]:
+            commit_exists(root, recipe_commit)
+            require(inputs["recipe"] == {name: hashlib.sha256(git_bytes(root, recipe_commit, f"scripts/{name}")).hexdigest() for name in RECIPES},
+                    "Immutable recipe bytes differ from provenance")
+    keys(inputs["host_tools"], TOOLS)
+    for tool in inputs["host_tools"].values():
+        keys(tool, ("version", "sha256"))
+        require(match(r"[A-Za-z0-9 ._()+,:=\-]+", tool["version"]) and match(HEX, tool["sha256"]), "Invalid public tool identity")
+    asset = manifest["asset"]
+    keys(asset, ("name", "size", "sha256"))
+    binary = directory / ASSETS[0]
+    require(asset["name"] == ASSETS[0] and type(asset["size"]) is int and asset["size"] > 0 and
+            asset["size"] == binary.stat().st_size and asset["sha256"] == digest(binary), "Binary bytes differ from provenance")
+    with binary.open("rb") as stream:
+        header = stream.read(20)
+    require(len(header) == 20 and header[:6] == b"\x7fELF\x02\x01" and struct.unpack_from("<H", header, 18)[0] == 62,
+            "Wrong binary architecture")
+    runtime = manifest["runtime"]
+    keys(runtime, ("binary", "native_baseline", "cpu", "native_variant", "fully_static"))
+    require(runtime["cpu"] == "x86-64-v2" and runtime["native_variant"] == "baseline" and runtime["fully_static"] is False,
+            "Wrong runtime contract")
+    verify_elf(runtime["binary"])
+    require(runtime["binary"]["interpreter"] == "ld-linux-x86-64.so.2", "Wrong GNU loader")
+    keys(runtime["native_baseline"], ("sha256", "elf"))
+    require(match(HEX, runtime["native_baseline"]["sha256"]), "Invalid native digest")
+    verify_elf(runtime["native_baseline"]["elf"])
+    keys(manifest["checks"], CHECKS)
+    qualification = manifest["qualification"]
+    if qualification is None:
+        require(not release and manifest["checks"] == {name: "passed" if name == "elf" else "not_run" for name in CHECKS},
+                "Completed qualification is required")
+    else:
+        keys(qualification, ("binary_sha256", "source_commit", "recipe_commit", "environment", "checks"))
+        require(qualification["binary_sha256"] == asset["sha256"] and qualification["source_commit"] == commit and
+                qualification["recipe_commit"] == source["recipe_commit"], "Qualification tuple differs")
+        require(manifest["checks"] == qualification["checks"] == {name: "passed" for name in CHECKS}, "Incomplete qualification")
+        environment = qualification["environment"]
+        keys(environment, ("execution", "cpu", "glibc", "loader", "runtime_image"))
+        require(environment["execution"] == "native-amd64" and environment["cpu"] == "x86-64-v2" and
+                environment["loader"] == "ld-linux-x86-64.so.2" and match(r"[0-9]+(?:\.[0-9]+)+", environment["glibc"]) and
+                match(IMAGE, environment["runtime_image"]), "Invalid qualified runtime baseline")
+        for observation in (runtime["binary"], runtime["native_baseline"]["elf"]):
+            floor = observation["glibc_required"]
+            require(floor is not None and tuple(map(int, environment["glibc"].split("."))) >= tuple(map(int, floor.split("."))),
+                    "Qualified libc is below the required floor")
+    expected = "".join(f"{digest(directory / name)}  {name}\n" for name in ASSETS[:2])
+    require((directory / ASSETS[2]).read_text() == expected, "Checksum list differs from exact asset set")
+    return manifest
+
+
+def build(args):
+    root = Path(__file__).resolve().parent.parent
+    commit_exists(root, args.commit)
+    require(args.commit == APPLICATION_COMMIT, "The fleet application source is fixed")
+    require(match(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.output), "Output must be a new dist child")
+    tag_object = ""
+    if args.candidate:
+        require(not args.recipe_commit and not args.tag, "Candidates cannot claim committed release identity")
+    else:
+        assert_recipes(root, args.recipe_commit)
+        tag_object = validate_tag(root, args.commit, args.tag, args.allowed_signers, args.revoked_signers)
+    docker = validate_docker(args.docker_socket, args.builder)
+    require(args.builder is not None, "An approved local builder is required")
+    dist = root / "dist"
+    require(not dist.is_symlink(), "A symlinked dist is forbidden")
+    dist.mkdir(exist_ok=True)
+    destination = dist / args.output
+    require(not destination.exists() and not destination.is_symlink(), "Output already exists")
+    with tempfile.TemporaryDirectory(prefix=".linux-amd64-build.", dir=dist) as temporary:
+        context = Path(temporary)
+        source = context / "source"
+        source.mkdir()
+        with subprocess.Popen(["git", "-C", str(root), "archive", "--format=tar", args.commit],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as archive:
+            with tarfile.open(fileobj=archive.stdout, mode="r|") as stream:
+                stream.extractall(source, filter="data")
+            require(archive.wait() == 0, "Immutable source export failed")
+        recipe = context / "recipe"
+        recipe.mkdir()
+        for name in RECIPES:
+            data = (root / "scripts" / name).read_bytes() if args.candidate else git_bytes(root, args.recipe_commit, f"scripts/{name}")
+            (recipe / name).write_bytes(data)
+        epoch = capture("git", "-C", str(root), "show", "-s", "--format=%ct", args.commit).strip()
+        command = docker + ["buildx", "build", "--builder", args.builder, "--platform", "linux/amd64", "--file", str(recipe / "linux-amd64.Dockerfile")]
+        for name, value in {"SOURCE_COMMIT": args.commit, "SOURCE_TAG": args.tag, "SOURCE_TAG_OBJECT": tag_object,
+                            "SOURCE_DATE_EPOCH": epoch, "RECIPE_COMMITTED": "0" if args.candidate else "1",
+                            "RECIPE_COMMIT": args.recipe_commit}.items():
+            command += ["--build-arg", f"{name}={value}"]
+        command += ["--provenance=false", "--sbom=false", "--progress=plain", "--output", f"type=local,dest={context / 'artifacts'}", str(context)]
+        print("Phase: building exact application and reviewed recipe in isolated Linux layers.", flush=True)
+        # Emit only known build phases, never paths, environment values or raw diagnostics.
+        phases = ("Phase: locked JavaScript dependencies.", "Phase: GNU amd64 baseline native addon.",
+                  "Phase: embedding native/resources and compiling baseline Bun.")
+        observed = set()
+        with (context / "build.log").open("wb") as log:
+            with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
+                for line in process.stdout:
+                    log.write(line)
+                    for phase in phases:
+                        if phase.encode() in line and phase not in observed:
+                            observed.add(phase)
+                            print(phase, flush=True)
+                require(process.wait() == 0, "Disposable build failed")
+        verify(context / "artifacts", args.commit, args.tag, False, args.recipe_commit, root)
+        destination.mkdir()
+        for name in ASSETS if args.receipts else ASSETS[:1]:
+            with (context / "artifacts" / name).open("rb") as source_stream, (destination / name).open("xb") as target:
+                shutil.copyfileobj(source_stream, target)
+        (destination / ASSETS[0]).chmod(0o755)
+    print("Phase: complete; unqualified Linux-amd64 artifacts exported.")
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise SystemExit("Invalid Linux-amd64 route arguments; no action is permitted.")
+
+
+def main():
+    parser = Parser(description=__doc__)
+    parser.add_argument("mode", choices=("create", "verify", "build"))
+    parser.add_argument("directory", type=Path, nargs="?")
+    parser.add_argument("--commit", default="")
+    parser.add_argument("--recipe-commit", default="")
+    parser.add_argument("--tag", default="")
+    parser.add_argument("--release", action="store_true")
+    parser.add_argument("--allowed-signers", type=Path)
+    parser.add_argument("--revoked-signers", type=Path)
+    parser.add_argument("--docker-socket", default="")
+    parser.add_argument("--builder")
+    parser.add_argument("--candidate", action="store_true")
+    parser.add_argument("--receipts", action="store_true")
+    parser.add_argument("--output", default="linux-amd64")
+    args = parser.parse_args()
+    try:
+        if args.mode == "build":
+            build(args)
+        elif args.mode == "create":
+            create(args.directory)
+        else:
+            verify(args.directory, args.commit, args.tag, args.release, args.recipe_commit)
+        print("Public linux-amd64 receipt verified.")
+    except (ValueError, OSError, KeyError, TypeError, AttributeError, subprocess.SubprocessError, tarfile.TarError):
+        raise SystemExit("Public linux-amd64 route rejected; no asset publication is permitted.") from None
+
+
+if __name__ == "__main__":
+    main()
