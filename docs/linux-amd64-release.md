@@ -203,11 +203,31 @@ With the standard `--scratch`, `--run-id` and explicit local `--docker-socket` i
 | Command | Contract |
 | --- | --- |
 | `start --recipe-commit "$RECIPE_COMMIT"` | Submits the whole prepare, candidate-verify, qualify and signed-verify chain as the transient system service `omp-witness-<run-id>.service`. Refuses any existing unit of that name; systemd also rejects a concurrent name collision. The scratch working directory, fixed `env -i` environment and null stdin/stdout/stderr exclude SSH streams, journald output and raw logs. |
+| `start --recipe-commit "$RECIPE_COMMIT" --tag "$SOURCE_TAG"` | Opts into release identity. Requires scratch-owned, regular, non-symlink `source-allowed-signers` and `source-revoked-signers` files directly in the validated scratch directory. Validates the SSH-signed annotated tag against both public files before submitting the service, then revalidates it before the sole build. |
 | `status` | Read-only, path-free `systemctl show` state plus allowlisted progress and terminal status. Exit zero requires terminal `success` and an absent or cleanly inactive unit; a gone unit without success is failure, never permission for handoff or another build. |
 | `stop` | Uses `systemctl stop` for that exact unit, with systemd control-group termination and a 180-second stop deadline. The worker handles SIGTERM by stopping independently label-checked run containers before recording failure. Stop never fabricates terminal evidence; abort removes leftovers if the worker cannot finish. |
 | `cleanup` | Requires terminal success and the Mac verification acknowledgment before any Docker query or removal. |
 | `abort` | Requires the preflight baseline and an inactive, failed or absent unit, including failed submission or abrupt worker death without terminal evidence. Never needs or creates a Mac acknowledgment, never prunes cache, and preserves scratch, evidence and key. |
 | `retire` | Explicitly deletes only the validated private scratch directory after a valid cleanup or abort record. Preserve that record and required evidence on the Mac first; abort itself does not authorize retirement. |
+
+Without `--tag`, candidate argv, environment, phases, stage IDs, progress/status vocabulary, records, deadlines and cleanup remain unchanged.
+Release mode is approved only for the one-time fork OMP native witness under fleet-migration Amendment A2 (2026-10-16), after independent tool review and separate approval of the exact run batch.
+This exception does not approve another release build on that host, signing a source tag with an operator key, enabling immutable releases, or publishing anything.
+The helpers consume an already signed tag; they neither create tags nor publish.
+
+The private runner must bundle the release branch and exactly the chosen `refs/tags/$SOURCE_TAG`, transfer the two explicitly enrolled public signer files, and check that the annotated tag directly names the fixed application commit and that the application is an ancestor of the reviewed recipe commit.
+Both signer files are mandatory in this route: supply an explicitly empty revocation file when no signer is revoked, rather than silently omitting revocation policy.
+They stay outside the repository, immutable source export, Docker build context, containers and public assets.
+The runtime helper accepts `--tag`, `--allowed-signers` and `--revoked-signers` for that same release preparation path, and reuses the receipt module's tag validation.
+There is still one no-RUN workspace export and one resource-bounded preparation container, not a separate release build.
+The prepared image and three public assets share `SOURCE_COMMIT`, `SOURCE_TAG`, validated `SOURCE_TAG_OBJECT`, `RECIPE_COMMITTED=1` and `RECIPE_COMMIT`.
+The exported manifest must name that same tag object before the runtime snapshot is committed.
+
+Release assets use `dist/witness-release`; the historical `verify-candidate` phase name still means pre-qualification receipt verification, not candidate identity.
+Qualification adds `--recipe-commit`, producing a signed attestation with `mode=release` and the exact recipe binding.
+Final verification, including the Mac-side check, adds `--tag "$SOURCE_TAG" --recipe-commit "$RECIPE_COMMIT" --release` and the explicit qualification attestation/signers.
+No progress/status allowlist change is needed: release preparation reuses `Phase: prepared runtime complete.` instead of the candidate-only export summary.
+Release mode preserves every lifecycle phase, stage allowlist, JSON record shape, deadline and cleanup boundary described below.
 
 Systemd is the sole lifecycle owner: Type=exec, Restart=no, KillMode=control-group, TimeoutStopSec=180s, RuntimeMaxSec=9h and UMask=0077.
 No detached session, PID file, process-group identity or job-request record is used.
