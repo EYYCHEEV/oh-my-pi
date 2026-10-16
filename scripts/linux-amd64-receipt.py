@@ -15,7 +15,7 @@ import tarfile
 import tempfile
 
 REPOSITORY = "EYYCHEEV/oh-my-pi"
-APPLICATION_COMMIT = "dd8d9785aa36b5b072817a089177030b1b3519df"
+APPLICATION_COMMIT = "5e43891a87140fb0972c982f3027f0228c4f6378"
 ASSETS = ("omp-linux-amd64", "RELEASE_MANIFEST.json", "SHA256SUMS.txt")
 RECIPES = ("build-linux-amd64.sh", "linux-amd64.Dockerfile", "linux-amd64-receipt.py",
            "qualify-linux-amd64.sh", "linux-amd64-qualify.py", "linux-amd64-smoke.sh",

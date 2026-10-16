@@ -24,7 +24,7 @@ This route neither modifies the legacy updater nor repairs old releases.
 
 ## Exact application and independent recipe
 
-The application pin remains `dd8d9785aa36b5b072817a089177030b1b3519df`, version `18.8.0`.
+The application pin is `5e43891a87140fb0972c982f3027f0228c4f6378`, version `18.8.0`.
 It does not contain the new release tools.
 `--recipe-commit` therefore binds a separate reviewed full Git commit containing the release route.
 The builder exports application bytes only from `--commit` and recipe bytes only from `--recipe-commit`.
@@ -79,7 +79,7 @@ Only known phase names are printed, never raw build logs.
 After the applicable build approval, choose a fresh output name and approved local transport inputs:
 
 ```sh
-SOURCE_COMMIT=dd8d9785aa36b5b072817a089177030b1b3519df
+SOURCE_COMMIT=5e43891a87140fb0972c982f3027f0228c4f6378
 : "${BUILD_DOCKER_SOCKET:?bind the approved local Unix socket}"
 : "${QUALIFY_DOCKER_SOCKET:?bind the approved native-amd64 local Unix socket}"
 : "${QUALIFICATION_IMAGE:?bind the approved already-present image by digest}"
@@ -168,7 +168,7 @@ The downloaded immutable parent base is not relabeled or deleted.
 
 ```sh
 python3 scripts/linux-amd64-runtime.py \
-  --commit dd8d9785aa36b5b072817a089177030b1b3519df \
+  --commit 5e43891a87140fb0972c982f3027f0228c4f6378 \
   --recipe-commit "$RECIPE_COMMIT" \
   --docker-socket unix:///var/run/docker.sock \
   --witness-run-id "$RUN_ID" --output witness-candidate \

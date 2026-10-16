@@ -20,7 +20,7 @@ QUALIFY_SPEC = importlib.util.spec_from_file_location("publish_qualifier", Path(
 qualifier = importlib.util.module_from_spec(QUALIFY_SPEC)
 QUALIFY_SPEC.loader.exec_module(qualifier)
 VERIFY_RECEIPT = publisher.receipt.verify
-COMMIT = "dd8d9785aa36b5b072817a089177030b1b3519df"
+COMMIT = "5e43891a87140fb0972c982f3027f0228c4f6378"
 RECIPE = "a" * 40
 TAG_OBJECT = "b" * 40
 TAG = "stronk-omp-s1-2026.10.16.0001"
