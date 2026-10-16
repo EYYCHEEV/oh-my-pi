@@ -13,10 +13,11 @@ import tempfile
 import unittest
 
 
-REPORT = (Path(__file__).resolve().parents[1] / "docs/exec-plans/active/"
-          "s1-fleet-migration/artifacts/w14-s1-witness-prep/W14-REPORT.md")
+REPORT = Path(os.environ["OMP_WITNESS_REPORT"]) if os.environ.get("OMP_WITNESS_REPORT") else None
 BEGIN = "# BEGIN MAC OUTPUT WRAPPERS\n"
 END = "# END MAC OUTPUT WRAPPERS"
+TRANSPORT_BEGIN = "# BEGIN MAC TRANSPORT WRAPPERS\n"
+TRANSPORT_END = "# END MAC TRANSPORT WRAPPERS"
 # This is the exact report block, not an alternate implementation of the seam.
 MAC_OUTPUT_WRAPPERS = r'''mac_quiet() {
   local result
@@ -47,6 +48,15 @@ mac_signer_bytes() {
     cat "$1"
 }
 '''
+MAC_TRANSPORT_WRAPPERS = r'''witness_ssh() {
+  local -a options=(-o BatchMode=yes -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o LogLevel=QUIET)
+  ssh "${options[@]}" "$@"
+}
+witness_scp() {
+  local -a options=(-o BatchMode=yes -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o LogLevel=QUIET)
+  scp -q "${options[@]}" "$@"
+}
+'''
 FAILURE = b"Local step failed.\n"
 
 
@@ -65,7 +75,7 @@ class MacBatchOutputTests(unittest.TestCase):
         self.home.mkdir()
 
     def shell(self, command, *arguments):
-        script = "set -euo pipefail\nset -C\numask 077\n" + MAC_OUTPUT_WRAPPERS + command
+        script = "set -euo pipefail\nset -C\numask 077\n" + MAC_OUTPUT_WRAPPERS + MAC_TRANSPORT_WRAPPERS + command
         return subprocess.run(
             [self.bash, "--noprofile", "--norc", "-c", script, "fixture", *map(str, arguments)],
             cwd=self.root,
@@ -83,13 +93,78 @@ class MacBatchOutputTests(unittest.TestCase):
         self.assertNotIn(b"synthetic-home", result.stdout + result.stderr)
 
     def test_exact_private_report_wrappers_when_report_is_available(self):
-        if not REPORT.exists():
+        if REPORT is None or not REPORT.exists():
             self.skipTest("Private report is not distributed with the public fixtures")
         report = REPORT.read_text()
         self.assertEqual(report.count(BEGIN), 1)
         self.assertEqual(report.count(END), 1)
         wrappers = report.split(BEGIN, 1)[1].split(END, 1)[0]
         self.assertEqual(wrappers, MAC_OUTPUT_WRAPPERS)
+        self.assertEqual(report.count(TRANSPORT_BEGIN), 1)
+        self.assertEqual(report.count(TRANSPORT_END), 1)
+        transport = report.split(TRANSPORT_BEGIN, 1)[1].split(TRANSPORT_END, 1)[0]
+        self.assertEqual(transport, MAC_TRANSPORT_WRAPPERS)
+
+    def test_fresh_recovery_shell_owns_all_transport_options(self):
+        command = r'''ssh() {
+  [[ $# == 10 && $1 == -o && $2 == BatchMode=yes &&
+     $3 == -o && $4 == StrictHostKeyChecking=yes &&
+     $5 == -o && $6 == UpdateHostKeys=no &&
+     $7 == -o && $8 == LogLevel=QUIET &&
+     $9 == fixture-alias && ${10} == fixture-command ]]
+}
+scp() {
+  [[ $# == 11 && $1 == -q && $2 == -o && $3 == BatchMode=yes &&
+     $4 == -o && $5 == StrictHostKeyChecking=yes &&
+     $6 == -o && $7 == UpdateHostKeys=no &&
+     $8 == -o && $9 == LogLevel=QUIET &&
+     ${10} == fixture-source && ${11} == fixture-destination ]]
+}
+unset SSH_OPTIONS
+mac_quiet witness_ssh fixture-alias fixture-command
+mac_quiet witness_scp fixture-source fixture-destination
+SSH_OPTIONS=(-o StrictHostKeyChecking=no)
+mac_quiet witness_ssh fixture-alias fixture-command
+mac_quiet witness_scp fixture-source fixture-destination
+'''
+        result = self.shell(command)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout + result.stderr, b"")
+
+    def test_exact_report_status_accepts_unit_fields_but_never_promotes_transport_success(self):
+        if REPORT is None or not REPORT.exists():
+            self.skipTest("Private report is not distributed with the public fixtures")
+        report = REPORT.read_text()
+        function = "witness_status() {\n" + report.split("witness_status() {\n", 1)[1].split("\nwitness_stop()", 1)[0]
+        cases = [
+            ("Witness unit absent.\nWitness terminal: success; exit code 0.", 0, 0),
+            ("Witness unit: ActiveState=active; SubState=running; Result=success; ExecMainStatus=0.\n"
+             "Witness job running.", 2, 2),
+            ("Witness unit: ActiveState=failed; SubState=failed; Result=exit-code; ExecMainStatus=17.\n"
+             "Witness terminal: failed:prepare; exit code 17.", 1, 1),
+            ("Witness unit absent.\nWitness failed: terminal result unavailable; preserve scratch.", 1, 1),
+            ("Witness unit absent.", 0, 2),
+        ]
+        for output, remote_code, expected in cases:
+            with self.subTest(remote_code=remote_code, expected=expected):
+                command = function + r'''
+witness_command() {
+  printf '%s\n' "$FIXTURE_OUTPUT"
+  return "$FIXTURE_CODE"
+}
+FIXTURE_OUTPUT=$1
+FIXTURE_CODE=$2
+result=0
+witness_status || result=$?
+exit "$result"
+'''
+                result = self.shell(command, output, remote_code)
+                self.assertEqual(result.returncode, expected)
+                self.assertEqual(result.stdout.decode(), output + "\n")
+                if expected:
+                    self.assertEqual(result.stderr, b"Witness status is not successful; do not advance or rebuild.\n")
+                else:
+                    self.assertEqual(result.stderr, b"")
 
     def test_existing_private_directory_fails_without_disclosing_its_path(self):
         existing = self.home / "private-already-exists"

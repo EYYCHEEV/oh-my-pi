@@ -183,18 +183,24 @@ With the standard `--scratch`, `--run-id` and explicit local `--docker-socket` i
 
 | Command | Contract |
 | --- | --- |
-| `start --recipe-commit "$RECIPE_COMMIT"` | Reserves one launch, invokes `setsid` through Python's `start_new_session`, and detaches the entire prepare, candidate-verify, qualify and signed-verify chain. Stdin, raw stdout and raw stderr go to `/dev/null`, never journald or a raw log. |
-| `status` | Read-only, path-free allowlisted progress and terminal status. Exit zero means only terminal `success`; running, missing or failed terminal evidence never authorizes artifact handoff or another build. |
-| `stop` | Checks the saved PID, process group, session and process start time, sends SIGTERM to that group and waits for its terminal record. The worker stops independently label-checked run containers before recording controlled failure. A dead driver without a terminal result can be marked stopped only after its group is absent and its owned containers have been stopped. |
+| `start --recipe-commit "$RECIPE_COMMIT"` | Submits the whole prepare, candidate-verify, qualify and signed-verify chain as the transient system service `omp-witness-<run-id>.service`. Refuses any existing unit of that name; systemd also rejects a concurrent name collision. The scratch working directory, fixed `env -i` environment and null stdin/stdout/stderr exclude SSH streams, journald output and raw logs. |
+| `status` | Read-only, path-free `systemctl show` state plus allowlisted progress and terminal status. Exit zero requires terminal `success` and an absent or cleanly inactive unit; a gone unit without success is failure, never permission for handoff or another build. |
+| `stop` | Uses `systemctl stop` for that exact unit, with systemd control-group termination and a 180-second stop deadline. The worker handles SIGTERM by stopping independently label-checked run containers before recording failure. Stop never fabricates terminal evidence; abort removes leftovers if the worker cannot finish. |
 | `cleanup` | Requires terminal success and the Mac verification acknowledgment before any Docker query or removal. |
-| `abort` | Requires the preflight baseline and a terminal/stopped job, or no job launch at all. Never needs or creates a Mac acknowledgment, never prunes cache, and preserves scratch, evidence and key. |
+| `abort` | Requires the preflight baseline and an inactive, failed or absent unit, including failed submission or abrupt worker death without terminal evidence. Never needs or creates a Mac acknowledgment, never prunes cache, and preserves scratch, evidence and key. |
 | `retire` | Explicitly deletes only the validated private scratch directory after a valid cleanup or abort record. Preserve that record and required evidence on the Mac first; abort itself does not authorize retirement. |
 
-Fixed private scratch files are `job-request.json`, `job.json` (PID/process-group/start-time identity), `job-progress` (allowlisted lines only), and `job-terminal.json`.
-The terminal record is exactly one `success` with exit code zero, or `failed:<phase>` with a nonzero exit code.
-Only the detached supervisor writes it, except explicit `stop` may record `failed:stop` for an already dead, fully stopped job.
+Systemd is the sole lifecycle owner: Type=exec, Restart=no, KillMode=control-group, TimeoutStopSec=180s, RuntimeMaxSec=9h and UMask=0077.
+No detached session, PID file, process-group identity or job-request record is used.
+Fixed private scratch records are immutable allowlisted milestones under `job-progress/` and `job-terminal.json`.
+The terminal record is exactly one `success` with exit code zero, or `failed:<phase>` with a nonzero exit code; only the job itself writes it as its last lifecycle step.
+Every helper JSON record is written to a private temporary file, flushed and fsynced, then published atomically by a no-overwrite hard link and directory fsync.
+Pollers therefore never see an incomplete final record.
+Status selects only LoadState, ActiveState, SubState, Result and ExecMainStatus, validates the fields and prints no paths.
+Successful transient units unload normally; cleanup/abort reset only the exact failed unit with `systemctl reset-failed` and confirm that no unit remains.
+No unit is enabled, persisted or written by the helper.
 Existing workspace-export, four-hour preparation, snapshot and qualification deadlines and container resource limits remain intact.
-Additional supervisor ceilings bound each child phase, and their expiry terminates the owned job group.
+GNU timeout enforces the additional 21600/900/5400/900-second child ceilings without Python process/group signaling.
 An SSH drop changes none of this state: reconnect and poll `status`, never restart the build.
 
 Both cleanup branches recheck every container/image label and preserve the initial image inventory.
@@ -206,6 +212,7 @@ Use an exclusive Docker maintenance window for this batch because shared default
 The helpers never contact a remote machine, provision a builder, change daemon settings/networks, create tags, publish, or install Bun/Node on the host.
 The private operator batch owns bundle transfer, dedicated one-time key generation outside containers, public-key return, local attestation verification and separate scratch retirement.
 Mac-side path-bearing commands discard both streams and preserve exit status, including shell redirection errors; comparisons use `cmp -s`, and only fixed path-free messages escape.
+The SSH/SCP functions own their fixed noninteractive authentication, strict host-key, disabled host-key-update and quiet options, including in a fresh recovery shell.
 Any failed phase stops the success path; use the explicit approved abort branch to recover without changing inputs, fabricating verification, rebuilding or working around a download failure.
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scratch-owned witness lifecycle, safe inventory and narrowly scoped cleanup."""
+"""Systemd-owned witness lifecycle, safe inventory and narrowly scoped cleanup."""
 import argparse
 import grp
 import importlib.util
@@ -11,7 +11,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 
 SPEC = importlib.util.spec_from_file_location("receipt", Path(__file__).with_name("linux-amd64-receipt.py"))
@@ -22,8 +21,13 @@ LABEL = "org.stronk.omp-witness"
 MIN_FREE = 884 * 10**9
 MIN_DOCKER_FREE = 200 * 1024**3
 JOB_PHASES = ("launch", "prepare", "verify-candidate", "qualify", "verify", "stop")
+CONTROL_ENV = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+               "LANG": "C", "LC_ALL": "C", "SYSTEMD_COLORS": "0"}
+UNIT_FIELDS = ("LoadState", "ActiveState", "SubState", "Result", "ExecMainStatus")
+UNIT_RESULTS = ("success", "resources", "timeout", "exit-code", "signal", "core-dump",
+                "watchdog", "start-limit-hit", "oom-kill", "exec-condition", "protocol")
 PROGRESS = (
-    "Phase: prepare.", "Phase: verify-candidate.", "Phase: qualify.", "Phase: verify.",
+    "Phase: prepare.",
     "Phase: exporting a no-RUN workspace to the local daemon.",
     "Phase: preparing runtime under hard CPU and memory limits.",
     "Phase: installing pinned build tools.",
@@ -34,6 +38,7 @@ PROGRESS = (
     "Phase: validating prepared runtime contract.",
     "Phase: prepared runtime complete.",
     "Phase: unqualified candidate assets and prepared local image exported.",
+    "Phase: verify-candidate.", "Phase: qualify.", "Phase: verify.",
 )
 INFO = ('{"architecture":"{{.Architecture}}","os":"{{.OSType}}",'
         '"version":"{{.ServerVersion}}","driver":"{{.Driver}}",'
@@ -93,9 +98,21 @@ def scratch_path(path, run_id):
 
 
 def write_new(path, value):
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(descriptor, "wb") as stream:
-        stream.write(receipt.canonical_json(value))
+    # Publish only fully written, durable bytes. link() refuses an existing name.
+    descriptor, temporary = tempfile.mkstemp(prefix=".record-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(receipt.canonical_json(value))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, path, follow_symlinks=False)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        os.unlink(temporary)
 
 
 def preflight(docker, scratch, run_id):
@@ -135,30 +152,60 @@ def baseline(scratch, run_id):
     return before
 
 
-def process_identity(pid):
-    try:
-        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
-    except FileNotFoundError:
+def unit_name(run_id):
+    receipt.witness_label(run_id)
+    require(bool(run_id), "A witness run identifier is required")
+    return "omp-witness-" + run_id + ".service"
+
+
+def unit_state(run_id):
+    command = ["systemctl", "--system", "show", "--no-pager"]
+    command += ["--property=" + field for field in UNIT_FIELDS]
+    result = subprocess.run(command + ["--", unit_name(run_id)], env=CONTROL_ENV,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, timeout=60, check=False)
+    fields = {}
+    for line in result.stdout.decode().splitlines():
+        key, separator, value = line.partition("=")
+        require(separator and key in UNIT_FIELDS and key not in fields, "Invalid unit state")
+        fields[key] = value
+    if fields.get("LoadState") == "not-found":
+        require(result.returncode in (0, 4) and fields.get("ActiveState") == "inactive" and
+                fields.get("SubState") == "dead", "Unit absence cannot be established")
         return None
-    return {"state": fields[0], "pgid": int(fields[2]), "session": int(fields[3]), "start_ticks": int(fields[19])}
+    require(result.returncode == 0 and set(fields) == set(UNIT_FIELDS) and fields["LoadState"] == "loaded" and
+            fields["ActiveState"] in ("inactive", "activating", "active", "deactivating", "failed", "reloading") and
+            receipt.match(r"[a-z][a-z-]{0,47}", fields["SubState"]) and fields["Result"] in UNIT_RESULTS and
+            fields["ExecMainStatus"].isdigit() and 0 <= int(fields["ExecMainStatus"]) <= 255, "Invalid unit state")
+    return fields
 
 
-def job_record(scratch, run_id):
-    record = receipt.strict_json((scratch / "job.json").read_bytes())
-    require(set(record) == {"schema", "run_id", "pid", "pgid", "start_ticks"} and
-            record["schema"] == 1 and record["run_id"] == run_id and
-            all(type(record[key]) is int and record[key] > 1 for key in ("pid", "pgid", "start_ticks")) and
-            record["pid"] == record["pgid"], "Invalid job identity")
-    return record
+def unit_control(action, run_id):
+    subprocess.run(["systemctl", "--system", action, "--", unit_name(run_id)], env=CONTROL_ENV,
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   timeout=240, check=True)
 
 
-def job_alive(record):
-    current = process_identity(record["pid"])
-    if current is None or current["state"] == "Z":
-        return False
-    require(current["start_ticks"] == record["start_ticks"] and
-            current["pgid"] == current["session"] == record["pgid"], "Job process identity differs")
-    return True
+def inactive(state):
+    return state is None or state["ActiveState"] in ("inactive", "failed")
+
+
+def successful_unit(state):
+    return state is None or (state["ActiveState"] == "inactive" and
+                             state["Result"] == "success" and state["ExecMainStatus"] == "0")
+
+
+def clear_unit(run_id, *, success=False):
+    state = unit_state(run_id)
+    require(inactive(state), "Witness unit is still active")
+    require(not success or successful_unit(state), "Witness unit did not exit successfully")
+    if state is not None and state["ActiveState"] == "failed":
+        unit_control("reset-failed", run_id)
+    deadline = time.monotonic() + 10
+    while state is not None:
+        require(time.monotonic() < deadline, "Witness unit has not unloaded; preserve scratch")
+        time.sleep(0.1)
+        state = unit_state(run_id)
 
 
 def terminal(scratch, run_id):
@@ -176,47 +223,49 @@ def terminal(scratch, run_id):
 
 
 def quiescent(scratch, run_id):
-    result = terminal(scratch, run_id)
-    if (scratch / "job.json").exists():
-        require(not job_alive(job_record(scratch, run_id)), "Witness job is still active")
-    require(result is not None or not any((scratch / name).exists() for name in ("job-request.json", "job.json")),
-            "Witness job has no terminal result; preserve scratch")
-    return result
+    require(inactive(unit_state(run_id)), "Witness unit is still active")
+    return terminal(scratch, run_id)
 
 
 def progress(scratch, text):
     require(text in PROGRESS, "Invalid progress")
-    descriptor = os.open(scratch / "job-progress", os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(descriptor, "a") as stream:
-        stream.write(text + "\n")
+    directory = scratch / "job-progress"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    require(directory.is_dir() and not directory.is_symlink(), "Invalid progress directory")
+    path = directory / f"{PROGRESS.index(text):02d}.json"
+    value = {"line": text}
+    if path.exists():
+        require(receipt.strict_json(path.read_bytes()) == value, "Invalid progress record")
+    else:
+        write_new(path, value)
 
 
 def start(scratch, run_id, recipe_commit):
     baseline(scratch, run_id)
     require(receipt.match(receipt.OID, recipe_commit), "A reviewed recipe commit is required")
+    require(unit_state(run_id) is None, "Witness unit already exists")
     require(not any((scratch / name).exists() for name in
-                    ("job.json", "job-progress", "job-terminal.json", "abort.json", "cleanup.json")),
+                    ("job-progress", "job-terminal.json", "abort.json", "cleanup.json")),
             "Witness job state already exists")
     repo = scratch / "repo"
     require(query([], "git", "-C", str(repo), "rev-parse", "HEAD") == recipe_commit, "Recipe checkout differs")
     for name in ("linux-amd64-witness.py", "linux-amd64-receipt.py"):
         require((scratch / name).read_bytes() == (repo / "scripts" / name).read_bytes(), "Scratch helper differs")
-    write_new(scratch / "job-request.json", {"schema": 1, "run_id": run_id, "recipe_commit": recipe_commit})
-    environment = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                   "HOME": str(scratch), "TMPDIR": str(scratch / "tmp"), "LANG": "C", "LC_ALL": "C",
-                   "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "PYTHONDONTWRITEBYTECODE": "1"}
-    try:
-        # start_new_session invokes setsid. No SSH stream or journald log is inherited.
-        subprocess.Popen([sys.executable, str(scratch / "linux-amd64-witness.py"), "worker",
-                          "--scratch", str(scratch), "--run-id", run_id,
-                          "--docker-socket", "unix:///var/run/docker.sock"],
-                         cwd=scratch, env=environment, stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    except OSError:
-        write_new(scratch / "job-terminal.json",
-                  {"schema": 1, "run_id": run_id, "status": "failed:launch", "exit_code": 1})
-        raise
-    print("Witness job launched. Poll status; never restart after a disconnect.")
+    environment = dict(CONTROL_ENV, HOME=str(scratch), TMPDIR=str(scratch / "tmp"),
+                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null", PYTHONDONTWRITEBYTECODE="1")
+    command = ["systemd-run", "--system", "--quiet", "--unit=" + unit_name(run_id), "--service-type=exec"]
+    command += ["--property=" + value for value in (
+        "WorkingDirectory=" + str(scratch), "StandardInput=null", "StandardOutput=null", "StandardError=null",
+        "KillMode=control-group", "TimeoutStopSec=180s", "SendSIGKILL=yes", "Restart=no", "UMask=0077",
+        "RuntimeMaxSec=9h")]
+    # env -i excludes manager and transport environment, not just the client's.
+    command += ["--", "/usr/bin/env", "-i"] + [key + "=" + value for key, value in environment.items()]
+    command += [sys.executable, str(scratch / "linux-amd64-witness.py"), "worker", "--scratch", str(scratch),
+                "--run-id", run_id, "--docker-socket", "unix:///var/run/docker.sock",
+                "--recipe-commit", recipe_commit]
+    subprocess.run(command, cwd=scratch, env=CONTROL_ENV, stdin=subprocess.DEVNULL,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=True)
+    print("Witness unit submitted. Poll status; never restart after a disconnect.")
 
 
 def stop_containers(docker, run_id):
@@ -228,39 +277,19 @@ def stop_containers(docker, run_id):
         query(docker, "container", "stop", "--time=30", container)
 
 
-def run_phase(command, repo, scratch, cancelled, seconds):
-    def expire():
-        cancelled["code"] = 124
-        os.killpg(os.getpgrp(), signal.SIGTERM)
-
-    timer = threading.Timer(seconds, expire)
-    timer.daemon = True
+def run_phase(command, repo, scratch, seconds):
+    # GNU timeout owns each child deadline; systemd owns cancellation of the unit.
+    command = ["timeout", "--signal=TERM", "--kill-after=30s", str(seconds) + "s"] + command
     with subprocess.Popen(command, cwd=repo, stdin=subprocess.DEVNULL,
                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
-        timer.start()
-        try:
-            if cancelled["code"]:
-                process.terminate()
-            for line in iter(lambda: process.stdout.readline(65536), b""):
-                text = line.decode("utf-8", errors="replace").strip()
-                if text in PROGRESS:
-                    progress(scratch, text)
-            return process.wait()
-        finally:
-            timer.cancel()
-            if process.poll() is None:
-                process.kill()
-                process.wait()
+        for line in iter(lambda: process.stdout.readline(65536), b""):
+            text = line.decode("utf-8", errors="replace").strip()
+            if text in PROGRESS:
+                progress(scratch, text)
+        return process.wait()
 
 
-def worker(docker, scratch, run_id):
-    baseline(scratch, run_id)
-    request = receipt.strict_json((scratch / "job-request.json").read_bytes())
-    require(request["schema"] == 1 and request["run_id"] == run_id and
-            receipt.match(receipt.OID, request["recipe_commit"]), "Invalid job request")
-    pid = os.getpid()
-    identity = process_identity(pid)
-    require(identity is not None and identity["pgid"] == identity["session"] == pid, "Job must own a new session")
+def worker(docker, scratch, run_id, recipe_commit):
     cancelled = {"code": 0}
 
     def terminate(_signal, _frame):
@@ -270,88 +299,85 @@ def worker(docker, scratch, run_id):
     previous = signal.signal(signal.SIGTERM, terminate)
     phase, code = "launch", 1
     try:
-        write_new(scratch / "job.json", {"schema": 1, "run_id": run_id, "pid": pid,
-                                        "pgid": pid, "start_ticks": identity["start_ticks"]})
-        repo, evidence = scratch / "repo", scratch / "evidence"
-        python = sys.executable
-        source = receipt.APPLICATION_COMMIT
-        assets = "dist/witness-candidate"
-        common_verify = [python, "scripts/linux-amd64-receipt.py", "verify", assets, "--commit", source]
-        prepare = [python, "scripts/linux-amd64-runtime.py", "--commit", source,
-                   "--recipe-commit", request["recipe_commit"], "--docker-socket", "unix:///var/run/docker.sock",
-                   "--witness-run-id", run_id, "--output", "witness-candidate",
-                   "--image-id-file", str(evidence / "runtime-image-id")]
-        for phase, command, seconds in (("prepare", prepare, 21600), ("verify-candidate", common_verify, 900),
-                                        ("qualify", None, 5400), ("verify", common_verify + [
-                                            "--attestation", str(evidence / "qualification.json"),
-                                            "--qualification-signers", str(evidence / "qualification-signers")], 900)):
-            if cancelled["code"]:
-                break
-            progress(scratch, "Phase: " + phase + ".")
-            if phase == "qualify":
-                image = (evidence / "runtime-image-id").read_text().strip()
-                require(receipt.match(receipt.DIGEST, image), "Invalid runtime image")
-                command = ["bash", "scripts/qualify-linux-amd64.sh", "--commit", source, "--assets", assets,
-                           "--docker-socket", "unix:///var/run/docker.sock", "--runtime-image", image,
-                           "--witness-run-id", run_id, "--attestation-key", str(evidence / "qualification-key"),
-                           "--attestation", str(evidence / "qualification.json")]
-            code = run_phase(command, repo, scratch, cancelled, seconds)
-            if code or cancelled["code"]:
-                break
-    except (ValueError, OSError, KeyError, IndexError, TypeError, subprocess.SubprocessError):
-        code = 1
-    finally:
-        code = cancelled["code"] or (128 - code if code < 0 else code)
-        if code:
+        with tempfile.TemporaryDirectory(prefix="docker-client-", dir=scratch) as config:
+            docker = docker + ["--config", config]
             try:
-                stop_containers(docker, run_id)
-            except (ValueError, OSError, subprocess.SubprocessError):
-                phase, code = "stop", 1
+                baseline(scratch, run_id)
+                require(receipt.match(receipt.OID, recipe_commit), "A reviewed recipe commit is required")
+                (scratch / "job-progress").mkdir(mode=0o700)
+                repo, evidence = scratch / "repo", scratch / "evidence"
+                python = sys.executable
+                source = receipt.APPLICATION_COMMIT
+                assets = "dist/witness-candidate"
+                common_verify = [python, "scripts/linux-amd64-receipt.py", "verify", assets, "--commit", source]
+                prepare = [python, "scripts/linux-amd64-runtime.py", "--commit", source,
+                           "--recipe-commit", recipe_commit, "--docker-socket", "unix:///var/run/docker.sock",
+                           "--witness-run-id", run_id, "--output", "witness-candidate",
+                           "--image-id-file", str(evidence / "runtime-image-id")]
+                for phase, command, seconds in (("prepare", prepare, 21600), ("verify-candidate", common_verify, 900),
+                                                ("qualify", None, 5400), ("verify", common_verify + [
+                                                    "--attestation", str(evidence / "qualification.json"),
+                                                    "--qualification-signers", str(evidence / "qualification-signers")], 900)):
+                    if cancelled["code"]:
+                        break
+                    progress(scratch, "Phase: " + phase + ".")
+                    if phase == "qualify":
+                        image = (evidence / "runtime-image-id").read_text().strip()
+                        require(receipt.match(receipt.DIGEST, image), "Invalid runtime image")
+                        command = ["bash", "scripts/qualify-linux-amd64.sh", "--commit", source, "--assets", assets,
+                                   "--docker-socket", "unix:///var/run/docker.sock", "--runtime-image", image,
+                                   "--witness-run-id", run_id, "--attestation-key", str(evidence / "qualification-key"),
+                                   "--attestation", str(evidence / "qualification.json")]
+                    code = run_phase(command, repo, scratch, seconds)
+                    if code or cancelled["code"]:
+                        break
+            except (ValueError, OSError, KeyError, IndexError, TypeError, subprocess.SubprocessError):
+                code = 1
+            finally:
+                code = cancelled["code"] or (128 - code if code < 0 else code)
+                if code:
+                    try:
+                        stop_containers(docker, run_id)
+                    except (ValueError, OSError, subprocess.SubprocessError):
+                        phase, code = "stop", 1
+    except (ValueError, OSError, KeyError, IndexError, TypeError, subprocess.SubprocessError):
+        code = cancelled["code"] or 1
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        # Client cleanup and owned-container stopping precede the last publication.
         write_new(scratch / "job-terminal.json", {"schema": 1, "run_id": run_id,
                   "status": "failed:" + phase if code else "success", "exit_code": min(code, 255)})
-        signal.signal(signal.SIGTERM, previous)
+    return min(code, 255)
 
 
 def status(scratch, run_id):
-    path = scratch / "job-progress"
-    if path.exists():
-        lines = path.read_text().splitlines()
-        require(all(line in PROGRESS for line in lines), "Invalid progress record")
-        for line in lines:
-            print(line)
+    state = unit_state(run_id)
+    if state is None:
+        print("Witness unit absent.")
+    else:
+        print("Witness unit: " + "; ".join(key + "=" + state[key] for key in UNIT_FIELDS[1:]) + ".")
+    for index, text in enumerate(PROGRESS):
+        path = scratch / "job-progress" / f"{index:02d}.json"
+        if path.exists():
+            require(receipt.strict_json(path.read_bytes()) == {"line": text}, "Invalid progress record")
+            print(text)
     result = terminal(scratch, run_id)
     if result is not None:
         print("Witness terminal: " + result["status"] + "; exit code " + str(result["exit_code"]) + ".")
-        return 0 if result["status"] == "success" else 1
-    if (scratch / "job.json").exists():
-        alive = job_alive(job_record(scratch, run_id))
-        print("Witness job running." if alive else "Witness terminal result unavailable; preserve scratch.")
-    else:
-        print("Witness job launch pending." if (scratch / "job-request.json").exists() else "Witness job not started.")
-    return 2
+        return 0 if result["status"] == "success" and successful_unit(state) else 1
+    if not inactive(state):
+        print("Witness job running.")
+        return 2
+    print("Witness failed: terminal result unavailable; preserve scratch.")
+    return 1
 
 
-def stop(docker, scratch, run_id):
+def stop(scratch, run_id):
     baseline(scratch, run_id)
-    record = job_record(scratch, run_id)
-    if job_alive(record) and terminal(scratch, run_id) is None:
-        os.killpg(record["pgid"], signal.SIGTERM)
-    deadline = time.monotonic() + 180
-    while job_alive(record):
-        require(time.monotonic() < deadline, "Job has not stopped; preserve scratch")
-        time.sleep(0.2)
-    if terminal(scratch, run_id) is None:
-        # A dead leader alone does not prove that its children have stopped.
-        try:
-            os.killpg(record["pgid"], 0)
-        except ProcessLookupError:
-            pass
-        else:
-            raise ValueError("Job group is still present; preserve scratch")
-        stop_containers(docker, run_id)
-        write_new(scratch / "job-terminal.json",
-                  {"schema": 1, "run_id": run_id, "status": "failed:stop", "exit_code": 143})
-    print("Witness job terminal. Inspect status before cleanup.")
+    if unit_state(run_id) is not None:
+        unit_control("stop", run_id)
+    require(inactive(unit_state(run_id)), "Witness unit has not stopped; preserve scratch")
+    print("Witness unit stopped or absent; inspect status before abort.")
 
 
 def cleanup(docker, scratch, run_id, *, abort=False):
@@ -361,6 +387,7 @@ def cleanup(docker, scratch, run_id, *, abort=False):
     if not abort:
         require(result is not None and result["status"] == "success", "Witness terminal success is required")
         require((scratch / "mac-verified").read_bytes() == b"verified\n", "Mac artifact verification is not acknowledged")
+    clear_unit(run_id, success=not abort)
     original = set(before["images"])
     # Never force image deletion. Every target gets an independent label and baseline check.
     container_ids = query(docker, "ps", "--all", "--quiet", "--no-trunc", "--filter", f"label={LABEL}={run_id}").splitlines()
@@ -414,6 +441,7 @@ def retire(scratch, run_id):
     else:
         require(result is not None and result["status"] == "success" and
                 (scratch / "mac-verified").read_bytes() == b"verified\n", "Successful handoff required")
+    clear_unit(run_id, success=not aborted)
     os.chdir("/")
     shutil.rmtree(scratch)
     print("Only the validated witness scratch directory removed; dedicated key retired.")
@@ -440,18 +468,19 @@ def main():
         if args.phase == "retire":
             retire(args.scratch, args.run_id)
             return 0
+        if args.phase == "stop":
+            stop(args.scratch, args.run_id)
+            return 0
         docker = receipt.validate_docker(args.docker_socket)
         if args.phase == "start":
             start(args.scratch, args.run_id, args.recipe_commit)
             return 0
+        if args.phase == "worker":
+            return worker(docker, args.scratch, args.run_id, args.recipe_commit)
         with tempfile.TemporaryDirectory(prefix="docker-client-", dir=args.scratch) as config:
             docker += ["--config", config]
             if args.phase == "preflight":
                 preflight(docker, args.scratch, args.run_id)
-            elif args.phase == "worker":
-                worker(docker, args.scratch, args.run_id)
-            elif args.phase == "stop":
-                stop(docker, args.scratch, args.run_id)
             else:
                 cleanup(docker, args.scratch, args.run_id, abort=args.phase == "abort")
         return 0

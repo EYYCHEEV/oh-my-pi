@@ -60,6 +60,43 @@ class InventoryTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 witness.write_new(path, {"schema": 2})
 
+    def test_record_is_complete_private_and_synced_before_atomic_publication(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "record.json"
+            link = os.link
+            with patch.object(os, "fsync", wraps=os.fsync) as fsync:
+                def publish(source, destination, **kwargs):
+                    self.assertFalse(path.exists())
+                    self.assertEqual(Path(source).read_bytes(), b'{"schema":1}\n')
+                    self.assertEqual(stat.S_IMODE(Path(source).stat().st_mode), 0o600)
+                    self.assertEqual(fsync.call_count, 1)
+                    link(source, destination, **kwargs)
+                with patch.object(os, "link", side_effect=publish):
+                    witness.write_new(path, {"schema": 1})
+                self.assertEqual(fsync.call_count, 2)
+            self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_interrupted_write_never_exposes_incomplete_record(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "record.json"
+            with patch.object(os, "fsync", side_effect=OSError("fixture write failure")):
+                with self.assertRaises(OSError):
+                    witness.write_new(path, {"schema": 1})
+            self.assertFalse(path.exists())
+            self.assertEqual(list(path.parent.iterdir()), [])
+
+    def test_atomic_publish_never_replaces_a_concurrent_winner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "record.json"
+            link = os.link
+            def publish(source, destination, **kwargs):
+                path.write_bytes(b'{"schema":2}\n')
+                link(source, destination, **kwargs)
+            with patch.object(os, "link", side_effect=publish), self.assertRaises(FileExistsError):
+                witness.write_new(path, {"schema": 1})
+            self.assertEqual(path.read_bytes(), b'{"schema":2}\n')
+            self.assertEqual(list(path.parent.iterdir()), [path])
+
     def test_memory_capacity_keeps_eight_gib_available_to_the_host(self):
         with patch.object(Path, "read_text", return_value="MemAvailable: 33554432 kB\n"):
             self.assertEqual(witness.available_memory(), 32 * 1024**3)
@@ -132,13 +169,6 @@ class InventoryTests(unittest.TestCase):
                                  for word in ("prune", "rm", "run", "build", "pull")))
             self.assertEqual(query.call_count, 6)
 
-    def test_process_identity_selects_only_group_session_and_start_time(self):
-        fields = ["S", "1", "321", "321"] + ["0"] * 15 + ["100"]
-        with patch.object(Path, "read_text", return_value="321 (fixture worker) " + " ".join(fields)):
-            self.assertEqual(witness.process_identity(321),
-                             {"state": "S", "pgid": 321, "session": 321, "start_ticks": 100})
-        with patch.object(Path, "read_text", side_effect=FileNotFoundError):
-            self.assertIsNone(witness.process_identity(321))
 
 
 class CleanupTests(unittest.TestCase):
@@ -179,14 +209,11 @@ class CleanupTests(unittest.TestCase):
                 witness.write_new(scratch / "job-terminal.json",
                                   {"schema": 1, "run_id": RUN, "status": terminal_status,
                                    "exit_code": 0 if terminal_status == "success" else 143})
-            if active:
-                witness.write_new(scratch / "job-request.json", {"schema": 1})
-                witness.write_new(scratch / "job.json",
-                                  {"schema": 1, "run_id": RUN, "pid": 321, "pgid": 321, "start_ticks": 100})
             if acknowledged:
                 (scratch / "mac-verified").write_bytes(b"verified\n")
             try:
-                with patch.object(witness, "job_alive", return_value=active):
+                state = {"ActiveState": "active"} if active else None
+                with patch.object(witness, "unit_state", return_value=state):
                     witness.cleanup(["docker"], scratch, RUN, abort=abort)
                 record = witness.receipt.strict_json((scratch / ("abort.json" if abort else "cleanup.json")).read_bytes())
                 self.assertEqual(record["cache_pruned"], empty and not abort)
@@ -268,10 +295,10 @@ class JobTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.query = self.stack.enter_context(patch.object(witness, "query", side_effect=AssertionError("unexpected query")))
         self.popen = self.stack.enter_context(patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected process")))
-        self.killpg = self.stack.enter_context(patch.object(os, "killpg", side_effect=AssertionError("unexpected signal")))
-        self.identity = self.stack.enter_context(patch.object(
-            witness, "process_identity", return_value={"state": "S", "pgid": 321, "session": 321, "start_ticks": 100}))
-        self.stack.enter_context(patch.object(os, "getpid", return_value=321))
+        self.run = self.stack.enter_context(patch.object(subprocess, "run", side_effect=self.systemd))
+        self.state = None
+        self.fail_start = False
+        self.race_start = False
         self.handler = None
 
         def register(sig, handler):
@@ -281,50 +308,114 @@ class JobTests(unittest.TestCase):
 
         self.stack.enter_context(patch.object(signal, "signal", side_effect=register))
 
-    def request(self):
-        witness.write_new(self.scratch / "job-request.json",
-                          {"schema": 1, "run_id": RUN, "recipe_commit": "a" * 40})
+    @staticmethod
+    def fields(active="active", sub="running", result="success", code="0"):
+        return {"LoadState": "loaded", "ActiveState": active, "SubState": sub,
+                "Result": result, "ExecMainStatus": code}
 
-    def record(self):
-        witness.write_new(self.scratch / "job.json",
-                          {"schema": 1, "run_id": RUN, "pid": 321, "pgid": 321, "start_ticks": 100})
+    def systemd(self, command, **kwargs):
+        self.assertEqual(kwargs["env"], witness.CONTROL_ENV)
+        for stream in ("stdin", "stderr"):
+            self.assertEqual(kwargs[stream], subprocess.DEVNULL)
+        if command[0] == "systemctl":
+            self.assertEqual(command[-2:], ["--", "omp-witness-fixture-run.service"])
+            if command[2] == "show":
+                self.assertEqual(set(command[4:-2]), {"--property=" + key for key in witness.UNIT_FIELDS})
+                fields = self.state or {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead"}
+                return SimpleNamespace(returncode=0 if self.state else 4,
+                                       stdout="".join(key + "=" + value + "\n" for key, value in fields.items()).encode())
+            self.assertEqual(kwargs["stdout"], subprocess.DEVNULL)
+            if command[2] == "stop":
+                self.state = self.fields("inactive", "dead")
+            elif command[2] == "reset-failed":
+                self.assertEqual(self.state["ActiveState"], "failed")
+                self.state = None
+            else:
+                raise AssertionError(command)
+        elif command[0] == "systemd-run":
+            self.assertEqual(kwargs["stdout"], subprocess.DEVNULL)
+            if self.fail_start or self.race_start:
+                if self.race_start:
+                    self.state = self.fields()
+                raise subprocess.CalledProcessError(1, command)
+            self.assertIsNone(self.state)
+            self.state = self.fields()
+        else:
+            raise AssertionError(command)
+        return SimpleNamespace(returncode=0)
 
     def result(self, status="success", code=0):
         witness.write_new(self.scratch / "job-terminal.json",
                           {"schema": 1, "run_id": RUN, "status": status, "exit_code": code})
 
-    def test_start_detaches_all_streams_and_never_allows_a_second_launch(self):
+    def milestones(self):
+        return [witness.receipt.strict_json(path.read_bytes())["line"]
+                for path in sorted((self.scratch / "job-progress").glob("*.json"))]
+
+    def test_start_refuses_existing_systemd_unit(self):
+        for active, sub in (("active", "running"), ("failed", "failed"), ("inactive", "dead")):
+            with self.subTest(active=active):
+                self.state = self.fields(active, sub)
+                with self.assertRaises(ValueError):
+                    witness.start(self.scratch, RUN, "a" * 40)
+        self.assertTrue(all(call.args[0][0] == "systemctl" for call in self.run.call_args_list))
+        self.popen.assert_not_called()
+        self.query.assert_not_called()
+
+    def test_start_uses_transient_service_null_streams_and_fixed_worker_environment(self):
         self.query.side_effect = None
         self.query.return_value = "a" * 40
-        self.popen.side_effect = None
         with contextlib.redirect_stdout(io.StringIO()):
             witness.start(self.scratch, RUN, "a" * 40)
-        self.assertTrue(self.popen.call_args.kwargs["start_new_session"])
-        for stream in ("stdin", "stdout", "stderr"):
-            self.assertEqual(self.popen.call_args.kwargs[stream], subprocess.DEVNULL)
-        self.assertEqual(self.popen.call_args.kwargs["cwd"], self.scratch)
-        self.assertIn("worker", self.popen.call_args.args[0])
-        self.assertNotIn("SSH_AUTH_SOCK", self.popen.call_args.kwargs["env"])
-        with self.assertRaises(FileExistsError):
-            witness.start(self.scratch, RUN, "a" * 40)
-        self.assertEqual(self.popen.call_count, 1)
-
-    def test_failed_launch_has_terminal_failure_and_still_forbids_restart(self):
-        self.query.side_effect = None
-        self.query.return_value = "a" * 40
-        self.popen.side_effect = OSError("synthetic path error")
-        with self.assertRaises(OSError):
-            witness.start(self.scratch, RUN, "a" * 40)
-        self.assertEqual(witness.terminal(self.scratch, RUN)["status"], "failed:launch")
+        command = self.run.call_args.args[0]
+        for option in ("--system", "--unit=omp-witness-fixture-run.service", "--service-type=exec",
+                       "--property=WorkingDirectory=" + str(self.scratch), "--property=StandardInput=null",
+                       "--property=StandardOutput=null", "--property=StandardError=null",
+                       "--property=KillMode=control-group", "--property=TimeoutStopSec=180s",
+                       "--property=RuntimeMaxSec=9h", "--property=Restart=no", "--property=UMask=0077"):
+            self.assertIn(option, command)
+        self.assertEqual(command[command.index("--") + 1:command.index("--") + 3], ["/usr/bin/env", "-i"])
+        self.assertIn("worker", command)
+        self.assertEqual(command[-2:], ["--recipe-commit", "a" * 40])
+        self.assertEqual(self.run.call_args.kwargs["cwd"], self.scratch)
+        self.assertNotIn("--collect", command)
+        self.assertNotIn("SSH_AUTH_SOCK", " ".join(command))
+        self.assertFalse((self.scratch / "job-request.json").exists())
+        self.assertFalse((self.scratch / "job.json").exists())
         with self.assertRaises(ValueError):
             witness.start(self.scratch, RUN, "a" * 40)
-        self.assertEqual(self.popen.call_count, 1)
+
+    def test_systemd_atomic_name_collision_never_adopts_or_stops_existing_unit(self):
+        self.query.side_effect = None
+        self.query.return_value = "a" * 40
+        self.race_start = True
+        with self.assertRaises(subprocess.CalledProcessError):
+            witness.start(self.scratch, RUN, "a" * 40)
+        self.assertIsNone(witness.terminal(self.scratch, RUN))
+        self.assertEqual(len([call for call in self.run.call_args_list if call.args[0][0] == "systemd-run"]), 1)
+        self.assertFalse(any(call.args[0][2] == "stop" for call in self.run.call_args_list))
+
+    def test_failed_start_leaves_no_reservation_and_abort_can_recover(self):
+        self.query.side_effect = None
+        self.query.return_value = "a" * 40
+        self.fail_start = True
+        with self.assertRaises(subprocess.CalledProcessError):
+            witness.start(self.scratch, RUN, "a" * 40)
+        self.assertIsNone(witness.terminal(self.scratch, RUN))
+        self.assertFalse((self.scratch / "job-request.json").exists())
+        self.query.side_effect = ["", "", ORIGINAL, "", witness.receipt.canonical_json(USAGE[0]).decode()]
+        with contextlib.redirect_stdout(io.StringIO()):
+            witness.cleanup(["docker"], self.scratch, RUN, abort=True)
+        self.assertTrue((self.scratch / "abort.json").is_file())
+        self.assertFalse((self.scratch / "mac-verified").exists())
+        self.assertFalse(any("prune" in call.args for call in self.query.call_args_list))
+        with self.assertRaises(ValueError):
+            witness.start(self.scratch, RUN, "a" * 40)
 
     def test_worker_runs_entire_chain_and_binds_exact_image_then_records_success(self):
-        self.request()
         calls = []
 
-        def run(command, repo, scratch, cancelled, seconds):
+        def run(command, repo, scratch, seconds):
             calls.append((command, seconds))
             self.assertEqual(repo, self.repo)
             if "--image-id-file" in command:
@@ -332,20 +423,18 @@ class JobTests(unittest.TestCase):
             return 0
 
         with patch.object(witness, "run_phase", side_effect=run), patch.object(witness, "stop_containers") as stop:
-            witness.worker(["docker"], self.scratch, RUN)
+            self.assertEqual(witness.worker(["docker"], self.scratch, RUN, "a" * 40), 0)
         self.assertEqual(len(calls), 4)
         self.assertEqual([seconds for _, seconds in calls], [21600, 900, 5400, 900])
         qualify = calls[2][0]
         self.assertEqual(qualify[qualify.index("--runtime-image") + 1], RUNTIME)
         self.assertIn("--qualification-signers", calls[3][0])
         self.assertEqual(witness.terminal(self.scratch, RUN)["status"], "success")
-        self.assertEqual((self.scratch / "job-progress").read_text().splitlines(),
+        self.assertEqual(self.milestones(),
                          ["Phase: prepare.", "Phase: verify-candidate.", "Phase: qualify.", "Phase: verify."])
         stop.assert_not_called()
 
-    def test_phase_failure_and_group_termination_stop_owned_containers_before_terminal(self):
-        self.request()
-
+    def test_sigterm_stops_owned_containers_before_terminal_failure(self):
         def terminate(*args):
             self.handler(signal.SIGTERM, None)
             return -15
@@ -355,103 +444,140 @@ class JobTests(unittest.TestCase):
 
         with patch.object(witness, "run_phase", side_effect=terminate) as run, \
              patch.object(witness, "stop_containers", side_effect=stopped) as stop:
-            witness.worker(["docker"], self.scratch, RUN)
+            self.assertEqual(witness.worker(["docker"], self.scratch, RUN, "a" * 40), 143)
         self.assertEqual(run.call_count, 1)
-        stop.assert_called_once_with(["docker"], RUN)
+        stop.assert_called_once()
+        self.assertEqual(stop.call_args.args[0][:2], ["docker", "--config"])
+        self.assertEqual(stop.call_args.args[1], RUN)
         self.assertEqual(witness.terminal(self.scratch, RUN)["status"], "failed:prepare")
         self.assertEqual(witness.terminal(self.scratch, RUN)["exit_code"], 143)
 
+    def test_phase_exception_stops_owned_containers_and_preserves_failure(self):
+        with patch.object(witness, "run_phase", side_effect=OSError("fixture failure")), \
+             patch.object(witness, "stop_containers") as stop:
+            self.assertEqual(witness.worker(["docker"], self.scratch, RUN, "a" * 40), 1)
+        stop.assert_called_once()
+        self.assertEqual(witness.terminal(self.scratch, RUN)["status"], "failed:prepare")
+        self.assertFalse(list(self.scratch.glob("docker-client-*")))
+
+    def test_terminal_is_published_after_private_docker_client_cleanup(self):
+        write_new = witness.write_new
+        def publish(path, value):
+            if path.name == "job-terminal.json":
+                self.assertFalse(list(self.scratch.glob("docker-client-*")))
+            write_new(path, value)
+        with patch.object(witness, "run_phase", return_value=17), patch.object(witness, "stop_containers"), \
+             patch.object(witness, "write_new", side_effect=publish):
+            self.assertEqual(witness.worker(["docker"], self.scratch, RUN, "a" * 40), 17)
+
     def test_phase_failure_never_runs_the_next_phase(self):
-        self.request()
         with patch.object(witness, "run_phase", return_value=17) as run, \
              patch.object(witness, "stop_containers") as stop:
-            witness.worker(["docker"], self.scratch, RUN)
+            self.assertEqual(witness.worker(["docker"], self.scratch, RUN, "a" * 40), 17)
         self.assertEqual(run.call_count, 1)
         stop.assert_called_once()
         self.assertEqual(witness.terminal(self.scratch, RUN)["exit_code"], 17)
 
-    def test_run_phase_discards_unknown_output_and_preserves_only_allowlist(self):
+    def test_run_phase_uses_gnu_deadline_and_only_publishes_allowlisted_progress(self):
         process = MagicMock()
         process.__enter__.return_value = process
         process.stdout = io.BytesIO(b"untrusted diagnostic\nPhase: installing pinned build tools.\n")
         process.wait.return_value = 0
-        process.poll.return_value = 0
         self.popen.side_effect = None
         self.popen.return_value = process
-        with patch.object(witness.threading, "Timer") as timer:
-            self.assertEqual(witness.run_phase(["fixture"], self.repo, self.scratch, {"code": 0}, 900), 0)
-        self.assertEqual((self.scratch / "job-progress").read_text(), "Phase: installing pinned build tools.\n")
+        self.assertEqual(witness.run_phase(["fixture"], self.repo, self.scratch, 900), 0)
+        self.assertEqual(self.milestones(), ["Phase: installing pinned build tools."])
         self.assertEqual(self.popen.call_args.kwargs["stderr"], subprocess.DEVNULL)
-        timer.return_value.start.assert_called_once()
-        timer.return_value.cancel.assert_called_once()
+        self.assertEqual(self.popen.call_args.args[0],
+                         ["timeout", "--signal=TERM", "--kill-after=30s", "900s", "fixture"])
 
-    def test_status_is_read_only_path_free_and_zero_only_for_success(self):
-        self.record()
+    def test_status_is_read_only_path_free_and_zero_only_for_stopped_success(self):
+        self.state = self.fields()
         witness.progress(self.scratch, "Phase: prepare.")
-        before = {p.name: p.read_bytes() for p in self.scratch.iterdir() if p.is_file()}
+        before = {p.relative_to(self.scratch): p.read_bytes() for p in self.scratch.rglob("*") if p.is_file()}
         with contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(witness.status(self.scratch, RUN), 2)
         self.assertIn("Witness job running.", output.getvalue())
+        self.assertIn("ActiveState=active; SubState=running; Result=success; ExecMainStatus=0", output.getvalue())
         self.assertNotIn(str(self.scratch), output.getvalue())
-        self.assertEqual(before, {p.name: p.read_bytes() for p in self.scratch.iterdir() if p.is_file()})
+        self.assertEqual(before, {p.relative_to(self.scratch): p.read_bytes()
+                                  for p in self.scratch.rglob("*") if p.is_file()})
         self.result()
-        with contextlib.redirect_stdout(io.StringIO()) as output:
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertNotEqual(witness.status(self.scratch, RUN), 0)
+            self.state = None
             self.assertEqual(witness.status(self.scratch, RUN), 0)
-        self.assertIn("Witness terminal: success; exit code 0.", output.getvalue())
+        self.assertTrue(all(call.args[0][2] == "show" for call in self.run.call_args_list))
         self.query.assert_not_called()
 
+    def test_terminal_success_never_overrides_systemd_failure_or_authorizes_success_cleanup(self):
+        self.result()
+        self.state = self.fields("failed", "failed", "signal", "15")
+        (self.scratch / "mac-verified").write_bytes(b"verified\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertNotEqual(witness.status(self.scratch, RUN), 0)
+        with self.assertRaises(ValueError):
+            witness.cleanup(["docker"], self.scratch, RUN)
+        self.query.assert_not_called()
+
+    def test_status_failed_unit_and_gone_without_terminal_are_failures(self):
+        for state in (None, self.fields("failed", "failed", "exit-code", "17")):
+            self.state = state
+            with self.subTest(state=state), contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(witness.status(self.scratch, RUN), 1)
+                self.assertIn("Witness failed: terminal result unavailable", output.getvalue())
+        self.result("failed:prepare", 17)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(witness.status(self.scratch, RUN), 1)
+        self.assertIn("Witness terminal: failed:prepare; exit code 17.", output.getvalue())
+
     def test_status_rejects_injected_progress_and_invalid_terminal_success(self):
-        (self.scratch / "job-progress").write_text("synthetic/private/path\n")
+        witness.progress(self.scratch, "Phase: prepare.")
+        path = self.scratch / "job-progress/00.json"
+        path.write_bytes(b'{"line":"synthetic/private/path"}\n')
         with self.assertRaises(ValueError):
             witness.status(self.scratch, RUN)
-        (self.scratch / "job-progress").unlink()
+        path.unlink()
         self.result(status="success", code=1)
         with self.assertRaises(ValueError):
             witness.status(self.scratch, RUN)
 
-    def test_stop_signals_only_verified_group_and_waits_for_terminal_evidence(self):
-        self.record()
-        self.identity.side_effect = [
-            {"state": "S", "pgid": 321, "session": 321, "start_ticks": 100}, None]
+    def test_systemctl_failure_or_invalid_state_never_looks_like_absent_unit(self):
+        for response in (SimpleNamespace(returncode=1, stdout=b""),
+                         SimpleNamespace(returncode=4, stdout=b"LoadState=not-found\n"),
+                         SimpleNamespace(returncode=0, stdout=b"untrusted/private/path\n")):
+            self.run.side_effect = None
+            self.run.return_value = response
+            with self.subTest(response=response), self.assertRaises(ValueError):
+                witness.status(self.scratch, RUN)
+        self.query.assert_not_called()
 
-        def kill(group, sig):
-            self.assertEqual((group, sig), (321, signal.SIGTERM))
-            self.result("failed:prepare", 143)
-
-        self.killpg.side_effect = kill
+    def test_stop_uses_exact_systemd_unit_and_does_not_fabricate_terminal(self):
+        self.state = self.fields()
         with contextlib.redirect_stdout(io.StringIO()):
-            witness.stop(["docker"], self.scratch, RUN)
-        self.killpg.assert_called_once_with(321, signal.SIGTERM)
-        self.query.assert_not_called()
-
-    def test_explicit_stop_recovers_dead_driver_only_after_group_disappears(self):
-        self.record()
-        self.identity.return_value = None
-        self.killpg.side_effect = ProcessLookupError
-        with patch.object(witness, "stop_containers") as stop, contextlib.redirect_stdout(io.StringIO()):
-            witness.stop(["docker"], self.scratch, RUN)
-        stop.assert_called_once_with(["docker"], RUN)
-        self.assertEqual(witness.terminal(self.scratch, RUN)["status"], "failed:stop")
-        self.killpg.assert_called_once_with(321, 0)
-
-    def test_dead_driver_with_live_group_does_not_authorize_cleanup(self):
-        self.record()
-        self.identity.return_value = None
-        self.killpg.side_effect = None
-        with patch.object(witness, "stop_containers") as stop, self.assertRaises(ValueError):
-            witness.stop(["docker"], self.scratch, RUN)
-        stop.assert_not_called()
+            witness.stop(self.scratch, RUN)
+        controls = [call.args[0] for call in self.run.call_args_list if call.args[0][2] != "show"]
+        self.assertEqual(controls, [["systemctl", "--system", "stop", "--", "omp-witness-fixture-run.service"]])
         self.assertIsNone(witness.terminal(self.scratch, RUN))
-
-    def test_reused_pid_never_receives_a_signal_or_authorizes_abort(self):
-        self.record()
-        self.identity.return_value = {"state": "S", "pgid": 321, "session": 321, "start_ticks": 101}
-        with self.assertRaises(ValueError):
-            witness.stop(["docker"], self.scratch, RUN)
-        with self.assertRaises(ValueError):
-            witness.cleanup(["docker"], self.scratch, RUN, abort=True)
-        self.killpg.assert_not_called()
         self.query.assert_not_called()
+
+    def test_stop_absent_unit_is_safe_and_preserves_existing_terminal(self):
+        self.result()
+        before = (self.scratch / "job-terminal.json").read_bytes()
+        with contextlib.redirect_stdout(io.StringIO()):
+            witness.stop(self.scratch, RUN)
+        self.assertEqual((self.scratch / "job-terminal.json").read_bytes(), before)
+        self.assertTrue(all(call.args[0][2] == "show" for call in self.run.call_args_list))
+
+    def test_failed_unit_is_reset_only_by_exact_name_before_abort_finishes(self):
+        self.state = self.fields("failed", "failed", "signal", "9")
+        self.query.side_effect = ["", "", ORIGINAL, "", witness.receipt.canonical_json(USAGE[0]).decode()]
+        with contextlib.redirect_stdout(io.StringIO()):
+            witness.cleanup(["docker"], self.scratch, RUN, abort=True)
+        self.assertIsNone(self.state)
+        controls = [call.args[0] for call in self.run.call_args_list if call.args[0][2] != "show"]
+        self.assertEqual(controls, [["systemctl", "--system", "reset-failed", "--", "omp-witness-fixture-run.service"]])
+        self.assertFalse((self.scratch / "job-terminal.json").exists())
 
     def test_stop_container_requires_independent_label_check(self):
         self.query.side_effect = [CONTAINER, "other-run"]
@@ -463,20 +589,34 @@ class JobTests(unittest.TestCase):
         witness.stop_containers(["docker"], RUN)
         self.assertEqual(self.query.call_args.args[1:], ("container", "stop", "--time=30", CONTAINER))
 
-    def test_abort_refuses_missing_terminal_result_or_wrong_baseline_before_docker(self):
-        self.request()
+    def test_abort_refuses_active_unit_or_wrong_baseline_before_docker(self):
+        self.state = self.fields()
         with self.assertRaises(ValueError):
             witness.cleanup(["docker"], self.scratch, RUN, abort=True)
         with self.assertRaises(ValueError):
             witness.cleanup(["docker"], self.scratch, "other-run", abort=True)
         self.query.assert_not_called()
 
-    def test_dead_job_identity_without_request_still_needs_explicit_stop(self):
-        self.record()
-        self.identity.return_value = None
-        with self.assertRaises(ValueError):
-            witness.cleanup(["docker"], self.scratch, RUN, abort=True)
+    def test_cli_status_and_stop_need_no_docker_client_or_checkout(self):
+        self.state = self.fields()
+        for action, expected in (("status", 2), ("stop", 0)):
+            arguments = ["witness", action, "--scratch", str(self.scratch), "--run-id", RUN,
+                         "--docker-socket", "unix:///var/run/docker.sock"]
+            with self.subTest(action=action), patch.object(witness.sys, "argv", arguments), \
+                 patch.object(witness, "scratch_path"), \
+                 patch.object(witness.receipt, "validate_docker", side_effect=AssertionError("unexpected Docker")), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(witness.main(), expected)
         self.query.assert_not_called()
+
+    def test_cli_preserves_worker_failure_for_systemd(self):
+        arguments = ["witness", "worker", "--scratch", str(self.scratch), "--run-id", RUN,
+                     "--docker-socket", "unix:///var/run/docker.sock", "--recipe-commit", "a" * 40]
+        with patch.object(witness.sys, "argv", arguments), patch.object(witness, "scratch_path"), \
+             patch.object(witness.receipt, "validate_docker", return_value=["docker"]), \
+             patch.object(witness, "worker", return_value=17) as worker:
+            self.assertEqual(witness.main(), 17)
+        worker.assert_called_once_with(["docker"], self.scratch, RUN, "a" * 40)
 
     def test_explicit_retirement_requires_abort_or_verified_cleanup_record(self):
         with patch.object(witness.shutil, "rmtree") as remove, patch.object(os, "chdir"):
