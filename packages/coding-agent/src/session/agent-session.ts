@@ -1353,7 +1353,13 @@ export class AgentSession implements SettingsScope {
 		const event: AgentActivityStateEvent = { type: "agent_activity_state", runId: run.runId, state };
 		if (outcome !== undefined) event.outcome = outcome;
 		this.#emit(event);
-		void this.#emitExtensionEvent(event);
+		// Fire and forget: an extension failure must not leave an unhandled rejection.
+		void this.#emitExtensionEvent(event).catch(error => {
+			logger.warn("Activity state extension emit failed", {
+				type: event.type,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
 	}
 
 	/** Pause or resume the current root activity while an interactive modal owns focus. */

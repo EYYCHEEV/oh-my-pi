@@ -1260,17 +1260,17 @@ it("parks a steer that lands mid-dispatch until the owning prompt goes live, the
 	await promptDone;
 	await session.waitForIdle();
 
-	// The run went live; the loop's boundary poll injected the parked steer
-	// after the first response, and the continuation answered it in turn.
+	// The run went live and the parked steer admitted into it. The fork's
+	// before-run hooks (runtime requirements, prepared-budget settlement)
+	// yield before the loop's first steering poll, so the steer can ride the
+	// first request instead of the boundary after its response; either way an
+	// assistant response must follow it.
 	const messages = session.agent.state.messages;
 	const steerIndex = messages.findIndex(
 		message => message.role === "user" && JSON.stringify(message.content).includes("steer the dispatching turn"),
 	);
-	const answerIndex = messages.findIndex(
-		message => message.role === "assistant" && JSON.stringify(message.content).includes("steer answer"),
-	);
 	expect(steerIndex).toBeGreaterThanOrEqual(0);
-	expect(answerIndex).toBeGreaterThan(steerIndex);
+	expect(messages.slice(steerIndex + 1).some(message => message.role === "assistant")).toBe(true);
 });
 
 it("refuses a steer into an agent-initiated turn whose output has no client forwarder", async () => {
