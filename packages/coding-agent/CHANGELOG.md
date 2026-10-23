@@ -18,6 +18,10 @@
 - Added the `mnemopi.graphLinkWindow` setting so each project or bot config sets how many of the newest memories a new episodic summary links against (`0` links against every memory); unset keeps `MNEMOPI_GRAPH_LINK_WINDOW` (200)
 - Added the `mnemopi.allowModelDownload` setting (default on). Set to `false` so an unattended run never installs fastembed or downloads the embedding model: it uses the cached model when both are already on disk, otherwise keyword search with one log warning. `mnemopi.noEmbeddings` still avoids every fetch
 
+### Changed
+
+- Changed the Mnemopi `retain` tool to return the id of every memory it stored, in item order, in the result text (`id: ...` / `ids: ...`) and in `details.ids`, so a caller can later edit or forget exactly what it stored with `memory_edit`
+
 ### Fixed
 
 - Fixed Ultrafast availability using another account's cached capabilities when launching with `--oauth-account`.

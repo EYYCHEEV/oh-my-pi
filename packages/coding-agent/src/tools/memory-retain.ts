@@ -98,6 +98,7 @@ export class MemoryRetainTool implements AgentTool<MemoryRetainSchema, MemoryRet
 		return prompt.render(retainDescription, {
 			globalScope: isGlobalMemoryScopeAvailable(this.session.settings),
 			expiry: cfgMemoryBackend.get(this.session.settings) === "mnemopi",
+			storedIds: cfgMemoryBackend.get(this.session.settings) === "mnemopi",
 		});
 	}
 	get parameters(): MemoryRetainSchema {
@@ -190,9 +191,11 @@ export class MemoryRetainTool implements AgentTool<MemoryRetainSchema, MemoryRet
 
 			const count = params.items.length;
 			const noun = count === 1 ? "memory" : "memories";
+			// The ids let the caller edit or forget exactly what this call stored, in the order of the items.
+			const idLine = count === 1 ? `id: ${storedIds[0]}` : `ids: ${storedIds.join(", ")}`;
 			return {
-				content: [{ type: "text", text: `${count} ${noun} stored.` }],
-				details: { count },
+				content: [{ type: "text", text: `${count} ${noun} stored.\n${idLine}` }],
+				details: { count, ids: storedIds },
 			};
 		}
 

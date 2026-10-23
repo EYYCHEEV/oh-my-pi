@@ -44,8 +44,8 @@ Hindsight:
 
 Mnemopi:
 - `content[0].type = "text"`
-- `content[0].text = "<count> memory stored."` or `"<count> memories stored."`
-- `details = { count: number }`
+- `content[0].text = "<count> memory stored.\nid: <id>"` or `"<count> memories stored.\nids: <id>, <id>, ..."`, ids in the order of `items` (Mnemopi backend; pass one to `memory_edit` or read `memory://<id>`). The Hindsight backend queues writes and returns only `"<count> memory queued."`-style text without ids.
+- `details = { count: number; ids?: string[] }` (`ids` only on the Mnemopi backend)
 - The tool writes each item synchronously through `rememberScoped(...)`. A storage failure throws, stops the batch, and reports the failed item, ids of earlier items kept, and whether later items were not attempted. A successful count confirms all synchronous writes, not completion of background extraction.
 
 ## Flow
