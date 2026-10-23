@@ -342,3 +342,16 @@ export const cfgMnemopiGraphLinkWindow = register({
 	type: "number",
 	default: undefined,
 });
+
+/**
+ * Days a working-memory row is kept after session-start consolidation (`sleep`) summarized it. Past that
+ * age its verbatim copy, full-text entry, vector and annotations are deleted and the episodic summary
+ * stays, which is what bounds a long-lived database. Only consolidated, non-IMPORTED rows that a live
+ * summary lists are ever deleted. Unset or `0` keeps every row (the default). A per-config setting, so
+ * an unattended bot's own config decides without touching the process environment.
+ */
+export const cfgMnemopiPruneConsolidatedDays = register({
+	id: "mnemopi.pruneConsolidatedDays",
+	type: "number",
+	default: undefined,
+});

@@ -64,6 +64,7 @@ Memory text is scanned on the way in and on the way out. Writes redact provider 
 | `mnemopi.tier2Days`           | env/`30`           | Age in days at which an episodic memory is cut to its first 800 characters and loses its vector. `0` never cuts. Unset keeps `MNEMOPI_TIER2_DAYS` (default `30`). |
 | `mnemopi.tier3Days`           | env/`180`          | Age in days at which a tier 2 memory is cut to its key sentences (300 characters). `0` never cuts. Unset keeps `MNEMOPI_TIER3_DAYS` (default `180`). |
 | `mnemopi.graphLinkWindow`     | env/`200`          | Newest memories a new episodic summary is linked against when consolidation runs (session start does). `0` links against every memory, at a cost that grows with history. Negative or non-numeric reads as unset; unset keeps `MNEMOPI_GRAPH_LINK_WINDOW`. |
+| `mnemopi.pruneConsolidatedDays` | unset (off)      | Days a working-memory row is kept after session-start consolidation summarized it. Past that age the row and its full-text, vector and annotation entries are deleted and the episodic summary stays. Unset or `0` keeps every row. Negative or non-numeric reads as unset. See Bounded growth. |
 | `mnemopi.debug`               | `false`            | Enable debug logging for backend failures.                                                                                                                                                                                                                                             |
 | `mnemopi.noEmbeddings`        | `false`            | Pass `noEmbeddings` to `Mnemopi` and force FTS-only recall.                                                                                                                                                                                                                            |
 | `mnemopi.allowModelDownload`  | `true`             | `true` keeps the first-use install and download of the local embedding model; `false` never downloads or installs: the model is used only if it is already cached, otherwise the run uses keyword search and logs one warning. See Embedding downloads and unattended runs. |
@@ -103,6 +104,31 @@ Retention writes a marker-free transcript projection: when the host supplies an 
 `sleep` shrinks old episodic memories so a long-lived database stays small: after `mnemopi.tier2Days` (30) a memory keeps only its first 800 characters and loses its vector (tier 2), and after `mnemopi.tier3Days` (180) a tier 2 memory keeps only about 300 characters of key sentences (tier 3). The cut runs when `sleep` runs, and a cut memory is never re-embedded. Facts or details that sat past the kept prefix are no longer reachable through the episodic row; working-memory rows that were consolidated into it still hold the full text for keyword search.
 
 The setting is per config, so each project or bot can choose its own cut. `0` turns a tier off (`tier2Days: 0` keeps every episodic memory whole; `tier3Days` only applies to memories already at tier 2). Negative values read as unset. When the setting is absent, the `MNEMOPI_TIER2_DAYS` / `MNEMOPI_TIER3_DAYS` environment variables keep working exactly as before; a configured setting wins over them.
+
+## Bounded growth
+
+`sleep` turns working rows into episodic summaries but keeps the rows, so every memory is stored twice, and the working copy is the larger one: the full text, a full-text index entry of about the same size again, two annotation rows, and with embeddings a vector of about 16 KB of JSON. On a synthetic Commander year (50 transcript rows of 3 KB a day, autoRetain on) the working rows and their indexes are 88% of a 215 MB file with embeddings off and 91% of a 539 MB file with embeddings on. An explicit-retain bot (3 notes a day) grows about 5 MB a year with embeddings off and 41 MB with them on.
+
+`mnemopi.pruneConsolidatedDays: N` bounds that part. It is off by default. When it is on, `sleep` (session start and `/memory enqueue`) deletes a working row `N` days after it was consolidated, with its full-text entry, vector, annotations, validation log and graph nodes and edges. The episodic summary stays, and so do the facts extracted from the row. A row goes only if all of these hold: it is consolidated, it is not `IMPORTED`, and a live (not superseded, not expired) episodic row lists it in `summary_of`. An unconsolidated row, a row a schema migration merely marked, and a row whose only summary was retired are never touched, so the only copy of a memory is never deleted. With the default tier cut the summary keeps only 800 characters after 30 days and the working row is the only full text, so pruning at 30 days gives that text up; set `tier2Days: 0` as well when the summary has to stay whole, as for an explicit-retain bot.
+
+What you give up: the verbatim row. The summary holds the same text with light AAAK abbreviation, up to `maxEpisodeChars`, then cut to 800 and 300 characters by the tier cut. `forget` and `memory_edit update` act on working rows, so they no longer find a pruned memory; `invalidate` still hides it through its summary. A forget or invalidate of a row whose summary also covers a pruned row cannot rewrite that summary without the pruned text, so the summary is deleted or retired whole. Facts extracted from a pruned row keep their source id, which no longer resolves, and stay recallable.
+
+Cost and space. A run removes at most 5000 rows, in batches of 500 per write transaction, and ends with one full-text index merge (`optimize`, about 70 ms for a 10 MB index; deletes otherwise leave the index four times its fresh size). Enabling it on an existing 539 MB bank took four session starts (3.6, 1.6, 1.5 and 1.3 s), the last of which also compacted the file to 89 MB. SQLite reuses freed pages but never returns them, so a run compacts the file with `VACUUM` once it has no backlog and a quarter of the file (4 MiB or more) is free; a steady prune frees about what new writes need and never gets there. In WAL mode `VACUUM` is one write transaction: readers in other processes keep reading, writers wait out the 5 s busy timeout, and it needs free disk of about the database size while it runs. It was exercised against a process holding a read transaction and another writing without pause, with no lost write and a clean integrity check. Failures are logged and retried at the next start.
+
+Synthetic results (fake clock, one year, file size after a WAL checkpoint, MB):
+
+| Profile | Setting | Day 30 | Day 180 | Day 365 |
+| --- | --- | --- | --- | --- |
+| Bot, 3 retains a day, FTS only, `tier2Days: 0` | off | 0.8 | 2.8 | 5.2 |
+| | `30` | 0.8 | 1.7 | 2.7 |
+| Bot, same, with embeddings | off | 3.7 | 20.5 | 41.1 |
+| | `30` | 3.7 | 12.0 | 22.1 |
+| Commander, 50 rows of 3 KB a day, FTS only, default tier cut | off | 22.8 | 109.7 | 214.7 |
+| | `30` | 22.8 | 35.4 | 43.9 |
+| Commander, same, with embeddings | off | 49.4 | 269.8 | 539.3 |
+| | `30` | 49.4 | 72.0 | 93.3 |
+
+Growth does not stop: what is left is the episodic side, about 5 KB a day for the bot and 46 KB a day for the Commander with embeddings off (the episodic rows, their graph edges, gists and logs), and the summaries' own vectors with embeddings on. Bounding that means expiring summaries, which forgets the memory; it is not part of this setting.
 
 ## LLM and embeddings
 

@@ -26,6 +26,7 @@ import {
 	cfgMnemopiNoEmbeddings,
 	cfgMnemopiPolyphonicRecall,
 	cfgMnemopiProactiveLinking,
+	cfgMnemopiPruneConsolidatedDays,
 	cfgMnemopiRecallContextTurns,
 	cfgMnemopiRecallLimit,
 	cfgMnemopiRecallMaxQueryChars,
@@ -68,6 +69,8 @@ export interface MnemopiBackendConfig {
 	tier3Days?: number;
 	/** Newest memories a new summary is linked against; `0` links against all, `undefined` keeps `MNEMOPI_GRAPH_LINK_WINDOW` (200). */
 	graphLinkWindow?: number;
+	/** Days a consolidated working row is kept after it was summarized; `0` or `undefined` keeps every row. */
+	pruneConsolidatedDays?: number;
 	providerOptions: MnemopiProviderOptions;
 	llmMode: MnemopiLlmMode;
 	llmBaseUrl?: string;
@@ -110,6 +113,7 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 		tier2Days: wholeCount(cfgMnemopiTier2Days.get(settings)),
 		tier3Days: wholeCount(cfgMnemopiTier3Days.get(settings)),
 		graphLinkWindow: wholeCount(cfgMnemopiGraphLinkWindow.get(settings)),
+		pruneConsolidatedDays: wholeCount(cfgMnemopiPruneConsolidatedDays.get(settings)),
 		retainEveryNTurns: Math.max(1, Math.floor(cfgMnemopiRetainEveryNTurns.get(settings))),
 		recallLimit: Math.max(1, Math.floor(cfgMnemopiRecallLimit.get(settings))),
 		recallContextTurns: Math.max(1, Math.floor(cfgMnemopiRecallContextTurns.get(settings))),
