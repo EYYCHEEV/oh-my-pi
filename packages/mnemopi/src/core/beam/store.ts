@@ -7,7 +7,11 @@ import { currentEmbeddingModel, embeddingsDisabled } from "../embeddings";
 import { EpisodicGraph } from "../episodic-graph";
 import { countExtractedFactCategories, extractFactCategoriesSafe } from "../extraction";
 import { getMnemopiRuntimeOptions, withMnemopiRuntimeOptions } from "../runtime-options";
-import { consolidateWorkingRowsById, storeExtractedFactCategories } from "./consolidate";
+import {
+	consolidateEligibleWorkingRows,
+	consolidateWorkingRowsById,
+	storeExtractedFactCategories,
+} from "./consolidate";
 import { type EmbedItem, scheduleEmbedding, vecAvailable, vecInsert } from "./helpers";
 import type {
 	BeamEvent,
@@ -219,12 +223,46 @@ function purgeWorkingMemoryArtifacts(db: BeamMemoryState["db"], ids: readonly st
 }
 
 /**
- * TTL / overflow guard for transient working memory. It never deletes an unconsolidated row:
- * each row older than `workingMemoryTtlHours`, or beyond `workingMemoryLimit`, is promoted to
- * episodic memory by the same consolidation `sleep` runs, so a session that stays open past the
- * TTL keeps its memories even though session-start consolidation only runs once (#10770).
+ * Count overflow promotes down to this fraction of `workingMemoryLimit`, not to the limit itself, so
+ * a steady writer consolidates in chunks of about a tenth of the limit instead of one row per write.
+ */
+const WORKING_MEMORY_LOW_WATER_RATIO = 0.9;
+
+/** Scratch rows the trim may act on. Rows flagged `IMPORTED` are durable (issue #4819). */
+const TRIMMABLE_WORKING_ROWS = "session_id = ? AND consolidated_at IS NULL AND trust_tier IS NOT 'IMPORTED'";
+
+function countTrimmableWorkingRows(beam: BeamMemoryState, cutoff: string): { live: number; expired: number } {
+	using statement = beam.db.prepare(
+		`SELECT COUNT(*) AS live, COALESCE(SUM(timestamp < ?), 0) AS expired FROM working_memory WHERE ${TRIMMABLE_WORKING_ROWS}`,
+	);
+	return statement.get(cutoff, beam.sessionId) as { live: number; expired: number };
+}
+
+/** Oldest-first ids of every trimmable row except the newest `keep`. */
+function trimmableIdsBeyondNewest(beam: BeamMemoryState, keep: number): string[] {
+	using statement = beam.db.prepare(`
+		SELECT id FROM working_memory
+		WHERE ${TRIMMABLE_WORKING_ROWS}
+		  AND id NOT IN (
+			SELECT id FROM working_memory WHERE ${TRIMMABLE_WORKING_ROWS} ORDER BY timestamp DESC LIMIT ?
+		  )
+		ORDER BY timestamp ASC
+	`);
+	return (statement.all(beam.sessionId, beam.sessionId, keep) as { id: string }[]).map(row => row.id);
+}
+
+/**
+ * TTL / overflow guard for transient working memory. It never deletes an unconsolidated row: it
+ * promotes rows to episodic memory with the consolidation pipeline `sleep` runs, so a session that
+ * stays open past the TTL keeps its memories even though session-start consolidation only runs once
+ * (#10770). Promotion is batched, so a steady writer does not leave one tiny summary per write:
+ * - TTL: when a row is older than `workingMemoryTtlHours`, promote every row `sleep` would take now
+ *   (older than half the TTL, same selection as `sleep`), about one grouped pass per half TTL.
+ * - Count: when more than `workingMemoryLimit` rows are live, promote the oldest down to a low-water
+ *   mark below the limit, so overflow arrives in chunks.
  * `consolidated_at IS NULL` alone does not mark scratch: restored or imported durable rows carry a
- * NULL marker with an old event timestamp (issue #4819), so rows flagged `IMPORTED` are skipped.
+ * NULL marker with an old event timestamp (issue #4819), so the trigger and the count path skip
+ * `IMPORTED` rows; the TTL batch matches `sleep`, which has no trust-tier filter.
  * A failed promotion is rolled back and logged; every row stays unconsolidated for the next write.
  */
 function trimWorkingMemory(beam: BeamMemoryState): void {
@@ -233,30 +271,18 @@ function trimWorkingMemory(beam: BeamMemoryState): void {
 	const ttlHours = beam.config.workingMemoryTtlHours;
 	const cutoff = toUtcIso(new Date(Date.now() - ttlHours * 3_600_000));
 	transaction(beam.db, () => {
-		using selectStatement = beam.db.prepare(`
-			SELECT id FROM working_memory
-			WHERE session_id = ?
-			  AND consolidated_at IS NULL
-			  AND trust_tier IS NOT 'IMPORTED'
-			  AND (
-				timestamp < ? OR
-				id NOT IN (
-					SELECT id FROM working_memory
-					WHERE session_id = ? AND consolidated_at IS NULL AND trust_tier IS NOT 'IMPORTED'
-					ORDER BY timestamp DESC
-					LIMIT ?
-				)
-			  )
-		`);
-		const ids = (selectStatement.all(beam.sessionId, cutoff, beam.sessionId, limit) as { id: string }[]).map(
-			row => row.id,
-		);
-		if (ids.length === 0) return;
+		const { live, expired } = countTrimmableWorkingRows(beam, cutoff);
+		if (expired === 0 && live <= limit) return;
 		// A savepoint, so a failure cannot leave rows claimed but unconsolidated, even when this runs
 		// inside `rememberBatch`'s transaction.
 		beam.db.run("SAVEPOINT promote_working_memory");
 		try {
-			consolidateWorkingRowsById(beam, ids);
+			if (expired > 0) consolidateEligibleWorkingRows(beam);
+			// The TTL batch may already have cleared the overflow, so count again after it ran.
+			if ((expired > 0 ? countTrimmableWorkingRows(beam, cutoff).live : live) > limit) {
+				const lowWater = Math.max(1, Math.min(limit - 1, Math.floor(limit * WORKING_MEMORY_LOW_WATER_RATIO)));
+				consolidateWorkingRowsById(beam, trimmableIdsBeyondNewest(beam, lowWater));
+			}
 			beam.db.run("RELEASE promote_working_memory");
 		} catch (error) {
 			beam.db.run("ROLLBACK TO promote_working_memory");

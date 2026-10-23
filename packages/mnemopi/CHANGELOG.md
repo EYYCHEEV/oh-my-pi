@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed the working-memory trim deleting unconsolidated rows: a session that stayed open past the 24-hour TTL, or wrote more than `workingMemoryLimit` rows, silently lost memories that consolidation had not reached yet. Trim now promotes those rows to episodic memory with the same pipeline as `sleep` instead of deleting them, and rolls back and logs a failed promotion so the rows stay for the next write.
+- Fixed the working-memory trim deleting unconsolidated rows: a session that stayed open past the 24-hour TTL, or wrote more than `workingMemoryLimit` rows, silently lost memories that consolidation had not reached yet. Trim now promotes those rows to episodic memory with the same pipeline as `sleep` instead of deleting them, in batches so a steady writer does not leave one tiny summary per write: when a row passes the TTL it promotes every row `sleep` would take (older than half the TTL), and on count overflow it promotes the oldest rows down to 90% of the limit. A failed promotion is rolled back and logged so the rows stay for the next write.
 
 ## [18.5.1] - 2026-10-03
 

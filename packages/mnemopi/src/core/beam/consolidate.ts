@@ -1093,9 +1093,19 @@ export function sleep(beam: BeamMemoryState, dryRun = false): SleepResult {
 }
 
 /**
+ * `sleep` without tier degradation: promote every working row `sleep` would take right now (older
+ * than half the working-memory TTL, no trust-tier filter). The write-time trim runs it when a row
+ * crosses the TTL, so a long session consolidates in the same per-source groups a session restart
+ * gives, instead of one summary per write. Degradation is maintenance and stays out of the write path.
+ */
+export function consolidateEligibleWorkingRows(beam: BeamMemoryState): SleepResult {
+	return consolidateWorkingRows(beam, eligibleWorkingRows(beam, sourceSession(beam)), false, false);
+}
+
+/**
  * Promote working rows the caller already selected, using the same pipeline as `sleep`. The
- * working-memory trim uses it so rows it would otherwise drop are consolidated first. It skips
- * `degradeEpisodic`: tier compression is `sleep` maintenance and must not run on every write.
+ * working-memory trim uses it for count overflow. It skips `degradeEpisodic`: tier compression is
+ * `sleep` maintenance and must not run on every write.
  */
 export function consolidateWorkingRowsById(beam: BeamMemoryState, ids: readonly string[]): SleepResult {
 	const batch = ids.slice(0, SLEEP_BATCH_SIZE);

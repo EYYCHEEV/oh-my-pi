@@ -290,9 +290,10 @@ describe("beam store free functions", () => {
 		// A normal write triggers the automatic trim.
 		remember(beam, "a fresh conversational note", { source: "conversation" });
 
-		// Durable row survives with all artifacts intact.
+		// Durable row survives: content intact and no linked artifact removed. The TTL batch matches
+		// `sleep`, which also takes old IMPORTED rows, so consolidating may add links to it.
 		expect(get(beam, durableId)?.content).toBe("canonical fact");
-		expect(artifactCount(durableId)).toBe(7);
+		expect(artifactCount(durableId)).toBeGreaterThanOrEqual(7);
 
 		// Transient old row is promoted, not dropped: still present, now marked consolidated, and
 		// its linked artifacts stay attached to it (trim no longer deletes anything).
