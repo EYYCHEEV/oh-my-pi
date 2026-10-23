@@ -218,7 +218,7 @@ describe("beam store free functions", () => {
 		expect(scratchpadRead(dest).map(row => row.content)).toEqual([]);
 	});
 
-	it("keeps restored durable rows and cascades linked artifacts on trim, force-import, and forget (issue #4819)", () => {
+	it("keeps restored durable rows, promotes expired scratch on trim, and cascades linked artifacts on forget (issue #4819)", () => {
 		const beam = makeState("trim-4819");
 		// EpisodicGraph owns the `gists` / `graph_edges` schema; init it so the
 		// cascade can be exercised end to end on the shared connection.
@@ -290,14 +290,18 @@ describe("beam store free functions", () => {
 		// A normal write triggers the automatic trim.
 		remember(beam, "a fresh conversational note", { source: "conversation" });
 
-		// Durable row survives with all artifacts intact.
+		// Durable row survives: content intact and no linked artifact removed. The TTL batch matches
+		// `sleep`, which also takes old IMPORTED rows, so consolidating may add links to it.
 		expect(get(beam, durableId)?.content).toBe("canonical fact");
-		expect(artifactCount(durableId)).toBe(7);
+		expect(artifactCount(durableId)).toBeGreaterThanOrEqual(7);
 
-		// Transient old row is trimmed and every linked artifact cascades.
-		expect(get(beam, durableId) === null).toBe(false);
-		expect(countOf("SELECT COUNT(*) AS count FROM working_memory WHERE id = ?", transientId)).toBe(0);
-		expect(artifactCount(transientId)).toBe(0);
+		// Transient old row is promoted, not dropped: still present, now marked consolidated, and
+		// its linked artifacts stay attached to it (trim no longer deletes anything).
+		const transient = beam.db
+			.prepare("SELECT consolidated_at AS at FROM working_memory WHERE id = ?")
+			.get(transientId) as { at: string | null } | null;
+		expect(typeof transient?.at).toBe("string");
+		expect(artifactCount(transientId)).toBeGreaterThanOrEqual(7);
 
 		// (3) forgetWorking cascades every linked artifact, not just annotations.
 		expect(forgetWorking(beam, durableId)).toBe(true);
