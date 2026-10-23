@@ -98,6 +98,8 @@ Retention writes a marker-free transcript projection: when the host supplies an 
 
 FTS and embedding paths use the settings below. `llmMode: smol` resolves the `memory` role and its configured retry chain, fetching credentials at call time. When unset, the role reuses `tiny`, then the fast (`smol`) defaults. It supports both local-inference and online models. `llmMode: remote` uses the OpenAI-compatible endpoint settings; `llmMode: none` disables LLM calls. If no usable model or credential resolves, Mnemopi continues without LLM-backed work. The legacy `providers.memoryModel` setting is migrated into the `memory` role.
 
+Vector recall (the default ranking whenever embeddings are on) compares the query embedding with the stored embeddings of the newest 5000 rows of each memory tier, so a purely semantic match is still found when thousands of newer memories were written after it. The bound keeps a recall near 190 ms per tier with the default 768-dimension model (about 100 ms at 384 dimensions); a row older than the newest 5000 of its tier is found by keyword only.
+
 FTS-only:
 
 ```yaml

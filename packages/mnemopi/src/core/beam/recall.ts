@@ -241,6 +241,14 @@ export function clipRecallContent(
 }
 
 const DEFAULT_LIMIT = 500;
+/**
+ * Most rows per tier (newest first) whose stored embeddings a vector recall compares with the query.
+ * Each row costs one JSON parse of its embedding, about 25 µs at 768 dimensions (the default model),
+ * so the bound caps a recall at roughly 190 ms per tier however far the bank grows, instead of the
+ * cost scaling with its history. A row older than the newest `VECTOR_SCAN_LIMIT` of its tier is
+ * reachable by keyword only.
+ */
+const VECTOR_SCAN_LIMIT = 5000;
 const STOP_WORDS = new Set([
 	"a",
 	"an",
@@ -744,7 +752,7 @@ function allVisibleIds(
 	const { where, params } = buildWhere(beam, "", options);
 	const rows = queryAll(beam, `SELECT id FROM ${table} WHERE ${where} ORDER BY timestamp DESC LIMIT ?`, [
 		...params,
-		DEFAULT_LIMIT,
+		VECTOR_SCAN_LIMIT,
 	]);
 	return rows.map(row => asString(row.id)).filter(Boolean);
 }
