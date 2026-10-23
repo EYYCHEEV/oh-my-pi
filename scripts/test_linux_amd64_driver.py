@@ -79,7 +79,7 @@ class RedactorTests(unittest.TestCase):
 
     def test_ordinary_progress_text_is_left_alone(self):
         redact = driver.Redactor({"~/.ssh/omp-ci001-build"})
-        for text in ("Application check passed: omp 18.8.0, Bazel 9.2.0, Bun 1.4.2, 27 fork contracts.",
+        for text in ("Application check passed: omp 18.8.0, Bazel 9.2.0, Bun 1.4.2, 28 fork contracts, manifest 5125865e63f5.",
                      "started 2026-10-23T12:30:45Z", "run b20261023153012-3fa9c1d2", "sha256 " + "ab12" * 16,
                      "state: running (qualify)", "Phase: door unpack."):
             self.assertEqual(redact(text), text)

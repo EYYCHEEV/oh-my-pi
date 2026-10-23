@@ -13,6 +13,7 @@ Nothing in this packet has been run on ci-001 yet.
 | --- | --- | --- |
 | Part A, read-only fact script, return its output | Main | ci-001, as root |
 | Part B, install in one root sitting, return the report | Main | ci-001, as root |
+| Optional, Docker daemon proxy block (after Part B) | Main, only if Part A shows the proxy service and the Captain wants it | ci-001, as root |
 | Part D, ssh alias and known-hosts line | Mac owner or the Mac agent | Mac |
 | Part E, smoke steps | Main for the box checks, the Mac for the door and build checks | both |
 | Part F, undo | Main, with the Captain's approval | ci-001, as root |
@@ -29,7 +30,7 @@ The entry matches that text in full against exactly one of the four shapes below
 Anything else prints `refused: invalid command`, exits 2 and is not logged.
 
 ```text
-build   <app-40hex> <recipe-40hex> [<stronk-omp-s1-YYYY.MM.DD.NNNN>]   (a git bundle on standard input)
+build   <app-40hex> <recipe-40hex> <fork-manifest-sha256-64hex> [<stronk-omp-s1-YYYY.MM.DD.NNNN>]   (a git bundle on standard input)
 status  <run-id>
 fetch   <run-id>
 cleanup <run-id>
@@ -38,7 +39,7 @@ run-id  = b<14 digits>-<8 hex>
 
 | Command | Does | Prints | Exit |
 | --- | --- | --- | --- |
-| `build` | Takes the one build slot, checks the host, reads at most 256 MiB of bundle, starts a detached supervisor | `run <id>`, allowlisted phase lines, then `state: <final>` | 0 succeeded, 1 failed, timed out or cancelled, 2 refused |
+| `build` | Takes the one build slot, checks the host, reads at most 256 MiB of bundle, checks the fork manifest inside it against the stated SHA-256, starts a detached supervisor | `run <id>`, allowlisted phase lines, then `state: <final>` | 0 succeeded, 1 failed, timed out or cancelled, 2 refused |
 | `status` | Reads the run record | `run`, `state`, `phase`, `qualified`, `cleanup`, `started`, `reason` | 0 succeeded, 1 failed, 2 refused, 3 still running |
 | `fetch` | Re-verifies the finished run, then streams a tar of exactly six regular files | the tar | 0, or 2 refused (no tar) |
 | `cleanup` | Cancels a running build if needed, removes its containers and images, deletes the run folder | `cleaned <id>` | 0, or 2 refused (the run is kept) |
@@ -51,7 +52,8 @@ Limits, all fixed in the entry (an SSH caller cannot change them):
 
 | Limit | Value | Why |
 | --- | --- | --- |
-| Bundle | 256 MiB, upload within 20 minutes | A shallow bundle of the two commits measured about 78 MiB; a full-history one is over 600 MiB |
+| Bundle | 256 MiB, upload within 20 minutes | A shallow bundle of the two commits plus the one-file registry commit measured about 78 MiB; a full-history one is over 600 MiB |
+| Fork manifest | 1 MiB, exactly one regular file | The workstation's `fork_boundary.json` is about 78 KB for 31 contracts |
 | Builds at once | 1 | An exclusive lock the supervisor holds for the whole run |
 | Whole run | 4 hours, then the step's process group is killed and the run is swept | The recipe's own prepare deadline is 4 hours; the observed run is about 20 minutes |
 | Cancel grace | 120 seconds | `cleanup` on a running build |
@@ -60,7 +62,7 @@ Limits, all fixed in the entry (an SSH caller cannot change them):
 | Available memory to start | 32 GiB | The recipe caps its build container at 24 GiB |
 | Kept runs | the newest 3 finished runs, at most 7 days | Older ones are purged under the lock at the next `build` |
 
-The log is one line per command that matched the grammar: UTC time, verb, run id, status, seconds, the first 12 characters of each commit and `candidate` or `release`.
+The log is one line per command that matched the grammar: UTC time, verb, run id, status, seconds, the first 12 characters of each commit, `candidate` or `release`, and the first 12 characters of the fork manifest hash.
 It never holds a path, a key, an address or an environment value.
 
 ## Security choices
@@ -73,8 +75,13 @@ It never holds a path, a key, an address or an environment value.
 - The command is matched with an anchored regular expression and never evaluated.
   The run id and the commits are fixed-form, so nothing the caller sends becomes a path or an argument without passing that match.
 - Python runs with `-I` (no `PYTHON*` variables, no user site folders), and every build step gets a minimal environment: no `SSH_*`, no secrets, no door variables.
-- The bundle must hold exactly `refs/omp/app`, `refs/omp/recipe` and (release only) the tag, no prerequisites, and nothing else.
+- The bundle must hold exactly `refs/omp/app`, `refs/omp/recipe`, `refs/omp/forkmanifest` and (release only) the tag, no prerequisites, and nothing else.
   It is unpacked with `fsckObjects` and no hooks into an empty repository; only `scripts/` from the recipe commit is extracted, and the application commit is only ever read through the recipe's own checks.
+- The contract registry is an input, never part of the recipe.
+  `refs/omp/forkmanifest` must be one parentless commit holding exactly one regular file, `fork_boundary.json`, of at most 1 MiB, whose SHA-256 equals the 64 hex characters in the command.
+  The door writes those exact bytes into the run folder and passes the file and its hash to the early check, the runtime preparation and the qualifier, and the hash to the final verification, which requires the signed qualification to name it.
+  A missing, oversized or altered file, an application README contract block that is not exactly the manifest's active contract ids in order, a verification command that is not `bun test <relative .test.ts files> [--test-name-pattern <text>]` (shell syntax, absolute or parent paths and URIs are refused as the updater refuses them; a `cargo test` command parses but this recipe cannot run it offline, so it is refused until a new recipe commit exists), an active contract whose test file is missing in the application commit, and a result whose qualification names another hash all refuse the build with a fixed message.
+  The hash is recorded in `RELEASE_MANIFEST.json` and the signed qualification, and the Mac driver checks the recorded value against the file it sent.
 - The build runs in the account's own rootless Docker, never as root, with `cpus 4`, 24 GiB, no swap, 1024 processes, no mounts from the host and no network inside the qualification container.
   The door refuses to run as euid 0, refuses a rootful daemon, and requires Docker's data on the capped data filesystem.
 - Egress is fenced by an nftables table keyed on the account's uid: private ranges, Tailscale, link-local and the SWAN benchmarking address are dropped; public internet is allowed.
@@ -143,6 +150,11 @@ facts() {
   nft list tables 2>&1
   for unit in cdm-ci-fence swan-ci-sshd omp-build-fence omp-build-sshd; do printf '%s: ' "$unit"; systemctl is-active "$unit.service" 2>&1; done
   ufw status 2>&1 | head -n 1
+  section "outbound proxy (service and process names only)"
+  proxy_units=$(systemctl list-units --type=service --all --no-legend --plain '*mihomo*' '*clash*' 2>/dev/null | awk '{ print $1, $3, $4 }')
+  echo "outbound proxy service present: $([[ -n $proxy_units ]] && echo yes || echo no)"
+  echo "${proxy_units:-no proxy service unit listed}"
+  echo "proxy processes: $(cat /proc/[0-9]*/comm 2>/dev/null | grep -ixE 'mihomo|clash|clash-meta' | sort -u | tr '\n' ' ')"
   section "paths this install would create"
   for path in /srv/omp-ci /srv/omp-ci.img /etc/omp-build /usr/local/lib/omp-build /var/log/omp-build /home/ompbuild /etc/systemd/system/omp-build-sshd.service /etc/systemd/system/omp-build-fence.service; do ls -ld "$path" 2>&1; done
   ls -d /etc/systemd/system/user@*.service.d 2>&1
@@ -160,6 +172,8 @@ Main reads the output before Part B, and stops and asks the Captain if any of th
 - The account `ompbuild` already exists and is in the `sudo` or `docker` group.
 
 `KillUserProcesses=yes` in the logind lines is only a note, not a stop: the door's sessions are not logind sessions (`UsePAM no`), and Part E step 5 proves that a detached build survives a dropped connection.
+The "outbound proxy" section only decides whether the optional Docker daemon proxy block after Part B is relevant: `outbound proxy service present: yes` means the design notes' proxy (`devbox-mihomo`) runs on this box, `no` means skip the block.
+It prints unit and process names and states only, never an address or a port.
 
 ## Part B. Install (Main, one root sitting)
 
@@ -435,6 +449,59 @@ echo "hostkey-line $(cut -d' ' -f1,2 /etc/omp-build/ssh_host_ed25519_key.pub)"
 Release builds also need `/etc/omp-build/source-allowed-signers` and `/etc/omp-build/source-revoked-signers` (root-owned, mode 0644, the allowed file non-empty, the revoked file empty when nothing is revoked).
 They hold public keys only and come from the Captain after he separately approves release signing; the candidate smoke below does not need them.
 
+### Optional: the rootless Docker daemon through the outbound proxy
+
+Skip this unless Part A printed `outbound proxy service present: yes`, Part E step 2's last `curl` cannot reach the public internet directly, and the Captain wants it.
+The design notes list an outbound proxy (`devbox-mihomo`) and say new CI accounts reach the public internet through it.
+This block only gives the account's own Docker daemon the standard proxy variables (a systemd user drop-in), so image pulls use the proxy.
+It does not change the egress fence, container networking or the recipe, and it needs the proxy's address from the box owner: put it in the command by hand, nothing here holds a real one.
+The script refuses an address with credentials, refuses to run while any build run folder exists (restarting the daemon would end it), writes only `~/.config/systemd/user/docker.service.d/omp-build-proxy.conf` and prints no address.
+Undo: `bash optional-docker-proxy.sh undo` removes that one file and restarts the daemon; Part F's `REMOVE_ACCOUNT=1` removes it with the account's home.
+
+```bash optional-docker-proxy.sh
+#!/bin/bash
+# OPTIONAL. Run as root on ci-001 after Part B, only if Part A printed "outbound proxy service present: yes".
+#   bash optional-docker-proxy.sh set "http://<proxy-host>:<proxy-port>"   write the drop-in, restart the account's Docker daemon
+#   bash optional-docker-proxy.sh undo                                     remove that one drop-in, restart it
+set -euo pipefail
+U=ompbuild
+HOME_DIR=/home/$U
+DIR=$HOME_DIR/.config/systemd/user/docker.service.d
+FILE=$DIR/omp-build-proxy.conf
+valid_proxy() { [[ $1 =~ ^http://[A-Za-z0-9][A-Za-z0-9.-]*:[0-9]{1,5}$ ]]; }
+
+[[ $(id -u) -eq 0 ]] || { echo "must run as root"; exit 1; }
+uid=$(id -u "$U")
+for path in "$HOME_DIR/.config" "$HOME_DIR/.config/systemd" "$HOME_DIR/.config/systemd/user" "$DIR" "$FILE"; do
+  [[ ! -L $path ]] || { echo "$path is a symbolic link; inspect it first"; exit 1; }
+done
+[[ -z $(ls -A /srv/omp-ci/state/runs 2>/dev/null) ]] || { echo "a build run folder exists; clean it up first"; exit 1; }
+as_u=(runuser -u "$U" -- env "HOME=$HOME_DIR" "XDG_RUNTIME_DIR=/run/user/$uid" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus")
+case ${1:-} in
+  set)
+    PROXY=${2:?proxy URL required}
+    valid_proxy "$PROXY" || { echo "expected http://<host>:<port> with no credentials"; exit 1; }
+    install -d -m 0700 -o "$U" -g "$U" "$DIR"
+    tmp=$(mktemp "$FILE.XXXXXX")
+    cat > "$tmp" <<EOF
+[Service]
+Environment="HTTP_PROXY=$PROXY"
+Environment="HTTPS_PROXY=$PROXY"
+Environment="NO_PROXY=localhost"
+EOF
+    chmod 0644 "$tmp"
+    chown "$U:$U" "$tmp"
+    mv -f "$tmp" "$FILE"
+    ;;
+  undo) rm -f "$FILE" ;;
+  *) echo "usage: optional-docker-proxy.sh set <proxy-url> | undo"; exit 2 ;;
+esac
+"${as_u[@]}" systemctl --user daemon-reload
+"${as_u[@]}" systemctl --user restart docker.service
+"${as_u[@]}" systemctl --user is-active docker.service
+echo "proxy drop-in present: $([[ -e $FILE ]] && echo yes || echo no)"
+```
+
 ## Part C. The authorized_keys line
 
 `install-host.sh` writes this line to `/etc/omp-build/authorized_keys/ompbuild`.
@@ -520,17 +587,20 @@ Stop at the first step that does not match, keep the output, and report it; do n
    ```
 
    Expected: `name=rootless` in the security options, cgroup `2` and `systemd`, the data root under `/srv/omp-ci/docker`; the first `curl` times out and the drop counter in the second listing is higher; the last `curl` prints an HTTP status line from GitHub.
-3. A real candidate build (Mac, after the Captain's go-ahead; it takes roughly 20 minutes the first time and is the first native end-to-end run of this route):
+3. A real candidate build (Mac, after the Captain's go-ahead; it takes roughly 20 minutes the first time and is the first native end-to-end run of this route).
+   The application commit is the head of `stronk-omp`, and the fork manifest is the workstation's current `fork_boundary.json`; the driver sends exactly that file and its hash with the build:
 
    ```sh
    cd ~/Documents/Work/Dev/worktrees/omp-linux-ci001-20261023
    python3 scripts/ci001/build-linux-amd64-remote \
-     --app 5e43891a87140fb0972c982f3027f0228c4f6378 \
+     --app "$(git rev-parse stronk-omp)" \
      --recipe "$(git rev-parse release/omp-linux-ci001-20261023)" \
+     --fork-manifest "<workstation worktree>/agents-tools/.agents/skills/upgrade-omp/fork_boundary.json" \
      --output ~/.local/state/omp-team/2026-10-23/ci001-smoke-1
    ```
 
-   Expected: a `run <id>` line, `Phase: door ...` progress lines, `state: succeeded`, then `verified: omp 18.8.0 linux-amd64 ...` and `qualified: all nine checks passed on the builder; tag none (candidate, never publishable)`.
+   Before this, run `python3 scripts/linux-amd64-receipt.py check --commit "$(git rev-parse stronk-omp)" --fork-manifest "<the same file>"` on the Mac: it refuses early, and offline, a manifest that the application's README block or test files do not satisfy.
+   Expected: a `run <id>` line, `Phase: door ...` progress lines (the check line names `manifest <12 hex>`), `state: succeeded`, then `verified: omp 18.8.0 linux-amd64 ...`, `qualified: all nine checks passed on the builder; tag none (candidate, never publishable)` and `fork manifest: <64 hex> (the qualification names exactly the file that was sent)`.
    The output folder holds `assets/` (three files) and `evidence/` (three files).
    Exit codes: 1 the remote build failed, 2 refused, 3 the Mac's own verification failed (the run is then kept on the box), 4 transport.
 4. Proof of removal (Main, as root, after step 3):
@@ -604,6 +674,7 @@ echo undone
 ```
 
 The Mac side of the undo: delete the `Host cdm-ci-001-ompbuild` block and `~/.ssh/known_hosts_omp_ci001_build`.
+The optional Docker daemon proxy drop-in is removed by `bash optional-docker-proxy.sh undo`, or goes with the account's home under `REMOVE_ACCOUNT=1`.
 The private key `~/.ssh/omp-ci001-build` is the Captain's to keep or destroy.
 
 ## Part G. Operating notes (Main)

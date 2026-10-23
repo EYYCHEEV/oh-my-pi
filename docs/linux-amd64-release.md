@@ -30,9 +30,9 @@ The application is an input: the full 40-hex commit passed as `--commit` (and to
 The first application built this way is `5e43891a87140fb0972c982f3027f0228c4f6378`, version `18.8.0`, which does not contain the new release tools.
 `--recipe-commit` therefore binds a separate reviewed full Git commit containing the release route.
 The builder exports application bytes only from `--commit` and recipe bytes only from `--recipe-commit`.
-Version-specific values come from the application commit and fail closed when this recipe's pinned toolchain cannot serve it: `linux-amd64-receipt.py check --commit <app>` compares the application's Bazel version, Bun requirement and locks with this recipe's pins (Bazel `9.2.0`, Bun `1.4.2`) before any daemon contact.
+Version-specific values come from the application commit and fail closed when this recipe's pinned toolchain cannot serve it: `linux-amd64-receipt.py check --commit <app> --fork-manifest <file>` compares the application's Bazel version, Bun requirement and locks with this recipe's pins (Bazel `9.2.0`, Bun `1.4.2`) and its README contract block and boundary tests with the supplied fork manifest before any daemon contact.
 All route files named by `linux-amd64-receipt.py:RECIPES`, including preparation, qualification and publishing code, must match the invoked local copies byte for byte.
-The manifest records both full commits and every recipe digest.
+The manifest records both full commits, every recipe digest and, in `qualification`, the SHA-256 of the fork manifest the application was judged against.
 Application version, timestamp and lock digests are checked against the immutable application tree, not the current checkout.
 Recipe digests are checked against the immutable recipe tree.
 Dirty application files never enter either export.
@@ -146,10 +146,11 @@ Expiry or any failed assertion leaves qualification unsuccessful and the owned c
 The run is offline, read-only except private disposable tmpfs state, without capabilities, with no-new-privileges and bounded process/memory/CPU/command limits.
 The runtime home and all caches start empty and credential-free.
 It exercises version/help, baseline-only native extraction/loading, native digest/ELF compatibility, embedded resource/worker operations through the built-in smoke, an initialized offline RPC session, every active fork-boundary command, the canonical native grep regression and coding-agent typecheck.
-The active regression snapshot is recipe-authenticated, tied to its canonical registry digest, and compared with the immutable application's README contract IDs.
+The fork-contract registry is an input, never part of the recipe: the caller supplies the workstation's `fork_boundary.json` with its SHA-256 (`--fork-manifest`, `--fork-manifest-sha256`), and the qualifier hashes the exact bytes, refuses a missing, oversized (over 1 MiB), linked, altered or non-updater-shaped file, and requires the immutable application's README contract block to equal the manifest's active contract ids in order.
+Each active contract's `verification` commands are parsed with the updater's strict rules (no shell syntax, relative paths, no URIs; mirrored, not imported) and then run only in the shape this recipe can execute offline: `bun test <relative .test.ts files> [--test-name-pattern <text>]`; a command in any other shape, including `cargo test`, is refused until a new recipe commit exists, and every referenced test file must exist in the application commit.
 Every boundary Bun test keeps its registry argv and filters, with `--timeout=30000` appended.
 After the binary smoke and offline session checks, source tests use `PI_TEST_RUNTIME=1`, `BUN_JSC_useConcurrentGC=0` and `BUN_JSC_numberOfGCMarkers=1`.
-These match the pinned application's ordinary runner in `scripts/ci-test-ts.ts:444-468,575-601`; the registry snapshot, 240-second command ceiling and passing-test/failure checks remain unchanged.
+These match the pinned application's ordinary runner in `scripts/ci-test-ts.ts:444-468,575-601`; the 240-second command ceiling and passing-test/failure checks remain unchanged.
 Missing, stale, failed or timed-out checks cannot become successful metadata.
 Qualification regenerates the HTML tool-view bundle from the immutable source and verified frozen dependencies before running source tests.
 The pristine source export deliberately excludes build-generated files; the active compiled-CLI boundary test needs this local JavaScript bundle.
@@ -167,13 +168,13 @@ Optional ML models/packages remain on-demand inputs and are not promised offline
 ### Preparing the runtime on ci-001
 
 Building and qualifying on ci-001 is a separately approved run, not permission to start one on any shared host.
-The Mac caller `scripts/ci001/build-linux-amd64-remote` bundles exactly the application commit, the recipe commit and, for a release, the annotated tag, without their history, and sends that one bundle through the forced-command door `scripts/ci001/omp-build-entry`.
+The Mac caller `scripts/ci001/build-linux-amd64-remote` bundles exactly the application commit, the recipe commit, one parentless commit holding only the workstation's `fork_boundary.json` (`--fork-manifest`) and, for a release, the annotated tag, without their history, and sends that one bundle through the forced-command door `scripts/ci001/omp-build-entry` together with the file's SHA-256.
 `docs/ci001-build-door.md` is the install packet, the command grammar and the undo.
 The door replaces the retired devbox-s1 witness: no root, no `systemd-run`, no scratch under `/root` and no fixed application commit.
 
-Before any daemon contact the door runs `python3 scripts/linux-amd64-receipt.py check --commit "$SOURCE_COMMIT"`.
-It refuses, with a fixed reason, an application commit whose Bazel version differs from this recipe's pin, whose Bun requirement (an exact pin or a floor) the recipe's Bun does not satisfy, that lacks a lock file, a fork-contract map or a boundary test this recipe runs, or whose omp version is not a release version.
-A refusal means a new reviewed recipe commit is needed; nothing is rebuilt or worked around.
+Before any daemon contact the door runs `python3 scripts/linux-amd64-receipt.py check --commit "$SOURCE_COMMIT" --fork-manifest "$FORK_MANIFEST" --fork-manifest-sha256 "$FORK_SHA"` against the file it unpacked from the bundle after re-hashing it; the same command works on the Mac with any local copy of the manifest.
+It refuses, with a fixed reason, an application commit whose Bazel version differs from this recipe's pin, whose Bun requirement (an exact pin or a floor) the recipe's Bun does not satisfy, that lacks a lock file, a boundary test the manifest names or a README block equal to the manifest's active contracts, or whose omp version is not a release version.
+A toolchain refusal means a new reviewed recipe commit is needed; a README or boundary-test refusal means the application commit and the manifest disagree, so the application (or the manifest) is fixed and the build is sent again; nothing is rebuilt or worked around.
 
 `linux-amd64-runtime.py` uses the same exact application archive, pinned base, signed Debian snapshot, Bun archive checksum and Bazel/Rust graph as the ordinary candidate recipe.
 Supply the full reviewed preparation commit with `--recipe-commit`; this checks the invoked route files but does not turn the resulting candidate into a release.
@@ -223,7 +224,7 @@ The door passes `--output candidate` or `--output release`; the historical `veri
 Qualification adds `--recipe-commit`, producing a signed attestation with `mode=release` and the exact recipe binding.
 Final verification adds `--tag "$SOURCE_TAG" --recipe-commit "$RECIPE_COMMIT" --release` and the explicit qualification attestation/signers.
 The door generates a fresh qualification key inside the run, verifies the signed result itself before it may be fetched, and returns only the three public assets plus the private qualification record (`qualification.json`, its signature and the one-line signers file).
-The Mac caller then independently re-checks bytes against `SHA256SUMS.txt`, manifest schema 2 with all nine checks passed, ELF64 x86-64, the application commit and version, the recipe and tag identity, and the attestation signature.
+The Mac caller then independently re-checks bytes against `SHA256SUMS.txt`, manifest schema 2 with all nine checks passed, ELF64 x86-64, the application commit and version, the recipe and tag identity, that the recorded fork manifest hash equals the SHA-256 of the file it sent, and the attestation signature.
 No progress/status allowlist change is needed: release preparation reuses `Phase: prepared runtime complete.` instead of the candidate-only export summary.
 
 The door, not systemd, owns the lifecycle.
@@ -289,7 +290,7 @@ Nested objects reject unknown fields, and one strict JSON decoder rejects repeat
 `asset` records the binary basename, size and SHA-256.
 `runtime` records ELF target, loader basename, libc floor, required sonames, baseline addon digest and CPU/variant/static-link contract.
 `checks` requires all of `elf`, `cli`, `native_runtime`, `resources_workers`, `builtin_smoke`, `offline_session`, `fork_boundaries`, `native_grep`, `coding_agent_typecheck` to be `passed` for release.
-`qualification` binds the actual binary SHA-256, application and recipe commits, the same complete check set, and only `execution`, `cpu`, `glibc`, `loader`, `runtime_image` as environment fields.
+`qualification` binds the actual binary SHA-256, application and recipe commits, the SHA-256 of the fork manifest (`fork_manifest_sha256`), the same complete check set, and only `execution`, `cpu`, `glibc`, `loader`, `runtime_image` as environment fields.
 It is `null` before qualification.
 `qualification.environment.runtime_image` is strictly the verified `sha256:` digest, never a registry/repository/account reference.
 

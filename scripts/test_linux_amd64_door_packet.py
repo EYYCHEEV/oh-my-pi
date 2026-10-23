@@ -68,8 +68,13 @@ class PacketTests(unittest.TestCase):
         self.assertEqual(re.findall(r"[0-9a-f]{64}", self.text), [digest, digest])
         self.assertIn(f"ENTRY_SHA={digest}", self.install)
 
-    def test_the_fact_script_only_ever_reads(self):
-        """Run it for real with every host-inspecting command replaced by a recording stub, and judge the recorded calls."""
+    PROXY_CALL = "systemctl list-units --type=service --all --no-legend --plain *mihomo* *clash*"
+
+    def run_facts(self, canned_extra=None):
+        """Run the fact script for real with every host-inspecting command replaced by a recording stub.
+
+        Returns what it printed and the recorded calls; every call must be a read-only one.
+        """
         read_only = {
             "docker": lambda a: a == ["--version"] or a == ["buildx", "version"] or (a[:1] == ["info"] and "--format" in a),
             "nft": lambda a: a == ["list", "tables"],
@@ -98,13 +103,17 @@ class PacketTests(unittest.TestCase):
             "docker": f"server=29.8.1 root=/data/docker containers=0 {v4}\n",
             "nft": "table inet cdm_fence\n",
             "systemctl": f"swan-ci-sshd.service loaded active running SWAN door via {v4}\n",
+            # The proxy probe is told apart by its exact arguments: a unit with an address in its description must be masked.
+            self.PROXY_CALL: f"devbox-mihomo.service loaded active running Outbound proxy at {v4}\n",
+            **(canned_extra or {}),
         }
         stub = "#!" + sys.executable + (
             "\nimport json, os, sys\n"
             "name = os.path.basename(sys.argv[0])\n"
             "with open(os.environ['STUB_LOG'], 'a') as log:\n"
             "    log.write(json.dumps([name, *sys.argv[1:]]) + '\\n')\n"
-            "sys.stdout.write(json.loads(os.environ['STUB_OUTPUT']).get(name, ''))\n"
+            "canned = json.loads(os.environ['STUB_OUTPUT'])\n"
+            "sys.stdout.write(canned.get(' '.join([name, *sys.argv[1:]]), canned.get(name, '')))\n"
             "sys.exit(2 if name == 'getent' else 0)\n")
         with tempfile.TemporaryDirectory(prefix="omp-facts-") as directory:
             work = Path(directory)
@@ -128,14 +137,69 @@ class PacketTests(unittest.TestCase):
                 self.assertIn(name, read_only, f"{name} is not a read-only command: {arguments}")
                 self.assertTrue(read_only[name](arguments), f"{name} {arguments} is not a read-only call")
             self.assertEqual({path for path in work.rglob("*")} - before - {work / "calls.log"}, set(), "the script created files")
-            for section in ("== host", "== memory", "== disk", "== tools", "== rootless prerequisites", "== accounts",
-                            "== ssh doors and ports", "== firewall and fences", "== paths this install would create"):
-                self.assertIn(section, shown)
-            self.assertIn("listening ports: 22 631 2223", shown)
             for leaked in (v4, v6):
                 self.assertNotIn(leaked, shown)
             self.assertIn("<addr>", shown)
+        return shown, calls
+
+    def test_the_fact_script_only_ever_reads(self):
+        shown, calls = self.run_facts()
+        for section in ("== host", "== memory", "== disk", "== tools", "== rootless prerequisites", "== accounts",
+                        "== ssh doors and ports", "== firewall and fences", "== outbound proxy", "== paths this install would create"):
+            self.assertIn(section, shown)
+        self.assertIn("listening ports: 22 631 2223", shown)
         self.assertTrue(self.facts.rstrip().endswith("facts 2>&1 | mask"))
+
+    def test_the_proxy_check_prints_service_names_and_states_only(self):
+        shown, calls = self.run_facts()
+        self.assertIn(self.PROXY_CALL.split(" ", 1)[0], {call[0] for call in calls})
+        self.assertIn(self.PROXY_CALL.split(" ", 1)[1].split(" "), [call[1:] for call in calls])  # the one probe, by exact arguments
+        section = shown.split("== outbound proxy", 1)[1].split("\n== ", 1)[0]
+        self.assertIn("outbound proxy service present: yes", section)
+        self.assertIn("devbox-mihomo.service active running", section)
+        self.assertNotIn("Outbound proxy at", section)  # the description column (where an address could hide) is never printed
+        self.assertIn("proxy processes:", section)
+        self.assertNotRegex(section, r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|:\d{2,5}\b")
+
+    def test_the_proxy_check_says_no_when_no_such_unit_is_listed(self):
+        shown, _ = self.run_facts({self.PROXY_CALL: ""})
+        section = shown.split("== outbound proxy", 1)[1].split("\n== ", 1)[0]
+        self.assertIn("outbound proxy service present: no", section)
+        self.assertIn("no proxy service unit listed", section)
+
+    def test_the_optional_docker_proxy_block_is_scoped_validated_and_reversible(self):
+        kind, script = self.blocks["optional-docker-proxy.sh"]
+        self.assertEqual(kind, "bash")
+        self.assertIn("OPTIONAL", script)
+        function = re.search(r"(?m)^valid_proxy\(\) \{.*\}$", script)
+        self.assertIsNotNone(function)
+
+        def valid(value):
+            return subprocess.run(["bash", "-c", function[0] + '\nvalid_proxy "$1"', "bash", value], check=False).returncode == 0
+
+        self.assertTrue(all(valid(value) for value in ("http://proxy.internal:7890", "http://a:1", "http://host-1.example:65535")))
+        for bad in ("", "https://proxy:1", "http://user:secret@proxy:1", "http://proxy", "http://proxy:", "http://proxy:123456", "http://proxy:80/",
+                    "http://proxy:80 x", "http://proxy:80;id", "http://pro$xy:80", "proxy:80", "http://-x:80", "http://[::1]:80", "http://x:80\nhttp://y:80"):
+            with self.subTest(value=bad):
+                self.assertFalse(valid(bad))
+        # It touches exactly one file under the account's docker.service.d, nothing system-wide, and no real address is typed in.
+        self.assertIn("FILE=$DIR/omp-build-proxy.conf", script)
+        self.assertIn("DIR=$HOME_DIR/.config/systemd/user/docker.service.d", script)
+        code = "\n".join(line for line in script.splitlines() if not line.lstrip().startswith("#"))
+        for foreign in ("/etc/", "nft ", "swan", "cdm", "rm -rf", "usermod", "useradd", "fstab", "curl", "docker "):
+            self.assertNotIn(foreign, code)
+        self.assertEqual(re.findall(r"\brm -f (\S+)", code), ['"$FILE"'])
+        self.assertEqual(re.findall(r"\bsystemctl --user (\S+)", code), ["daemon-reload", "restart", "is-active"])
+        self.assertIn("set)", script)
+        self.assertIn("undo)", script)
+        # The proxy variables are the standard daemon ones, written from the validated argument only.
+        for line in ('Environment="HTTP_PROXY=$PROXY"', 'Environment="HTTPS_PROXY=$PROXY"', 'Environment="NO_PROXY=localhost"'):
+            self.assertIn(line, script)
+        # It refuses to restart the daemon under a build that is running, and refuses links where root writes.
+        self.assertIn("/srv/omp-ci/state/runs", script)
+        self.assertIn("is a symbolic link", script)
+        self.assertIn("### Optional: the rootless Docker daemon through the outbound proxy", self.text)
+        self.assertIn("Skip this unless Part A printed `outbound proxy service present: yes`", self.text)
 
     def test_the_address_mask_hides_addresses_and_keeps_names(self):
         mask = next(line for line in self.facts.splitlines() if line.startswith("mask()"))
@@ -186,6 +250,19 @@ class PacketTests(unittest.TestCase):
             self.assertIn(phrase, self.text)
         self.assertIn("ForceCommand /usr/local/lib/omp-build/entry", self.install)
         self.assertNotIn("AcceptEnv ", heredoc(self.install, "put_file /etc/omp-build/sshd_config 0644 root:root <<EOF").split("\n", 3)[3])
+
+    def test_the_packet_the_entry_and_the_driver_agree_on_the_registry_input(self):
+        driver = door_tests.driver
+        self.assertIn(f'MANIFEST_REF = "{driver.MANIFEST_REF}"', self.entry)
+        self.assertIn(f'MANIFEST_FILE = "{driver.MANIFEST_FILE}"', self.entry)
+        self.assertIn("MANIFEST_CAP = 1024 * 1024", self.entry)
+        self.assertEqual(driver.MANIFEST_CAP, 1024 * 1024)
+        for name in ("refs/omp/app", "refs/omp/recipe", driver.MANIFEST_REF):
+            self.assertIn(f"`{name}`", self.text)
+        self.assertIn("build   <app-40hex> <recipe-40hex> <fork-manifest-sha256-64hex> [<stronk-omp-s1-YYYY.MM.DD.NNNN>]", self.text)
+        self.assertIn("build <app-40hex> <recipe-40hex> <fork-manifest-sha256> [<stronk-omp-s1-YYYY.MM.DD.NNNN>]", self.entry)
+        self.assertIn("--fork-manifest ", self.text)
+        self.assertNotIn("5e43891a87140fb0972c982f3027f0228c4f6378", self.text)  # no application commit is baked into the packet
 
     def test_the_install_never_touches_the_other_ci_doors_and_the_undo_removes_everything_it_adds(self):
         for script in (self.install, self.undo):
