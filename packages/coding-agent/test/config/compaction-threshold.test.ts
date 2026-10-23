@@ -335,11 +335,15 @@ describe("compaction.modelThresholds", () => {
 		expect(point.basis).toContain("capped by window");
 		const wide = { provider: "anthropic", id: "claude-opus-5-5", contextWindow: 1_000_000 } as Model;
 		expect(describeModelCompactionPoint(global, wide)).toMatchObject({ tokens: 300_000, basis: "fixed" });
-		// One token below the window is still the user's exact trigger.
+		// Fork contract context-occupancy-projection: a trigger inside the reserve is capped at the
+		// usable budget too, since the admission gate refuses there. (Upstream keeps it exact.)
 		const justBelow = Settings.isolated({ "compaction.thresholdTokens": 196_607 });
-		expect(describeModelCompactionPoint(justBelow, capped)).toMatchObject({ tokens: 196_607, basis: "fixed" });
+		expect(describeModelCompactionPoint(justBelow, capped)).toMatchObject({ tokens: 167_117, source: "global" });
+		// A trigger below the usable budget stays the user's exact value.
+		const belowBudget = Settings.isolated({ "compaction.thresholdTokens": 167_116 });
+		expect(describeModelCompactionPoint(belowBudget, capped)).toMatchObject({ tokens: 167_116, basis: "fixed" });
 
-		// A prefix entry the model falls back to; an entry below the window stays exact.
+		// A prefix entry the model falls back to; an entry inside the reserve is capped, one below stays exact.
 		const prefixed = Settings.isolated({ "compaction.modelThresholds": { "factory-droid/*": "f300000" } });
 		expect(planModelCompactionPoint(prefixed, capped, "", undefined)?.trigger).toEqual({
 			kind: "fixed",
@@ -348,7 +352,12 @@ describe("compaction.modelThresholds", () => {
 		});
 		expect(planModelCompactionPoint(prefixed, capped, "f190k", undefined)?.trigger).toEqual({
 			kind: "fixed",
-			tokens: 190_000,
+			tokens: 167_117,
+			cappedFrom: 190_000,
+		});
+		expect(planModelCompactionPoint(prefixed, capped, "f160k", undefined)?.trigger).toEqual({
+			kind: "fixed",
+			tokens: 160_000,
 		});
 	});
 

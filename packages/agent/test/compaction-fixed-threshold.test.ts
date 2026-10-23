@@ -30,16 +30,22 @@ describe("fixed compaction trigger near the window", () => {
 		expect(resolveThresholdTokens(window, fixed(-1))).toBe(budget);
 	});
 
-	it("keeps a trigger below the window exact", () => {
-		expect(resolveThresholdTokens(window, fixed(window - 1))).toBe(window - 1);
-		expect(resolveThresholdTokens(window, fixed(budget + 1))).toBe(budget + 1);
+	// Fork contract context-occupancy-projection: every trigger is capped by the usable-input budget,
+	// because the pre-dispatch admission gate refuses at that budget. A trigger inside the reserve
+	// would never fire before the gate refuses. (Upstream 18.12.6 keeps such a trigger exact.)
+	it("keeps a trigger below the usable budget exact and caps one inside the reserve at the budget", () => {
+		expect(resolveThresholdTokens(window, fixed(window - 1))).toBe(budget);
+		expect(resolveThresholdTokens(window, fixed(budget + 1))).toBe(budget);
+		expect(resolveThresholdTokens(window, fixed(budget))).toBe(budget);
+		expect(resolveThresholdTokens(window, fixed(budget - 1))).toBe(budget - 1);
 		expect(resolveThresholdTokens(window, fixed(100_000))).toBe(100_000);
 		expect(resolveThresholdTokens(1_000_000, fixed(300_000))).toBe(300_000);
 	});
 
 	it("uses an explicit reserve as the budget", () => {
 		expect(resolveThresholdTokens(200_000, fixed(250_000, { reserveTokens: 50_000 }))).toBe(150_000);
-		expect(resolveThresholdTokens(200_000, fixed(180_000, { reserveTokens: 50_000 }))).toBe(180_000);
+		expect(resolveThresholdTokens(200_000, fixed(180_000, { reserveTokens: 50_000 }))).toBe(150_000);
+		expect(resolveThresholdTokens(200_000, fixed(140_000, { reserveTokens: 50_000 }))).toBe(140_000);
 	});
 
 	it("falls back to the 15% reserve on small windows", () => {
