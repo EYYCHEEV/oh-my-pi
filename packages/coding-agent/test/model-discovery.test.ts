@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { FetchImpl, Model } from "@oh-my-pi/pi-ai";
 import { resetOAuthAccountRestrictions } from "@oh-my-pi/pi-ai/auth/eligibility";
-import { shouldSendServiceTier } from "@oh-my-pi/pi-ai/types";
+import { shouldSendServiceTier, shouldSendServiceTierForAccount } from "@oh-my-pi/pi-ai/types";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
@@ -537,10 +537,18 @@ describe("ModelRegistry runtime discovery", () => {
 		const createRegistry = () => new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 		const supportsUltrafast = (registry: ModelRegistry) =>
 			shouldSendServiceTier("ultrafast", registry.find("openai-codex", "gpt-6.1-sol"));
+		const sharedAccounts = (registry: ModelRegistry) =>
+			Object.keys(registry.find("openai-codex", "gpt-6.1-sol")?.accountAccess ?? {}).sort();
 		try {
 			const shared = createRegistry();
 			await shared.refreshProvider("openai-codex", "online");
-			expect(supportsUltrafast(shared)).toBe(false);
+			// Unpinned, the account-agnostic gate asks whether any pool account offers Ultrafast, and the shared
+			// row keeps each account's own tiers so a request is gated on its serving account.
+			expect(supportsUltrafast(shared)).toBe(true);
+			expect(sharedAccounts(shared)).toEqual(["basic-account", "ultra-account"]);
+			const sharedModel = shared.find("openai-codex", "gpt-6.1-sol")!;
+			expect(shouldSendServiceTierForAccount("ultrafast", sharedModel, "ultra-account")).toBe(true);
+			expect(shouldSendServiceTierForAccount("ultrafast", sharedModel, "basic-account")).toBe(false);
 			fetchedAccounts.length = 0;
 
 			authStorage.oauth.restrict("openai-codex", ultra.credentialId);
@@ -565,7 +573,12 @@ describe("ModelRegistry runtime discovery", () => {
 			expect(fetchedAccounts).toEqual([]);
 
 			resetOAuthAccountRestrictions();
-			expect(supportsUltrafast(createRegistry())).toBe(false);
+			// The restricted runs never touched the shared row: a cold registry still reads both accounts' own tiers.
+			const cold = createRegistry();
+			expect(sharedAccounts(cold)).toEqual(["basic-account", "ultra-account"]);
+			const coldModel = cold.find("openai-codex", "gpt-6.1-sol")!;
+			expect(shouldSendServiceTierForAccount("ultrafast", coldModel, "ultra-account")).toBe(true);
+			expect(shouldSendServiceTierForAccount("ultrafast", coldModel, "basic-account")).toBe(false);
 		} finally {
 			resetOAuthAccountRestrictions();
 		}
