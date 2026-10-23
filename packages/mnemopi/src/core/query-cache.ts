@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { type Env, enhancedRecallEnabled } from "../config";
-import { openDatabase } from "../db";
+import { enableWal, openDatabase } from "../db";
 import { cosineSimilarity } from "./vector-math";
 
 export type QueryCacheResult = Record<string, unknown>;
@@ -105,7 +105,7 @@ export class QueryCache<T = QueryCacheResult> {
 	#initDb(dbPath: string): void {
 		const db = openDatabase(dbPath, { pragmas: false });
 		this.#conn = db;
-		if (dbPath !== ":memory:") db.exec("PRAGMA journal_mode=WAL");
+		if (dbPath !== ":memory:") enableWal(db);
 		db.exec(`
 			CREATE TABLE IF NOT EXISTS query_cache (
 				normalized TEXT PRIMARY KEY,
