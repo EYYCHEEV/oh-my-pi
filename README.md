@@ -145,6 +145,7 @@ An upgrade fails before build or installation if the block is stale, any require
 - `mnemopi-graph-link-window`: Episodic graph linking is bounded to the newest N memories (mnemopi.graphLinkWindow), so session start stays flat as history grows
 - `mnemopi-offline-embeddings`: An unattended run can refuse to install fastembed or download the embedding model (mnemopi.allowModelDownload)
 - `mnemopi-retain-ids`: The retain tool returns the ids of the memories it stored (Mnemopi backend)
+- `mnemopi-prune-consolidated`: Mnemopi bounds database growth by deleting consolidated working rows N days after their summary (mnemopi.pruneConsolidatedDays, off by default)
 <!-- stronk-omp:fork-contracts:end -->
 
 ## Upstream alignment
