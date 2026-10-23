@@ -180,6 +180,17 @@ export const cfgMnemopiNoEmbeddings = register({
 	},
 });
 
+/**
+ * `false` never installs fastembed or downloads the embedding model during a run: the local model loads
+ * only when both are already on disk, otherwise the run uses keyword search only and logs it once.
+ * `true` keeps the first-use install and download. Ignored when `noEmbeddings` is on.
+ */
+export const cfgMnemopiAllowModelDownload = register({
+	id: "mnemopi.allowModelDownload",
+	type: "boolean",
+	default: true,
+});
+
 export const cfgMnemopiEmbeddingModel = register({
 	id: "mnemopi.embeddingModel",
 	type: "string",

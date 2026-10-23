@@ -7,6 +7,7 @@
 - Added `mnemopi backup <destination.db>` and `backupDatabase()`: a consistent, standalone single-file copy of a database another process is writing (`VACUUM INTO` of one snapshot, integrity-checked, never overwrites, no partial file on failure), instead of copying the main file and the `-wal` by hand
 - Added the `beamConfig` option of `Mnemopi` and the `tier2Days` / `tier3Days` beam settings so one instance can set the episodic tier cut ages (`0` never cuts) instead of only the process-wide `MNEMOPI_TIER2_DAYS` / `MNEMOPI_TIER3_DAYS`; unset keeps the environment defaults
 - Added the `graphLinkWindow` beam setting so one `Mnemopi` instance (`beamConfig`) sets how many of the newest memories a new episodic summary links against; unset keeps `MNEMOPI_GRAPH_LINK_WINDOW`
+- Added the `embeddings.allowDownload` option of `Mnemopi`: `false` never installs fastembed or downloads model files; the local embedding model is used only when it is already on disk, otherwise embeddings are skipped (keyword recall only) and one warning is logged. Unset keeps the first-use install and download
 
 ### Fixed
 

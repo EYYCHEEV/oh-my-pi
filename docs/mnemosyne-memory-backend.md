@@ -62,6 +62,7 @@ Read the full content and metadata for a recalled result with `read memory://<me
 | `mnemopi.graphLinkWindow`     | env/`200`          | Newest memories a new episodic summary is linked against when consolidation runs (session start does). `0` links against every memory, at a cost that grows with history. Negative or non-numeric reads as unset; unset keeps `MNEMOPI_GRAPH_LINK_WINDOW`. |
 | `mnemopi.debug`               | `false`            | Enable debug logging for backend failures.                                                                                                                                                                                                                                             |
 | `mnemopi.noEmbeddings`        | `false`            | Pass `noEmbeddings` to `Mnemopi` and force FTS-only recall.                                                                                                                                                                                                                            |
+| `mnemopi.allowModelDownload`  | `true`             | `true` keeps the first-use install and download of the local embedding model; `false` never downloads or installs: the model is used only if it is already cached, otherwise the run uses keyword search and logs one warning. See Embedding downloads and unattended runs. |
 | `mnemopi.embeddingVariant`    | `en`               | Local embedding model variant: `en` = `BAAI/bge-base-en-v1.5` (768d), `multilingual` = `intfloat/multilingual-e5-large` (1024d). `mnemopi.embeddingModel`/`MNEMOPI_EMBEDDING_MODEL` override it; changing it rebuilds stored embeddings on the next writable start.                    |
 | `mnemopi.embeddingModel`      | variant default    | Explicit embedding model id; overrides `mnemopi.embeddingVariant`. Precedence: this setting > `MNEMOPI_EMBEDDING_MODEL` env > variant default; a blank or `null` setting counts as unset.                                                                                                                                         |
 | `mnemopi.embeddingApiUrl`     | env/default        | OpenAI-compatible embedding endpoint passed to `Mnemopi`.                                                                                                                                                                                                                              |
@@ -183,6 +184,27 @@ new Mnemopi({
   llm: async (prompt, opts) => completeMemoryRoleWithCurrentAuth(prompt, opts),
 });
 ```
+
+## Embedding downloads and unattended runs
+
+With embeddings on (the default), the first run that needs a vector fetches up to two things: the first remember, the first recall, or a session start that finds stored memories without vectors. Nothing else in Mnemopi downloads or installs anything.
+
+1. The fastembed runtime, when it does not resolve from the omp install (the compiled binary and the bundle never carry it): a `bun install` of the pinned fastembed and its dependencies into `~/.omp/cache/fastembed-runtime/<version key>` (about 270 MB of native assets across platforms, plus onnxruntime's own install step).
+2. The model. The default `mnemopi.embeddingVariant: en` is `BAAI/bge-base-en-v1.5`, whose quantized ONNX files come from Hugging Face into `~/.omp/cache/fastembed`.
+
+Both caches live under the home folder, so every bot on one home shares them: the first run that needs them pays, later runs reuse them with no network. That first load has no time limit, and the first-turn recall waits for it, so a cold cache on a slow or blocked network can hold the first turn of an unattended run. Stored memories are never lost to this: a memory saved while no model is available is kept without a vector and is re-embedded the next time the database opens with a working model.
+
+Choose one for a bot:
+
+| Config | A run fetches | Recall |
+| --- | --- | --- |
+| `mnemopi.noEmbeddings: true` | nothing: no worker, no install, no model | keyword (FTS) only |
+| `mnemopi.allowModelDownload: false` | nothing: the cached model is used if both caches below are complete, otherwise embeddings are skipped and one warning is logged | vector plus keyword when cached, keyword only otherwise |
+| defaults | the runtime and the model, on first use | vector plus keyword |
+
+`allowModelDownload: false` checks the disk before it starts the embedding worker: fastembed must resolve (directly, or as `~/.omp/cache/fastembed-runtime/<version key>/node_modules/fastembed/package.json`) and every file of the model must exist under `~/.omp/cache/fastembed/Qdrant_bge-base-en-v1.5-onnx-Q/` (`model_optimized.onnx`, `tokenizer.json`, `tokenizer_config.json`, `config.json`, `special_tokens_map.json`). One gap: if fastembed resolves directly but its native library then fails to load, omp falls back to a runtime install that this setting does not stop.
+
+Warm the cache once, with network, by running a normal hand session with `allowModelDownload` unset and embeddings on, saving one memory and asking one question, then leave it open until the files above exist (print mode stops its embedding worker about 1.5 seconds after the turn, which can cut a download short; the next attempt resumes it). Then set `allowModelDownload: false` in the bot configs.
 
 ## Operational notes
 

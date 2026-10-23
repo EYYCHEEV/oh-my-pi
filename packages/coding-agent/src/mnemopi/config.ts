@@ -6,6 +6,7 @@ import { getMemoriesDir, logger } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 
 import {
+	cfgMnemopiAllowModelDownload,
 	cfgMnemopiAutoRecall,
 	cfgMnemopiAutoRetain,
 	cfgMnemopiBank,
@@ -40,7 +41,7 @@ export type MnemopiScoping = "global" | "per-project" | "per-project-tagged";
 
 export type MnemopiProviderOptions = Pick<
 	MnemopiOptions,
-	"noEmbeddings" | "embeddingModel" | "embeddingApiUrl" | "embeddingApiKey" | "llm" | "debug"
+	"noEmbeddings" | "embeddingModel" | "embeddingApiUrl" | "embeddingApiKey" | "embeddings" | "llm" | "debug"
 >;
 
 export interface MnemopiBackendConfig {
@@ -117,6 +118,7 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 		debug: cfgMnemopiDebug.get(settings),
 		providerOptions: {
 			noEmbeddings: cfgMnemopiNoEmbeddings.get(settings),
+			embeddings: cfgMnemopiAllowModelDownload.get(settings) ? undefined : { allowDownload: false },
 			debug: cfgMnemopiDebug.get(settings),
 			embeddingModel,
 			embeddingApiUrl: cfgMnemopiEmbeddingApiUrl.get(settings),
