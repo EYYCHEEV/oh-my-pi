@@ -542,12 +542,13 @@ export class Mnemopi {
 	}
 
 	/**
-	 * Cut `text` out of this bank's retained transcripts and the summaries and facts built from them, without
-	 * deleting any memory. `forget` does this for its own bank; call it on the other banks a session recalls
-	 * from. Returns the number of transcript rows rewritten.
+	 * Cut `texts` (`ForgetOutcome.forgottenTexts`) out of this bank's retained transcripts and the summaries and facts
+	 * built from them, without deleting any memory, and keep them as tombstones for transcripts retained later.
+	 * `forget` does this for its own bank; call it on the other banks a session recalls from. Returns the number of
+	 * transcript rows rewritten.
 	 */
-	scrubForgottenText(text: string): number {
-		return this.#withRuntimeOptions(() => this.beam.scrubForgottenText(text));
+	scrubForgottenTexts(texts: readonly string[]): number {
+		return this.#withRuntimeOptions(() => this.beam.scrubForgottenTexts(texts));
 	}
 
 	update(memoryId: string, content: string | null = null, importance: number | null = null): boolean {

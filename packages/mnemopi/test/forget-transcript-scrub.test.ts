@@ -323,12 +323,12 @@ describe("forget scrubs the forgotten text out of retained transcripts", () => {
 		const note = memory.remember(SECRET, { source: "coding-agent-retain" });
 		const { stored } = seedTranscripts(memory);
 
-		expect(memory.scrubForgottenText(SECRET)).toBe(2);
+		expect(memory.scrubForgottenTexts([SECRET])).toBe(2);
 
 		expect(rows(db, "SELECT content FROM working_memory WHERE id = ?", [note])).toEqual([SECRET]);
 		expect(rows(db, "SELECT content FROM working_memory WHERE id = ?", [stored])[0]).not.toContain(MARKER);
-		expect(memory.scrubForgottenText(SECRET)).toBe(0);
-		expect(memory.scrubForgottenText("  ")).toBe(0);
+		expect(memory.scrubForgottenTexts([SECRET])).toBe(0);
+		expect(memory.scrubForgottenTexts(["  "])).toBe(0);
 	});
 });
 
@@ -360,16 +360,31 @@ describe("the scrub only cuts whole words of a text long enough to be specific",
 		try {
 			const short = memory.remember("abcdefg", { source: "coding-agent-retain" });
 			retainTranscript(memory, [["user", "abcdefg is the word"]]);
-			expect(memory.forgetDetailed(short)).toEqual({ deleted: true, scrubbedRows: 0, skippedBelowChars: 8 });
+			expect(memory.forgetDetailed(short)).toEqual({
+				deleted: true,
+				scrubbedRows: 0,
+				skippedBelowChars: 8,
+				forgottenTexts: [],
+			});
 			expect(warn).toHaveBeenCalledTimes(1);
 			expect(warn.mock.calls[0]?.[1]).toEqual({ memoryId: short, minChars: 8 });
 
 			warn.mockClear();
 			const long = memory.remember("abcdefgh", { source: "coding-agent-retain" });
 			retainTranscript(memory, [["user", "abcdefgh is the word"]]);
-			expect(memory.forgetDetailed(long)).toEqual({ deleted: true, scrubbedRows: 1, skippedBelowChars: null });
+			expect(memory.forgetDetailed(long)).toEqual({
+				deleted: true,
+				scrubbedRows: 1,
+				skippedBelowChars: null,
+				forgottenTexts: ["abcdefgh"],
+			});
 			expect(warn).not.toHaveBeenCalled();
-			expect(memory.forgetDetailed(long)).toEqual({ deleted: false, scrubbedRows: 0, skippedBelowChars: null });
+			expect(memory.forgetDetailed(long)).toEqual({
+				deleted: false,
+				scrubbedRows: 0,
+				skippedBelowChars: null,
+				forgottenTexts: [],
+			});
 		} finally {
 			warn.mockRestore();
 		}

@@ -1224,6 +1224,30 @@ export function rebuildSleepSummary(beam: BeamMemoryState, summary: Row, keepIds
 	return created;
 }
 
+/**
+ * Replace the `sleep` summary `summary` with one that says `content`: the same rows, scope, validity, veracity,
+ * metadata and timestamps, so it differs only in the text that was cut. Its facts are extracted from the new text
+ * and it is embedded again, as for any summary. Unlike `rebuildSleepSummary` it needs none of the summarized rows,
+ * so it serves a summary whose rows were pruned. Returns the new id, or `null` when `summary` is not a `sleep`
+ * summary. The caller deletes the old one.
+ */
+export function rewriteSleepSummary(beam: BeamMemoryState, summary: Row, content: string): string | null {
+	if (sleepSummarySource(summary) === null) return null;
+	const metadata = JSON.parse(rowValue(summary, "metadata_json") ?? "{}") as Metadata;
+	const sourceIds = (rowValue(summary, "summary_of") ?? "").split(",").filter(id => id.length > 0);
+	const id = consolidateToEpisodic(beam, content, sourceIds, "sleep_consolidation", 0.6, {
+		scope: rowValue(summary, "scope") === "global" ? "global" : "session",
+		validUntil: rowValue(summary, "valid_until"),
+		veracity: clampEpisodicVeracity(rowValue(summary, "veracity")),
+		metadata: { ...metadata, rebuilt_from: rowValue(summary, "id") ?? "" },
+	});
+	beam.db.run(
+		"UPDATE episodic_memory SET timestamp = COALESCE(?, timestamp), created_at = COALESCE(?, created_at) WHERE id = ?",
+		[rowValue(summary, "timestamp"), rowValue(summary, "created_at"), id],
+	);
+	return id;
+}
+
 function consolidateWorkingRows(beam: BeamMemoryState, candidates: Row[], dryRun = false, degrade = true): SleepResult {
 	let rows = candidates;
 	if (rows.length === 0)
