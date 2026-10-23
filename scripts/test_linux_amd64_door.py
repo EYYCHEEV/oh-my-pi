@@ -236,7 +236,6 @@ def make_outputs(assets, app, recipe, tag="", *, machine=62, version="18.8.0", f
         "asset": {"name": ASSETS[0], "size": len(binary), "sha256": digest},
         "checks": dict(passed),
         "qualification": {"binary_sha256": digest, "source_commit": app, "recipe_commit": recipe if tag else None,
-                          "fork_manifest_sha256": MANIFEST_SHA if fork is None else fork,
                           "environment": {"execution": "native-amd64", "cpu": "x86-64-v2", "glibc": "2.36",
                                           "loader": "ld-linux-x86-64.so.2", "runtime_image": "sha256:" + "1" * 64},
                           "checks": dict(passed)}}
@@ -246,8 +245,9 @@ def make_outputs(assets, app, recipe, tag="", *, machine=62, version="18.8.0", f
     try:
         source, asset, qualification = manifest["source"], manifest["asset"], manifest["qualification"]
         binding = canonical({
-            "schema": 1, "binary_sha256": asset["sha256"], "source_commit": source["commit"],
-            "recipe_commit": source["recipe_commit"], "runtime_image_digest": qualification["environment"]["runtime_image"],
+            "schema": 2, "binary_sha256": asset["sha256"], "source_commit": source["commit"],
+            "recipe_commit": source["recipe_commit"], "fork_manifest_sha256": MANIFEST_SHA if fork is None else fork,
+            "runtime_image_digest": qualification["environment"]["runtime_image"],
             "mode": "release" if source["recipe_committed"] else "candidate", "checks": manifest["checks"],
             "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest()})
     except (KeyError, TypeError):  # a deliberately broken manifest has nothing coherent to bind
@@ -958,8 +958,13 @@ class LifecycleTests(DoorCase):
             "an unexpected tag": {"manifest_edit": lambda manifest: manifest["source"].update(tag=TAG)},
             "a partial qualification": {"manifest_edit": lambda manifest: manifest["qualification"]["checks"].update(cli="failed")},
             "the qualification names another binary": {"manifest_edit": lambda manifest: manifest["qualification"].update(binary_sha256="0" * 64)},
-            "the qualification names another registry": {"manifest_edit": lambda manifest: manifest["qualification"].update(fork_manifest_sha256="0" * 64)},
-            "the qualification does not name a registry": {"manifest_edit": lambda manifest: manifest["qualification"].pop("fork_manifest_sha256")},
+            "the record names another registry": {"fork": "0" * 64},
+            "the record names a malformed registry hash": {"fork": "short"},
+            "the record does not name a registry": {"binding_edit": lambda binding: canonical(
+                {key: value for key, value in json.loads(binding).items() if key != "fork_manifest_sha256"})},
+            "the public qualification carries the registry hash": {"manifest_edit": lambda manifest: manifest["qualification"].update(
+                fork_manifest_sha256=MANIFEST_SHA)},
+            "the public qualification carries any other new field": {"manifest_edit": lambda manifest: manifest["qualification"].update(extra="x")},
             "the target is wrong": {"manifest_edit": lambda manifest: manifest.update(target="linux-arm64")},
             "the binary is not x86-64": {"machine": 183},
             "the attestation does not bind the manifest": {"binding_edit": lambda binding: binding.replace(b"candidate", b"release")},

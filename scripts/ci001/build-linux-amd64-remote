@@ -31,6 +31,9 @@ EVIDENCE = ("qualification.json", "qualification.json.sig", "qualification-signe
 CHECKS = ("elf", "cli", "native_runtime", "resources_workers", "builtin_smoke", "offline_session",
           "fork_boundaries", "native_grep", "coding_agent_typecheck")
 IDENTITY = NAMESPACE = "stronk-omp-qualification"
+# The public manifest's qualification object has exactly these fields: the fleet puller reads it with an exact key set.
+QUALIFICATION_FIELDS = {"binary_sha256", "source_commit", "recipe_commit", "environment", "checks"}
+RECEIPT = "build-receipt.json"  # The Mac's own record next to assets/ and evidence/; never published, never uploaded.
 BUNDLE_CAP = 256 * 1024**2  # The door's own cap; its measured realistic bundle is about 78 MB.
 MANIFEST_CAP = 1024**2  # The door's own cap for the registry file; the real one is about 78 KB.
 MANIFEST_REF = "refs/omp/forkmanifest"
@@ -287,6 +290,22 @@ def unique_pairs(pairs):
     return value
 
 
+def write_receipt(path, value):
+    """One private (0600) local record of what was sent and what came back, written once and never through a link."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(canonical(value))
+
+
+def recorded_fork_manifest(record):
+    """The registry hash the signed private record names, or None unless it is exactly 64 lowercase hex characters."""
+    try:
+        value = json.loads(record, object_pairs_hook=unique_pairs).get("fork_manifest_sha256")
+    except (ValueError, AttributeError):
+        return None
+    return value if isinstance(value, str) and re.fullmatch(HEX, value) else None
+
+
 def verify(directory, app, recipe, tag, version, fork_manifest_sha256):
     """Independent of the recipe's own code: bytes, checks, architecture, identity and the signed attestation."""
     assets = directory
@@ -317,12 +336,9 @@ def verify(directory, app, recipe, tag, version, fork_manifest_sha256):
             raise fail("the manifest does not describe the binary")
         if manifest["checks"] != complete:
             raise fail("not all nine checks passed")
-        if not isinstance(qualification, dict) or qualification["checks"] != complete or \
-                qualification["binary_sha256"] != asset["sha256"]:
+        if not isinstance(qualification, dict) or set(qualification) != QUALIFICATION_FIELDS or \
+                qualification["checks"] != complete or qualification["binary_sha256"] != asset["sha256"]:
             raise fail("the qualification record is incomplete")
-        if re.fullmatch(HEX, str(qualification.get("fork_manifest_sha256"))) is None or \
-                qualification["fork_manifest_sha256"] != fork_manifest_sha256:
-            raise fail("the recorded fork manifest differs from the one that was sent")
         if source["commit"] != app or qualification["source_commit"] != app:
             raise fail("the application commit differs")
         if source["tag"] != (tag or None):
@@ -333,8 +349,9 @@ def verify(directory, app, recipe, tag, version, fork_manifest_sha256):
         if manifest["version"] != version:
             raise fail("the omp version differs from the application commit")
         binding = canonical({
-            "schema": 1, "binary_sha256": asset["sha256"], "source_commit": source["commit"],
-            "recipe_commit": source["recipe_commit"], "runtime_image_digest": qualification["environment"]["runtime_image"],
+            "schema": 2, "binary_sha256": asset["sha256"], "source_commit": source["commit"],
+            "recipe_commit": source["recipe_commit"], "fork_manifest_sha256": fork_manifest_sha256,
+            "runtime_image_digest": qualification["environment"]["runtime_image"],
             "mode": "release" if source["recipe_committed"] else "candidate", "checks": manifest["checks"],
             "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest()})
     except (KeyError, TypeError, ValueError, OSError):
@@ -343,7 +360,11 @@ def verify(directory, app, recipe, tag, version, fork_manifest_sha256):
         header = stream.read(20)
     if len(header) != 20 or header[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", header, 18)[0] != 62:
         raise fail("the binary is not an ELF64 x86-64 executable")
-    if (evidence / EVIDENCE[0]).read_bytes() != binding:
+    record = (evidence / EVIDENCE[0]).read_bytes()
+    # The hash travels in the signed private record, never in the public manifest (the fleet puller reads that exactly).
+    if recorded_fork_manifest(record) != fork_manifest_sha256:
+        raise fail("the recorded fork manifest differs from the one that was sent")
+    if record != binding:
         raise fail("the attestation does not bind this manifest")
     verified = subprocess.run(
         ["ssh-keygen", "-Y", "verify", "-f", str(evidence / EVIDENCE[2]), "-I", IDENTITY, "-n", NAMESPACE,
@@ -394,6 +415,7 @@ def drive(args, redact):
         stage.mkdir(mode=0o700)
         receive(door, run_id, stage)
         manifest = verify(stage, app, recipe, tag, version, manifest_sha)
+        received_sha = recorded_fork_manifest((stage / "evidence" / EVIDENCE[0]).read_bytes())
         public = Path(temporary) / "result"
         (public / "assets").mkdir(parents=True, mode=0o700)
         (public / "evidence").mkdir(mode=0o700)
@@ -402,10 +424,15 @@ def drive(args, redact):
         for name in EVIDENCE:
             shutil.move(stage / "evidence" / name, public / "evidence" / name)
         (public / "assets" / ASSETS[0]).chmod(0o755)
+        write_receipt(public / RECEIPT, {
+            "schema": 1, "mode": "release" if tag else "candidate", "app_commit": app, "recipe_commit": recipe,
+            "tag": tag or None, "binary_sha256": manifest["asset"]["sha256"],
+            "fork_manifest_sha256_sent": manifest_sha, "fork_manifest_sha256_received": received_sha})
         os.rename(public, output)
     print(f"verified: omp {manifest['version']} linux-amd64, {manifest['asset']['size']} bytes, sha256 {manifest['asset']['sha256']}")
     print(f"qualified: all nine checks passed on the builder; tag {tag or 'none (candidate, never publishable)'}")
-    print(f"fork manifest: {manifest_sha} (the qualification names exactly the file that was sent)")
+    print(f"fork manifest: {manifest_sha} (the signed qualification record names exactly the file that was sent)")
+    print(f"receipt: {RECEIPT} (private, beside assets/ and evidence/; never published)")
     if not args.keep_remote:
         lines, status = run_command(door, f"cleanup {run_id}")
         show(lines)
@@ -420,7 +447,7 @@ def main(argv=None):
     parser.add_argument("--recipe", required=True, help="recipe commit holding scripts/linux-amd64-*")
     parser.add_argument("--fork-manifest", required=True, help="the workstation's fork_boundary.json, sent with the build (about 78 KB)")
     parser.add_argument("--tag", help="signed stronk-omp-s1 tag naming the application commit (release build)")
-    parser.add_argument("--output", required=True, help="new folder: assets/ and evidence/ are written inside")
+    parser.add_argument("--output", required=True, help="new folder: assets/ and evidence/ and a private build-receipt.json are written inside")
     parser.add_argument("--alias", default=DEFAULT_ALIAS, help="ssh alias of the door (default %(default)s)")
     parser.add_argument("--key", default=DEFAULT_KEY, help="dedicated private key (never printed)")
     parser.add_argument("--repo", help="fork repository (default: the current one)")

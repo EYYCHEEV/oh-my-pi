@@ -32,7 +32,8 @@ The first application built this way is `5e43891a87140fb0972c982f3027f0228c4f637
 The builder exports application bytes only from `--commit` and recipe bytes only from `--recipe-commit`.
 Version-specific values come from the application commit and fail closed when this recipe's pinned toolchain cannot serve it: `linux-amd64-receipt.py check --commit <app> --fork-manifest <file>` compares the application's Bazel version, Bun requirement and locks with this recipe's pins (Bazel `9.2.0`, Bun `1.4.2`) and its README contract block and boundary tests with the supplied fork manifest before any daemon contact.
 All route files named by `linux-amd64-receipt.py:RECIPES`, including preparation, qualification and publishing code, must match the invoked local copies byte for byte.
-The manifest records both full commits, every recipe digest and, in `qualification`, the SHA-256 of the fork manifest the application was judged against.
+The manifest records both full commits and every recipe digest.
+The SHA-256 of the fork manifest the application was judged against is bound by the signed private qualification record, never by the public manifest (the fleet puller reads that file with exact key sets).
 Application version, timestamp and lock digests are checked against the immutable application tree, not the current checkout.
 Recipe digests are checked against the immutable recipe tree.
 Dirty application files never enter either export.
@@ -290,7 +291,8 @@ Nested objects reject unknown fields, and one strict JSON decoder rejects repeat
 `asset` records the binary basename, size and SHA-256.
 `runtime` records ELF target, loader basename, libc floor, required sonames, baseline addon digest and CPU/variant/static-link contract.
 `checks` requires all of `elf`, `cli`, `native_runtime`, `resources_workers`, `builtin_smoke`, `offline_session`, `fork_boundaries`, `native_grep`, `coding_agent_typecheck` to be `passed` for release.
-`qualification` binds the actual binary SHA-256, application and recipe commits, the SHA-256 of the fork manifest (`fork_manifest_sha256`), the same complete check set, and only `execution`, `cpu`, `glibc`, `loader`, `runtime_image` as environment fields.
+`qualification` binds the actual binary SHA-256, application and recipe commits, the same complete check set, and only `execution`, `cpu`, `glibc`, `loader`, `runtime_image` as environment fields; it has exactly the keys `binary_sha256`, `source_commit`, `recipe_commit`, `environment`, `checks`.
+The SHA-256 of the fork manifest (`fork_manifest_sha256`) lives in the signed private `qualification.json` (schema 2) beside the manifest's own SHA-256.
 It is `null` before qualification.
 `qualification.environment.runtime_image` is strictly the verified `sha256:` digest, never a registry/repository/account reference.
 

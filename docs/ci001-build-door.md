@@ -20,7 +20,7 @@ Nothing in this packet has been run on ci-001 yet.
 
 Files that go to ci-001 (Main copies them by the usual route): `scripts/ci001/omp-build-entry` only.
 This guide's scripts are pasted by Main.
-The entry file is the exact reviewed bytes: its SHA-256 is `6a60458727c160cca8aac92b9377d52eb82a0950e478ec5adb29803b41632ff1`, and the install script refuses any other bytes.
+The entry file is the exact reviewed bytes: its SHA-256 is `1f6ac7db0946f07aecbc49ddd63ea145bf61cf64021bf386ac12eadaac0784e7`, and the install script refuses any other bytes.
 
 ## The door at a glance
 
@@ -81,7 +81,7 @@ It never holds a path, a key, an address or an environment value.
   `refs/omp/forkmanifest` must be one parentless commit holding exactly one regular file, `fork_boundary.json`, of at most 1 MiB, whose SHA-256 equals the 64 hex characters in the command.
   The door writes those exact bytes into the run folder and passes the file and its hash to the early check, the runtime preparation and the qualifier, and the hash to the final verification, which requires the signed qualification to name it.
   A missing, oversized or altered file, an application README contract block that is not exactly the manifest's active contract ids in order, a verification command that is not `bun test <relative .test.ts files> [--test-name-pattern <text>]` (shell syntax, absolute or parent paths and URIs are refused as the updater refuses them; a `cargo test` command parses but this recipe cannot run it offline, so it is refused until a new recipe commit exists), an active contract whose test file is missing in the application commit, and a result whose qualification names another hash all refuse the build with a fixed message.
-  The hash is recorded in `RELEASE_MANIFEST.json` and the signed qualification, and the Mac driver checks the recorded value against the file it sent.
+  The hash is recorded in the signed private record (`evidence/qualification.json`), never in the public `RELEASE_MANIFEST.json` (the fleet puller reads that file with exact key sets), and the Mac driver checks the recorded value against the file it sent and keeps both values in a private `build-receipt.json`.
 - The build runs in the account's own rootless Docker, never as root, with `cpus 4`, 24 GiB, no swap, 1024 processes, no mounts from the host and no network inside the qualification container.
   The door refuses to run as euid 0, refuses a rootful daemon, and requires Docker's data on the capped data filesystem.
 - Egress is fenced by an nftables table keyed on the account's uid: private ranges, Tailscale, link-local and the SWAN benchmarking address are dropped; public internet is allowed.
@@ -194,7 +194,7 @@ DATA=/srv/omp-ci
 IMG=/srv/omp-ci.img
 IMG_GIB=256
 ENTRY_SRC=/root/omp-ci-install/omp-build-entry
-ENTRY_SHA=6a60458727c160cca8aac92b9377d52eb82a0950e478ec5adb29803b41632ff1
+ENTRY_SHA=1f6ac7db0946f07aecbc49ddd63ea145bf61cf64021bf386ac12eadaac0784e7
 PUB=${1:?public key line required}
 HOME_DIR=/home/$U
 
@@ -600,8 +600,8 @@ Stop at the first step that does not match, keep the output, and report it; do n
    ```
 
    Before this, run `python3 scripts/linux-amd64-receipt.py check --commit "$(git rev-parse stronk-omp)" --fork-manifest "<the same file>"` on the Mac: it refuses early, and offline, a manifest that the application's README block or test files do not satisfy.
-   Expected: a `run <id>` line, `Phase: door ...` progress lines (the check line names `manifest <12 hex>`), `state: succeeded`, then `verified: omp 18.8.0 linux-amd64 ...`, `qualified: all nine checks passed on the builder; tag none (candidate, never publishable)` and `fork manifest: <64 hex> (the qualification names exactly the file that was sent)`.
-   The output folder holds `assets/` (three files) and `evidence/` (three files).
+   Expected: a `run <id>` line, `Phase: door ...` progress lines (the check line names `manifest <12 hex>`), `state: succeeded`, then `verified: omp 18.8.0 linux-amd64 ...`, `qualified: all nine checks passed on the builder; tag none (candidate, never publishable)`, `fork manifest: <64 hex> (the signed qualification record names exactly the file that was sent)` and a `receipt:` line.
+   The output folder holds `assets/` (three public files), `evidence/` (three private files) and `build-receipt.json` (private, mode 0600, never published).
    Exit codes: 1 the remote build failed, 2 refused, 3 the Mac's own verification failed (the run is then kept on the box), 4 transport.
 4. Proof of removal (Main, as root, after step 3):
 

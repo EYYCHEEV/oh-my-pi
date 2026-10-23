@@ -91,6 +91,8 @@ ASSETS = ("omp-linux-amd64", "RELEASE_MANIFEST.json", "SHA256SUMS.txt")
 EVIDENCE = ("qualification.json", "qualification.json.sig", "qualification-signers")
 CHECKS = ("elf", "cli", "native_runtime", "resources_workers", "builtin_smoke", "offline_session",
           "fork_boundaries", "native_grep", "coding_agent_typecheck")
+# The public manifest's qualification object has exactly these fields: the fleet puller reads it with an exact key set.
+QUALIFICATION_FIELDS = {"binary_sha256", "source_commit", "recipe_commit", "environment", "checks"}
 IDENTITY = NAMESPACE = "stronk-omp-qualification"
 TERMINAL = ("succeeded", "failed", "timeout", "cancelled")
 SAFE_TEXT = r"[A-Za-z0-9 ,.;:()+=<>/'_-]"
@@ -757,14 +759,15 @@ def verify_outputs(out, state):
                  source["recipe_commit"] == (state["recipe"] if mode == "release" else None))
         complete = {name: "passed" for name in CHECKS}
         sound = sound and manifest["checks"] == complete and isinstance(qualification, dict) and \
+            set(qualification) == QUALIFICATION_FIELDS and \
             qualification["checks"] == complete and qualification["binary_sha256"] == asset["sha256"] and \
-            qualification["source_commit"] == state["app"] and qualification["recipe_commit"] == source["recipe_commit"] and \
-            qualification["fork_manifest_sha256"] == state["manifest"]
+            qualification["source_commit"] == state["app"] and qualification["recipe_commit"] == source["recipe_commit"]
         if not sound:
             raise ValueError("not qualified")
         binding = canonical({
-            "schema": 1, "binary_sha256": asset["sha256"], "source_commit": source["commit"],
-            "recipe_commit": source["recipe_commit"], "runtime_image_digest": qualification["environment"]["runtime_image"],
+            "schema": 2, "binary_sha256": asset["sha256"], "source_commit": source["commit"],
+            "recipe_commit": source["recipe_commit"], "fork_manifest_sha256": state["manifest"],
+            "runtime_image_digest": qualification["environment"]["runtime_image"],
             "mode": "release" if source["recipe_committed"] else "candidate", "checks": manifest["checks"],
             "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest()})
     except (KeyError, TypeError, ValueError, OSError):
@@ -773,7 +776,14 @@ def verify_outputs(out, state):
         header = stream.read(20)
     if len(header) != 20 or header[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", header, 18)[0] != 62:
         raise Refused("the run is not qualified: the binary is not an ELF64 x86-64 executable")
-    if (out / "evidence" / EVIDENCE[0]).read_bytes() != binding:
+    record = (out / "evidence" / EVIDENCE[0]).read_bytes()
+    try:
+        recorded = strict_json(record).get("fork_manifest_sha256")
+    except (ValueError, AttributeError):
+        recorded = None
+    if recorded != state["manifest"]:
+        raise Refused("the run is not qualified: the recorded fork manifest differs from the request")
+    if record != binding:
         raise Refused("the run is not qualified: the attestation does not bind this result")
     try:
         verified = subprocess.run(

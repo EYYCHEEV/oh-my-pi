@@ -111,12 +111,18 @@ class VerifyTests(unittest.TestCase):
     def test_a_returned_fork_manifest_hash_that_differs_from_what_was_sent_is_refused(self):
         sent = "5" * 64
         self.refuses(self.received(), "recorded fork manifest differs", fork=sent)  # the builder qualified another file
-        for recorded in ("0" * 64, MANIFEST_SHA.upper(), MANIFEST_SHA[:12], "", None, 7, [MANIFEST_SHA]):
+        for recorded in ("0" * 64, MANIFEST_SHA.upper(), MANIFEST_SHA[:12], "", 7, [MANIFEST_SHA]):
             with self.subTest(recorded=recorded):
-                self.refuses(self.received(manifest_edit=lambda m, v=recorded: m["qualification"].update(fork_manifest_sha256=v)),
-                             "recorded fork manifest differs")
-        self.refuses(self.received(manifest_edit=lambda m: m["qualification"].pop("fork_manifest_sha256")),
-                     "recorded fork manifest differs")
+                self.refuses(self.received(fork=recorded), "recorded fork manifest differs")  # the signed private record names it
+        absent = lambda binding: door_tests.canonical({key: value for key, value in json.loads(binding).items() if key != "fork_manifest_sha256"})
+        self.refuses(self.received(binding_edit=absent), "recorded fork manifest differs")
+        self.refuses(self.received(binding_edit=lambda binding: b"not json"), "recorded fork manifest differs")
+
+    def test_the_registry_hash_must_never_appear_in_the_public_manifest(self):
+        # The fleet puller reads RELEASE_MANIFEST.json with exact key sets; any new field in it would be refused there.
+        self.refuses(self.received(manifest_edit=lambda m: m["qualification"].update(fork_manifest_sha256=MANIFEST_SHA)),
+                     "qualification record is incomplete")
+        self.refuses(self.received(manifest_edit=lambda m: m["qualification"].update(extra="x")), "qualification record is incomplete")
 
     def test_a_bad_checksum_is_refused(self):
         directory = self.received()
@@ -524,6 +530,22 @@ class EndToEndTests(door_tests.DoorCase):
             self.assertNotIn(secret, shown)
         self.assertNotRegex(shown, r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 
+    def assertReceipt(self, output, *, mode, tag):
+        """The Mac's own record: private, outside assets/, naming what was sent and what came back, and nothing secret."""
+        path = output / driver.RECEIPT
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        raw = path.read_bytes()
+        value = json.loads(raw)
+        self.assertEqual(raw, door_tests.canonical(value))
+        binary = (output / "assets" / ASSETS[0]).read_bytes()
+        self.assertEqual(value, {
+            "schema": 1, "mode": mode, "app_commit": self.app, "recipe_commit": self.recipe, "tag": tag,
+            "binary_sha256": hashlib.sha256(binary).hexdigest(),
+            "fork_manifest_sha256_sent": MANIFEST_SHA, "fork_manifest_sha256_received": MANIFEST_SHA})
+        for secret in (str(self.key), self.address, str(self.temporary)):
+            self.assertNotIn(secret, raw.decode())
+        self.assertNotIn(driver.RECEIPT, [path.name for path in (output / "assets").iterdir()])  # never one of the public assets
+
     def test_a_candidate_build_is_driven_fetched_verified_and_cleaned_up(self):
         result = self.drive()
         self.assertEqual(result.returncode, 0, result.out + result.err)
@@ -532,7 +554,8 @@ class EndToEndTests(door_tests.DoorCase):
         self.assertRegex(result.out, r"(?m)^run b[0-9]{14}-[0-9a-f]{8}$")
         self.assertQuiet(result)
         output = self.results / "out"
-        self.assertEqual(sorted(path.name for path in output.iterdir()), ["assets", "evidence"])
+        self.assertEqual(sorted(path.name for path in output.iterdir()), ["assets", driver.RECEIPT, "evidence"])
+        self.assertReceipt(output, mode="candidate", tag=None)
         self.assertEqual(sorted(path.name for path in (output / "assets").iterdir()), sorted(ASSETS))
         self.assertEqual(sorted(path.name for path in (output / "evidence").iterdir()), sorted(EVIDENCE))
         self.assertEqual((output / "assets" / ASSETS[0]).read_bytes(), (self.fixture / "assets" / ASSETS[0]).read_bytes())
@@ -543,7 +566,8 @@ class EndToEndTests(door_tests.DoorCase):
             self.assertEqual(call[:9], ["-i", str(self.key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
                                         "-o", "ControlPath=none", "door-under-test"])
         self.assertEqual(self.calls()[0][-1], f"build {self.app} {self.recipe} {MANIFEST_SHA}")
-        self.assertIn(f"fork manifest: {MANIFEST_SHA} (the qualification names exactly the file that was sent)", result.out)
+        self.assertIn(f"fork manifest: {MANIFEST_SHA} (the signed qualification record names exactly the file that was sent)", result.out)
+        self.assertIn(f"receipt: {driver.RECEIPT} (private", result.out)
         self.assertEqual(self.runs(), [])  # the builder's run folder was removed
 
     def test_a_release_build_carries_the_tag_to_the_door_and_back(self):
@@ -555,6 +579,7 @@ class EndToEndTests(door_tests.DoorCase):
         self.assertIn(f"tag {TAG}", result.out)
         self.assertEqual(self.calls()[0][-1], f"build {self.app} {self.recipe} {MANIFEST_SHA} {TAG}")
         self.assertTrue((self.results / "out" / "assets" / ASSETS[0]).is_file())
+        self.assertReceipt(self.results / "out", mode="release", tag=TAG)
         self.assertQuiet(result)
 
     def test_a_failed_remote_build_is_reported_with_its_fixed_reason_and_leaves_no_output(self):
