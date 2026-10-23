@@ -447,7 +447,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 			}
 			this.#failedCompletionIds.add(message.completionId);
 			const socket = this.#socket;
-			if (socket && !socket.destroyed) {
+			if (socket && !socket.closed) {
 				// One increase per failed connection, not per notification in a replay batch.
 				this.#completionRetryDelayMs = Math.min(
 					Math.max(COMPLETION_RETRY_BASE_MS, this.#completionRetryDelayMs * 2),

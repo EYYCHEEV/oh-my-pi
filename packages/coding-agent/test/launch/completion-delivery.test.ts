@@ -1,12 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { once } from "node:events";
 import * as fs from "node:fs/promises";
-import * as net from "node:net";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { IpcConnection } from "@oh-my-pi/pi-natives";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
@@ -48,11 +47,63 @@ function completion(name: string, owner: string): DaemonCompletionNotification {
 }
 
 async function waitUntil(predicate: () => boolean | Promise<boolean>): Promise<void> {
-	const deadline = performance.now() + 5_000;
-	while (!(await predicate())) {
-		if (performance.now() >= deadline) throw new Error("Timed out waiting for completion settlement");
+	// Bounded by event-loop turns, not time: fake timers freeze every clock, so a missed condition
+	// would otherwise spin forever instead of failing.
+	for (let turn = 0; turn < 200_000; turn++) {
+		if (await predicate()) return;
 		await scheduler.yield();
 	}
+	throw new Error("Timed out waiting for completion settlement");
+}
+
+/** The broker connection opened by the `index`th `IpcConnection.connect` call. */
+async function connectionAt(
+	connections: { mock: { results: ReadonlyArray<{ value: unknown }> } },
+	index: number,
+): Promise<IpcConnection> {
+	await waitUntil(() => connections.mock.results[index] !== undefined);
+	const connection = await connections.mock.results[index]?.value;
+	if (!(connection instanceof IpcConnection)) throw new Error(`Expected broker connection ${index}`);
+	return connection;
+}
+
+/** Event-loop turns, not time: lets queued I/O callbacks run before the caller asserts an absence. */
+async function flushTurns(turns = 2_000): Promise<void> {
+	for (let turn = 0; turn < turns; turn++) await scheduler.yield();
+}
+
+/**
+ * Observes the client's native close callbacks. `IpcConnection.closed` flips as soon as
+ * `destroy()` runs, but the callback that schedules the reconnect timer reaches JS later, so the
+ * returned function waits for that callback to finish for one connection.
+ */
+function observeCloseCallbacks(): (connection: IpcConnection) => Promise<void> {
+	const settled = new Map<IpcConnection, Promise<void>>();
+	const start = IpcConnection.prototype.start;
+	vi.spyOn(IpcConnection.prototype, "start").mockImplementation(function (
+		this: IpcConnection,
+		onLine: (line: string) => void,
+		onClose: (reason: string | null) => void,
+	) {
+		const done = Promise.withResolvers<void>();
+		settled.set(this, done.promise);
+		return start.call(this, onLine, reason => {
+			try {
+				onClose(reason);
+			} finally {
+				done.resolve();
+			}
+		});
+	});
+	return async connection => {
+		const done = settled.get(connection);
+		if (!done) throw new Error("Broker connection was never started");
+		let finished = false;
+		void done.then(() => {
+			finished = true;
+		});
+		await waitUntil(() => finished);
+	};
 }
 
 interface CompletionHarness {
@@ -229,7 +280,8 @@ describe("daemon completion delivery recovery", () => {
 		const notification = completion("retryable", sessionManager.getSessionId());
 		await withBroker(sessionManager, [notification], async ({ client, pending }) => {
 			const warnings = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
-			const connections = vi.spyOn(net, "createConnection");
+			const connections = vi.spyOn(IpcConnection, "connect");
+			const closeObserved = observeCloseCallbacks();
 			let deliveries = 0;
 			let recovered = false;
 			vi.useFakeTimers();
@@ -238,23 +290,20 @@ describe("daemon completion delivery recovery", () => {
 					deliveries++;
 					if (!recovered) throw new Error("Temporary completion consumer failure");
 				});
-				const initialSocket = connections.mock.results[0]!.value;
-				if (!(initialSocket instanceof net.Socket)) throw new Error("Expected the initial broker socket");
-				const initiallyClosed = once(initialSocket, "close");
+				const initialSocket = await connectionAt(connections, 0);
 				await client.request({ op: "ping" }).catch(() => undefined);
-				await initiallyClosed;
-				await scheduler.yield();
+				await closeObserved(initialSocket);
 
 				for (const delay of [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000]) {
 					const before = connections.mock.calls.length;
 					vi.advanceTimersByTime(delay - 1);
+					await flushTurns();
 					expect(connections.mock.calls.length).toBe(before);
 					vi.advanceTimersByTime(1);
-					expect(connections.mock.calls.length).toBe(before + 1);
-					const socket = connections.mock.results[before]!.value;
-					if (!(socket instanceof net.Socket)) throw new Error("Expected the reconnected broker socket");
-					await once(socket, "close");
-					await scheduler.yield();
+					// The reconnect reads the token file before it connects, so the call lands a few turns later.
+					await waitUntil(() => connections.mock.calls.length === before + 1);
+					const socket = await connectionAt(connections, before);
+					await closeObserved(socket);
 				}
 				expect((await pending("retryable")).map(value => value.completionId)).toEqual(["retryable-completion"]);
 				recovered = true;
@@ -273,7 +322,8 @@ describe("daemon completion delivery recovery", () => {
 		const notification = completion("retired-retry", "other-session");
 		await withBroker(sessionManager, [notification], async ({ client, session, pending }) => {
 			const warnings = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
-			const connections = vi.spyOn(net, "createConnection");
+			const connections = vi.spyOn(IpcConnection, "connect");
+			const closeObserved = observeCloseCallbacks();
 			let deliveries = 0;
 			vi.useFakeTimers();
 			try {
@@ -283,28 +333,23 @@ describe("daemon completion delivery recovery", () => {
 					return session.queueLaunchCompletion(value);
 				});
 				client.onCompletion(sessionManager.getSessionId(), value => session.queueLaunchCompletion(value));
-				const initialSocket = connections.mock.results[0]!.value;
-				if (!(initialSocket instanceof net.Socket)) throw new Error("Expected the initial broker socket");
-				const initiallyClosed = once(initialSocket, "close");
+				const initialSocket = await connectionAt(connections, 0);
 				await client.request({ op: "ping" }).catch(() => undefined);
-				await initiallyClosed;
-				await scheduler.yield();
+				await closeObserved(initialSocket);
 
 				vi.advanceTimersByTime(1_000);
 				await waitUntil(() => deliveries === 2 && warnings.mock.calls.length === 2);
 				await client.request({ op: "ping" });
-				const socket = connections.mock.results[1]!.value;
-				if (!(socket instanceof net.Socket)) throw new Error("Expected the reconnected broker socket");
-				const closed = once(socket, "close");
+				const socket = await connectionAt(connections, 1);
 				socket.destroy();
-				await closed;
-				await scheduler.yield();
+				await closeObserved(socket);
 
 				const before = connections.mock.calls.length;
 				vi.advanceTimersByTime(49);
+				await flushTurns();
 				expect(connections.mock.calls.length).toBe(before);
 				vi.advanceTimersByTime(1);
-				expect(connections.mock.calls.length).toBe(before + 1);
+				await waitUntil(() => connections.mock.calls.length === before + 1);
 				await client.request({ op: "ping" });
 				expect(deliveries).toBe(2);
 				expect((await pending("retired-retry")).map(value => value.completionId)).toEqual([
