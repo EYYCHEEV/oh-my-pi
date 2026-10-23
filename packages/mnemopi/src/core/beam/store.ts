@@ -14,6 +14,7 @@ import {
 	rewriteSleepSummary,
 	storeExtractedFactCategories,
 } from "./consolidate";
+import { settleForget } from "./forget-durability";
 import {
 	FORGOTTEN_MARK,
 	MIN_SCRUB_CHARS,
@@ -583,6 +584,7 @@ export function scrubForgottenTexts(beam: BeamMemoryState, texts: readonly strin
 	const scrubbed = transaction(beam.db, () => scrubTranscripts(beam, texts, null));
 	invalidateCaches(beam);
 	reembedWorkingRows(beam, scrubbed);
+	if (scrubbed.length > 0) settleForget(beam.db);
 	return scrubbed.length;
 }
 
@@ -1272,6 +1274,7 @@ export function forgetWorkingDetailed(beam: BeamMemoryState, memoryId: string): 
 	if (done === null) return { deleted: false, scrubbedRows: 0, skippedBelowChars: null, forgottenTexts: [] };
 	invalidateCaches(beam);
 	reembedWorkingRows(beam, done.scrubbed);
+	settleForget(beam.db);
 	if (done.tooShort) {
 		logger.warn("mnemopi: forgotten text too short to scrub from retained transcripts; they keep any copy", {
 			memoryId,

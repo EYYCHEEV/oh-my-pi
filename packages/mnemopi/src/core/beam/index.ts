@@ -20,6 +20,7 @@ import {
 	sleep,
 	sleepAllSessions,
 } from "./consolidate";
+import { finishPendingForget } from "./forget-durability";
 import { factRecall, formatContext, recall, recallEnhanced } from "./recall";
 import { initBeam } from "./schema";
 import {
@@ -211,6 +212,7 @@ export class BeamMemory implements BeamMemoryState {
 			return;
 		}
 		this.#closed = true;
+		finishPendingForget(this.db);
 		closeQuietly(this.db);
 	}
 
@@ -348,10 +350,12 @@ export class BeamMemory implements BeamMemoryState {
 	}
 
 	sleep(dryRun = false): SleepResult {
+		if (!dryRun) finishPendingForget(this.db);
 		return sleep(this, dryRun);
 	}
 
 	sleepAllSessions(dryRun = false): SleepResult {
+		if (!dryRun) finishPendingForget(this.db);
 		return sleepAllSessions(this, dryRun);
 	}
 
