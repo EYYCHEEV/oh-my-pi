@@ -190,10 +190,11 @@ export interface RecallOptions {
 	mmrLambda?: number;
 	/**
 	 * Maximum characters of `content` returned per {@link RecallResult}. When the
-	 * stored content exceeds this, the preview is clipped and the trailing
-	 * character is replaced with `…` so callers can see it was truncated. The
-	 * full row is always reachable via {@link BeamMemoryState.get}. `0` or a
-	 * negative value disables clipping. Defaults to
+	 * stored content exceeds this, the preview is clipped and each cut side is
+	 * marked with `…` so callers can see it was truncated. The preview is the head
+	 * of the row, or a window around the query's match when the match lies past
+	 * the head. The full row is always reachable via {@link BeamMemoryState.get}.
+	 * `0` or a negative value disables clipping. Defaults to
 	 * {@link RECALL_CONTENT_PREVIEW_CHARS} (500).
 	 */
 	contentPreviewChars?: number;
@@ -267,8 +268,9 @@ export type RecallResult = RecallRowFields & {
 	/**
 	 * True when {@link content} is a clipped preview of the stored row. The
 	 * clip is capped at {@link RecallOptions.contentPreviewChars} (default 500)
-	 * and the last character is replaced with `…`. Fetch the full row via
-	 * `memory://<id>` (mnemopi backend) or the `Mnemopi.get(id)` API.
+	 * and each cut side is replaced with `…`: a leading `…` means the preview
+	 * starts past the head of the row, around what the query matched. Fetch the
+	 * full row via `memory://<id>` (mnemopi backend) or the `Mnemopi.get(id)` API.
 	 */
 	truncated?: boolean;
 	/** Original character count of `content` before {@link truncated} clipping. */

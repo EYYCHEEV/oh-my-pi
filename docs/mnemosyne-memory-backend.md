@@ -86,7 +86,7 @@ The combined project-plus-global behavior lives in the wrapper. The `@oh-my-pi/p
 
 ## Recall previews and full-row reads
 
-Recall results carry clipped content previews, not full rows. Content longer than the preview cap is truncated with a trailing `…`; the result also sets `truncated: true` and `full_length` (original character count), so callers can detect clipping without parsing the marker. The cap is `RecallOptions.contentPreviewChars` (default `500`; `0` disables clipping).
+Recall results carry clipped content previews, not full rows. Content longer than the preview cap is truncated with `…` on each cut side; the result also sets `truncated: true` and `full_length` (original character count), so callers can detect clipping without parsing the marker. The cap is `RecallOptions.contentPreviewChars` (default `500`; `0` disables clipping). The preview is the head of the row, unless the query matched only past the head: then it is a window around the match (a leading `…` marks it), preferring the query terms that are rare in that row, so a fact buried deep in a long row appears in the recall result instead of its first 499 characters.
 
 The full row is always reachable by reading `memory://<memory-id>`, which resolves the live working or episodic row and returns its full content behind a small YAML frontmatter header (`id`, `bank`, `store`, `memory_type`, timestamps, `importance`, `veracity`, `session_id`, `metadata`). The coding-agent's model-facing prompts require this read before any `memory_edit update`, since `update` replaces content wholesale and would otherwise discard the unseen tail of a clipped preview.
 
