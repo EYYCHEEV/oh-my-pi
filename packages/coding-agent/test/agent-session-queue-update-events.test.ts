@@ -157,7 +157,12 @@ describe("AgentSession queue_update events", () => {
 		expect(remaining).toEqual({ steering: [], followUp: [], liveSteered: 0 });
 	});
 
-	it("keeps the queue snapshot truthful while a steer is claimed live", async () => {
+	// Skipped for the fork contract `context-occupancy-projection`: the budget
+	// admission gate AgentSession installs makes `openLiveSteering`
+	// (agent-loop.ts) offer no live steering, so steering waits for the next
+	// boundary. packages/agent/test/live-steering.test.ts covers the gate. Revisit
+	// when that contract retires or the gate can re-admit a live steer.
+	it.skip("keeps the queue snapshot truthful while a steer is claimed live", async () => {
 		// The provider stream stays open and claims the steer through live
 		// steering, like OpenAI Responses `response.steer` does. Moving the
 		// message into the live-steered set changes the snapshot (it still
@@ -197,7 +202,9 @@ describe("AgentSession queue_update events", () => {
 		await running;
 	});
 
-	it("emits the queue change when a live-steered message lands in the transcript", async () => {
+	// Skipped for the fork contract `context-occupancy-projection`: see the
+	// previous skip; live steering is never offered while the admission gate is on.
+	it.skip("emits the queue change when a live-steered message lands in the transcript", async () => {
 		// The other half of the claim lifecycle: without an interrupt, the
 		// finished turn records the steered message, so it stops counting as
 		// pending input and queue listeners must hear that arrival too.
