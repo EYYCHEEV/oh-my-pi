@@ -1,6 +1,7 @@
 # Fork-only Linux amd64 releases
 
-The only fleet Linux release route is the Mac-controlled local build, qualification and publish-only commands in this guide.
+The only fleet Linux release route is the Mac-controlled build, qualification and publish-only commands in this guide.
+The Linux amd64 build itself runs on ci-001 behind a dedicated forced-command door (`docs/ci001-build-door.md`); the Mac only drives it, verifies what returns, signs and publishes.
 The public repository is exactly `EYYCHEEV/oh-my-pi`, target `linux-amd64`, namespace `stronk-omp-s1-YYYY.MM.DD.NNNN`.
 No upstream release, floating branch, latest-release lookup, ARM64 asset, legacy updater or existing-release backfill is a substitute.
 The retained Actions workflow is unconditionally dormant and has no publishing permissions or tag trigger.
@@ -11,6 +12,7 @@ Keep fork Actions disabled.
 These scripts do not grant execution approval.
 The operator separately owns approved builder/dependency capacity and cost, public trust enrollment, source/tag signing and pushes, qualification signing-key custody, repository immutability settings, and creation/upload/publication of the exact release.
 No script provisions a builder, changes Docker contexts, creates keys/trust stores, changes GitHub settings, pushes, installs a runtime, contacts a deployment host, or restarts a service.
+The one caller that contacts a machine is `scripts/ci001/build-linux-amd64-remote`; it reaches only the dedicated build door on ci-001, runs only after separate execution approval, and never signs, tags, pushes or publishes.
 Use only the existing approved GitHub credential mechanism; never pass a token in an argument or add broader credentials as a fallback.
 
 The publisher owns only a new release's draft/upload/read-back/publish/read-back transaction.
@@ -24,10 +26,11 @@ This route neither modifies the legacy updater nor repairs old releases.
 
 ## Exact application and independent recipe
 
-The application pin is `5e43891a87140fb0972c982f3027f0228c4f6378`, version `18.8.0`.
-It does not contain the new release tools.
+The application is an input: the full 40-hex commit passed as `--commit` (and to the ci-001 door), not a constant.
+The first application built this way is `5e43891a87140fb0972c982f3027f0228c4f6378`, version `18.8.0`, which does not contain the new release tools.
 `--recipe-commit` therefore binds a separate reviewed full Git commit containing the release route.
 The builder exports application bytes only from `--commit` and recipe bytes only from `--recipe-commit`.
+Version-specific values come from the application commit and fail closed when this recipe's pinned toolchain cannot serve it: `linux-amd64-receipt.py check --commit <app>` compares the application's Bazel version, Bun requirement and locks with this recipe's pins (Bazel `9.2.0`, Bun `1.4.2`) before any daemon contact.
 All route files named by `linux-amd64-receipt.py:RECIPES`, including preparation, qualification and publishing code, must match the invoked local copies byte for byte.
 The manifest records both full commits and every recipe digest.
 Application version, timestamp and lock digests are checked against the immutable application tree, not the current checkout.
@@ -79,7 +82,7 @@ Only known phase names are printed, never raw build logs.
 After the applicable build approval, choose a fresh output name and approved local transport inputs:
 
 ```sh
-SOURCE_COMMIT=5e43891a87140fb0972c982f3027f0228c4f6378
+SOURCE_COMMIT=<full 40-hex application commit>
 : "${BUILD_DOCKER_SOCKET:?bind the approved local Unix socket}"
 : "${QUALIFY_DOCKER_SOCKET:?bind the approved native-amd64 local Unix socket}"
 : "${QUALIFICATION_IMAGE:?bind the approved already-present image by digest}"
@@ -161,20 +164,29 @@ The native floor is x86-64-v2, not AVX2; the runtime records the actual qualifie
 A writable executable extraction cache is required.
 Optional ML models/packages remain on-demand inputs and are not promised offline.
 
-### Preparing a bounded, one-time native witness
+### Preparing the runtime on ci-001
 
-This is a separately approved preparation step, not permission to execute it on any shared host.
+Building and qualifying on ci-001 is a separately approved run, not permission to start one on any shared host.
+The Mac caller `scripts/ci001/build-linux-amd64-remote` bundles exactly the application commit, the recipe commit and, for a release, the annotated tag, without their history, and sends that one bundle through the forced-command door `scripts/ci001/omp-build-entry`.
+`docs/ci001-build-door.md` is the install packet, the command grammar and the undo.
+The door replaces the retired devbox-s1 witness: no root, no `systemd-run`, no scratch under `/root` and no fixed application commit.
+
+Before any daemon contact the door runs `python3 scripts/linux-amd64-receipt.py check --commit "$SOURCE_COMMIT"`.
+It refuses, with a fixed reason, an application commit whose Bazel version differs from this recipe's pin, whose Bun requirement (an exact pin or a floor) the recipe's Bun does not satisfy, that lacks a lock file, a fork-contract map or a boundary test this recipe runs, or whose omp version is not a release version.
+A refusal means a new reviewed recipe commit is needed; nothing is rebuilt or worked around.
+
 `linux-amd64-runtime.py` uses the same exact application archive, pinned base, signed Debian snapshot, Bun archive checksum and Bazel/Rust graph as the ordinary candidate recipe.
 Supply the full reviewed preparation commit with `--recipe-commit`; this checks the invoked route files but does not turn the resulting candidate into a release.
-All generated workspace/runtime images and build/qualification containers carry `org.stronk.omp-witness=<run-id>`.
+All generated workspace/runtime images and build/qualification containers carry `org.stronk.omp-witness=<run-id>`, and the preparation and qualification containers also have the fixed names `omp-build-<run-id>-prepare` and `omp-build-<run-id>-qualify`.
+The door proves removal through both selectors.
 The downloaded immutable parent base is not relabeled or deleted.
 
 ```sh
 python3 scripts/linux-amd64-runtime.py \
-  --commit 5e43891a87140fb0972c982f3027f0228c4f6378 \
+  --commit "$SOURCE_COMMIT" \
   --recipe-commit "$RECIPE_COMMIT" \
-  --docker-socket unix:///var/run/docker.sock \
-  --witness-run-id "$RUN_ID" --output witness-candidate \
+  --docker-socket "unix:///run/user/$(id -u)/docker.sock" \
+  --witness-run-id "$RUN_ID" --output candidate \
   --image-id-file "$PRIVATE_SCRATCH/runtime-image-id"
 ```
 
@@ -193,72 +205,38 @@ The dependency metadata uses the qualifier's own tree digest and verifies the Bu
 The resulting stopped-container snapshot is a local image ID, not a fabricated registry digest.
 Its normal user is `65532:65532`, and it is consumed by the existing offline qualifier with `--witness-run-id "$RUN_ID"`.
 
-`linux-amd64-witness.py preflight` records only allowlisted Docker product facts, image IDs, disk/cache usage and the approved source-host prerequisites in a new private scratch evidence file.
-It refuses fact drift, an existing run label, less than 884 decimal GB free on `/`, less than 200 GiB free on Docker storage, less than 32 GiB available host memory (leaving 8 GiB beyond the build cap), host Bun/Node, remote transport and ambient Docker overrides.
-The Docker reserve exceeds the 120-GiB upper disk estimate by 80 GiB; the estimate is not a writable-layer quota.
+The door's host profile fits ci-001 and is not devbox-s1's.
+It refuses to start unless it runs as the unprivileged build account (never euid 0), talks to that account's own rootless Docker socket, finds a native amd64 cgroup-v2 rootless daemon (Docker 27 or newer, BuildKit present, memory, swap, process and CPU limits enforceable), has Docker's data root on the capped build data filesystem, and sees at least 150 GiB free there and 32 GiB of available memory.
+While a run is going it stops the run when free space falls under 12 GiB, when the run folder passes 6 GiB or 150 000 entries, or when the whole run passes four hours.
+The disk figures follow the 40 to 120 GiB peak estimate and the 2.9 GB of BuildKit cache a failed run leaves; the peak has not been measured.
 
-The phase-1 scratch copies of `linux-amd64-witness.py` and `linux-amd64-receipt.py` own recovery even if the repository checkout is incomplete.
-With the standard `--scratch`, `--run-id` and explicit local `--docker-socket` inputs, the witness commands are:
-
-| Command | Contract |
-| --- | --- |
-| `start --recipe-commit "$RECIPE_COMMIT"` | Submits the whole prepare, candidate-verify, qualify and signed-verify chain as the transient system service `omp-witness-<run-id>.service`. Refuses any existing unit of that name; systemd also rejects a concurrent name collision. The scratch working directory, fixed `env -i` environment and null stdin/stdout/stderr exclude SSH streams, journald output and raw logs. |
-| `start --recipe-commit "$RECIPE_COMMIT" --tag "$SOURCE_TAG"` | Opts into release identity. Requires scratch-owned, regular, non-symlink `source-allowed-signers` and `source-revoked-signers` files directly in the validated scratch directory. Validates the SSH-signed annotated tag against both public files before submitting the service, then revalidates it before the sole build. |
-| `status` | Read-only, path-free `systemctl show` state plus allowlisted progress and terminal status. Exit zero requires terminal `success` and an absent or cleanly inactive unit; a gone unit without success is failure, never permission for handoff or another build. |
-| `stop` | Uses `systemctl stop` for that exact unit, with systemd control-group termination and a 180-second stop deadline. The worker handles SIGTERM by stopping independently label-checked run containers before recording failure. Stop never fabricates terminal evidence; abort removes leftovers if the worker cannot finish. |
-| `cleanup` | Requires terminal success and the Mac verification acknowledgment before any Docker query or removal. |
-| `abort` | Requires the preflight baseline and an inactive, failed or absent unit, including failed submission or abrupt worker death without terminal evidence. Never needs or creates a Mac acknowledgment, never prunes cache, and preserves scratch, evidence and key. |
-| `retire` | Explicitly deletes only the validated private scratch directory after a valid cleanup or abort record. Preserve that record and required evidence on the Mac first; abort itself does not authorize retirement. |
-
-Without `--tag`, candidate argv, environment, phases, stage IDs, progress/status vocabulary, records, deadlines and cleanup remain unchanged.
-Release mode is approved only for the one-time fork OMP native witness under fleet-migration Amendment A2 (2026-10-16), after independent tool review and separate approval of the exact run batch.
-This exception does not approve another release build on that host, signing a source tag with an operator key, enabling immutable releases, or publishing anything.
-The helpers consume an already signed tag; they neither create tags nor publish.
-
-The private runner must bundle the release branch and exactly the chosen `refs/tags/$SOURCE_TAG`, transfer the two explicitly enrolled public signer files, and check that the annotated tag directly names the fixed application commit and that the application is an ancestor of the reviewed recipe commit.
-Both signer files are mandatory in this route: supply an explicitly empty revocation file when no signer is revoked, rather than silently omitting revocation policy.
-They stay outside the repository, immutable source export, Docker build context, containers and public assets.
-The runtime helper accepts `--tag`, `--allowed-signers` and `--revoked-signers` for that same release preparation path, and reuses the receipt module's tag validation.
+Release mode is an opt-in tag on the build command, run on the door only after separate approval of the exact run.
+A release build needs root-owned, non-group-or-world-writable `source-allowed-signers` (non-empty) and `source-revoked-signers` (an explicitly empty file when nothing is revoked) in the door's `/etc/omp-build`; the door refuses a release without them, and the recipe validates the SSH-signed annotated tag against both files before the sole build.
+Both files stay outside the repository, immutable source export, Docker build context, containers and public assets.
+Approving release mode on the door does not approve signing a source tag with an operator key, enabling immutable releases, or publishing anything: the helpers consume an already signed tag and neither create tags nor publish.
+The runtime helper accepts `--tag`, `--allowed-signers` and `--revoked-signers` for the release preparation path, and reuses the receipt module's tag validation.
 There is still one no-RUN workspace export and one resource-bounded preparation container, not a separate release build.
 The prepared image and three public assets share `SOURCE_COMMIT`, `SOURCE_TAG`, validated `SOURCE_TAG_OBJECT`, `RECIPE_COMMITTED=1` and `RECIPE_COMMIT`.
 The exported manifest must name that same tag object before the runtime snapshot is committed.
 
-Release assets use `dist/witness-release`; the historical `verify-candidate` phase name still means pre-qualification receipt verification, not candidate identity.
+The door passes `--output candidate` or `--output release`; the historical `verify-candidate` phase name still means pre-qualification receipt verification, not candidate identity.
 Qualification adds `--recipe-commit`, producing a signed attestation with `mode=release` and the exact recipe binding.
-Final verification, including the Mac-side check, adds `--tag "$SOURCE_TAG" --recipe-commit "$RECIPE_COMMIT" --release` and the explicit qualification attestation/signers.
+Final verification adds `--tag "$SOURCE_TAG" --recipe-commit "$RECIPE_COMMIT" --release` and the explicit qualification attestation/signers.
+The door generates a fresh qualification key inside the run, verifies the signed result itself before it may be fetched, and returns only the three public assets plus the private qualification record (`qualification.json`, its signature and the one-line signers file).
+The Mac caller then independently re-checks bytes against `SHA256SUMS.txt`, manifest schema 2 with all nine checks passed, ELF64 x86-64, the application commit and version, the recipe and tag identity, and the attestation signature.
 No progress/status allowlist change is needed: release preparation reuses `Phase: prepared runtime complete.` instead of the candidate-only export summary.
-Release mode preserves every lifecycle phase, stage allowlist, JSON record shape, deadline and cleanup boundary described below.
 
-Systemd is the sole lifecycle owner: Type=exec, Restart=no, KillMode=control-group, TimeoutStopSec=180s, RuntimeMaxSec=9h and UMask=0077.
-No detached session, PID file, process-group identity or job-request record is used.
-Fixed private scratch records are immutable allowlisted milestones under `job-progress/`, `job-terminal.json`, and, only on failure, `job-failure.json`.
-The terminal record is exactly one `success` with exit code zero, or `failed:<phase>` with a nonzero exit code; only the job itself writes it as its last lifecycle step.
-Every helper JSON record is written to a private temporary file, flushed and fsynced, then published atomically by a no-overwrite hard link and directory fsync.
-Pollers therefore never see an incomplete final record.
-The failure record is mode `0600` inside the existing root-owned mode-`0700` scratch directory and contains exactly `{schema, run_id, stage}` with schema `1`.
-Its stage is the last validated qualification ID, or the fixed lifecycle phase if qualification had not announced one.
-The witness validates qualification IDs against the checked-out recipe's own allowlist; raw diagnostics are never persisted or echoed.
-Successful jobs write no failure record, and `status` and existing progress lines are unchanged.
-Preserve the failure record before separately approved scratch retirement when investigating a failed witness.
-Status selects only LoadState, ActiveState, SubState, Result and ExecMainStatus, validates the fields and prints no paths.
-Successful transient units unload normally; cleanup/abort reset only the exact failed unit with `systemctl reset-failed` and confirm that no unit remains.
-No unit is enabled, persisted or written by the helper.
-Existing workspace-export, four-hour preparation, snapshot and qualification deadlines and container resource limits remain intact.
-GNU timeout enforces the additional 21600/900/5400/900-second child ceilings without Python process/group signaling.
-An SSH drop changes none of this state: reconnect and poll `status`, never restart the build.
+The door, not systemd, owns the lifecycle.
+A detached supervisor owns each run and holds an exclusive lock on it for its whole life, so only one build runs at a time and a dropped SSH connection changes nothing: reconnect and poll `status`, never restart the build.
+A supervisor that vanished (for example a host restart) is reported `failed` and swept by the next build.
+Existing workspace-export, four-hour preparation, snapshot and qualification deadlines and container resource limits remain intact; the door adds a four-hour whole-run deadline and, when any limit expires, kills the running step's whole process group before it sweeps.
 
-Both cleanup branches recheck every container/image label and preserve the initial image inventory.
-Image removal is newest-first, never forced, and always uses `docker image rm --no-prune` so no unchecked parent is removed implicitly.
-They never delete a separately registered pinned base or require BuildKit's cached base to be registered as a Docker image.
-Only successful `cleanup` may prune default-builder cache, and only when preflight proved it was initially empty and no unexpected Docker state appeared.
-Otherwise cache is preserved and its remaining size recorded; abort always preserves it.
-Use an exclusive Docker maintenance window for this batch because shared default-builder cache has no per-witness ownership boundary.
-The helpers never contact a remote machine, provision a builder, change daemon settings/networks, create tags, publish, or install Bun/Node on the host.
-The private operator batch owns bundle transfer, dedicated one-time key generation outside containers, public-key return, local attestation verification and separate scratch retirement.
-Mac-side path-bearing commands discard both streams and preserve exit status, including shell redirection errors; comparisons use `cmp -s`, and only fixed path-free messages escape.
-The SSH/SCP functions own their fixed noninteractive authentication, strict host-key, disabled host-key-update and quiet options, including in a fresh recovery shell.
-Any failed phase stops the success path; use the explicit approved abort branch to recover without changing inputs, fabricating verification, rebuilding or working around a download failure.
-
+After every run, and on `cleanup`, the door removes containers selected by exact run label or by the fixed name prefix `omp-build-<run-id>-`, then images selected by the exact run label, newest first.
+Image removal is never forced and always uses `docker image rm --no-prune` so no unchecked parent is removed implicitly.
+It never deletes the separately downloaded pinned base; afterwards it prunes only the build cache of its own dedicated rootless daemon, which belongs to no one else.
+A run is `cleanup: proven` only when both selectors find nothing afterwards; an unproven run keeps its folder and blocks the next build until `cleanup` proves removal.
+Raw build output never leaves the builder: only allowlisted phase lines are streamed, and the door records one path-free log line per command.
+Any failed phase stops the success path; recover with `cleanup`, never by changing inputs, fabricating verification, rebuilding or working around a download failure.
 
 ## Release build and mandatory qualification
 
