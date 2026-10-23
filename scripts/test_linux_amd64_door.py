@@ -52,6 +52,10 @@ def load_driver():
 
 
 driver = load_driver()
+# A plausible registry: the door only hashes it, so its contents matter to the recipe steps and not here.
+MANIFEST = json.dumps({"schemaVersion": 1, "requireDeclaredPaths": False, "readme": {"path": "README.md"},
+                       "contracts": [{"id": "fixture-contract", "status": "active"}]}, indent=2).encode() + b"\n"
+MANIFEST_SHA = hashlib.sha256(MANIFEST).hexdigest()
 
 # ---- fake recipe steps (committed into the throwaway recipe commit) ---------------------------------
 
@@ -70,9 +74,14 @@ def value(flag):
 
 def hook(step):
     log = os.environ.get("OMP_TEST_LOG")
+    # What the recipe step actually finds in the registry file it was told about; it also checks the stated hash like the recipe.
+    fork = hashlib.sha256(Path(value("--fork-manifest")).read_bytes()).hexdigest() if "--fork-manifest" in ARGS else None
     if log:
         with open(log, "a") as stream:
-            stream.write(json.dumps({"step": step, "argv": ARGS, "env": sorted(os.environ), "cwd": os.getcwd()}) + "\n")
+            stream.write(json.dumps({"step": step, "argv": ARGS, "env": sorted(os.environ), "cwd": os.getcwd(), "fork": fork}) + "\n")
+    if fork is not None and fork != value("--fork-manifest-sha256"):
+        print("raw diagnostic that must never leave the builder", flush=True)
+        sys.exit(1)
     if os.environ.get("OMP_TEST_NOISE") == step:
         for line in NOISE:
             print(line, flush=True)
@@ -112,7 +121,7 @@ def leave(step):
 FAKE_RECEIPT = FAKE_COMMON + r'''
 if ARGS[0] == "check":
     hook("check")
-    print("Application check passed: omp 18.8.0, Bazel 9.2.0, Bun 1.4.2, 27 fork contracts.", flush=True)
+    print("Application check passed: omp 18.8.0, Bazel 9.2.0, Bun 1.4.2, 28 fork contracts, manifest " + value("--fork-manifest-sha256")[:12] + ".", flush=True)
 elif ARGS[0] == "verify":
     hook("verify-final" if "--attestation" in ARGS else "verify-candidate")
 else:
@@ -209,7 +218,7 @@ def elf(machine=62):
     return bytes(header) + b"fixture binary\n"
 
 
-def make_outputs(assets, app, recipe, tag="", *, machine=62, version="18.8.0", manifest_edit=None, binding_edit=None):
+def make_outputs(assets, app, recipe, tag="", *, machine=62, version="18.8.0", fork=None, manifest_edit=None, binding_edit=None):
     """Write the three public assets into `assets` and return the attestation binding bytes.
 
     The edits run before the manifest, checksums and binding are computed, so only the targeted defect appears.
@@ -227,6 +236,7 @@ def make_outputs(assets, app, recipe, tag="", *, machine=62, version="18.8.0", m
         "asset": {"name": ASSETS[0], "size": len(binary), "sha256": digest},
         "checks": dict(passed),
         "qualification": {"binary_sha256": digest, "source_commit": app, "recipe_commit": recipe if tag else None,
+                          "fork_manifest_sha256": MANIFEST_SHA if fork is None else fork,
                           "environment": {"execution": "native-amd64", "cpu": "x86-64-v2", "glibc": "2.36",
                                           "loader": "ld-linux-x86-64.so.2", "runtime_image": "sha256:" + "1" * 64},
                           "checks": dict(passed)}}
@@ -311,6 +321,34 @@ def make_repository(root):
     return repo, app, recipe
 
 
+def forged_bundle(repo, app, recipe, directory, build):
+    """The driver's bundle, except that the registry ref points at whatever `build(bare, git)` makes."""
+    directory, bare = Path(directory), Path(directory) / "forged.git"
+
+    def git(cwd, *args, data=None):
+        return subprocess.run(["git", "-C", str(cwd), *args], input=data, check=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, env={**os.environ, **GIT_ENVIRONMENT}).stdout.decode().strip()
+    git(directory, "init", "-q", "--bare", str(bare))
+    (bare / "objects" / "info").mkdir(parents=True, exist_ok=True)
+    (bare / "objects" / "info" / "alternates").write_text(git(repo, "rev-parse", "--path-format=absolute", "--git-path", "objects") + "\n")
+    (bare / "shallow").write_text(f"{app}\n{recipe}\n")
+    refs = [("refs/omp/app", app), ("refs/omp/recipe", recipe), ("refs/omp/forkmanifest", build(bare, git))]
+    for name, value in refs:
+        git(bare, "update-ref", name, value)
+    git(bare, "bundle", "create", str(directory / "forged.bundle"), *[name for name, _ in refs])
+    return (directory / "forged.bundle").read_bytes()
+
+
+def registry_commit(entries, history=False):
+    """A synthetic registry commit holding `entries` as (mode, name, bytes); `history` gives it a parent."""
+    def build(bare, git):
+        lines = "".join(f"{mode} blob {git(bare, 'hash-object', '-w', '--stdin', data=data)}\t{name}\n" for mode, name, data in entries)
+        tree = git(bare, "mktree", data=lines.encode())
+        parent = ["-p", git(bare, "commit-tree", git(bare, "mktree", data=b""), "-m", "earlier")] if history else []
+        return git(bare, "commit-tree", tree, "-m", "forged", *parent)
+    return build
+
+
 def reap(process):
     process.kill()
     process.wait()
@@ -355,7 +393,7 @@ class DoorCase(unittest.TestCase):
         for tag in ("", TAG):
             directory = cls.root / ("bundle-" + (tag or "candidate"))
             directory.mkdir()
-            cls.bundles[tag] = driver.make_bundle(cls.repo, cls.app, cls.recipe, tag, directory).read_bytes()
+            cls.bundles[tag] = driver.make_bundle(cls.repo, cls.app, cls.recipe, tag, directory, MANIFEST).read_bytes()
 
     def setUp(self):
         self.temporary = Path(tempfile.mkdtemp(prefix="omp-door-"))
@@ -408,8 +446,8 @@ class DoorCase(unittest.TestCase):
         result.err = result.stderr.decode()
         return result
 
-    def build_command(self, tag=""):
-        return f"build {self.app} {self.recipe}" + (f" {tag}" if tag else "")
+    def build_command(self, tag="", manifest=MANIFEST_SHA):
+        return f"build {self.app} {self.recipe} {manifest}" + (f" {tag}" if tag else "")
 
     def build(self, tag="", extra=None, bundle=None, **options):
         return self.door(self.build_command(tag), self.bundles[tag] if bundle is None else bundle, extra, **options)
@@ -496,10 +534,12 @@ class DoorCase(unittest.TestCase):
 
 class GrammarTests(DoorCase):
     def test_every_invalid_command_is_refused_before_any_state_is_touched(self):
-        h, o = "a" * 40, "b" * 40
-        cases = ["", "rm -rf /", "build", f"build {h}", f"build {h} {o} extra", f"build {h.upper()} {o}",
-                 f"build {h[:39]} {o}", f"build {h}  {o}", f"build {h} {o} stronk-omp-s1-2026.10.23",
-                 f"build {h} {o} v1.0.0", f"build {h} {o};id", f"build {h} {o}\n", f"build {h} {o} $(id)",
+        h, o, s = "a" * 40, "b" * 40, "c" * 64
+        cases = ["", "rm -rf /", "build", f"build {h}", f"build {h} {o}", f"build {h} {o} {TAG}", f"build {h} {o} {s} extra",
+                 f"build {h.upper()} {o} {s}", f"build {h[:39]} {o} {s}", f"build {h}  {o} {s}", f"build {h} {o} {s.upper()}",
+                 f"build {h} {o} {s[:63]}", f"build {h} {o} {s}0", f"build {h} {o} {s} stronk-omp-s1-2026.10.23",
+                 f"build {h} {o} {s} v1.0.0", f"build {h} {o} {s};id", f"build {h} {o} {s}\n", f"build {h} {o} {s} $(id)",
+                 f"build {h} {s} {o}", f"build {s} {h} {o}", f"build {h} {o} {TAG} {s}", f"build {h} {o} {s}|id", f"build {h} {o} ../{s}",
                  "status", "status ../../etc", "status b20261023153012-3fa9c1d2 extra", "status B20261023153012-3FA9C1D2",
                  "status b20261023153012-3fa9c1d", "fetch b20261023153012-3fa9c1d2;ls", "cleanup $(id)",
                  "cleanup b20261023153012-3fa9c1d2\nstatus b20261023153012-3fa9c1d2", "STATUS b20261023153012-3fa9c1d2",
@@ -583,14 +623,19 @@ class IntakeTests(DoorCase):
         def forge(lines):
             return ("\n".join(lines) + "\n\n").encode() + body
 
+        lines = {line.split(" ", 1)[1]: line for line in header[1:]}
+        app, recipe, registry = lines["refs/omp/app"], lines["refs/omp/recipe"], lines["refs/omp/forkmanifest"]
         cases = {
-            "wrong application commit": forge([header[0], f"{other} refs/omp/app", header[2]]),
-            "wrong recipe commit": forge([header[0], header[1], f"{other} refs/omp/recipe"]),
+            "wrong application commit": forge([header[0], f"{other} refs/omp/app", recipe, registry]),
+            "wrong recipe commit": forge([header[0], app, f"{other} refs/omp/recipe", registry]),
+            "missing registry ref": forge([header[0], app, recipe]),
+            "registry ref under another name": forge([header[0], app, recipe, registry.replace("forkmanifest", "fork")]),
+            "a second registry ref": forge(header + [registry.replace("forkmanifest", "forkmanifest2")]),
             "extra ref": forge(header + [f"{other} refs/heads/main"]),
-            "missing ref": forge(header[:2]),
+            "missing ref": forge([header[0], app, registry]),
             "prerequisite": forge(header + [f"-{other} some comment"]),
             "repeated ref": forge(header + [header[1]]),
-            "traversal ref": forge([header[0], header[1], f"{other} refs/omp/../../x"]),
+            "traversal ref": forge([header[0], app, recipe, f"{other} refs/omp/../../x"]),
             "other hash algorithm": forge(["# v3 git bundle", "@object-format=sha256", *header[1:]]),
             "unrequested tag": self.bundles[TAG],
         }
@@ -643,6 +688,58 @@ class IntakeTests(DoorCase):
         (self.etc / "source-revoked-signers").unlink()
         self.assertRefused(self.build(tag=TAG), "release builds need enrolled source signers")
         self.assertNothingLeftBehind()
+
+
+class ManifestIntakeTests(DoorCase):
+    """The registry travels as a third ref. The door refuses every shape but one file, and any file that is not the hashed bytes."""
+
+    def failed_in_unpack(self, bundle, reason, sha=MANIFEST_SHA):
+        result = self.door(self.build_command(manifest=sha), bundle)
+        self.assertEqual(result.returncode, 1, result.out)
+        run = self.run_of(result)
+        code, values = self.status(run)
+        self.assertEqual((values["state"], values["qualified"], values["reason"]), ("failed", "no", reason))
+        self.assertEqual(self.steps(), [], "a recipe step ran on a registry the door had refused")
+        self.door(f"cleanup {run}")
+
+    def forged(self, build):
+        with tempfile.TemporaryDirectory() as temporary:
+            return forged_bundle(self.repo, self.app, self.recipe, temporary, build)
+
+    def test_a_registry_that_is_not_the_bytes_that_were_hashed_is_refused_before_any_recipe_step(self):
+        weaker = MANIFEST.replace(b"fixture-contract", b"weaker-contract")
+        self.assertNotEqual(weaker, MANIFEST)
+        reason = "the fork manifest differs from the requested SHA-256"
+        self.failed_in_unpack(self.forged(registry_commit([("100644", "fork_boundary.json", weaker)])), reason)
+        # The same honest bundle under a hash its sender never computed is refused alike.
+        self.failed_in_unpack(self.bundles[""], reason, sha="0" * 64)
+
+    def test_a_registry_over_the_cap_or_empty_is_refused_and_one_at_the_cap_is_accepted(self):
+        cap = 1024 ** 2
+        for name, data in {"one byte over": b" " * (cap + 1), "empty": b""}.items():
+            with self.subTest(case=name):
+                bundle = self.forged(registry_commit([("100644", "fork_boundary.json", data)]))
+                self.failed_in_unpack(bundle, "the fork manifest is empty or exceeds its size cap", sha=hashlib.sha256(data).hexdigest())
+        padded = MANIFEST + b" " * (cap - len(MANIFEST))
+        sha = hashlib.sha256(padded).hexdigest()
+        self.write_fixture(fork=sha)
+        result = self.door(self.build_command(manifest=sha), self.forged(registry_commit([("100644", "fork_boundary.json", padded)])))
+        self.assertEqual(result.returncode, 0, result.out)
+
+    def test_anything_but_one_regular_file_named_for_the_registry_is_refused(self):
+        member = ("100644", "fork_boundary.json", MANIFEST)
+        exact = "the fork manifest must be exactly one regular file"
+        shapes = {
+            "a second file": (registry_commit([member, ("100644", "extra.txt", b"x")]), exact),
+            "another name": (registry_commit([("100644", "other.json", MANIFEST)]), exact),
+            "an executable": (registry_commit([("100755", "fork_boundary.json", MANIFEST)]), exact),
+            "a symbolic link": (registry_commit([("120000", "fork_boundary.json", b"/etc/passwd")]), exact),
+            "no file": (registry_commit([]), exact),
+            "a parent commit": (registry_commit([member], history=True), "the fork manifest commit must carry no history"),
+        }
+        for name, (build, reason) in shapes.items():
+            with self.subTest(case=name):
+                self.failed_in_unpack(self.forged(build), reason)
 
 
 class PreflightTests(DoorCase):
@@ -710,7 +807,8 @@ class LifecycleTests(DoorCase):
         self.assertEqual([line for line in lines if line.startswith("Phase: door ")],
                          [f"Phase: door {phase}." for phase in
                           ("unpack", "check", "prepare", "verify-candidate", "qualify", "verify", "collect", "cleanup")])
-        self.assertIn("Application check passed: omp 18.8.0, Bazel 9.2.0, Bun 1.4.2, 27 fork contracts.", lines)
+        self.assertIn("Application check passed: omp 18.8.0, Bazel 9.2.0, Bun 1.4.2, 28 fork contracts, manifest "
+                      + MANIFEST_SHA[:12] + ".", lines)
         self.assertIn("Phase: prepared runtime complete.", lines)
         self.assertIn("qualify-host-source", lines)
         code, values = self.status(run)
@@ -725,13 +823,23 @@ class LifecycleTests(DoorCase):
             self.assertEqual(path.stat().st_mode & 0o077, 0, f"{path.name} is reachable by others")
         steps = self.steps()
         self.assertEqual([step["step"] for step in steps], ["check", "prepare", "verify-candidate", "qualify", "verify-final"])
-        self.assertEqual(steps[0]["argv"], ["check", "--commit", self.app])
+        check = steps[0]["argv"]
+        self.assertEqual(check[:4], ["check", "--commit", self.app, "--fork-manifest"])
+        self.assertTrue(check[4].endswith("/input/fork_boundary.json"), check[4])
+        self.assertEqual(check[5:], ["--fork-manifest-sha256", MANIFEST_SHA])
         prepare = steps[1]["argv"]
         self.assertEqual(prepare[:6], ["--commit", self.app, "--recipe-commit", self.recipe, "--docker-socket",
                                        "unix://" + str(self.socket_path)])
         self.assertEqual(prepare[6:10], ["--witness-run-id", run, "--output", "candidate"])
         self.assertNotIn("--tag", prepare)
         self.assertNotIn("--release", steps[4]["argv"])
+        # Every step that judges the application saw the very bytes that were hashed; the final verify names the hash too.
+        self.assertEqual({step["step"]: step["fork"] for step in steps},
+                         {"check": MANIFEST_SHA, "prepare": MANIFEST_SHA, "verify-candidate": None, "qualify": MANIFEST_SHA,
+                          "verify-final": None})
+        for argv in (steps[1]["argv"], steps[3]["argv"], steps[4]["argv"]):
+            self.assertEqual(argv[argv.index("--fork-manifest-sha256") + 1], MANIFEST_SHA)
+        self.assertNotIn("--fork-manifest-sha256", steps[2]["argv"])
         for step in steps:
             self.assertTrue(step["cwd"].endswith("/repo"), step["cwd"])
             names = set(step["env"])
@@ -739,7 +847,7 @@ class LifecycleTests(DoorCase):
             self.assertFalse([name for name in names if name.startswith("OMP_BUILD_")], names)
         text = self.log_text()
         self.assertRegex(text, r"(?m)^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ build " + run + r" 0 \d+\.\d "
-                         + self.app[:12] + " " + self.recipe[:12] + " candidate$")
+                         + self.app[:12] + " " + self.recipe[:12] + " candidate " + MANIFEST_SHA[:12] + "$")
         self.assertEqual(len(text.splitlines()), 2, text)  # the build and the status call
         for forbidden in (str(self.temporary), "SECRET", "key", "hunter2"):
             self.assertNotIn(forbidden, text)
@@ -758,7 +866,7 @@ class LifecycleTests(DoorCase):
         self.assertEqual(steps["verify-candidate"][-4:], ["--tag", TAG, "--recipe-commit", self.recipe])
         self.assertIn("--release", steps["verify-final"])
         self.assertEqual(steps["qualify"][steps["qualify"].index("--recipe-commit") + 1], self.recipe)
-        self.assertRegex(self.log_text(), r" release\n")
+        self.assertRegex(self.log_text(), r" release " + MANIFEST_SHA[:12] + r"\n")
         self.assertEqual(self.status(run)[1]["qualified"], "yes")
 
     def test_fetch_returns_exactly_the_three_assets_and_the_signed_qualification(self):
@@ -850,6 +958,8 @@ class LifecycleTests(DoorCase):
             "an unexpected tag": {"manifest_edit": lambda manifest: manifest["source"].update(tag=TAG)},
             "a partial qualification": {"manifest_edit": lambda manifest: manifest["qualification"]["checks"].update(cli="failed")},
             "the qualification names another binary": {"manifest_edit": lambda manifest: manifest["qualification"].update(binary_sha256="0" * 64)},
+            "the qualification names another registry": {"manifest_edit": lambda manifest: manifest["qualification"].update(fork_manifest_sha256="0" * 64)},
+            "the qualification does not name a registry": {"manifest_edit": lambda manifest: manifest["qualification"].pop("fork_manifest_sha256")},
             "the target is wrong": {"manifest_edit": lambda manifest: manifest.update(target="linux-arm64")},
             "the binary is not x86-64": {"machine": 183},
             "the attestation does not bind the manifest": {"binding_edit": lambda binding: binding.replace(b"candidate", b"release")},

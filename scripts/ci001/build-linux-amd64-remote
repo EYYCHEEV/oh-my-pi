@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Build the stronk-omp Linux amd64 binary on ci-001 through its forced-command door, then verify what returns.
 
-The Mac only drives: it bundles two commits, calls the door through an ssh alias, polls, fetches and verifies.
+The Mac only drives: it bundles the application and recipe commits plus the workstation's fork_boundary.json,
+calls the door through an ssh alias, polls, fetches and verifies.
 It never signs and never publishes. The key path and any host address are redacted from everything it prints.
 Exit codes: 0 verified, 1 the remote build failed, 2 refused or bad input, 3 verification failed, 4 transport failure.
 """
@@ -12,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -22,6 +24,7 @@ import time
 
 OID = r"[0-9a-f]{40}"
 TAG = r"stronk-omp-s1-[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]{4}"
+HEX = r"[0-9a-f]{64}"
 RUN = r"b[0-9]{14}-[0-9a-f]{8}"
 ASSETS = ("omp-linux-amd64", "RELEASE_MANIFEST.json", "SHA256SUMS.txt")
 EVIDENCE = ("qualification.json", "qualification.json.sig", "qualification-signers")
@@ -29,6 +32,12 @@ CHECKS = ("elf", "cli", "native_runtime", "resources_workers", "builtin_smoke", 
           "fork_boundaries", "native_grep", "coding_agent_typecheck")
 IDENTITY = NAMESPACE = "stronk-omp-qualification"
 BUNDLE_CAP = 256 * 1024**2  # The door's own cap; its measured realistic bundle is about 78 MB.
+MANIFEST_CAP = 1024**2  # The door's own cap for the registry file; the real one is about 78 KB.
+MANIFEST_REF = "refs/omp/forkmanifest"
+MANIFEST_FILE = "fork_boundary.json"
+# One fixed identity and date make the synthetic registry commit a pure function of the file's bytes.
+COMMIT_ENVIRONMENT = {"GIT_AUTHOR_NAME": "omp-build", "GIT_AUTHOR_EMAIL": "", "GIT_AUTHOR_DATE": "@0 +0000",
+                      "GIT_COMMITTER_NAME": "omp-build", "GIT_COMMITTER_EMAIL": "", "GIT_COMMITTER_DATE": "@0 +0000"}
 LIMITS = {ASSETS[0]: 1024**3, ASSETS[1]: 1024**2, ASSETS[2]: 4096, EVIDENCE[0]: 1024**2, EVIDENCE[1]: 65536, EVIDENCE[2]: 4096}
 DEFAULT_ALIAS = "cdm-ci-001-ompbuild"
 DEFAULT_KEY = "~/.ssh/omp-ci001-build"
@@ -56,9 +65,9 @@ class Redactor:
         return self.ADDRESS.sub("[address]", text)
 
 
-def git(repo, *arguments, check=True):
-    result = subprocess.run(["git", "-C", str(repo), *arguments], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                            env={**os.environ, **GIT_ENVIRONMENT}, timeout=120, check=False)
+def git(repo, *arguments, check=True, data=None, environment=None):
+    result = subprocess.run(["git", "-C", str(repo), *arguments], input=data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            env={**os.environ, **GIT_ENVIRONMENT, **(environment or {})}, timeout=120, check=False)
     if check and result.returncode != 0:
         raise Failure("a git query failed; check the repository and the commits", 2)
     return result.stdout.decode("utf-8", "replace").strip() if result.returncode == 0 else None
@@ -71,15 +80,18 @@ def resolve(repo, revision, label):
     return commit
 
 
-def make_bundle(repo, app, recipe, tag, directory):
-    """A bundle of exactly the two commits (and the tag), without their history: about 78 MB, not 640 MB."""
+def make_bundle(repo, app, recipe, tag, directory, manifest):
+    """A bundle of exactly the two commits, the registry commit and (a) tag, without history: about 78 MB, not 640 MB."""
     objects = git(repo, "rev-parse", "--path-format=absolute", "--git-path", "objects")
     bare = Path(directory) / "source.git"
     git(Path(directory), "init", "-q", "--bare", str(bare))
     (bare / "objects" / "info").mkdir(parents=True, exist_ok=True)
     (bare / "objects" / "info" / "alternates").write_text(objects + "\n")
     (bare / "shallow").write_text(f"{app}\n{recipe}\n")
-    refs = [("refs/omp/app", app), ("refs/omp/recipe", recipe)]
+    # The registry travels as one parentless synthetic commit holding only the file; the door re-hashes it.
+    blob = git(bare, "hash-object", "-w", "--stdin", data=manifest)
+    tree = git(bare, "mktree", data=f"100644 blob {blob}\t{MANIFEST_FILE}\n".encode())
+    refs = [("refs/omp/app", app), ("refs/omp/recipe", recipe), (MANIFEST_REF, git(bare, "commit-tree", tree, "-m", "fork manifest", environment=COMMIT_ENVIRONMENT))]
     if tag:
         tag_object = git(repo, "rev-parse", "--verify", "--end-of-options", "refs/tags/" + tag, check=False)
         kind = git(repo, "cat-file", "-t", tag_object, check=False) if tag_object else None
@@ -234,6 +246,26 @@ def receive(door, run_id, destination):
         raise Failure("the door did not return a complete qualified result", 3)
 
 
+def read_fork_manifest(path):
+    """Read the registry file once: these bytes and this hash are what is sent and what the result must name."""
+    try:
+        with open(path, "rb", opener=lambda name, flags: os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK)) as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise OSError("not a regular file")
+            data = stream.read(MANIFEST_CAP + 1)
+    except (OSError, TypeError, ValueError):
+        raise Failure("--fork-manifest must be a readable regular file", 2) from None
+    if not data or len(data) > MANIFEST_CAP:
+        raise Failure("the fork manifest is empty or larger than the door's size cap", 2)
+    try:
+        value = json.loads(data, object_pairs_hook=unique_pairs)
+    except ValueError:
+        raise Failure("the fork manifest is not valid JSON", 2) from None
+    if not isinstance(value, dict) or not isinstance(value.get("contracts"), list):
+        raise Failure("the file is not a fork manifest", 2)
+    return data, hashlib.sha256(data).hexdigest()
+
+
 def sha256(path):
     result = hashlib.sha256()
     with open(path, "rb") as stream:
@@ -255,7 +287,7 @@ def unique_pairs(pairs):
     return value
 
 
-def verify(directory, app, recipe, tag, version):
+def verify(directory, app, recipe, tag, version, fork_manifest_sha256):
     """Independent of the recipe's own code: bytes, checks, architecture, identity and the signed attestation."""
     assets = directory
     binary, manifest_path = assets / ASSETS[0], assets / ASSETS[1]
@@ -288,6 +320,9 @@ def verify(directory, app, recipe, tag, version):
         if not isinstance(qualification, dict) or qualification["checks"] != complete or \
                 qualification["binary_sha256"] != asset["sha256"]:
             raise fail("the qualification record is incomplete")
+        if re.fullmatch(HEX, str(qualification.get("fork_manifest_sha256"))) is None or \
+                qualification["fork_manifest_sha256"] != fork_manifest_sha256:
+            raise fail("the recorded fork manifest differs from the one that was sent")
         if source["commit"] != app or qualification["source_commit"] != app:
             raise fail("the application commit differs")
         if source["tag"] != (tag or None):
@@ -329,6 +364,7 @@ def drive(args, redact):
     if tag and re.fullmatch(TAG, tag) is None:
         raise Failure("the tag must be a stronk-omp-s1 fleet tag", 2)
     package = git(top, "show", f"{app}:packages/coding-agent/package.json", check=False)
+    manifest_data, manifest_sha = read_fork_manifest(Path(args.fork_manifest).expanduser())
     try:
         version = json.loads(package)["version"]
     except (TypeError, ValueError, KeyError):
@@ -343,9 +379,10 @@ def drive(args, redact):
         if args.resume:
             run_id, state = args.resume, None
         else:
-            bundle = make_bundle(top, app, recipe, tag, temporary)
-            print(f"bundle: {bundle.stat().st_size} bytes; app {app[:12]} recipe {recipe[:12]}" + (f" tag {tag}" if tag else ""), flush=True)
-            run_id, state = upload_and_follow(door, " ".join(["build", app, recipe, tag]).strip(), bundle)
+            bundle = make_bundle(top, app, recipe, tag, temporary, manifest_data)
+            print(f"bundle: {bundle.stat().st_size} bytes; app {app[:12]} recipe {recipe[:12]} fork manifest {manifest_sha[:12]}"
+                  + (f" tag {tag}" if tag else ""), flush=True)
+            run_id, state = upload_and_follow(door, " ".join(["build", app, recipe, manifest_sha, tag]).strip(), bundle)
             bundle.unlink()
         if state is None:
             state, values = wait_for_run(door, run_id, args.poll, deadline)
@@ -356,7 +393,7 @@ def drive(args, redact):
         stage = Path(temporary) / "received"
         stage.mkdir(mode=0o700)
         receive(door, run_id, stage)
-        manifest = verify(stage, app, recipe, tag, version)
+        manifest = verify(stage, app, recipe, tag, version, manifest_sha)
         public = Path(temporary) / "result"
         (public / "assets").mkdir(parents=True, mode=0o700)
         (public / "evidence").mkdir(mode=0o700)
@@ -368,6 +405,7 @@ def drive(args, redact):
         os.rename(public, output)
     print(f"verified: omp {manifest['version']} linux-amd64, {manifest['asset']['size']} bytes, sha256 {manifest['asset']['sha256']}")
     print(f"qualified: all nine checks passed on the builder; tag {tag or 'none (candidate, never publishable)'}")
+    print(f"fork manifest: {manifest_sha} (the qualification names exactly the file that was sent)")
     if not args.keep_remote:
         lines, status = run_command(door, f"cleanup {run_id}")
         show(lines)
@@ -380,6 +418,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--app", required=True, help="application commit (any revision git can resolve)")
     parser.add_argument("--recipe", required=True, help="recipe commit holding scripts/linux-amd64-*")
+    parser.add_argument("--fork-manifest", required=True, help="the workstation's fork_boundary.json, sent with the build (about 78 KB)")
     parser.add_argument("--tag", help="signed stronk-omp-s1 tag naming the application commit (release build)")
     parser.add_argument("--output", required=True, help="new folder: assets/ and evidence/ are written inside")
     parser.add_argument("--alias", default=DEFAULT_ALIAS, help="ssh alias of the door (default %(default)s)")

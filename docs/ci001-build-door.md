@@ -19,7 +19,7 @@ Nothing in this packet has been run on ci-001 yet.
 
 Files that go to ci-001 (Main copies them by the usual route): `scripts/ci001/omp-build-entry` only.
 This guide's scripts are pasted by Main.
-The entry file is the exact reviewed bytes: its SHA-256 is `f124e891f04a94c716af0295211eee880a8d50774dd72324e86431796c4c4a64`, and the install script refuses any other bytes.
+The entry file is the exact reviewed bytes: its SHA-256 is `6a60458727c160cca8aac92b9377d52eb82a0950e478ec5adb29803b41632ff1`, and the install script refuses any other bytes.
 
 ## The door at a glance
 
@@ -180,7 +180,7 @@ DATA=/srv/omp-ci
 IMG=/srv/omp-ci.img
 IMG_GIB=256
 ENTRY_SRC=/root/omp-ci-install/omp-build-entry
-ENTRY_SHA=f124e891f04a94c716af0295211eee880a8d50774dd72324e86431796c4c4a64
+ENTRY_SHA=6a60458727c160cca8aac92b9377d52eb82a0950e478ec5adb29803b41632ff1
 PUB=${1:?public key line required}
 HOME_DIR=/home/$U
 

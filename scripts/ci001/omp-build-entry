@@ -3,7 +3,7 @@
 # Main installs this one standalone file root-owned, mode 0755; see docs/ci001-build-door.md.
 #
 # SSH_ORIGINAL_COMMAND is matched in full against exactly one of these and never evaluated by a shell:
-#   build <app-40hex> <recipe-40hex> [<stronk-omp-s1-YYYY.MM.DD.NNNN>]   a git bundle on standard input
+#   build <app-40hex> <recipe-40hex> <fork-manifest-sha256> [<stronk-omp-s1-YYYY.MM.DD.NNNN>]   a git bundle on standard input
 #   status <run-id>    fetch <run-id>    cleanup <run-id>
 # Exit codes: 0 done, 1 failed, 2 refused, 3 still running (status only).
 set -eu
@@ -71,6 +71,10 @@ FOLLOW_SECONDS = setting("OMP_BUILD_FOLLOW_SECONDS", 0.5)
 MEMINFO = setting("OMP_BUILD_MEMINFO", Path("/proc/meminfo"))
 KEEP_RUNS = 3
 KEEP_SECONDS = 7 * 86400
+# The workstation's fork_boundary.json was about 78 KB for 31 contracts; the cap leaves over ten times that.
+MANIFEST_CAP = 1024 * 1024
+MANIFEST_REF = "refs/omp/forkmanifest"
+MANIFEST_FILE = "fork_boundary.json"
 SAFE_PATH = "/usr/local/bin:/usr/bin:/bin"
 PATH = os.environ.get("PATH", SAFE_PATH) if TESTING else SAFE_PATH
 os.environ["PATH"] = PATH
@@ -78,9 +82,10 @@ ENTRY = os.path.abspath(sys.argv[0])
 
 LABEL = "org.stronk.omp-witness"
 OID = r"[0-9a-f]{40}"
+HEX = r"[0-9a-f]{64}"
 TAG = r"stronk-omp-s1-[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]{4}"
 RUN = r"b[0-9]{14}-[0-9a-f]{8}"
-BUILD_COMMAND = re.compile(rf"build ({OID}) ({OID})(?: ({TAG}))?")
+BUILD_COMMAND = re.compile(rf"build ({OID}) ({OID}) ({HEX})(?: ({TAG}))?")
 RUN_COMMAND = re.compile(rf"(status|fetch|cleanup) ({RUN})")
 ASSETS = ("omp-linux-amd64", "RELEASE_MANIFEST.json", "SHA256SUMS.txt")
 EVIDENCE = ("qualification.json", "qualification.json.sig", "qualification-signers")
@@ -193,12 +198,12 @@ def existing_run(run_id):
     return run_dir
 
 
-def log_line(started, command, run_id, status, seconds, app="-", recipe="-", mode="-"):
+def log_line(started, command, run_id, status, seconds, app="-", recipe="-", mode="-", manifest="-"):
     try:
         LOGS.mkdir(parents=True, exist_ok=True)
         with open(LOGS / "runs.log", "a") as log:
             fcntl.flock(log, fcntl.LOCK_EX)
-            log.write(f"{started} {command} {run_id or '-'} {status} {seconds:.1f} {app[:12]} {recipe[:12]} {mode}\n")
+            log.write(f"{started} {command} {run_id or '-'} {status} {seconds:.1f} {app[:12]} {recipe[:12]} {mode} {manifest[:12]}\n")
     except OSError:
         say("error: could not append the run log")
 
@@ -346,7 +351,7 @@ def receive_bundle(path):
 
 
 def validate_bundle(path, app, recipe, tag):
-    """Accept only a prerequisite-free bundle whose refs are exactly the requested commits (and tag)."""
+    """Accept only a prerequisite-free bundle whose refs are exactly the requested commits, the registry and (a) tag."""
     with open(path, "rb") as stream:
         head = stream.read(16384)
     end = head.find(b"\n\n")
@@ -366,7 +371,7 @@ def validate_bundle(path, app, recipe, tag):
         if found is None or found[2] in refs:
             raise Refused("the bundle carries unexpected content")
         refs[found[2]] = found[1]
-    expected = {"refs/omp/app": app, "refs/omp/recipe": recipe}
+    expected = {"refs/omp/app": app, "refs/omp/recipe": recipe, MANIFEST_REF: None}
     if tag:
         expected["refs/tags/" + tag] = None
     if set(refs) != set(expected) or any(want is not None and refs[name] != want for name, want in expected.items()):
@@ -525,17 +530,42 @@ def step(run, watch, argv, *, cwd, reason, forward=True, merge=False):
         raise Stop("failed", reason)
 
 
+def read_manifest(run, git, expected):
+    """The registry ref is one parentless commit holding exactly one regular file of bounded size with the requested hash."""
+    def query(*arguments):
+        found = subprocess.run(git + list(arguments), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=run.environment,
+                               timeout=60, check=False)
+        if found.returncode != 0:
+            raise Stop("failed", "the fork manifest could not be read from the bundle")
+        return found.stdout
+
+    commit = query("rev-list", "--parents", "-n", "1", MANIFEST_REF).decode("ascii", "replace").split()
+    if len(commit) != 1 or re.fullmatch(OID, commit[0]) is None:
+        raise Stop("failed", "the fork manifest commit must carry no history")
+    listing = re.fullmatch(rb"100644 blob ([0-9a-f]{40}) +([0-9]{1,12})\t" + re.escape(MANIFEST_FILE.encode()) + rb"\x00",
+                           query("ls-tree", "-z", "-l", MANIFEST_REF))
+    if listing is None:
+        raise Stop("failed", "the fork manifest must be exactly one regular file")
+    if not 0 < int(listing[2]) <= MANIFEST_CAP:
+        raise Stop("failed", "the fork manifest is empty or exceeds its size cap")
+    data = query("cat-file", "blob", listing[1].decode("ascii"))
+    if len(data) != int(listing[2]) or hashlib.sha256(data).hexdigest() != expected:
+        raise Stop("failed", "the fork manifest differs from the requested SHA-256")
+    with open(run.dir / "input" / MANIFEST_FILE, "xb") as stream:
+        stream.write(data)
+
+
 def unpack(run, watch, state):
     app, recipe, tag = state["app"], state["recipe"], state["tag"]
     repo = run.dir / "repo"
-    for name in ("home", "tmp", "evidence"):
+    for name in ("home", "tmp", "evidence", "input"):
         (run.dir / name).mkdir(mode=0o700)
     git = ["git", "-C", str(repo), "-c", "core.hooksPath=/dev/null", "-c", "fetch.fsckObjects=true",
            "-c", "transfer.fsckObjects=true"]
     step(run, watch, ["git", "init", "-q", str(repo)], cwd=run.dir, reason="the bundle could not be unpacked", forward=False)
     # Only the two commits (and the tag) travel, without their history; mark them as shallow roots.
     (repo / ".git" / "shallow").write_text(f"{app}\n{recipe}\n")
-    refspecs = ["refs/omp/app:refs/omp/app", "refs/omp/recipe:refs/omp/recipe"]
+    refspecs = ["refs/omp/app:refs/omp/app", "refs/omp/recipe:refs/omp/recipe", f"{MANIFEST_REF}:{MANIFEST_REF}"]
     if tag:
         refspecs.append(f"refs/tags/{tag}:refs/tags/{tag}")
     step(run, watch, git + ["fetch", "-q", "--no-tags", str(run.dir / "in.bundle"), *refspecs], cwd=run.dir,
@@ -545,6 +575,7 @@ def unpack(run, watch, state):
                                stderr=subprocess.DEVNULL, env=run.environment, timeout=60, check=False)
         if found.returncode != 0 or found.stdout.decode("ascii", "replace").strip() != oid:
             raise Stop("failed", "the bundle commits differ from the request")
+    read_manifest(run, git, state["manifest"])
     step(run, watch, git + ["update-ref", "--no-deref", "HEAD", recipe], cwd=run.dir,
          reason="the bundle could not be unpacked", forward=False)
     archive = run.dir / "tmp" / "scripts.tar"
@@ -589,6 +620,8 @@ def pipeline(run, watch):
     app, recipe, tag = state["app"], state["recipe"], state["tag"]
     mode = state["mode"]
     repo, evidence = run.dir / "repo", run.dir / "evidence"
+    # The same registry file and hash go to every recipe step that judges the application against it.
+    fork = ["--fork-manifest", str(run.dir / "input" / MANIFEST_FILE), "--fork-manifest-sha256", state["manifest"]]
     socket = "unix://" + SOCKET
     python = sys.executable
     assets = f"dist/{mode}"
@@ -596,12 +629,12 @@ def pipeline(run, watch):
     run.phase("unpack")
     unpack(run, watch, state)
     run.phase("check")
-    step(run, watch, [python, "scripts/linux-amd64-receipt.py", "check", "--commit", app], cwd=repo,
+    step(run, watch, [python, "scripts/linux-amd64-receipt.py", "check", "--commit", app, *fork], cwd=repo,
          reason="the application does not match this recipe", merge=True)
     run.phase("prepare")
     prepare = [python, "scripts/linux-amd64-runtime.py", "--commit", app, "--recipe-commit", recipe,
                "--docker-socket", socket, "--witness-run-id", run.dir.name, "--output", mode,
-               "--image-id-file", str(evidence / "runtime-image-id")]
+               "--image-id-file", str(evidence / "runtime-image-id"), *fork]
     if tag:
         prepare += ["--tag", tag, "--allowed-signers", str(ETC / "source-allowed-signers"),
                     "--revoked-signers", str(ETC / "source-revoked-signers")]
@@ -617,13 +650,13 @@ def pipeline(run, watch):
     qualify = [python, "scripts/linux-amd64-qualify.py", "--commit", app, "--assets", assets,
                "--docker-socket", socket, "--runtime-image", image, "--witness-run-id", run.dir.name,
                "--attestation-key", str(evidence / "qualification-key"),
-               "--attestation", str(evidence / "qualification.json")]
+               "--attestation", str(evidence / "qualification.json"), *fork]
     if tag:
         qualify += ["--recipe-commit", recipe]
     step(run, watch, qualify, cwd=repo, reason="qualification failed")
     run.phase("verify")
     final = [python, "scripts/linux-amd64-receipt.py", "verify", assets, "--commit", app, *identity,
-             "--attestation", str(evidence / "qualification.json"),
+             "--fork-manifest-sha256", state["manifest"], "--attestation", str(evidence / "qualification.json"),
              "--qualification-signers", str(evidence / "qualification-signers")]
     step(run, watch, final + (["--release"] if tag else []), cwd=repo, reason="final verification failed", forward=False)
     run.phase("collect")
@@ -637,7 +670,7 @@ def pipeline(run, watch):
 
 def scrub(run, keep_outputs):
     removed = True
-    for name in ("repo", "tmp", "home", "in.bundle", "evidence") + (() if keep_outputs else ("out",)):
+    for name in ("repo", "tmp", "home", "input", "in.bundle", "evidence") + (() if keep_outputs else ("out",)):
         path = run.dir / name
         try:
             if path.is_dir() and not path.is_symlink():
@@ -685,7 +718,7 @@ def supervise(run_id, build_descriptor, run_descriptor):
             state["qualified"] = False
         write_state(run_dir, state)
         log_line(state["started"], "build", run_id, state["exit"], time.monotonic() - began,
-                 state["app"], state["recipe"], state["mode"])
+                 state["app"], state["recipe"], state["mode"], state["manifest"])
         os.close(run_descriptor)
         os.close(build_descriptor)
 
@@ -725,7 +758,8 @@ def verify_outputs(out, state):
         complete = {name: "passed" for name in CHECKS}
         sound = sound and manifest["checks"] == complete and isinstance(qualification, dict) and \
             qualification["checks"] == complete and qualification["binary_sha256"] == asset["sha256"] and \
-            qualification["source_commit"] == state["app"] and qualification["recipe_commit"] == source["recipe_commit"]
+            qualification["source_commit"] == state["app"] and qualification["recipe_commit"] == source["recipe_commit"] and \
+            qualification["fork_manifest_sha256"] == state["manifest"]
         if not sound:
             raise ValueError("not qualified")
         binding = canonical({
@@ -822,7 +856,7 @@ def supervisor_environment():
     return environment
 
 
-def build(app, recipe, tag):
+def build(app, recipe, manifest, tag):
     os.umask(0o077)
     if not PLAIN_DATA and not os.path.ismount(DATA):
         raise Refused("the build data filesystem is not mounted")
@@ -850,7 +884,7 @@ def build(app, recipe, tag):
     run_dir.mkdir(mode=0o700)
     run_lock = os.open(run_dir / "lock", os.O_CREAT | os.O_RDWR | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     fcntl.flock(run_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    state = {"schema": 1, "run": run_id, "app": app, "recipe": recipe, "tag": tag or None,
+    state = {"schema": 1, "run": run_id, "app": app, "recipe": recipe, "manifest": manifest, "tag": tag or None,
              "mode": "release" if tag else "candidate", "state": "running", "phase": "upload", "started": now(),
              "qualified": False, "cleanup": "pending", "exit": None, "reason": ""}
     write_state(run_dir, state)
@@ -956,9 +990,9 @@ def main():
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
     try:
         if built:
-            app, recipe, tag = built.groups()
-            logged = (app, recipe, "release" if tag else "candidate")
-            run_id, run_dir = build(app, recipe, tag)
+            app, recipe, manifest, tag = built.groups()
+            logged = (app, recipe, "release" if tag else "candidate", manifest)
+            run_id, run_dir = build(app, recipe, manifest, tag)
             supervised = True  # The supervisor writes this command's log line when the run ends.
             say(f"run {run_id}")
             final = follow(run_dir)

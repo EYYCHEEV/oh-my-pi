@@ -26,6 +26,7 @@ import test_linux_amd64_door as door_tests
 driver = door_tests.driver
 ASSETS, EVIDENCE, TAG = door_tests.ASSETS, door_tests.EVIDENCE, door_tests.TAG
 make_received, make_repository = door_tests.make_received, door_tests.make_repository
+MANIFEST, MANIFEST_SHA = door_tests.MANIFEST, door_tests.MANIFEST_SHA
 
 FAKE_SSH = r'''
 import json, os, subprocess, sys
@@ -96,16 +97,26 @@ class VerifyTests(unittest.TestCase):
         make_received(directory, self.app, self.recipe, tag, **options)
         return directory
 
-    def refuses(self, directory, fragment, *, tag="", app=None, recipe=None, version="18.8.0"):
+    def refuses(self, directory, fragment, *, tag="", app=None, recipe=None, version="18.8.0", fork=MANIFEST_SHA):
         with self.assertRaises(driver.Failure) as raised:
-            driver.verify(directory, app or self.app, recipe or self.recipe, tag, version)
+            driver.verify(directory, app or self.app, recipe or self.recipe, tag, version, fork)
         self.assertEqual(raised.exception.code, 3)
         self.assertIn(fragment, str(raised.exception))
 
     def test_a_consistent_qualified_result_is_accepted(self):
-        manifest = driver.verify(self.received(), self.app, self.recipe, "", "18.8.0")
+        manifest = driver.verify(self.received(), self.app, self.recipe, "", "18.8.0", MANIFEST_SHA)
         self.assertEqual((manifest["schema"], manifest["version"]), (2, "18.8.0"))
-        driver.verify(self.received(TAG), self.app, self.recipe, TAG, "18.8.0")
+        driver.verify(self.received(TAG), self.app, self.recipe, TAG, "18.8.0", MANIFEST_SHA)
+
+    def test_a_returned_fork_manifest_hash_that_differs_from_what_was_sent_is_refused(self):
+        sent = "5" * 64
+        self.refuses(self.received(), "recorded fork manifest differs", fork=sent)  # the builder qualified another file
+        for recorded in ("0" * 64, MANIFEST_SHA.upper(), MANIFEST_SHA[:12], "", None, 7, [MANIFEST_SHA]):
+            with self.subTest(recorded=recorded):
+                self.refuses(self.received(manifest_edit=lambda m, v=recorded: m["qualification"].update(fork_manifest_sha256=v)),
+                             "recorded fork manifest differs")
+        self.refuses(self.received(manifest_edit=lambda m: m["qualification"].pop("fork_manifest_sha256")),
+                     "recorded fork manifest differs")
 
     def test_a_bad_checksum_is_refused(self):
         directory = self.received()
@@ -311,15 +322,18 @@ class ArgumentTests(unittest.TestCase):
         cls.bin.mkdir()
         install_fake_ssh(cls.bin)
         cls.ssh_log = cls.root / "ssh.log"
+        cls.manifest = cls.root / "fork_boundary.json"
+        cls.manifest.write_bytes(MANIFEST)
 
     def setUp(self):
         self.results = Path(tempfile.mkdtemp(prefix="omp-results-"))
         self.addCleanup(shutil.rmtree, self.results, True)
         self.ssh_log.unlink(missing_ok=True)
 
-    def drive(self, *arguments, app=None, recipe=None, output=None):
+    def drive(self, *arguments, app=None, recipe=None, output=None, manifest=None):
         argv = ["--app", app or self.app, "--recipe", recipe or self.recipe, "--output", str(output or self.results / "out"),
-                "--repo", str(self.repo), "--key", str(self.root / "no-such-key"), *arguments]
+                "--repo", str(self.repo), "--key", str(self.root / "no-such-key"),
+                *([] if manifest is False else ["--fork-manifest", str(manifest or self.manifest)]), *arguments]
         out, err = io.StringIO(), io.StringIO()
         environment = {"PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}", "OMP_TEST_SSH_LOG": str(self.ssh_log),
                        "OMP_TEST_SSH_DOWN": "1", "OMP_TEST_ADDRESS": "unused"}
@@ -372,16 +386,91 @@ class ArgumentTests(unittest.TestCase):
         with patch.object(driver, "BUNDLE_CAP", 100):
             self.assertRefusedBeforeContact(self.drive(), "exceeds the door's size cap")
 
-    def test_the_bundle_holds_exactly_the_two_commits_and_no_history(self):
+    def embedded(self, bundle):
+        """What the door would find: the refs in the bundle header, the registry commit's file list and its bytes."""
+        header = Path(bundle).read_bytes().split(b"\n\n", 1)[0].decode().split("\n")
+        refs = dict(line.split(" ", 1)[::-1] for line in header[1:])
+        scratch = Path(tempfile.mkdtemp(prefix="omp-embedded-"))
+        self.addCleanup(shutil.rmtree, scratch, True)
+
+        def git(*args):
+            return subprocess.run(["git", "-C", str(scratch), *args], check=True, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, env={**os.environ, **door_tests.GIT_ENVIRONMENT}).stdout
+
+        git("init", "-q")
+        git("fetch", "-q", str(bundle), "refs/omp/forkmanifest")
+        return header, refs, git("ls-tree", "FETCH_HEAD").decode(), git("cat-file", "blob", "FETCH_HEAD:fork_boundary.json"), \
+            git("rev-list", "--parents", "FETCH_HEAD").decode().split()
+
+    def test_the_bundle_holds_exactly_the_two_commits_the_registry_commit_and_no_history(self):
         directory = self.results / "bundle"
         directory.mkdir()
-        bundle = driver.make_bundle(self.repo, self.app, self.recipe, "", directory)
-        header = bundle.read_bytes().split(b"\n\n", 1)[0].decode().split("\n")
-        self.assertEqual(header, ["# v2 git bundle", f"{self.app} refs/omp/app", f"{self.recipe} refs/omp/recipe"])
+        bundle = driver.make_bundle(self.repo, self.app, self.recipe, "", directory, MANIFEST)
+        header, refs, tree, data, commits = self.embedded(bundle)
+        self.assertEqual(header[0], "# v2 git bundle")
+        self.assertEqual(sorted(refs), ["refs/omp/app", "refs/omp/forkmanifest", "refs/omp/recipe"])
+        self.assertEqual((refs["refs/omp/app"], refs["refs/omp/recipe"]), (self.app, self.recipe))
+        self.assertEqual(data, MANIFEST)  # the exact bytes, hence the exact hash
+        self.assertEqual(len(tree.splitlines()), 1, tree)  # nothing but the one file
+        self.assertTrue(tree.endswith("\tfork_boundary.json\n"), tree)
+        self.assertEqual(commits, [refs["refs/omp/forkmanifest"]])  # parentless: no history rides along
         self.assertLess(bundle.stat().st_size, 30_000)  # the 300 kB blob of an earlier commit is not inside
-        tagged = driver.make_bundle(self.repo, self.app, self.recipe, TAG, directory)
-        refs = [line.split(" ", 1)[1] for line in tagged.read_bytes().split(b"\n\n", 1)[0].decode().split("\n")[1:]]
-        self.assertEqual(refs, ["refs/omp/app", "refs/omp/recipe", "refs/tags/" + TAG])
+        again = driver.make_bundle(self.repo, self.app, self.recipe, "", self.results / "bundle", MANIFEST)
+        self.assertEqual(self.embedded(again)[1]["refs/omp/forkmanifest"], refs["refs/omp/forkmanifest"])  # a pure function of the bytes
+        tagged = driver.make_bundle(self.repo, self.app, self.recipe, TAG, directory, MANIFEST)
+        self.assertEqual(sorted(self.embedded(tagged)[1]),
+                         ["refs/omp/app", "refs/omp/forkmanifest", "refs/omp/recipe", "refs/tags/" + TAG])
+
+    def test_a_file_swapped_after_it_was_read_changes_neither_what_is_sent_nor_what_is_expected(self):
+        original = driver.make_bundle
+        sent = {}
+
+        def swapping(repo, app, recipe, tag, directory, manifest):
+            self.manifest.write_bytes(b'{"contracts": []}\n')  # the file on disk changes after it was hashed
+            bundle = original(repo, app, recipe, tag, directory, manifest)
+            sent["data"] = self.embedded(bundle)[3]
+            return bundle
+
+        self.addCleanup(self.manifest.write_bytes, MANIFEST)
+        with patch.object(driver, "make_bundle", swapping):
+            code, out, err = self.drive()
+        self.assertEqual(code, 4, out + err)  # the fake ssh is down; the bundle was made and the build was attempted
+        self.assertEqual(sent["data"], MANIFEST)
+        self.assertIn("fork manifest " + MANIFEST_SHA[:12], out)
+        self.assertEqual(json.loads(self.ssh_log.read_text().splitlines()[0])[-1].split(" ")[3], MANIFEST_SHA)
+
+    def test_a_missing_or_unreadable_or_unsuitable_fork_manifest_is_refused_before_any_contact(self):
+        with self.assertRaises(SystemExit) as raised:  # the input is required
+            self.drive(manifest=False)
+        self.assertEqual(raised.exception.code, 2)
+        self.assertFalse(self.ssh_log.exists())
+        readable = "--fork-manifest must be a readable regular file"
+        self.assertRefusedBeforeContact(self.drive(manifest=self.results / "absent.json"), readable)
+        self.assertRefusedBeforeContact(self.drive(manifest=self.results), readable)  # a folder
+        (self.results / "link.json").symlink_to(self.manifest)
+        self.assertRefusedBeforeContact(self.drive(manifest=self.results / "link.json"), readable)
+        os.mkfifo(self.results / "pipe.json")  # opening it must neither block nor be accepted
+        self.assertRefusedBeforeContact(self.drive(manifest=self.results / "pipe.json"), readable)
+        cases = {
+            "empty": (b"", "empty or larger"),
+            "oversized": (MANIFEST + b" " * 1024, "empty or larger"),
+            "not json": (b"contracts: []\n", "not valid JSON"),
+            "invalid utf-8": (b'{"contracts": [], "x": "\xff"}', "not valid JSON"),
+            "a repeated key": (b'{"contracts": [], "contracts": []}', "not valid JSON"),
+            "not an object": (b"[]", "not a fork manifest"),
+            "no contract list": (b'{"contracts": {}}', "not a fork manifest"),
+        }
+        for name, (data, fragment) in cases.items():
+            with self.subTest(case=name):
+                path = self.results / "case.json"
+                path.write_bytes(data)
+                with patch.object(driver, "MANIFEST_CAP", 1024):
+                    self.assertRefusedBeforeContact(self.drive(manifest=path), fragment)
+
+    def test_the_manifest_size_cap_is_the_one_the_door_enforces(self):
+        found = re.search(r"(?m)^MANIFEST_CAP = ([0-9* ]+)$", door_tests.ENTRY.read_text())
+        self.assertIsNotNone(found)
+        self.assertEqual(driver.MANIFEST_CAP, eval(found[1], {"__builtins__": {}}))
 
     def test_ssh_is_called_with_exactly_the_agreed_options_and_nothing_else(self):
         door = driver.Door("cdm-ci-001-ompbuild", "/key/path", lambda text: text)
@@ -408,12 +497,15 @@ class EndToEndTests(door_tests.DoorCase):
         self.results = self.temporary / "results"
         self.results.mkdir()
         self.address = address("198", "51", "100", "23")
+        self.manifest = self.temporary / "fork_boundary.json"
+        self.manifest.write_bytes(MANIFEST)
 
-    def drive(self, *arguments, env=None, output=None, tag=None):
+    def drive(self, *arguments, env=None, output=None, tag=None, manifest=None):
         environment = self.environment("", {"OMP_TEST_SSH_LOG": str(self.ssh_log), "OMP_TEST_ENTRY": str(door_tests.ENTRY),
                                             "OMP_TEST_ADDRESS": self.address, **(env or {})})
         del environment["SSH_ORIGINAL_COMMAND"]
         argv = [sys.executable, str(door_tests.DRIVER), "--app", self.app, "--recipe", self.recipe,
+                "--fork-manifest", str(manifest or self.manifest),
                 "--output", str(output or self.results / "out"), "--alias", "door-under-test", "--key", str(self.key),
                 "--repo", str(self.repo), "--poll", "0.1", *(["--tag", tag] if tag else []), *arguments]
         result = subprocess.run(argv, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, check=False)
@@ -450,7 +542,8 @@ class EndToEndTests(door_tests.DoorCase):
         for call in self.calls():
             self.assertEqual(call[:9], ["-i", str(self.key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
                                         "-o", "ControlPath=none", "door-under-test"])
-        self.assertEqual(self.calls()[0][-1], f"build {self.app} {self.recipe}")
+        self.assertEqual(self.calls()[0][-1], f"build {self.app} {self.recipe} {MANIFEST_SHA}")
+        self.assertIn(f"fork manifest: {MANIFEST_SHA} (the qualification names exactly the file that was sent)", result.out)
         self.assertEqual(self.runs(), [])  # the builder's run folder was removed
 
     def test_a_release_build_carries_the_tag_to_the_door_and_back(self):
@@ -460,7 +553,7 @@ class EndToEndTests(door_tests.DoorCase):
         result = self.drive(tag=TAG)
         self.assertEqual(result.returncode, 0, result.out + result.err)
         self.assertIn(f"tag {TAG}", result.out)
-        self.assertEqual(self.calls()[0][-1], f"build {self.app} {self.recipe} {TAG}")
+        self.assertEqual(self.calls()[0][-1], f"build {self.app} {self.recipe} {MANIFEST_SHA} {TAG}")
         self.assertTrue((self.results / "out" / "assets" / ASSETS[0]).is_file())
         self.assertQuiet(result)
 
@@ -496,6 +589,33 @@ class EndToEndTests(door_tests.DoorCase):
         self.assertEqual(list(self.results.iterdir()), [])
         self.assertNotIn("cleanup", self.commands())  # the run is kept on the builder for inspection
         self.assertEqual(len(self.runs()), 1)
+
+    def assertDoorRefusedTheResult(self, outcome):
+        self.assertEqual(outcome.returncode, 1, outcome.out + outcome.err)
+        self.assertIn("the remote build did not succeed (failed): the door's own verification refused the result", outcome.err)
+        self.assertEqual(list(self.results.iterdir()), [])
+        self.assertNotIn("cleanup", self.commands())
+
+    def test_a_file_that_differs_from_the_one_the_result_names_fails_at_the_door(self):
+        other = self.temporary / "other.json"
+        other.write_bytes(MANIFEST.replace(b"fixture-contract", b"another-contract"))
+        self.assertDoorRefusedTheResult(self.drive(manifest=other))  # the fixture still reports the first file's hash
+
+    def test_a_result_that_reports_another_fork_manifest_hash_fails_at_the_door(self):
+        self.write_fixture(fork="0" * 64)
+        self.assertDoorRefusedTheResult(self.drive())
+
+    def test_the_driver_refuses_on_its_own_a_result_that_names_another_file_than_the_one_it_sent(self):
+        first = self.drive("--keep-remote")
+        self.assertEqual(first.returncode, 0, first.out + first.err)
+        run = re.search(r"(?m)^run (b[0-9]{14}-[0-9a-f]{8})$", first.out)[1]
+        other = self.temporary / "other.json"
+        other.write_bytes(MANIFEST.replace(b"fixture-contract", b"another-contract"))
+        second = self.drive("--resume", run, manifest=other, output=self.results / "again")  # the door has nothing to object to
+        self.assertEqual(second.returncode, 3, second.out + second.err)
+        self.assertIn("verification failed: the recorded fork manifest differs from the one that was sent", second.err)
+        self.assertFalse((self.results / "again").exists())
+        self.assertNotIn("cleanup", self.commands())
 
     def test_keep_remote_and_resume_fetch_again_without_uploading(self):
         first = self.drive("--keep-remote")
