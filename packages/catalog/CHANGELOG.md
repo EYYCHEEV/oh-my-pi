@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added per-account `serviceTiers` to `ModelAccountAccess`: Codex multi-account discovery records each account's advertised tiers beside its cyber programs.
+
 ### Fixed
 
 - Kept Codex model catalogs for restricted OAuth accounts separate from shared account catalogs.
