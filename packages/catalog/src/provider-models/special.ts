@@ -52,16 +52,18 @@ export interface OpenAICodexModelManagerConfig {
 	 */
 	baseUrl?: string;
 	clientVersion?: string;
+	/** Hard OAuth-account restriction; isolates that account's cached capabilities. */
+	oauthCredentialId?: number;
 	fetch?: FetchImpl;
 }
 
 export function openaiCodexModelManagerOptions(
 	config: OpenAICodexModelManagerConfig = {},
 ): ModelManagerOptions<"openai-codex-responses"> {
-	const { resolveAccounts, baseUrl, clientVersion, fetch } = config;
+	const { resolveAccounts, baseUrl, clientVersion, oauthCredentialId, fetch } = config;
 	return {
 		providerId: "openai-codex",
-		cacheProviderId: resolveModelCacheProviderId("openai-codex", { baseUrl }),
+		cacheProviderId: resolveModelCacheProviderId("openai-codex", { baseUrl, oauthCredentialId }),
 		dynamicModelsAuthoritative: providerEntry("openai-codex")?.dynamicModelsAuthoritative === true,
 		...(resolveAccounts
 			? {

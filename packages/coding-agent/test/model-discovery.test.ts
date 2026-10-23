@@ -4,6 +4,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { FetchImpl, Model } from "@oh-my-pi/pi-ai";
+import { resetOAuthAccountRestrictions } from "@oh-my-pi/pi-ai/auth/eligibility";
+import { shouldSendServiceTier } from "@oh-my-pi/pi-ai/types";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
@@ -495,6 +497,78 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(modelListCalls).toBe(1);
 		expect(registry.find("openai-codex", "gpt-5.6-terra")).toBeDefined();
 		expect(registry.find("openai-codex", "gpt-5.4-nano")).toBeUndefined();
+	});
+
+	test("a restricted Codex account uses its own cached Ultrafast capabilities", async () => {
+		await authStorage.credentials.set("openai-codex", [
+			{
+				type: "oauth",
+				access: "basic-access",
+				refresh: "basic-refresh",
+				expires: Date.now() + 3_600_000,
+				accountId: "basic-account",
+				email: "basic@example.test",
+			},
+			{
+				type: "oauth",
+				access: "ultra-access",
+				refresh: "ultra-refresh",
+				expires: Date.now() + 3_600_000,
+				accountId: "ultra-account",
+				email: "ultra@example.test",
+			},
+		]);
+		const accounts = authStorage.oauth.accounts("openai-codex");
+		const basic = accounts.find(account => account.accountId === "basic-account")!;
+		const ultra = accounts.find(account => account.accountId === "ultra-account")!;
+		const fetchedAccounts: string[] = [];
+		const fetchMock: FetchImpl = async (_input, init) => {
+			const accountId = new Headers(init?.headers).get("chatgpt-account-id")!;
+			fetchedAccounts.push(accountId);
+			return Response.json({
+				models: [
+					{
+						slug: "gpt-6.1-sol",
+						service_tiers: [{ id: "priority" }, ...(accountId === "ultra-account" ? [{ id: "ultrafast" }] : [])],
+					},
+				],
+			});
+		};
+		const createRegistry = () => new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		const supportsUltrafast = (registry: ModelRegistry) =>
+			shouldSendServiceTier("ultrafast", registry.find("openai-codex", "gpt-6.1-sol"));
+		try {
+			const shared = createRegistry();
+			await shared.refreshProvider("openai-codex", "online");
+			expect(supportsUltrafast(shared)).toBe(false);
+			fetchedAccounts.length = 0;
+
+			authStorage.oauth.restrict("openai-codex", ultra.credentialId);
+			const restricted = createRegistry();
+			await restricted.refreshProvider("openai-codex", "online-if-uncached");
+			expect(supportsUltrafast(restricted)).toBe(true);
+			expect(fetchedAccounts).toEqual(["ultra-account"]);
+			fetchedAccounts.length = 0;
+
+			authStorage.oauth.restrict("openai-codex", basic.credentialId);
+			const other = createRegistry();
+			await other.refreshProvider("openai-codex", "online-if-uncached");
+			expect(supportsUltrafast(other)).toBe(false);
+			expect(fetchedAccounts).toEqual(["basic-account"]);
+			fetchedAccounts.length = 0;
+
+			authStorage.oauth.restrict("openai-codex", ultra.credentialId);
+			const resumed = createRegistry();
+			expect(supportsUltrafast(resumed)).toBe(true);
+			await resumed.refreshProvider("openai-codex", "online-if-uncached");
+			expect(supportsUltrafast(resumed)).toBe(true);
+			expect(fetchedAccounts).toEqual([]);
+
+			resetOAuthAccountRestrictions();
+			expect(supportsUltrafast(createRegistry())).toBe(false);
+		} finally {
+			resetOAuthAccountRestrictions();
+		}
 	});
 
 	test("Codex discovery falls back to a resolved non-OAuth token when no OAuth accounts exist", async () => {

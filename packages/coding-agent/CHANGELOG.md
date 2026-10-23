@@ -16,6 +16,7 @@
 
 ### Fixed
 
+- Fixed Ultrafast availability using another account's cached capabilities when launching with `--oauth-account`.
 - Fixed stale supervised-process completions flooding logs while preserving notifications for resumed sessions.
 - Fixed JavaScript evaluator startup failing during synchronous cleanup-handler loading after the CLI was imported.
 - Fixed restricted extension sessions failing to start in compiled OMP binaries.

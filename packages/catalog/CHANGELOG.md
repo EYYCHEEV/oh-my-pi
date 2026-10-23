@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Kept Codex model catalogs for restricted OAuth accounts separate from shared account catalogs.
+
 ## [18.8.0] - 2026-10-07
 
 ### Changed

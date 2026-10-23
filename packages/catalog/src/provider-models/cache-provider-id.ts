@@ -12,6 +12,8 @@ import {
 export interface ModelCacheProviderIdOptions extends AccountScope {
 	apiKey?: string;
 	baseUrl?: string;
+	/** Durable credential id when Codex discovery is restricted to one OAuth account. */
+	oauthCredentialId?: number;
 }
 
 const CREDENTIAL_SCOPED_MODEL_CACHE_PROVIDERS: Readonly<Record<string, true>> = {
@@ -92,13 +94,14 @@ function cursorCredentialSubject(apiKey: string): string | undefined {
 export function resolveModelCacheProviderId(providerId: string, options: ModelCacheProviderIdOptions = {}): string {
 	switch (providerId) {
 		case "openai-codex": {
-			// The backend filters the roster by client version. A Codex-compatible
-			// gateway publishes its own roster; discovery is authoritative, so the
-			// namespace must follow the endpoint. The official backend keeps the
-			// unhashed namespace so existing caches stay valid.
+			// Account-restricted discovery must not reuse an unrestricted catalog
+			// or another account's capabilities, even on the same endpoint.
 			const baseUrl = options.baseUrl?.trim().replace(/\/+$/, "");
-			if (!baseUrl || baseUrl === CODEX_BASE_URL) return `${providerId}:${CODEX_CLIENT_VERSION}`;
-			return `${providerId}:${CODEX_CLIENT_VERSION}:${Bun.hash(baseUrl).toString(36)}`;
+			const namespace =
+				!baseUrl || baseUrl === CODEX_BASE_URL
+					? `${providerId}:${CODEX_CLIENT_VERSION}`
+					: `${providerId}:${CODEX_CLIENT_VERSION}:${Bun.hash(baseUrl).toString(36)}`;
+			return options.oauthCredentialId === undefined ? namespace : `${namespace}:oauth:${options.oauthCredentialId}`;
 		}
 		case "ollama":
 			return resolveOllamaModelCacheProviderId(providerId, options.baseUrl);

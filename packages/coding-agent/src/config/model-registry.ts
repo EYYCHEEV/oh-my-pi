@@ -1217,7 +1217,10 @@ export class ModelRegistry {
 			this.#runtimeProviderOverrides.get(providerId)?.baseUrl ??
 			this.#providerOverrides.get(providerId)?.baseUrl ??
 			(this.#hasFullSnapshot ? this.getProviderBaseUrl(providerId) : undefined);
-		return resolveModelCacheProviderId(providerId, { baseUrl });
+		return resolveModelCacheProviderId(providerId, {
+			baseUrl,
+			oauthCredentialId: this.authStorage.oauth.restriction(providerId),
+		});
 	}
 
 	#loadCachedStandardProviderModels(providerIds: readonly string[]): {
@@ -2164,6 +2167,7 @@ export class ModelRegistry {
 					// actually being sent: a runtime provider's command key is only a
 					// fallback behind a live OAuth token, which `peek` returns first.
 					const configuredBaseUrl = this.#descriptorBaseUrl("openai-codex");
+					const oauthCredentialId = this.authStorage.oauth.restriction("openai-codex");
 					const officialCredential =
 						accessToken === getEnvApiKey("openai-codex") ||
 						getOAuthCredentialsForProvider(this.authStorage, "openai-codex").some(
@@ -2172,12 +2176,14 @@ export class ModelRegistry {
 					if (officialCredential || isOfficialCodexApiUrl(configuredBaseUrl)) {
 						return openaiCodexModelManagerOptions({
 							baseUrl: officialCredential ? undefined : configuredBaseUrl,
+							oauthCredentialId,
 							resolveAccounts: () => resolveCodexDiscoveryAccounts(this.authStorage, accessToken),
 							fetch: this.#fetch,
 						});
 					}
 					return openaiCodexModelManagerOptions({
 						baseUrl: configuredBaseUrl,
+						oauthCredentialId,
 						resolveAccounts: async () => [{ accessToken }],
 						fetch: this.#fetch,
 					});
