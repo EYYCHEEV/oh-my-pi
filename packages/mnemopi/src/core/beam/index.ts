@@ -36,6 +36,7 @@ import {
 	scratchpadClear,
 	scratchpadRead,
 	scratchpadWrite,
+	scrubForgottenText,
 	updateWorking,
 } from "./store";
 import type {
@@ -251,6 +252,11 @@ export class BeamMemory implements BeamMemoryState {
 
 	forgetWorking(memoryId: string): boolean {
 		return forgetWorking(this, memoryId);
+	}
+
+	/** Cut `text` out of this bank's retained transcripts and what was built from them; deletes no memory. */
+	scrubForgottenText(text: string): number {
+		return scrubForgottenText(this, text);
 	}
 
 	consolidateToEpisodic(

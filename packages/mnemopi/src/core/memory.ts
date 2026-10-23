@@ -527,6 +527,15 @@ export class Mnemopi {
 		return this.#withRuntimeOptions(() => this.beam.forgetWorking(memoryId));
 	}
 
+	/**
+	 * Cut `text` out of this bank's retained transcripts and the summaries and facts built from them, without
+	 * deleting any memory. `forget` does this for its own bank; call it on the other banks a session recalls
+	 * from. Returns the number of transcript rows rewritten.
+	 */
+	scrubForgottenText(text: string): number {
+		return this.#withRuntimeOptions(() => this.beam.scrubForgottenText(text));
+	}
+
 	update(memoryId: string, content: string | null = null, importance: number | null = null): boolean {
 		return this.#withRuntimeOptions(() => this.beam.updateWorking(memoryId, content, importance));
 	}
