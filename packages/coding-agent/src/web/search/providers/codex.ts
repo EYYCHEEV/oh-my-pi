@@ -1442,34 +1442,68 @@ export async function searchCodex(params: SearchParams): Promise<SearchResponse>
 			},
 		);
 	} else {
+		// `hasCodexSearch` admits this provider from `keys.source()`, which knows
+		// about env bearers; `oauth.access` below does not — it only reads stored
+		// `type: "oauth"` rows. So an OPENAI_CODEX_OAUTH_TOKEN-only setup passed
+		// the availability check and then failed here with "No Codex OAuth
+		// credentials found". Take the registry resolver when the stored pool is
+		// empty but the origin is an env var, as the xAI search provider does.
 		const seed = await params.authStorage.oauth.access("openai-codex", params.sessionId, {
 			signal: params.signal,
 		});
 		if (!seed) {
-			throw new Error(
-				"No Codex OAuth credentials found. Login with 'omp /login openai-codex' to enable Codex web search.",
+			const credentialOrigin = (params.modelRegistry?.authStorage ?? params.authStorage).keys.source("openai-codex");
+			if (credentialOrigin?.kind !== "env") {
+				throw new Error(
+					"No Codex OAuth credentials found. Login with 'omp /login openai-codex' to enable Codex web search.",
+				);
+			}
+			const resolverOptions = {
+				sessionId: params.sessionId,
+				baseUrl: transport.baseUrl,
+				modelId: firstCandidate.modelId,
+			};
+			result = await withAuth(
+				params.modelRegistry
+					? params.modelRegistry.resolver("openai-codex", resolverOptions)
+					: params.authStorage.keys.resolver("openai-codex", resolverOptions),
+				async accessToken => {
+					const requestTransport = await resolveCodexSearchTransport(params.modelRegistry, firstCandidate.modelId);
+					return runCodexSearchCandidates({
+						auth: { accessToken, accountId: getCodexAccountId(accessToken) },
+						params,
+						query,
+						modelCandidates,
+						modelWasConfigured: configuredModel !== undefined,
+						transport: requestTransport,
+					});
+				},
+				{
+					signal: params.signal,
+					missingKeyMessage: 'Codex credentials not found for provider "openai-codex".',
+				},
+			);
+		} else {
+			result = await withOAuthAccess(
+				params.authStorage,
+				"openai-codex",
+				async access => {
+					// A refreshed/rotated credential can carry a different bearer and
+					// ChatGPT account id than the seed used to select the first attempt.
+					const accountId = access.accountId ?? getCodexAccountId(access.accessToken);
+					const requestTransport = await resolveCodexSearchTransport(params.modelRegistry, firstCandidate.modelId);
+					return runCodexSearchCandidates({
+						auth: { accessToken: access.accessToken, accountId },
+						params,
+						query,
+						modelCandidates,
+						modelWasConfigured: configuredModel !== undefined,
+						transport: requestTransport,
+					});
+				},
+				{ sessionId: params.sessionId, signal: params.signal, seed },
 			);
 		}
-
-		result = await withOAuthAccess(
-			params.authStorage,
-			"openai-codex",
-			async access => {
-				// A refreshed/rotated credential can carry a different bearer and
-				// ChatGPT account id than the seed used to select the first attempt.
-				const accountId = access.accountId ?? getCodexAccountId(access.accessToken);
-				const requestTransport = await resolveCodexSearchTransport(params.modelRegistry, firstCandidate.modelId);
-				return runCodexSearchCandidates({
-					auth: { accessToken: access.accessToken, accountId },
-					params,
-					query,
-					modelCandidates,
-					modelWasConfigured: configuredModel !== undefined,
-					transport: requestTransport,
-				});
-			},
-			{ sessionId: params.sessionId, signal: params.signal, seed },
-		);
 	}
 
 	let sources = result.sources;

@@ -141,7 +141,7 @@ describe("eval tool description", () => {
 		}
 		for (const api of [
 			"completion(prompt",
-			"judge(state, questions)",
+			"judge(state, questions",
 			"budget.total",
 			"tool(fn, name=",
 			"agent(prompt",

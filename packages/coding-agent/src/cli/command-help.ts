@@ -6,8 +6,14 @@ export const acpHelp = {
 
 export const agentsHelp = { description: "Manage bundled task agents" } satisfies CommandMetadata;
 
+export const anonymizeHelp = {
+	description:
+		"Write a shareable copy of a session and its subagents: turn contents redacted, metadata kept, paths and literals replaced by consistent mock tokens",
+} satisfies CommandMetadata;
+
 export const authHelp = {
-	description: "List, pause, or resume stored OAuth accounts by credential id",
+	description:
+		"Export or import stored credentials as JSON, or list, pause, and resume stored OAuth accounts by credential id",
 } satisfies CommandMetadata;
 
 export const authBrokerHelp = {
@@ -124,6 +130,10 @@ export const sayHelp = {
 } satisfies CommandMetadata;
 
 export const searchHelp = { description: "Test web search providers" } satisfies CommandMetadata;
+
+export const sessionHelp = {
+	description: "Hand a session to another machine: pack it, unpack it, or mark the local copy moved",
+} satisfies CommandMetadata;
 
 export const shareHelp = {
 	description: "Share a saved session via an encrypted link (same as /share)",

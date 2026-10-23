@@ -21,11 +21,10 @@ import {
 	pickElectronTarget,
 	probeCdpStatus,
 	resolveSpawnArgs,
-	shouldPreserveConnectedBrowserFocus,
 	waitForCdp,
 	waitForMainFrame,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
-import { ensureChromiumExecutable } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
+import { ensureChromiumExecutable, loadPuppeteer } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import {
 	acquireBrowser,
 	type BrowserHandle,
@@ -34,7 +33,14 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import { acquireTab, getTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
-import type { Browser, HTTPRequest, Page, Target } from "puppeteer-core";
+import {
+	type Browser,
+	type ConnectionTransport,
+	type HTTPRequest,
+	type Page,
+	type Target,
+	TimeoutError,
+} from "puppeteer-core";
 import { rejectionOf } from "../helpers/rejection";
 import { chromiumAvailable } from "./chromium-probe";
 
@@ -323,11 +329,6 @@ describe("pickElectronTarget", () => {
 		} as unknown as Browser;
 
 		await expect(pickElectronTarget(browser, { preferVisible: true })).resolves.toBe(first);
-	});
-
-	test("preserves connected-browser focus only for automatic target selection", () => {
-		expect(shouldPreserveConnectedBrowserFocus()).toBe(true);
-		expect(shouldPreserveConnectedBrowserFocus("example.com")).toBe(false);
 	});
 
 	test("rejects websocket cdp_url values with an actionable diagnostic", () => {
@@ -854,6 +855,96 @@ describe("pickElectronTarget relay path", () => {
 		});
 		expect(picked).toBe(firstPage);
 		expect(second.pageSpy).not.toHaveBeenCalled();
+	});
+
+	it("waits for a just-opened tab to reach /json before failing the matcher", async () => {
+		const opened = {
+			id: "PAGE_NEW",
+			type: "page",
+			title: "",
+			url: "https://example.com/?omp-probe=new",
+			active: "false",
+			discarded: "false",
+		};
+		let served = 0;
+		relay.reload({ fetch: () => Response.json(++served === 1 ? RELAY_ENTRIES : [...RELAY_ENTRIES, opened]) });
+		const openedPage = makePage([() => {}], opened.url).page;
+		const target = makeTarget("PAGE_NEW", openedPage);
+
+		const picked = await pickElectronTarget(makeBrowser([target.target]), { relayJson, matcher: "omp-probe=new" });
+
+		expect(picked).toBe(openedPage);
+		expect(served).toBe(2);
+	});
+
+	it("names the missing tab and what to pass when no tab ever matches", async () => {
+		const error = await rejectionOf(pickElectronTarget(makeBrowser([]), { relayJson, matcher: "omp-probe=none" }));
+
+		expect(error).toBeInstanceOf(Error);
+		const message = (error as Error).message;
+		expect(message).toContain('No page target matched "omp-probe=none" after waiting 2s for a newly opened tab');
+		expect(message).toContain("omit it to use the active tab");
+		expect(message).toContain("- Docs  https://docs.example.com");
+	});
+
+	it("waits for Puppeteer to see a tab that /json already lists", async () => {
+		const cartPage = makePage([() => {}], RELAY_ENTRIES[1]!.url).page;
+		const late = makeTarget("PAGE11", cartPage);
+		const targets: Array<Target & { _targetId: string }> = [];
+		const browser = Object.assign(makeBrowser(targets), {
+			waitForTarget: async (predicate: (target: Target) => boolean) => {
+				targets.push(late.target);
+				return targets.find(predicate);
+			},
+		});
+
+		expect(await pickElectronTarget(browser, { relayJson, matcher: "whole foods" })).toBe(cartPage);
+	});
+
+	it("tells the model to retry when Puppeteer never sees the selected tab, with release-build class names", async () => {
+		// A connected browser with no targets, so Puppeteer's own wait times out and builds its own error.
+		const transport: ConnectionTransport = {
+			send(message) {
+				const { id, method } = JSON.parse(message) as { id: number; method: string };
+				const result = method === "Target.getBrowserContexts" ? { browserContextIds: [] } : {};
+				queueMicrotask(() => transport.onmessage?.(JSON.stringify({ id, result })));
+			},
+			close() {
+				transport.onclose?.();
+			},
+		};
+		const puppeteerBrowser = await (await loadPuppeteer()).connect({ transport, defaultViewport: null });
+		const nameDescriptor = Object.getOwnPropertyDescriptor(TimeoutError, "name")!;
+		// Release builds minify class names, so Puppeteer names its timeout like this there.
+		Object.defineProperty(TimeoutError, "name", { ...nameDescriptor, value: "Og" });
+		try {
+			const browser = Object.assign(makeBrowser([]), {
+				waitForTarget: (predicate: (target: Target) => boolean) =>
+					puppeteerBrowser.waitForTarget(predicate, { timeout: 50 }),
+			});
+
+			const error = await rejectionOf(pickElectronTarget(browser, { relayJson, matcher: "whole foods" }));
+
+			expect((error as Error).message).toMatch(/^Selected tab did not become available.*retry, or reopen it/);
+		} finally {
+			Object.defineProperty(TimeoutError, "name", nameDescriptor);
+			await puppeteerBrowser.disconnect();
+		}
+	});
+
+	it("falls back to target enumeration at once when /json lists no pages", async () => {
+		let served = 0;
+		relay.reload({
+			fetch: () => {
+				served++;
+				return Response.json([]);
+			},
+		});
+		const cartPage = fakePage({ url: "https://example.com/cart", title: "Cart" });
+		const cart = makeTarget("PAGE_CART", cartPage);
+
+		expect(await pickElectronTarget(makeBrowser([cart.target]), { relayJson, matcher: "cart" })).toBe(cartPage);
+		expect(served).toBe(1);
 	});
 
 	it("does not adopt another live tab when the selected tab is unreadable", async () => {

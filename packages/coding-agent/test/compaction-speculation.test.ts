@@ -7,13 +7,14 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import type { CompactionMethod } from "@oh-my-pi/pi-coding-agent/session/compaction-methods";
+import { type CompactionMethod, resolveSpeculationMethod } from "@oh-my-pi/pi-coding-agent/session/compaction-methods";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionMaintenance, type SessionMaintenanceHost } from "@oh-my-pi/pi-coding-agent/session/session-maintenance";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as snapcompactModule from "@oh-my-pi/snapcompact";
 
 import {
+	cfgCompaction,
 	cfgCompactionMethodOrder,
 	cfgCompactionReserveTokens,
 	cfgCompactionThresholdPercent,
@@ -134,6 +135,7 @@ describe("async speculative compaction", () => {
 			reconnectToAgent: () => {},
 			drainStrandedQueuedMessages: () => {},
 			buildDisplaySessionContext: () => sessionManager.buildSessionContext(),
+			persistEvalStateContext: () => {},
 			convertToLlmForSideRequest:
 				options.convertToLlmForSideRequest ?? ((messages: AgentMessage[]) => messages as never),
 			buildLiveProviderContext:
@@ -995,5 +997,14 @@ describe("async speculative compaction", () => {
 		expect(entry?.type === "compaction" ? entry.tokensAfter : undefined).toBe(
 			agent.tokenizer.countMessages(convertToLlm(agent.state.messages), { excludeEncryptedReasoning: true }),
 		);
+	});
+});
+
+describe("resolveSpeculationMethod", () => {
+	it("speculates past snapcompact when the model's wire strips image input", () => {
+		const settings = cfgCompaction.get(Settings.isolated({ "compaction.methodOrder": ["snapcompact", "soft"] }));
+		// Same declared input; only the second drops images on the wire.
+		expect(resolveSpeculationMethod(getBundledModel("anthropic", "claude-sonnet-4-5"), settings)).toBeUndefined();
+		expect(resolveSpeculationMethod(getBundledModel("venice", "deepseek-v4-1-flash"), settings)).toBe("soft");
 	});
 });

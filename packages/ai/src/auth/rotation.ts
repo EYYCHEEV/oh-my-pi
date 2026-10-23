@@ -141,6 +141,7 @@ export class RateLimits implements LimitsApi {
 	}
 	#blockCredentialForRotation(
 		provider: string,
+		sessionId: string | undefined,
 		credentialType: AuthCredential["type"],
 		targetIndex: number,
 		blockedUntil: number,
@@ -190,7 +191,8 @@ export class RateLimits implements LimitsApi {
 				(entry): entry is { credential: AuthCredential; index: number } =>
 					entry.credential.type === credentialType &&
 					entry.index !== targetIndex &&
-					this.#deps.pool.isAutoSelectableAt(provider, entry.index),
+					this.#deps.pool.isAutoSelectableAt(provider, entry.index) &&
+					this.#deps.affinity.allows(provider, sessionId, entry.credential),
 			);
 
 		let retryAtMs: number | undefined;
@@ -294,6 +296,7 @@ export class RateLimits implements LimitsApi {
 			.findIndex(entry => entry.id === targetCredentialId && entry.credential.type === credentialType);
 		const rotation = this.#blockCredentialForRotation(
 			provider,
+			sessionId,
 			credentialType,
 			targetIndex,
 			blockedUntil,
@@ -458,6 +461,7 @@ export class RateLimits implements LimitsApi {
 			}
 			const mark = this.#blockCredentialForRotation(
 				provider,
+				sessionId,
 				sessionCredential.type,
 				sessionCredential.index,
 				Date.now() + DEFAULT_BLOCK_MS,
@@ -477,7 +481,8 @@ export class RateLimits implements LimitsApi {
 					credential.type === sessionCredential.type &&
 					index !== sessionCredential.index &&
 					this.#deps.pool.isAutoSelectableAt(provider, index) &&
-					!this.#deps.blocks.isBlocked(provider, providerKey, index),
+					!this.#deps.blocks.isBlocked(provider, providerKey, index) &&
+					this.#deps.affinity.allows(provider, sessionId, credential),
 			);
 		const target = this.#deps.pool.entries(provider)[sessionCredential.index];
 		const sticky = this.#deps.affinity.get(provider, sessionId);

@@ -1,7 +1,7 @@
 /**
  * Unified Web Search Tool
  *
- * Single tool supporting Anthropic, Perplexity, Exa, Brave, Jina, Kimi, Gemini, Codex, Tavily, Kagi, Z.AI, SearXNG, and Synthetic
+ * Single tool supporting Anthropic, Perplexity, Exa, Brave, DeepSeek, Jina, Kimi, Gemini, Codex, Tavily, Kagi, Z.AI, SearXNG, and Synthetic
  * providers with provider-specific parameters exposed conditionally.
  */
 
@@ -31,6 +31,7 @@ import {
 	type SearchProvider,
 } from "./provider";
 import { CODEX_WEB_RUN_DESCRIPTION, CODEX_WEB_RUN_PARAMETERS, executeCodexWebRun } from "./providers/codex";
+import { rankXAIProviders, targetsX, xaiModelChain, xSearchAvailable } from "./providers/xai";
 import { applyQueryConstraints, parseSearchQuery } from "./query";
 import {
 	DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS,
@@ -199,6 +200,17 @@ function expandHostedCandidate(
 	return models.map(model => ({ ...candidate, model }));
 }
 
+/**
+ * Move the chain's xAI-grounded candidates to the front, keeping their order,
+ * or prepend {@link xaiModelChain} when the chain has none. Unchanged without
+ * xAI credentials.
+ */
+function preferXAI(chain: RoleChainCandidate[], modelRegistry: ModelRegistry): RoleChainCandidate[] {
+	const xai = chain.filter(candidate => candidate.model.webSearch === "xai");
+	if (xai.length > 0) return [...xai, ...chain.filter(candidate => candidate.model.webSearch !== "xai")];
+	return [...xaiModelChain(modelRegistry, settings).map(model => ({ model, explicit: false })), ...chain];
+}
+
 /** Execute web search */
 async function executeSearch(
 	_toolCallId: string,
@@ -220,15 +232,20 @@ async function executeSearch(
 		!options.sessionModel && options.standaloneCodexFallback
 			? pool.find(model => model.provider === "openai-codex" && model.webSearch === "codex")
 			: undefined;
-	const expanded = candidates.flatMap(candidate =>
-		expandHostedCandidate(
-			candidate,
-			options.sessionModel ?? (candidate.explicit ? undefined : standaloneCodexModel),
-			pool,
-		),
-	);
-
 	const parsedQuery = parseSearchQuery(params.query);
+	let expanded = rankXAIProviders(
+		candidates.flatMap(candidate =>
+			expandHostedCandidate(
+				candidate,
+				options.sessionModel ?? (candidate.explicit ? undefined : standaloneCodexModel),
+				pool,
+			),
+		),
+		candidate => candidate.model,
+		settings,
+	);
+	// Only xAI reaches X posts; X-only queries try it first even when the role prefers another engine.
+	if (!params.model && targetsX(parsedQuery)) expanded = preferXAI(expanded, modelRegistry);
 
 	// Invariant across candidates; resolve once before walking the role chain.
 	let antigravityEndpointMode: "auto" | "production" | "sandbox" | undefined;
@@ -413,6 +430,16 @@ export async function runSearchQuery(
 	}
 }
 
+/** Description without the X operators, for hosts without a model registry. */
+const plainDescription = prompt.render(webSearchDescription);
+
+/**
+ * Description rendered on first read with a model registry, then reused for
+ * the process: re-checking xAI auth per read would rewrite the tool
+ * description, and invalidate the prompt cache, whenever auth changes.
+ */
+let registryDescription: string | undefined;
+
 /**
  * Web search tool implementation.
  *
@@ -422,7 +449,6 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 	readonly name = "web_search";
 	readonly approval = "read" as const;
 	readonly label = "Web Search";
-	readonly description: string;
 	readonly parameters = webSearchSchema;
 	readonly strict = true;
 	readonly native = CODEX_WEB_RUN_NATIVE_TOOL;
@@ -433,7 +459,14 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 
 	constructor(session: ToolSession) {
 		this.#session = session;
-		this.description = prompt.render(webSearchDescription);
+	}
+
+	/** Advertises X search operators when xAI credentials existed at the process's first read. */
+	get description(): string {
+		const modelRegistry = this.#session.modelRegistry;
+		if (!modelRegistry) return plainDescription;
+		registryDescription ??= prompt.render(webSearchDescription, { xSearch: xSearchAvailable(modelRegistry) });
+		return registryDescription;
 	}
 
 	async execute(
@@ -477,7 +510,7 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 export const webSearchCustomTool: CustomTool<typeof webSearchSchema, SearchResultDetails> = {
 	name: "web_search",
 	label: "Web Search",
-	description: prompt.render(webSearchDescription),
+	description: plainDescription,
 	parameters: webSearchSchema,
 
 	native: CODEX_WEB_RUN_NATIVE_TOOL,

@@ -31,6 +31,8 @@ import {
 	isFeedModelBadgeEnabled,
 	pluralize,
 	previewLine,
+	clipCollapsed,
+	flattenLine,
 	previewWindowRows,
 	replaceTabs,
 	shortenEmbeddedPaths,
@@ -351,7 +353,7 @@ function renderOutputSection(
 		lines.push(
 			`${continuePrefix}  ${theme.fg("warning", theme.status.warning)} ${theme.fg(
 				"dim",
-				truncateToWidth(sanitizeText(warning), 80),
+				clipCollapsed(sanitizeText(warning), 80, expanded),
 			)}`,
 		);
 
@@ -395,7 +397,7 @@ function renderOutputSection(
 		const outputLines = trimmedOutput.split("\n");
 		const previewCount = expanded ? maxExpanded : maxCollapsed;
 		for (const line of outputLines.slice(0, previewCount)) {
-			lines.push(`${continuePrefix}  ${theme.fg("dim", truncateToWidth(replaceTabs(line), 70))}`);
+			lines.push(`${continuePrefix}  ${theme.fg("dim", clipCollapsed(replaceTabs(line), 70, expanded))}`);
 		}
 
 		if (outputLines.length > previewCount) {
@@ -448,7 +450,7 @@ function renderOutputSection(
 	const outputLines = trimmedOutput.split("\n");
 	const previewCount = expanded ? maxExpanded : maxCollapsed;
 	for (const line of outputLines.slice(0, previewCount)) {
-		lines.push(`${continuePrefix}  ${theme.fg("dim", truncateToWidth(replaceTabs(line), 70))}`);
+		lines.push(`${continuePrefix}  ${theme.fg("dim", clipCollapsed(replaceTabs(line), 70, expanded))}`);
 	}
 
 	if (outputLines.length > previewCount) {
@@ -472,7 +474,7 @@ function renderTaskSection(
 	lines.push(`${continuePrefix}${theme.fg("dim", "Task")}`);
 	const taskLines = trimmed.split("\n");
 	for (const line of taskLines.slice(0, maxExpanded)) {
-		lines.push(`${continuePrefix}  ${theme.fg("dim", truncateToWidth(replaceTabs(line), 70))}`);
+		lines.push(`${continuePrefix}  ${theme.fg("dim", replaceTabs(line))}`);
 	}
 	if (taskLines.length > maxExpanded) {
 		lines.push(`${continuePrefix}  ${theme.fg("dim", formatMoreItems(taskLines.length - maxExpanded, "line"))}`);
@@ -762,6 +764,15 @@ function renderAgentProgress(
 
 	// Current tool (if running) or most recent completed tool
 	if (progress.status === "running") {
+		if (progress.stage) {
+			lines.push(
+				truncateTaskRow(
+					`${continuePrefix}${theme.fg("muted", replaceTabs(sanitizeText(progress.stage)))}`,
+					maxWidth,
+					"",
+				),
+			);
+		}
 		if (progress.currentTool) {
 			let toolLine = `${continuePrefix}${theme.tree.hook} ${theme.fg("muted", sanitizeText(progress.currentTool))}`;
 			const toolDetail = toolCallDetail(
@@ -1123,7 +1134,7 @@ function renderAgentResult(
 		lines.push(
 			`${continuePrefix}${theme.fg("error", theme.status.aborted)} ${theme.fg(
 				"dim",
-				previewLine(sanitizeText(result.abortReason), 80),
+				clipCollapsed(flattenLine(sanitizeText(result.abortReason)), 80, expanded),
 			)}`,
 		);
 	}
@@ -1215,7 +1226,7 @@ function renderAgentResult(
 		lines.push(
 			`${continuePrefix}${theme.fg("warning", theme.status.warning)} ${theme.fg(
 				"dim",
-				truncateToWidth(sanitizeText(missingCompleteWarning), 80),
+				clipCollapsed(sanitizeText(missingCompleteWarning), 80, expanded),
 			)}`,
 		);
 	}
@@ -1255,7 +1266,7 @@ function renderAgentResult(
 	// Error message
 	if (result.error && (!success || mergeFailed) && (!aborted || result.error !== result.abortReason)) {
 		lines.push(
-			`${continuePrefix}${theme.fg(mergeFailed ? "warning" : "error", previewLine(sanitizeText(result.error), 70))}`,
+			`${continuePrefix}${theme.fg(mergeFailed ? "warning" : "error", clipCollapsed(flattenLine(sanitizeText(result.error)), 70, expanded))}`,
 		);
 	}
 
@@ -1397,7 +1408,7 @@ export function renderResult(
 	const aborted = abortedCount > 0;
 	const failed = failCount > 0;
 	const mergeFailed = mergeFailedCount > 0;
-	const isError = result.isError === true || aborted || failed;
+	const isError = aborted || failed;
 	const agentCount = hasResults ? details.results.length : (details.progress?.length ?? 0);
 	const icon: ToolUIStatus = options.isPartial ? "running" : isError ? "error" : mergeFailed ? "warning" : "success";
 	// Header meta is the spawn count only; each row carries its own ⟨agent⟩
@@ -1871,6 +1882,9 @@ function describeProgressAgent(progress: AgentProgress, state: AgentDescribeStat
 					age: progress.currentToolStartMs ? Math.max(0, nowMs - progress.currentToolStartMs) : undefined,
 				}
 			: null;
+	const summary = taskSummary(progress.description || progress.assignment || progress.task);
+	// The agent's own stage line (from its completion probe) rides beside the task while it runs.
+	const stage = running && progress.stage ? plainText(progress.stage) : "";
 	const retry =
 		running && progress.retryState
 			? {
@@ -1885,7 +1899,7 @@ function describeProgressAgent(progress: AgentProgress, state: AgentDescribeStat
 		{
 			name: formatTaskId(progress.id),
 			agent: progress.agent || undefined,
-			task: taskSummary(progress.description || progress.assignment || progress.task) || undefined,
+			task: stage ? (summary ? [span(summary), span(` · ${stage}`, "muted")] : stage) : summary || undefined,
 			status,
 			model: progress.resolvedModelIdentity ?? progress.resolvedModel,
 			thinking: thinkingToken(progress.resolvedThinkingLevel),
@@ -2204,14 +2218,16 @@ export interface TaskItem {
 	name?: string;
 	/** Agent type to run this item (e.g. "scout"). Defaults to the spawn policy's default agent. */
 	agent?: string;
+	/** Historical source session selected by the bundled consult agent. */
+	sourceSession?: string;
+	/** Optional model selector override for the historical source session. */
+	model?: string | string[];
 	/** The work; required by the schema. */
 	task?: string;
 	/** How open-ended the work is; required by the schema and the child's sole `auto` thinking classification input. */
 	solutionSpace?: string;
 	/** Per-spawn thinking effort: lowest/middle/highest level the resolved model supports. Overrides the agent's default selector (e.g. `auto`). */
 	effort?: "lo" | "med" | "hi";
-	/** Per-spawn model selector or ordered selector array; overrides agent and settings preferences. */
-	model?: string | string[];
 	/** Caller-provided output schema; its presence overrides the selected agent's schema. */
 	outputSchema?: unknown;
 	/** Validation behavior for a caller-provided or inherited output schema. */
@@ -2233,14 +2249,16 @@ export interface TaskParams {
 	name?: string;
 	/** Agent type to spawn (flat form); omitted values resolve from the session spawn policy. */
 	agent?: string;
+	/** Historical source session selected by the bundled consult agent. */
+	sourceSession?: string;
+	/** Optional model selector override for the historical source session. */
+	model?: string | string[];
 	/** The work (flat form). */
 	task?: string;
 	/** How open-ended the work is (flat form); see {@link TaskItem.solutionSpace}. */
 	solutionSpace?: string;
 	/** Per-spawn thinking effort (flat form): lowest/middle/highest level the resolved model supports. */
 	effort?: "lo" | "med" | "hi";
-	/** Per-spawn model selector or ordered selector array; overrides agent and settings preferences. */
-	model?: string | string[];
 	/** Caller-provided output schema; its presence overrides the selected agent's schema. */
 	outputSchema?: unknown;
 	/** Validation behavior for a caller-provided or inherited output schema. */
@@ -2377,6 +2395,18 @@ export interface AgentProgress {
 	advisor?: boolean;
 	/** The agent's latest self-estimate of task completion (0–100), from the periodic `task.completionProbe` side request. */
 	completionPercent?: number;
+	/**
+	 * The agent's current step in its own words (one line, ≤ 80 chars), from the
+	 * same probe reply as {@link completionPercent}. Running rows prefer it over
+	 * `lastIntent`; the job widget uses it as its stage line.
+	 */
+	stage?: string;
+	/**
+	 * What the agent says shows its progress live (one line, ≤ 200 chars), e.g.
+	 * "BENCH lines in bg_2 pipe:1, tok_s higher is better, target 70% of roofline";
+	 * from the probe reply. Feeds the job widget author's brief; never rendered.
+	 */
+	watch?: string;
 	/** Data extracted by registered subprocess tool handlers (keyed by tool name) */
 	extractedToolData?: Record<string, unknown[]>;
 	/**

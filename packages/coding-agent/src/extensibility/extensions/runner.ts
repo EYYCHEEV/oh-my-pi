@@ -35,7 +35,7 @@ import { type Settings, withActiveSettings } from "../../config/settings";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
-import type { AsyncJobSnapshot } from "../../session/agent-session";
+import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
 import { MAIN_AGENT_ID } from "../../registry/agent-registry";
 import type { SessionManager, SessionPersistenceReceipt } from "../../session/session-manager";
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
@@ -45,6 +45,7 @@ import { getLoadedRuntimeOrigin, type RequiredExtensionHandlerSnapshot } from ".
 import { accumulateToolCallResult, buildAggregatedToolCallResult } from "../shared-events";
 import { ManagedTimers } from "./managed-timers";
 import { createExtensionModelQuery } from "./model-api";
+import { trackUserWaits, type UserWaitTracker } from "./user-wait";
 import type { ComposerShapeDefinition } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
 import type {
 	AfterProviderResponseEvent,
@@ -64,6 +65,8 @@ import type {
 	Extension,
 	ExtensionActions,
 	ExtensionAgentIdentity,
+	ExtensionAnnotationsAPI,
+	ExtensionAnnotationsFactory,
 	ExtensionCommandContext,
 	ExtensionCommandContextActions,
 	ExtensionContext,
@@ -198,6 +201,7 @@ function createHandlerUIContext(
 	timeoutBudget?: HandlerTimeoutBudget,
 ): ExtensionUIContext {
 	const askDialog = ui.askDialog;
+	const approve = ui.approve;
 	const runDialog = async <T>(dialog: () => Promise<T>): Promise<T> => {
 		timeoutBudget?.pause();
 		try {
@@ -216,6 +220,10 @@ function createHandlerUIContext(
 		askDialog: askDialog
 			? (questions, dialogOptions) =>
 					runDialog(() => askDialog.call(ui, questions, attachHandlerSignal(dialogOptions, handlerSignal)))
+			: undefined,
+		approve: approve
+			? (prompt, dialogOptions) =>
+					runDialog(() => approve.call(ui, prompt, attachHandlerSignal(dialogOptions, handlerSignal)))
 			: undefined,
 		custom: async (factory, options) => {
 			let customSettled = false;
@@ -242,7 +250,7 @@ function createHandlerUIContext(
 		},
 		editor: (title, prefill, dialogOptions, editorOptions) =>
 			runDialog(() => ui.editor(title, prefill, attachHandlerSignal(dialogOptions, handlerSignal), editorOptions)),
-	} satisfies Pick<ExtensionUIContext, "select" | "confirm" | "input" | "askDialog" | "custom" | "editor">;
+	} satisfies Pick<ExtensionUIContext, "select" | "confirm" | "input" | "askDialog" | "approve" | "custom" | "editor">;
 	const delegatedMethods = new Map<PropertyKey, unknown>();
 
 	return new Proxy(ui, {
@@ -473,6 +481,7 @@ const noOpUIContext: ExtensionUIContext = {
 	editor: async () => undefined,
 	addAutocompleteProvider: () => {},
 	setEditorComponent: () => {},
+	getEditorComponent: () => undefined,
 	get theme() {
 		return theme;
 	},
@@ -497,11 +506,20 @@ export const TOP_LEVEL_AGENT: ExtensionAgentIdentity = Object.freeze({
 	depth: 0,
 });
 
+/** `ctx.annotations` for hosts that inject no implementation: every call rejects. */
+export const UNAVAILABLE_ANNOTATIONS: ExtensionAnnotationsAPI = Object.freeze({
+	submit: () => Promise.reject(new Error("ctx.annotations is not available in this host.")),
+	open: () => Promise.reject(new Error("ctx.annotations is not available in this host.")),
+});
+
 export class ExtensionRunner {
 	private extensions: readonly Extension[];
 	#uiContext: ExtensionUIContext;
 	#mode: ExtensionMode = "print";
 	#toolApprovalPreviewWaiter?: (toolCallId: string) => Promise<void>;
+	/** Grant keys (see `sessionApprovalScope`) approved "for this session", each prefixed by the session it covers. */
+	#sessionApprovals = new Set<string>();
+	#trackUserWait?: UserWaitTracker;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
 	#getModel: () => Model | undefined = () => undefined;
 	#isIdleFn: () => boolean = () => true;
@@ -523,7 +541,11 @@ export class ExtensionRunner {
 	#switchSessionHandler: SwitchSessionHandler = async () => ({ cancelled: false });
 	#reloadHandler: () => Promise<void> = async () => {};
 	#shutdownHandler: ShutdownHandler = () => {};
+	#resolvePlanReviewFn: NonNullable<ExtensionContextActions["resolvePlanReview"]> = () => false;
+	#getPendingPlanReviewFn: NonNullable<ExtensionContextActions["getPendingPlanReview"]> = () => undefined;
+	#openPlanReviewFn: NonNullable<ExtensionContextActions["openPlanReview"]> = async () => false;
 	#getMemoryFn?: () => MemoryRuntimeContext | undefined;
+	#createAnnotations?: ExtensionAnnotationsFactory;
 	#commandDiagnostics: Array<{ type: string; message: string; path: string }> = [];
 	#toolRegistrationScope = new AsyncLocalStorage<ToolRegistrationScope>();
 	#toolRegistrationBarrier: Promise<void> | undefined;
@@ -531,6 +553,10 @@ export class ExtensionRunner {
 	/** Full load order, captured on the first {@link setSuspendedExtensions} call. */
 	#loadOrder: Extension[] | undefined;
 	#suspendedExtensions = new Set<Extension>();
+	/** Per-extension listener factories from {@link onToolRegistered}, applied to late-added extensions too. */
+	#toolRegistrationSubscribers = new Set<(extension: Extension) => ToolRegistrationListener>();
+	/** Latest `session_start` broadcast, replayed to extensions added afterwards. */
+	#sessionStartEvent: RunnerEmitEvent | undefined;
 	/**
 	 * Buffer for `credential_disabled` events received via {@link emitCredentialDisabled}
 	 * before {@link initialize} has run. Drained through {@link emit} once initialize sets
@@ -676,6 +702,11 @@ export class ExtensionRunner {
 		return this.#nativeToolResolver?.(name) !== undefined;
 	}
 
+	/** Guidance a same-name replacement inherits from the native `name` tool it can delegate to. */
+	getNativeDelegationGuidance(name: string): string {
+		return this.#nativeToolResolver?.(name)?.tool.delegationGuidance ?? "";
+	}
+
 	/**
 	 * Run the native built-in of `name` with `params` and return its result — the delegation target
 	 * of a same-tool `ctx.invokeTool`. Calls the unwrapped native `execute` directly with the loop's
@@ -730,6 +761,9 @@ export class ExtensionRunner {
 		getAsyncJobSnapshot?: () => AsyncJobSnapshot | null,
 		/** Identity of the agent this runner's session runs; defaults to the top-level agent. */
 		private readonly agent: ExtensionAgentIdentity = TOP_LEVEL_AGENT,
+		/** Builds `ctx.annotations`; supplied by the host that wires the bundled `/annotate` command. */
+		createAnnotations?: ExtensionAnnotationsFactory,
+		/** Fork: attested required-extension `tool_call` handlers; trailing so upstream positional callers stay valid. */
 		requiredHandlerSnapshot?: RequiredExtensionHandlerSnapshot,
 	) {
 		// The host selects explicit instances and enforces required-extension attestation.
@@ -737,6 +771,7 @@ export class ExtensionRunner {
 		this.extensions = Object.freeze([...extensions]);
 		this.#uiContext = noOpUIContext;
 		this.#getMemoryFn = getMemory;
+		this.#createAnnotations = createAnnotations;
 		this.#getAsyncJobSnapshotFn = getAsyncJobSnapshot ?? (() => null);
 		this.#requiredToolCallHandlers = requiredHandlerSnapshot
 			? {
@@ -843,6 +878,9 @@ export class ExtensionRunner {
 		this.#abortFn = contextActions.abort;
 		this.#hasPendingMessagesFn = contextActions.hasPendingMessages;
 		this.#shutdownHandler = contextActions.shutdown;
+		if (contextActions.resolvePlanReview) this.#resolvePlanReviewFn = contextActions.resolvePlanReview;
+		if (contextActions.getPendingPlanReview) this.#getPendingPlanReviewFn = contextActions.getPendingPlanReview;
+		if (contextActions.openPlanReview) this.#openPlanReviewFn = contextActions.openPlanReview;
 		this.#getContextUsageFn = contextActions.getContextUsage;
 		this.#compactFn = contextActions.compact;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
@@ -865,7 +903,10 @@ export class ExtensionRunner {
 			this.#compactFn = commandContextActions.compact;
 		}
 
-		this.#uiContext = uiContext ?? noOpUIContext;
+		this.#uiContext =
+			uiContext && this.#trackUserWait
+				? trackUserWaits(uiContext, this.#trackUserWait)
+				: (uiContext ?? noOpUIContext);
 		this.#mode = mode;
 		this.runtime.requestStatusLineRender = () => this.#uiContext.requestStatusLineRender?.();
 		this.runtime.hostStatusSegment = (key, definition) => this.#uiContext.registerStatusSegment?.(key, definition);
@@ -886,72 +927,7 @@ export class ExtensionRunner {
 		// installing this one's trampolines.
 		this.disposeFileFallbacks();
 		// Suspended extensions keep a (gated) trampoline so resuming them needs no rewire.
-		for (const ext of this.getLoadedExtensions()) {
-			// Nothing registered by this extension means no trampoline, so a host with
-			// no fallback-registering extension leaves the seam genuinely empty and
-			// `hasFileWriteFallback()`/`hasFileDeleteFallback()` false — the invariant
-			// the whole feature rests on. Each seam is checked separately, so an
-			// extension that only brokers writes never appears in the delete registry.
-			if (ext.fileWriteFallbackHandlers.length === 0 && ext.fileDeleteFallbackHandlers.length === 0) continue;
-			// One trampoline per extension per seam, not per handler: the list is walked
-			// at mutation time so a handler this extension adds later still takes effect,
-			// and `createContext()` takes no extension argument, so within one invocation
-			// a single context is all any of this extension's handlers would have
-			// received anyway.
-			//
-			// The context is built PER INVOCATION rather than captured here, matching
-			// every other dispatch site. `createContext()` materializes `cwd` and
-			// `hasUI` as values, so a trampoline holding one context for the life of the
-			// session would keep handing handlers the workspace this runner initialized
-			// in — wrong the moment `SessionManager.moveTo()` relocates the session
-			// (`/move`), and a handler that scopes or prompts against `ctx.cwd` would
-			// then allow the old workspace and deny the new one. A denied mutation is a
-			// rare path, so the extra object costs nothing that matters.
-			//
-			// Isolation is per HANDLER, not per extension. The registry only sees one
-			// trampoline per extension, so a throw escaping this loop would advance the
-			// registry to the NEXT extension and skip every later handler this one
-			// registered — breaking both the documented "a throwing handler is skipped"
-			// contract and registration order for a backup-handler setup.
-			if (ext.fileWriteFallbackHandlers.length > 0) {
-				this.#fileFallbackDisposers.push(
-					addFileWriteFallback(async req => {
-						if (this.#suspendedExtensions.has(ext)) return false;
-						const ctx = this.createContext();
-						for (const handler of ext.fileWriteFallbackHandlers) {
-							try {
-								if (await handler(req, ctx)) return true;
-							} catch (error) {
-								logger.warn("Extension file write fallback handler threw; trying next handler", {
-									extension: ext.path,
-									error: error instanceof Error ? error.message : String(error),
-								});
-							}
-						}
-						return false;
-					}),
-				);
-			}
-			if (ext.fileDeleteFallbackHandlers.length > 0) {
-				this.#fileFallbackDisposers.push(
-					addFileDeleteFallback(async req => {
-						if (this.#suspendedExtensions.has(ext)) return false;
-						const ctx = this.createContext();
-						for (const handler of ext.fileDeleteFallbackHandlers) {
-							try {
-								if (await handler(req, ctx)) return true;
-							} catch (error) {
-								logger.warn("Extension file delete fallback handler threw; trying next handler", {
-									extension: ext.path,
-									error: error instanceof Error ? error.message : String(error),
-								});
-							}
-						}
-						return false;
-					}),
-				);
-			}
-		}
+		for (const ext of this.getLoadedExtensions()) this.#installFileFallbacks(ext);
 
 		// Drain events buffered by emitCredentialDisabled() before initialize ran. The
 		// spread adds the `type` discriminator — `event` is the pi-ai shape (no `type`).
@@ -1076,9 +1052,26 @@ export class ExtensionRunner {
 		};
 	}
 
+	/**
+	 * Runs each dialog of the UI context the next {@link initialize} receives (tool approvals, extension prompts) as a
+	 * wait for the user.
+	 */
+	setUserWaitTracker(track: UserWaitTracker): void {
+		this.#trackUserWait = track;
+	}
+
 	/** Waits until the interactive transcript can show the tool call being approved. */
 	async waitForToolApprovalPreview(toolCallId: string): Promise<void> {
 		await this.#toolApprovalPreviewWaiter?.(toolCallId);
+	}
+
+	/** Whether the user approved `key` for the current session; a new or switched session starts with none. */
+	hasSessionApproval(key: string): boolean {
+		return this.#sessionApprovals.has(`${this.sessionId}\0${key}`);
+	}
+
+	grantSessionApproval(key: string): void {
+		this.#sessionApprovals.add(`${this.sessionId}\0${key}`);
 	}
 
 	getUIContext(): ExtensionUIContext {
@@ -1087,6 +1080,121 @@ export class ExtensionRunner {
 
 	hasUI(): boolean {
 		return this.#uiContext !== noOpUIContext;
+	}
+
+	/**
+	 * Install this extension's file-mutation fallback trampolines.
+	 *
+	 * Nothing registered by this extension means no trampoline, so a host with
+	 * no fallback-registering extension leaves the seam genuinely empty and
+	 * `hasFileWriteFallback()`/`hasFileDeleteFallback()` false — the invariant
+	 * the whole feature rests on. Each seam is checked separately, so an
+	 * extension that only brokers writes never appears in the delete registry.
+	 *
+	 * One trampoline per extension per seam, not per handler: the list is walked
+	 * at mutation time so a handler this extension adds later still takes effect,
+	 * and `createContext()` takes no extension argument, so within one invocation
+	 * a single context is all any of this extension's handlers would have
+	 * received anyway.
+	 *
+	 * The context is built PER INVOCATION rather than captured here, matching
+	 * every other dispatch site. `createContext()` materializes `cwd` and
+	 * `hasUI` as values, so a trampoline holding one context for the life of the
+	 * session would keep handing handlers the workspace this runner initialized
+	 * in — wrong the moment `SessionManager.moveTo()` relocates the session
+	 * (`/move`), and a handler that scopes or prompts against `ctx.cwd` would
+	 * then allow the old workspace and deny the new one. A denied mutation is a
+	 * rare path, so the extra object costs nothing that matters.
+	 *
+	 * Isolation is per HANDLER, not per extension. The registry only sees one
+	 * trampoline per extension, so a throw escaping this loop would advance the
+	 * registry to the NEXT extension and skip every later handler this one
+	 * registered — breaking both the documented "a throwing handler is skipped"
+	 * contract and registration order for a backup-handler setup.
+	 */
+	#installFileFallbacks(ext: Extension): void {
+		if (ext.fileWriteFallbackHandlers.length > 0) {
+			this.#fileFallbackDisposers.push(
+				addFileWriteFallback(async req => {
+					if (this.#suspendedExtensions.has(ext)) return false;
+					const ctx = this.createContext();
+					for (const handler of ext.fileWriteFallbackHandlers) {
+						try {
+							if (await handler(req, ctx)) return true;
+						} catch (error) {
+							logger.warn("Extension file write fallback handler threw; trying next handler", {
+								extension: ext.path,
+								error: error instanceof Error ? error.message : String(error),
+							});
+						}
+					}
+					return false;
+				}),
+			);
+		}
+		if (ext.fileDeleteFallbackHandlers.length > 0) {
+			this.#fileFallbackDisposers.push(
+				addFileDeleteFallback(async req => {
+					if (this.#suspendedExtensions.has(ext)) return false;
+					const ctx = this.createContext();
+					for (const handler of ext.fileDeleteFallbackHandlers) {
+						try {
+							if (await handler(req, ctx)) return true;
+						} catch (error) {
+							logger.warn("Extension file delete fallback handler threw; trying next handler", {
+								extension: ext.path,
+								error: error instanceof Error ? error.message : String(error),
+							});
+						}
+					}
+					return false;
+				}),
+			);
+		}
+	}
+
+	/**
+	 * Append extensions bound after this runner was built (startup-deferred
+	 * extensions binding into the live session runtime). They join last, so they
+	 * win name collisions as any later-loaded extension does. Tools their
+	 * factories registered reach every {@link onToolRegistered} subscriber, file
+	 * fallbacks install when the runner is already initialized, and a
+	 * `session_start` that already went out is replayed to them alone. Resolves
+	 * once those tool activations and handlers settle.
+	 */
+	async addExtensions(added: readonly Extension[]): Promise<void> {
+		if (added.length === 0) return;
+		// The fork keeps an immutable identity snapshot of the selected extensions; replace it, never mutate it.
+		this.extensions = Object.freeze([...this.extensions, ...added]);
+		this.#loadOrder?.push(...added);
+		if (this.#initialized) {
+			for (const extension of added) this.#installFileFallbacks(extension);
+		}
+		for (const extension of added) {
+			const scope: ToolRegistrationScope = {
+				pending: new Set(),
+				closed: false,
+				signal: AbortSignal.timeout(extensionHandlerTimeoutMs),
+			};
+			this.#toolRegistrationScope.run(scope, () => {
+				for (const attach of this.#toolRegistrationSubscribers) {
+					const listener = attach(extension);
+					for (const toolName of extension.tools.keys()) listener(toolName);
+				}
+			});
+			scope.closed = true;
+			try {
+				await this.#flushToolRegistrations(scope.pending);
+			} catch (error) {
+				this.emitError({
+					extensionPath: extension.path,
+					event: "tool_registration",
+					error: error instanceof Error ? error.message : String(error),
+					stack: error instanceof Error ? error.stack : undefined,
+				});
+			}
+		}
+		if (this.#sessionStartEvent) await this.#emitTo(added, this.#sessionStartEvent);
 	}
 
 	getExtensionPaths(): string[] {
@@ -1161,7 +1269,7 @@ export class ExtensionRunner {
 	 */
 	onToolRegistered(listener: (tool: RegisteredTool, signal?: AbortSignal) => void | Promise<void>): () => void {
 		const subscriptions: Array<{ extension: Extension; listener: ToolRegistrationListener }> = [];
-		for (const extension of this.extensions) {
+		const attach = (extension: Extension): ToolRegistrationListener => {
 			const trackRegistration = (pending: Promise<void>): void => {
 				const registrationBarrier = pending.then(
 					() => undefined,
@@ -1205,8 +1313,12 @@ export class ExtensionRunner {
 			extension.toolRegistrationListeners ??= new Set();
 			extension.toolRegistrationListeners.add(wrapped);
 			subscriptions.push({ extension, listener: wrapped });
-		}
+			return wrapped;
+		};
+		for (const extension of this.extensions) attach(extension);
+		this.#toolRegistrationSubscribers.add(attach);
 		return () => {
+			this.#toolRegistrationSubscribers.delete(attach);
 			for (const subscription of subscriptions) {
 				subscription.extension.toolRegistrationListeners?.delete(subscription.listener);
 			}
@@ -1425,6 +1537,9 @@ export class ExtensionRunner {
 		const getModel = model ? () => model : this.#getModel;
 		const sessionId = this.sessionId;
 		const runEphemeralTurn = this.#runEphemeralTurnFn;
+		const createAnnotations = this.#createAnnotations;
+		const sendUserMessage = (text: string, options?: SendUserMessageOptions): void =>
+			this.runtime.sendUserMessage(text, options);
 		return {
 			toolOutputBudgetBytes: resolveToolOutputBudgetBytes(delegation?.context?.settings ?? this.settings),
 			evaluationAdmission: getEvaluationAdmission(),
@@ -1448,6 +1563,9 @@ export class ExtensionRunner {
 			abort: () => this.#abortFn(),
 			hasPendingMessages: () => this.#hasPendingMessagesFn(),
 			shutdown: () => this.#shutdownHandler(),
+			resolvePlanReview: (reviewId, choice, input) => this.#resolvePlanReviewFn(reviewId, choice, input),
+			getPendingPlanReview: () => this.#getPendingPlanReviewFn(),
+			openPlanReview: () => this.#openPlanReviewFn(),
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			runEphemeralTurn: runEphemeralTurn
 				? async options => {
@@ -1478,6 +1596,11 @@ export class ExtensionRunner {
 				: undefined,
 			localProtocolOptions: this.localProtocolOptions,
 			memory: this.#getMemoryFn?.(),
+			// A getter, not a value: `createHandlerContext` scopes a handler via `Object.create(ctx)`, and
+			// `this` here is that receiver, so the overlay mounts through the handler's timeout-aware `ui`.
+			get annotations(): ExtensionAnnotationsAPI {
+				return createAnnotations ? createAnnotations(() => this, sendUserMessage) : UNAVAILABLE_ANNOTATIONS;
+			},
 			setInterval: (callback, ms, ...args) => this.#managedTimers.setInterval(callback, ms, ...args),
 			setTimeout: (callback, ms, ...args) => this.#managedTimers.setTimeout(callback, ms, ...args),
 			clearTimer: timer => this.#managedTimers.clear(timer),
@@ -1647,6 +1770,16 @@ export class ExtensionRunner {
 	}
 
 	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
+		// Recorded before the broadcast starts: it walks the immutable snapshot taken here, so an extension
+		// added while it runs (or later) is reached once, by the replay in addExtensions, never twice.
+		if (event.type === "session_start") this.#sessionStartEvent = event;
+		return this.#emitTo(this.extensions, event);
+	}
+
+	async #emitTo<TEvent extends RunnerEmitEvent>(
+		extensions: readonly Extension[],
+		event: TEvent,
+	): Promise<RunnerEmitResult<TEvent>> {
 		// Defer the per-event context allocation (and the Promise.race/Bun.sleep
 		// timeout machinery) to the first matching handler. Streaming sessions emit
 		// message_update / tool_execution_* per delta with usually no extension
@@ -1657,7 +1790,7 @@ export class ExtensionRunner {
 		if (this.#isSessionShutdownEvent(event)) {
 			const timeoutMs = handlerTimeoutForEvent(event.type);
 			const promises: Promise<unknown>[] = [];
-			for (const ext of this.extensions) {
+			for (const ext of extensions) {
 				const handlers = ext.handlers.get(event.type);
 				if (!handlers || handlers.length === 0) continue;
 				ctx ??= this.createContext();
@@ -1669,7 +1802,7 @@ export class ExtensionRunner {
 			return result as RunnerEmitResult<TEvent>;
 		}
 
-		for (const ext of this.extensions) {
+		for (const ext of extensions) {
 			const handlers = ext.handlers.get(event.type);
 			if (!handlers || handlers.length === 0) continue;
 			ctx ??= this.createContext();

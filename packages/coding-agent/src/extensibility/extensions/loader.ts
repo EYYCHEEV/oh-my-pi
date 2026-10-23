@@ -603,6 +603,7 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 
 	registerProvider(name: string, config: ProviderConfig): void {
 		if (!this.canRegister()) return;
+		this.extension.registersProviders = true;
 		this.runtime.registerProvider(name, config, this.extension.path);
 	}
 
@@ -849,11 +850,11 @@ async function loadExtensionPaths(
 	paths: readonly string[],
 	cwd: string,
 	eventBus?: EventBus,
+	runtime: IExtensionRuntime = new ExtensionRuntime(),
 ): Promise<LoadExtensionsResult> {
 	const extensions: Extension[] = [];
 	const errors: Array<{ path: string; error: string }> = [];
 	const resolvedEventBus = eventBus ?? new EventBus();
-	const runtime = new ExtensionRuntime();
 	const seen = new Set<string>();
 	const deduplicatedPaths: string[] = [];
 	for (const extPath of paths) {
@@ -883,16 +884,20 @@ async function loadExtensionPaths(
 	};
 }
 
-/** Bind previously imported extension factories to a fresh session runtime. */
+/**
+ * Bind previously imported extension factories. A fresh session runtime is
+ * created unless `runtime` is given: deferred startup extensions bind into the
+ * live session's runtime so they share its flag values and wired actions.
+ */
 export async function bindPreparedExtensions(
 	preparedExtensions: readonly PreparedExtension[],
 	cwd: string,
 	eventBus?: EventBus,
+	runtime: IExtensionRuntime = new ExtensionRuntime(),
 ): Promise<LoadExtensionsResult> {
 	const extensions: Extension[] = [];
 	const errors: Array<{ path: string; error: string }> = [];
 	const resolvedEventBus = eventBus ?? new EventBus();
-	const runtime = new ExtensionRuntime();
 
 	for (const prepared of preparedExtensions) {
 		const { extension, error } = await bindExtension(prepared.path, prepared, cwd, resolvedEventBus, runtime);
@@ -1005,9 +1010,17 @@ export async function loadExtensionsWithRequiredAttestation(
 }
 
 /**
- * Load extensions from paths.
+ * Load extensions from paths. A fresh session runtime is created unless
+ * `runtime` is given: deferred startup extensions bind into the live session's
+ * runtime so they share its flag values and wired actions.
  */
-export async function loadExtensions(paths: string[], cwd: string, eventBus?: EventBus): Promise<LoadExtensionsResult> {
+export async function loadExtensions(
+	paths: string[],
+	cwd: string,
+	eventBus?: EventBus,
+	runtime?: IExtensionRuntime,
+): Promise<LoadExtensionsResult> {
+	if (runtime) return loadExtensionPaths(paths, cwd, eventBus, runtime);
 	return loadExtensionsWithRequiredAttestation({ paths }, cwd, eventBus);
 }
 
