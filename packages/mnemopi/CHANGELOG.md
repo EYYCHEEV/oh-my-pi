@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `mnemopi backup <destination.db>` and `backupDatabase()`: a consistent, standalone single-file copy of a database another process is writing (`VACUUM INTO` of one snapshot, integrity-checked, never overwrites, no partial file on failure), instead of copying the main file and the `-wal` by hand
+
 ### Fixed
 
 - Fixed the working-memory trim deleting unconsolidated rows: a session that stayed open past the 24-hour TTL, or wrote more than `workingMemoryLimit` rows, silently lost memories that consolidation had not reached yet. Trim now promotes those rows to episodic memory with the same pipeline as `sleep` instead of deleting them, in batches so a steady writer does not leave one tiny summary per write: when a row passes the TTL it promotes every row `sleep` would take (older than half the TTL), and on count overflow it promotes the oldest rows down to 90% of the limit. A failed promotion is rolled back and logged so the rows stay for the next write.

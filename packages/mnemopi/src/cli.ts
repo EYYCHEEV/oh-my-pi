@@ -7,6 +7,7 @@ import { BankManager, ValueError } from "./core/banks";
 import { BeamMemory } from "./core/beam";
 import type { ImportStats, RecallResult } from "./core/beam/types";
 import { runDiagnostics } from "./diagnose";
+import { backupDatabase, FileNotFoundError } from "./dr/recovery";
 import { main as runMcpMain } from "./mcp-server";
 
 export interface CliIo {
@@ -329,6 +330,21 @@ export const cmdDiagnose: CommandHandler = (_args, context) => {
 	return result.checks_failed === 0 ? 0 : 1;
 };
 
+/** A consistent single-file copy that is safe while another process is writing the database. */
+export const cmdBackup: CommandHandler = (args, context) => {
+	if (args.length !== 1) usage("Usage: mnemopi backup <destination.db>");
+	try {
+		const result = backupDatabase(resolveDbPath(context), args[0] ?? "");
+		out(context, `Backed up ${result.source} to ${result.destination} (${result.size} bytes, integrity ok)`);
+		return 0;
+	} catch (error) {
+		if (error instanceof FileNotFoundError || (error instanceof Error && /already exists/.test(error.message))) {
+			fail(error.message, 1);
+		}
+		throw error;
+	}
+};
+
 export const COMMANDS: Readonly<Record<string, CommandHandler>> = {
 	store: cmdRemember,
 	remember: cmdRemember,
@@ -348,6 +364,7 @@ export const COMMANDS: Readonly<Record<string, CommandHandler>> = {
 	bank: cmdBank,
 	diagnose: cmdDiagnose,
 	doctor: cmdDiagnose,
+	backup: cmdBackup,
 	mcp: cmdMcp,
 };
 
@@ -365,6 +382,7 @@ export function printHelp(context?: CliContext): void {
 	out(context, "  sleep                                  Run consolidation");
 	out(context, "  scratchpad read|write|clear [content]  Manage scratchpad");
 	out(context, "  diagnose                               Run diagnostics");
+	out(context, "  backup <destination.db>                Copy the database consistently, even while it is in use");
 	out(context, "  bank list|create|delete [name]         Manage memory banks");
 	out(context, "  mcp [args]                             Run MCP server");
 }

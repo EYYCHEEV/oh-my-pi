@@ -199,3 +199,15 @@ Aliased subagent states do not own or close the shared banks; the parent state o
 Interactive and print exits give this drain 1.5 seconds. If the budget expires, shutdown detaches the in-flight drain and arranges for handles to close when it settles rather than racing writes against closed databases. The process may exit first. Working-memory rows already written remain durable, but promotion or embedding for the last few turns can remain incomplete; earlier turn retention performed at agent end is unaffected.
 
 `/memory enqueue` is the explicit stronger durability boundary: it forces retention, flushes pending extraction, and runs full sleep/consolidation across the owned banks. It does not bypass Mnemopi's age gate: `sleepAllSessions` selects unconsolidated working-memory rows older than `Math.floor(workingMemoryTtlHours / 2)` hours (12 hours with the default 24-hour TTL). Fresh rows therefore remain in working memory after an immediate enqueue. Use the command before exit to force retention and flush pending work, or after the age gate to promote eligible rows; normal shutdown does not promote them.
+
+### Backing up a database that is in use
+
+Do not copy a live database with `cp`. Mnemopi runs SQLite in WAL mode, so committed rows sit in `mnemopi.db-wal` until a checkpoint: the main file alone can be missing almost everything (a probe with a busy writer had a 4 KB main file and a 156 MB `-wal`), and copying `db`, `-wal` and `-shm` one after the other can tear. `-shm` is only a rebuildable index; the main file and the `-wal` are one unit. A `.pre_e6_backup` beside the database is the one-time copy the triple-store migration made before it ran; it is an old-format snapshot, not part of the live set.
+
+`mnemopi backup <destination.db>` writes one consistent, standalone file (no `-wal` or `-shm` to carry) while another process writes the database. It reads a single snapshot with `VACUUM INTO` (the writer is never blocked), checks the copy with `PRAGMA integrity_check`, refuses to overwrite an existing file, and leaves no partial file on failure. It backs up `$MNEMOPI_DATA_DIR/mnemopi.db`, like the other `mnemopi` subcommands. The compiled `omp` binary does not carry this CLI; from any program or shell the same call works against the file named by `mnemopi.dbPath`:
+
+```sh
+sqlite3 /path/to/mnemopi.db "VACUUM INTO '/path/to/backup.db'"
+```
+
+Restore by copying the backup to the new database path and deleting any `-wal` / `-shm` found there first: a leftover `-wal` from another database would be replayed into the restored file. Banks other than the shared one (`scoping: per-project` or `per-project-tagged`) are separate files under `<dbDir>/banks/`; back each up the same way, or set `mnemopi.scoping: "global"` so the whole memory is the one file.
