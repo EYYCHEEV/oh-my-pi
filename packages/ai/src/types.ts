@@ -166,7 +166,8 @@ export type ServiceTierFamily = "openai" | "anthropic" | "google";
  */
 export type ServiceTierByFamily = Partial<Record<ServiceTierFamily, ServiceTier>>;
 
-type ServiceTierModel = Pick<Model, "provider" | "api" | "identity"> & Partial<Pick<Model, "serviceTiers">>;
+type ServiceTierModel = Pick<Model, "provider" | "api" | "identity"> &
+	Partial<Pick<Model, "serviceTiers" | "accountAccess">>;
 // The service-tier matrix below intentionally stays in TypeScript rather than
 // the KDL compat tree: `shouldSendServiceTier` accepts bare provider strings
 // (agent telemetry, google-shared header placement) and the stats parser
@@ -234,6 +235,57 @@ export function resolveModelServiceTier(
 }
 
 /**
+ * Verdict of one advertised Codex tier list for `tier`. `ultrafast` needs an
+ * explicit listing; other tiers are dropped only when a non-empty list omits
+ * them (codex-rs `service_tier_for_request`). `undefined` means the list says
+ * nothing ("not reported", accounts whose `/models` lists no tiers keep
+ * `/fast`), so the provider-level answer stands.
+ */
+function codexTierListVerdict(tier: ServiceTier, advertised: readonly string[] | undefined): boolean | undefined {
+	if (tier === "ultrafast") return advertised?.includes(tier) === true;
+	if (advertised !== undefined && advertised.length > 0) return advertised.includes(tier);
+	return undefined;
+}
+
+/** True when multi-account discovery recorded a tier list for at least one account. */
+function hasAccountServiceTiers(access: Model["accountAccess"]): access is NonNullable<Model["accountAccess"]> {
+	if (!access) return false;
+	for (const accountId in access) {
+		if (access[accountId]?.serviceTiers !== undefined) return true;
+	}
+	return false;
+}
+
+/**
+ * Codex tier verdict for a model. Tiers are an account entitlement (plans
+ * differ), so once discovery recorded per-account lists they decide; the
+ * model-level list is only the first listing account's view and applies when no
+ * account carries its own. A `scoped` request is served by `accountId`; an
+ * account with no recorded list (added after discovery, or not identifiable
+ * from its token) is unknown, so `ultrafast` is withheld for it. An unscoped
+ * question asks whether any pool account can serve the tier.
+ */
+function codexServiceTierVerdict(
+	tier: ServiceTier,
+	model: ServiceTierModel,
+	scoped: boolean,
+	accountId: string | undefined,
+): boolean | undefined {
+	const access = model.accountAccess;
+	if (!hasAccountServiceTiers(access)) return codexTierListVerdict(tier, model.serviceTiers);
+	if (scoped) {
+		return codexTierListVerdict(tier, accountId === undefined ? undefined : access[accountId]?.serviceTiers);
+	}
+	let deferred = false;
+	for (const id in access) {
+		const verdict = codexTierListVerdict(tier, access[id]?.serviceTiers);
+		if (verdict === true) return true;
+		if (verdict === undefined) deferred = true;
+	}
+	return deferred ? undefined : false;
+}
+
+/**
  * True when the tier should be sent on the wire as the provider's service-tier
  * request field. `auto` is never forwarded — it is OpenAI's implicit default, so
  * omitting `service_tier` is identical to requesting `auto`, and the Codex
@@ -251,10 +303,41 @@ export function resolveModelServiceTier(
  * provider-level answer stands. `flex` and `default` are never gated.
  * First-party OpenAI takes `ultrafast` as-is. A bare provider string cannot
  * carry the list, so it answers for the provider alone.
+ *
+ * This is the account-agnostic answer (UI gates, telemetry, stats): for a
+ * multi-account Codex pool it holds when some pool account can serve the tier.
+ * The request that actually goes out must use
+ * {@link shouldSendServiceTierForAccount} with the serving account.
  */
 export function shouldSendServiceTier(
 	serviceTier: ServiceTier | null | undefined,
 	target: Provider | ServiceTierModel | undefined,
+): boolean {
+	return sendServiceTier(serviceTier, target, false, undefined);
+}
+
+/**
+ * {@link shouldSendServiceTier} for a request served by one account of a
+ * multi-account Codex pool: the tier list that account advertised decides, so
+ * a priority-only account never receives `ultrafast` because a sibling lists it
+ * (and the reverse). `accountId` is the serving ChatGPT account id, `undefined`
+ * when it cannot be identified. Models without per-account tiers (single
+ * account, gateways, caches from before per-account discovery) answer as
+ * {@link shouldSendServiceTier}.
+ */
+export function shouldSendServiceTierForAccount(
+	serviceTier: ServiceTier | null | undefined,
+	model: ServiceTierModel,
+	accountId: string | undefined,
+): boolean {
+	return sendServiceTier(serviceTier, model, true, accountId);
+}
+
+function sendServiceTier(
+	serviceTier: ServiceTier | null | undefined,
+	target: Provider | ServiceTierModel | undefined,
+	scoped: boolean,
+	accountId: string | undefined,
 ): boolean {
 	if (!serviceTier || serviceTier === "auto") return false;
 	const provider = typeof target === "string" ? target : target?.provider;
@@ -264,9 +347,8 @@ export function shouldSendServiceTier(
 		serviceTier !== "flex" &&
 		serviceTier !== "default"
 	) {
-		const advertised = target.serviceTiers;
-		if (serviceTier === "ultrafast") return advertised?.includes(serviceTier) === true;
-		if (advertised !== undefined && advertised.length > 0) return advertised.includes(serviceTier);
+		const verdict = codexServiceTierVerdict(serviceTier, target, scoped, accountId);
+		if (verdict !== undefined) return verdict;
 	}
 	if (serviceTier === "ultrafast") {
 		return provider === "openai" || (typeof target === "string" && provider === "openai-codex");

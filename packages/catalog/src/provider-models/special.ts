@@ -93,7 +93,11 @@ export function openaiCodexModelManagerOptions(
 
 /**
  * Merge complete per-account Codex catalogs into one authoritative list via
- * {@link unionAccountCatalogs}.
+ * {@link unionAccountCatalogs}. Account access (cyber programs and advertised
+ * service tiers) is merged from every account whose catalog lists a model id.
+ * The spec's own `serviceTiers` therefore stays the first account's view and is
+ * only a fallback: request-time tier gating reads
+ * `accountAccess[accountId].serviceTiers` instead.
  *
  * Returns `null` when any account's fetch failed transiently, so a partial list
  * cannot replace the previous or bundled authoritative catalog. An account

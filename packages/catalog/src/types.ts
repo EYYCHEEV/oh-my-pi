@@ -1499,6 +1499,15 @@ export interface ModelAccountAccess {
 	 * Absent when the backend reported no program metadata.
 	 */
 	cyberPrograms?: readonly string[];
+	/**
+	 * Codex `service_tiers[].id` this account's catalog advertises for the model
+	 * (`priority`, `ultrafast`). Plans differ, so tiers are an account entitlement:
+	 * request-time gating reads the serving account's list instead of the
+	 * model-level {@link Model.serviceTiers}, which only reflects the first
+	 * account to list the model. Absent when the account's catalog carried no
+	 * `service_tiers` array; an empty array means "not reported" (keeps `/fast`).
+	 */
+	serviceTiers?: readonly string[];
 }
 
 /** One Cursor `RequestedModel.parameters` entry recovered from rich discovery. */
@@ -1730,7 +1739,9 @@ export interface Model<TApi extends Api = Api> {
 	/**
 	 * Service-tier ids the provider advertises for this model (Codex discovery
 	 * `service_tiers[].id`, e.g. `priority`, `ultrafast`). Absent when the
-	 * provider publishes no per-model tier list.
+	 * provider publishes no per-model tier list. In a multi-account Codex pool
+	 * this is the first listing account's view and only the fallback: when
+	 * {@link Model.accountAccess} carries per-account tiers, those decide.
 	 */
 	serviceTiers?: readonly string[];
 	/** Preferred model to switch to when context promotion is triggered (model id or provider/id). */

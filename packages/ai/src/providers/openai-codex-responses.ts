@@ -47,7 +47,7 @@ import type {
 	ToolResultMessage,
 	Usage,
 } from "../types";
-import { getPremiumServiceTierRequests, parseServiceTier } from "../types";
+import { getPremiumServiceTierRequests, parseServiceTier, shouldSendServiceTierForAccount } from "../types";
 import {
 	clampOpenAIResponsesImageDetailForReplay,
 	createOpenAIResponsesHistoryPayload,
@@ -129,7 +129,6 @@ import {
 	appendReasoningSummaryTextDelta,
 	appendResponsesImageResult,
 	appendResponsesToolResultMessages,
-	applyOpenAIServiceTier,
 	applyReasoningSummaryDone,
 	buildResponsesDeltaInput,
 	computerCallMetadata,
@@ -1582,6 +1581,15 @@ function codexReasoningControls(
 	return { reasoningEffort: getSupportedEfforts(model)[0] };
 }
 
+/** ChatGPT account serving a request: the id its bearer token carries, resolved like {@link createCodexRequestContext}. */
+function resolveCodexRequestAccountId(
+	model: Model<"openai-codex-responses">,
+	options: OpenAICodexResponsesOptions | undefined,
+): string | undefined {
+	const apiKey = options?.apiKey || getEnvApiKey(model.provider);
+	return apiKey ? getCodexAccountId(apiKey) : undefined;
+}
+
 /** Serialize normal Codex turns and V2 compaction with the same cacheable prefix. */
 export async function buildTransformedCodexRequestBody(
 	model: Model<"openai-codex-responses">,
@@ -1606,7 +1614,16 @@ export async function buildTransformedCodexRequestBody(
 	// `{"detail":"Unsupported parameter: temperature"}` etc., so we drop
 	// everything from `StreamOptions` rather than forwarding any of them.
 	// (#3117 — codex-rs sends none of these either.)
-	applyOpenAIServiceTier(params, options?.serviceTier, model);
+
+	// Tiers are an account entitlement: gate on the account this request is served by, not on a
+	// catalog merged across the pool (a priority-only account must not receive `ultrafast`).
+	const serviceTier = options?.serviceTier;
+	if (
+		serviceTier &&
+		shouldSendServiceTierForAccount(serviceTier, model, resolveCodexRequestAccountId(model, options))
+	) {
+		params.service_tier = serviceTier;
+	}
 	if (context.tools && context.tools.length > 0) {
 		let requestTools = context.tools;
 		const requestedChoice = options?.toolChoice;
@@ -3465,7 +3482,12 @@ export async function prewarmOpenAICodexResponses(
 	const routedRequest: Pick<RequestBody, "model" | "service_tier"> = {
 		model: model.requestModelId ?? model.id,
 	};
-	applyOpenAIServiceTier(routedRequest, options?.serviceTier, model);
+	// Same account-scoped gate as the request body: a pool account that does not advertise the tier
+	// must not receive it through the prewarmed socket's routing header either.
+	const prewarmServiceTier = options?.serviceTier;
+	if (prewarmServiceTier && shouldSendServiceTierForAccount(prewarmServiceTier, model, accountId)) {
+		routedRequest.service_tier = prewarmServiceTier;
+	}
 	const headers = logger.time(
 		"prewarmCodex:createHeaders",
 		createCodexHeaders,

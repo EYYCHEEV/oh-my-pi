@@ -3,7 +3,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { shouldSendServiceTier } from "@oh-my-pi/pi-ai/types";
+import { shouldSendServiceTier, shouldSendServiceTierForAccount } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { fetchCodexModels } from "@oh-my-pi/pi-catalog/discovery/codex";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
@@ -645,6 +645,71 @@ describe("Codex model discovery", () => {
 			expect(result.models.find(model => model.id === "gpt-daybreak-blue-latest")?.accountAccess).toEqual({
 				"account-a": { cyberPrograms: ["daybreak_blue"] },
 			});
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps each account's advertised service tiers instead of the first account's list", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-codex-tiers-"));
+		const tiersByAccount: Record<string, unknown[] | undefined> = {
+			"account-basic": [{ id: "priority" }],
+			"account-ultra": [{ id: "priority" }, { id: "ultrafast" }],
+			"account-free": [],
+			"account-silent": undefined,
+		};
+		const fetchFn: typeof fetch = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit) => {
+				const accountId = new Headers(init?.headers).get("chatgpt-account-id") ?? "";
+				const tiers = tiersByAccount[accountId];
+				return Response.json({
+					models: [{ slug: "gpt-6.1-sol", ...(tiers === undefined ? {} : { service_tiers: tiers }) }],
+				});
+			},
+			{ preconnect() {} },
+		);
+		try {
+			// The priority-only account is listed first, so its model-level list wins the merge.
+			const result = await resolveProviderModels(
+				{
+					...openaiCodexModelManagerOptions({
+						resolveAccounts: async () =>
+							Object.keys(tiersByAccount).map(accountId => ({ accessToken: accountId, accountId })),
+						fetch: fetchFn,
+					}),
+					cacheDbPath: path.join(tempDir, "models.db"),
+				},
+				"online",
+			);
+			const spec = result.models.find(model => model.id === "gpt-6.1-sol");
+			expect(spec?.serviceTiers).toEqual(["priority"]);
+			expect(spec?.accountAccess).toEqual({
+				"account-basic": { serviceTiers: ["priority"] },
+				"account-ultra": { serviceTiers: ["priority", "ultrafast"] },
+				"account-free": { serviceTiers: [] },
+				"account-silent": {},
+			});
+
+			const model = buildModel(spec!);
+			const wire = (tier: "ultrafast" | "priority", accountId: string | undefined) =>
+				shouldSendServiceTierForAccount(tier, model, accountId);
+			expect(Object.keys(tiersByAccount).map(accountId => wire("ultrafast", accountId))).toEqual([
+				false,
+				true,
+				false,
+				false,
+			]);
+			// `[]` and a missing list mean "not reported": Fast stays available on those accounts.
+			expect(Object.keys(tiersByAccount).map(accountId => wire("priority", accountId))).toEqual([
+				true,
+				true,
+				true,
+				true,
+			]);
+			// An account the catalog never saw, or one that cannot be identified, is unknown: no Ultrafast.
+			expect([wire("ultrafast", "account-added-later"), wire("ultrafast", undefined)]).toEqual([false, false]);
+			// Account-agnostic questions (the `/fast ultra` gate) ask whether some pool account offers it.
+			expect(shouldSendServiceTier("ultrafast", model)).toBe(true);
 		} finally {
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}

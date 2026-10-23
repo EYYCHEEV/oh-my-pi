@@ -17,6 +17,7 @@
 ### Fixed
 
 - Fixed Ultrafast availability using another account's cached capabilities when launching with `--oauth-account`.
+- Fixed Ultrafast availability depending on which Codex account was listed first in an unpinned multi-account pool: `/fast ultra` is accepted when any pool account offers it, and each request is gated on the serving account's own tiers.
 - Fixed stale supervised-process completions flooding logs while preserving notifications for resumed sessions.
 - Fixed JavaScript evaluator startup failing during synchronous cleanup-handler loading after the CLI was imported.
 - Fixed restricted extension sessions failing to start in compiled OMP binaries.
