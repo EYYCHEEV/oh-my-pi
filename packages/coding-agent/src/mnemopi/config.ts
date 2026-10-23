@@ -16,6 +16,7 @@ import {
 	cfgMnemopiEmbeddingModel,
 	cfgMnemopiEmbeddingVariant,
 	cfgMnemopiEnhancedRecall,
+	cfgMnemopiGraphLinkWindow,
 	cfgMnemopiInjectionTokenLimit,
 	cfgMnemopiLlmApiKey,
 	cfgMnemopiLlmBaseUrl,
@@ -64,6 +65,8 @@ export interface MnemopiBackendConfig {
 	/** Episodic tier cut ages in days; `0` never cuts, `undefined` keeps the `MNEMOPI_TIER*_DAYS` defaults. */
 	tier2Days?: number;
 	tier3Days?: number;
+	/** Newest memories a new summary is linked against; `0` links against all, `undefined` keeps `MNEMOPI_GRAPH_LINK_WINDOW` (200). */
+	graphLinkWindow?: number;
 	providerOptions: MnemopiProviderOptions;
 	llmMode: MnemopiLlmMode;
 	llmBaseUrl?: string;
@@ -103,8 +106,9 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 		polyphonicRecall: cfgMnemopiPolyphonicRecall.get(settings),
 		enhancedRecall: cfgMnemopiEnhancedRecall.get(settings),
 		proactiveLinking: cfgMnemopiProactiveLinking.get(settings),
-		tier2Days: wholeDays(cfgMnemopiTier2Days.get(settings)),
-		tier3Days: wholeDays(cfgMnemopiTier3Days.get(settings)),
+		tier2Days: wholeCount(cfgMnemopiTier2Days.get(settings)),
+		tier3Days: wholeCount(cfgMnemopiTier3Days.get(settings)),
+		graphLinkWindow: wholeCount(cfgMnemopiGraphLinkWindow.get(settings)),
 		retainEveryNTurns: Math.max(1, Math.floor(cfgMnemopiRetainEveryNTurns.get(settings))),
 		recallLimit: Math.max(1, Math.floor(cfgMnemopiRecallLimit.get(settings))),
 		recallContextTurns: Math.max(1, Math.floor(cfgMnemopiRecallContextTurns.get(settings))),
@@ -133,8 +137,8 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 	};
 }
 
-/** A configured day count as a whole number of days; unset, negative or non-numeric values read as unset. */
-function wholeDays(value: number | undefined): number | undefined {
+/** A configured day or memory count as a whole number; unset, negative or non-numeric values read as unset. */
+function wholeCount(value: number | undefined): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined;
 }
 

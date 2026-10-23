@@ -6,10 +6,12 @@
 
 - Added `mnemopi backup <destination.db>` and `backupDatabase()`: a consistent, standalone single-file copy of a database another process is writing (`VACUUM INTO` of one snapshot, integrity-checked, never overwrites, no partial file on failure), instead of copying the main file and the `-wal` by hand
 - Added the `beamConfig` option of `Mnemopi` and the `tier2Days` / `tier3Days` beam settings so one instance can set the episodic tier cut ages (`0` never cuts) instead of only the process-wide `MNEMOPI_TIER2_DAYS` / `MNEMOPI_TIER3_DAYS`; unset keeps the environment defaults
+- Added the `graphLinkWindow` beam setting so one `Mnemopi` instance (`beamConfig`) sets how many of the newest memories a new episodic summary links against; unset keeps `MNEMOPI_GRAPH_LINK_WINDOW`
 
 ### Fixed
 
 - Fixed the working-memory trim deleting unconsolidated rows: a session that stayed open past the 24-hour TTL, or wrote more than `workingMemoryLimit` rows, silently lost memories that consolidation had not reached yet. Trim now promotes those rows to episodic memory with the same pipeline as `sleep` instead of deleting them, in batches so a steady writer does not leave one tiny summary per write: when a row passes the TTL it promotes every row `sleep` would take (older than half the TTL), and on count overflow it promotes the oldest rows down to 90% of the limit. A failed promotion is rolled back and logged so the rows stay for the next write.
+- Fixed consolidation, and with it session start, getting slower as a database aged: the episodic graph linked every new summary against every known memory (reading and tokenizing all their text), so a year of history cost seconds per start and the edge count grew quadratically. A new memory now links to the newest 200 known memories; `MNEMOPI_GRAPH_LINK_WINDOW` changes the window and `0` restores linking against everything, and `ingestMemory` takes a per-call `linkWindow`
 
 ## [18.5.1] - 2026-10-03
 

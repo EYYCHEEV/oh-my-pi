@@ -1012,7 +1012,11 @@ function createMemory(config: MnemopiBackendConfig, bank: string): Mnemopi {
 		proactiveLinking: config.proactiveLinking,
 		polyphonicRecall: config.polyphonicRecall,
 		enhancedRecall: config.enhancedRecall,
-		beamConfig: { tier2Days: config.tier2Days, tier3Days: config.tier3Days },
+		beamConfig: {
+			tier2Days: config.tier2Days,
+			tier3Days: config.tier3Days,
+			graphLinkWindow: config.graphLinkWindow,
+		},
 	} as ConstructorParameters<typeof Mnemopi>[0]);
 }
 

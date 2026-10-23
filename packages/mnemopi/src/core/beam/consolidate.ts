@@ -478,6 +478,7 @@ function ingestIntoEpisodicGraph(beam: BeamMemoryState, memoryId: string, summar
 			sessionId: sourceSession(beam),
 			linkExisting: true,
 			extractEntities: true,
+			linkWindow: beam.config?.graphLinkWindow,
 		});
 	} catch {
 		// Graph enrichment is best-effort and never blocks consolidation.

@@ -77,6 +77,11 @@ export interface BeamConfig {
 	 * `0` never cuts. Unset defers to `MNEMOPI_TIER3_DAYS` (180).
 	 */
 	tier3Days?: number;
+	/**
+	 * Newest known memories a new episodic summary (or proactively linked memory) is linked against.
+	 * `0` links against every memory. Unset defers to `MNEMOPI_GRAPH_LINK_WINDOW` (200).
+	 */
+	graphLinkWindow?: number;
 }
 
 export interface BeamMemoryOptions {

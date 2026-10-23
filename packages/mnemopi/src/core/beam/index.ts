@@ -94,6 +94,7 @@ function normalizeConfig(options: BeamMemoryOptions): BeamConfig {
 		enhancedRecall: options.enhancedRecall ?? configured.enhancedRecall,
 		tier2Days: configured.tier2Days,
 		tier3Days: configured.tier3Days,
+		graphLinkWindow: configured.graphLinkWindow,
 	};
 }
 function autoMigrateAnnotations(db: Database, dbPath: string | undefined): void {

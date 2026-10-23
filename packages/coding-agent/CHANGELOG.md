@@ -15,6 +15,7 @@
 - Sessions rerouted off a paused account show one warning naming both accounts; `/session pin` refuses paused accounts, and re-logging in as a paused account says it is still paused.
 - Added the `mnemopi.tier2Days` and `mnemopi.tier3Days` settings so each project or bot config sets when episodic memories are cut to 800 and 300 characters (`0` never cuts); unset keeps `MNEMOPI_TIER2_DAYS` / `MNEMOPI_TIER3_DAYS`
 - Added an optional `expires` to the Mnemopi `retain` tool (an ISO date, an ISO date-time with a UTC offset, or a duration such as `30d`) that sets the memory's `valid_until`, so recall stops returning stale facts; a malformed or past value rejects the whole batch
+- Added the `mnemopi.graphLinkWindow` setting so each project or bot config sets how many of the newest memories a new episodic summary links against (`0` links against every memory); unset keeps `MNEMOPI_GRAPH_LINK_WINDOW` (200)
 
 ### Fixed
 

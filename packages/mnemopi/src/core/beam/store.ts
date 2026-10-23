@@ -327,6 +327,7 @@ function proactiveLinkIfEnabled(
 			sessionId: beam.sessionId,
 			linkExisting: true,
 			extractEntities,
+			linkWindow: beam.config.graphLinkWindow,
 		});
 	} catch {
 		// Proactive graph enrichment must never block durable memory storage.

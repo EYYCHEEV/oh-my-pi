@@ -319,3 +319,15 @@ export const cfgMnemopiTier2Days = register({ id: "mnemopi.tier2Days", type: "nu
  * cuts. Unset keeps `MNEMOPI_TIER3_DAYS` (default 180). Only memories already cut by `tier2Days` qualify.
  */
 export const cfgMnemopiTier3Days = register({ id: "mnemopi.tier3Days", type: "number", default: undefined });
+
+/**
+ * Newest known memories a new episodic summary is linked against during consolidation (which is what
+ * session start runs). `0` links against every memory, at a cost that grows with the history. Unset
+ * keeps `MNEMOPI_GRAPH_LINK_WINDOW` (default 200). A per-config setting, so a bot's own config decides
+ * without touching the process environment.
+ */
+export const cfgMnemopiGraphLinkWindow = register({
+	id: "mnemopi.graphLinkWindow",
+	type: "number",
+	default: undefined,
+});
