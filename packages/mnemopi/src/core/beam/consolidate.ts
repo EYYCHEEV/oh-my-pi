@@ -478,6 +478,7 @@ function ingestIntoEpisodicGraph(beam: BeamMemoryState, memoryId: string, summar
 			sessionId: sourceSession(beam),
 			linkExisting: true,
 			extractEntities: true,
+			linkWindow: beam.config?.graphLinkWindow,
 		});
 	} catch {
 		// Graph enrichment is best-effort and never blocks consolidation.
@@ -948,24 +949,39 @@ function invalidateEpisodicVectors(beam: BeamMemoryState, memoryId: string): voi
 	beam.db.run("UPDATE episodic_memory SET binary_vector = NULL WHERE id = ?", [memoryId]);
 }
 
+/**
+ * Days after which a tier rolls down: the beam's own setting when it has one (`0` = never, `null`
+ * here), else the `MNEMOPI_TIER*_DAYS` default. A non-finite or negative setting counts as unset.
+ */
+function tierCutDays(configured: number | undefined, fallback: number): number | null {
+	if (configured === undefined || !Number.isFinite(configured) || configured < 0) return fallback;
+	return configured === 0 ? null : configured;
+}
+
 export function degradeEpisodic(beam: BeamMemoryState, dryRun = false): Record<string, JsonValue> {
 	const now = isoNow();
-	const tier2Cutoff = cutoffIso(TIER2_DAYS, 24 * 60 * 60 * 1000);
-	const tier3Cutoff = cutoffIso(TIER3_DAYS, 24 * 60 * 60 * 1000);
-	const tier1Rows = asRows(
-		beam.db
-			.query(
-				`SELECT id, content FROM episodic_memory WHERE tier = 1 AND created_at < ? ORDER BY created_at ASC LIMIT ?`,
-			)
-			.all(tier2Cutoff, DEGRADE_BATCH_SIZE),
-	);
-	const tier2Rows = asRows(
-		beam.db
-			.query(
-				`SELECT id, content FROM episodic_memory WHERE tier = 2 AND created_at < ? ORDER BY created_at ASC LIMIT ?`,
-			)
-			.all(tier3Cutoff, Math.max(1, Math.floor(DEGRADE_BATCH_SIZE / 2))),
-	);
+	const tier2Days = tierCutDays(beam.config?.tier2Days, TIER2_DAYS);
+	const tier3Days = tierCutDays(beam.config?.tier3Days, TIER3_DAYS);
+	const tier1Rows =
+		tier2Days === null
+			? []
+			: asRows(
+					beam.db
+						.query(
+							`SELECT id, content FROM episodic_memory WHERE tier = 1 AND created_at < ? ORDER BY created_at ASC LIMIT ?`,
+						)
+						.all(cutoffIso(tier2Days, 24 * 60 * 60 * 1000), DEGRADE_BATCH_SIZE),
+				);
+	const tier2Rows =
+		tier3Days === null
+			? []
+			: asRows(
+					beam.db
+						.query(
+							`SELECT id, content FROM episodic_memory WHERE tier = 2 AND created_at < ? ORDER BY created_at ASC LIMIT ?`,
+						)
+						.all(cutoffIso(tier3Days, 24 * 60 * 60 * 1000), Math.max(1, Math.floor(DEGRADE_BATCH_SIZE / 2))),
+				);
 	const result = {
 		status: dryRun ? "dry_run" : "degraded",
 		tier1_to_tier2: tier1Rows.length,

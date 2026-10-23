@@ -124,7 +124,7 @@ export const retainToolRenderer = {
 		const contents = retainContents(args);
 		// `summary` is the tool's own "N memories stored/queued." line; drop the
 		// trailing period so it reads cleanly as a status meta segment.
-		const summary = resultText(result).trim().replace(/\.$/, "");
+		const summary = (resultText(result).trim().split("\n")[0] ?? "").replace(/\.$/, "");
 		const header = renderStatusLine(
 			{
 				iconOverride: theme.styledSymbol("tool.memory", "accent"),
@@ -147,7 +147,10 @@ export const retainToolRenderer = {
 		return retainResultMemo.get(result, [], () => {
 			if (result.isError)
 				return { ...errorView("Retain", resultText(result).trim() || "Retain failed"), inline: true };
-			return describeRetain(retainContents(args), resultText(result).trim().replace(/\.$/, ""));
+			return describeRetain(
+				retainContents(args),
+				(resultText(result).trim().split("\n")[0] ?? "").replace(/\.$/, ""),
+			);
 		});
 	},
 } satisfies ToolRenderer<RetainRenderArgs, MemoryRetainDetails>;
@@ -296,7 +299,8 @@ export const reflectToolRenderer = {
 	},
 } satisfies ToolRenderer<QueryRenderArgs, unknown>;
 
-/** Number of memories accepted by retain. */
+/** Memories accepted by retain: how many, and the ids of the ones stored (Mnemopi backend only). */
 export interface MemoryRetainDetails {
 	count: number;
+	ids?: string[];
 }

@@ -13,6 +13,14 @@
 - Added `/login manage [provider]` and `omp auth list|pause|resume <provider> [credential-id] [--json]` to pause and resume stored OAuth accounts by durable credential id; paused accounts are skipped by routing, usage polling, reset sweeps, Codex model discovery, and security-scan account picking in every process.
 - Added `--oauth-account <provider>:<credential-id>` to restrict one process to exactly one stored OAuth account, with startup refusals for missing, disabled, broker-backed, or overridden accounts and a fail-fast usage-limit path that never falls back to another account or provider.
 - Sessions rerouted off a paused account show one warning naming both accounts; `/session pin` refuses paused accounts, and re-logging in as a paused account says it is still paused.
+- Added the `mnemopi.tier2Days` and `mnemopi.tier3Days` settings so each project or bot config sets when episodic memories are cut to 800 and 300 characters (`0` never cuts); unset keeps `MNEMOPI_TIER2_DAYS` / `MNEMOPI_TIER3_DAYS`
+- Added an optional `expires` to the Mnemopi `retain` tool (an ISO date, an ISO date-time with a UTC offset, or a duration such as `30d`) that sets the memory's `valid_until`, so recall stops returning stale facts; a malformed or past value rejects the whole batch
+- Added the `mnemopi.graphLinkWindow` setting so each project or bot config sets how many of the newest memories a new episodic summary links against (`0` links against every memory); unset keeps `MNEMOPI_GRAPH_LINK_WINDOW` (200)
+- Added the `mnemopi.allowModelDownload` setting (default on). Set to `false` so an unattended run never installs fastembed or downloads the embedding model: it uses the cached model when both are already on disk, otherwise keyword search with one log warning. `mnemopi.noEmbeddings` still avoids every fetch
+
+### Changed
+
+- Changed the Mnemopi `retain` tool to return the id of every memory it stored, in item order, in the result text (`id: ...` / `ids: ...`) and in `details.ids`, so a caller can later edit or forget exactly what it stored with `memory_edit`
 
 ### Fixed
 
@@ -26,6 +34,7 @@
 - Fixed completed mid-turn compaction replaying a cached copy of the old conversation in the next request.
 - Fixed budget refusals hanging automatic retries or printing an earlier answer as success in text mode.
 - Fixed late provider-request growth stopping at the budget gate when OMP could safely compact and retry.
+- Fixed Mnemopi losing the turns it had not retained yet when a run was stopped by a signal: SIGTERM, SIGINT, SIGHUP and fatal exits now retain them at once without fact extraction, instead of waiting behind the slower session teardown steps (up to about 10 s) or, in RPC mode, never retaining them; a stopping session no longer schedules fact extraction on a late `agent_end`
 - Added awaitable extension custom-message admission receipts and session-scoped persistence barriers, without changing existing message-send completion behavior.
 - Added generic session-wide runtime requirements with durable obligations, fresh loader-backed attachment checks, `session_ready`, startup `requiredRuntimeExtensions`, and the `--require-runtime-contract=1` support assertion. Refused execution preserves queued work and keeps saved history readable; recovery guidance is bounded and display-only.
 - Fixed the first-turn memory block, the `recall` tool and the `reflect` tool showing only the first 499 characters of a long recalled Mnemopi memory even when the query matched far past them: they now show the part the query matched, with `…` on each cut side

@@ -8,7 +8,7 @@ import { AnnotationStore } from "./annotations";
 import { BankManager } from "./banks";
 import { BeamMemory, initBeam } from "./beam/index";
 import { reconcileEmbeddingModel } from "./beam/store";
-import type { RecallEnhancedOptions, RecallOptions, RecallResult, SleepResult } from "./beam/types";
+import type { BeamConfig, RecallEnhancedOptions, RecallOptions, RecallResult, SleepResult } from "./beam/types";
 import { EpisodicGraph } from "./episodic-graph";
 import {
 	isPiAiModel,
@@ -54,6 +54,11 @@ export interface MnemopiOptions {
 	 * `configureRecallFeatures`; `MNEMOPI_ENHANCED_RECALL` wins when set.
 	 */
 	readonly enhancedRecall?: boolean;
+	/**
+	 * Per-instance beam settings (episodic tier cut days, ...). Unset fields keep the
+	 * `MNEMOPI_*` environment defaults.
+	 */
+	readonly beamConfig?: Partial<BeamConfig>;
 	/** Escalate best-effort failure logs (embedding pipeline) from debug to warn. */
 	readonly debug?: boolean;
 	/**
@@ -193,6 +198,7 @@ function resolveRuntimeOptions(options: MnemopiOptions): ResolvedMnemopiRuntimeO
 	const embeddingApiKey = options.embeddingApiKey ?? nestedEmbeddings?.apiKey;
 	const embeddingProvider = resolveEmbeddingProvider(nestedEmbeddings?.provider);
 	const embeddingMaxInputChars = nestedEmbeddings?.maxInputChars;
+	const embeddingAllowDownload = nestedEmbeddings?.allowDownload;
 
 	const embeddings =
 		embeddingDisabled !== undefined ||
@@ -200,7 +206,8 @@ function resolveRuntimeOptions(options: MnemopiOptions): ResolvedMnemopiRuntimeO
 		embeddingApiUrl !== undefined ||
 		embeddingApiKey !== undefined ||
 		embeddingProvider !== undefined ||
-		embeddingMaxInputChars !== undefined
+		embeddingMaxInputChars !== undefined ||
+		embeddingAllowDownload !== undefined
 			? {
 					disabled: embeddingDisabled,
 					model: embeddingModel,
@@ -208,6 +215,7 @@ function resolveRuntimeOptions(options: MnemopiOptions): ResolvedMnemopiRuntimeO
 					apiKey: embeddingApiKey,
 					provider: embeddingProvider,
 					maxInputChars: embeddingMaxInputChars,
+					allowDownload: embeddingAllowDownload,
 				}
 			: undefined;
 
@@ -424,6 +432,7 @@ export class Mnemopi {
 			proactiveLinking: options.proactiveLinking,
 			polyphonicRecall: options.polyphonicRecall,
 			enhancedRecall: options.enhancedRecall,
+			config: options.beamConfig,
 		});
 		this.#ownsDb = options.db === undefined;
 		if (options.db !== undefined) {

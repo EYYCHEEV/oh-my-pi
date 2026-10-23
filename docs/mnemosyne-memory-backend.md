@@ -61,8 +61,12 @@ Memory text is scanned on the way in and on the way out. Writes redact provider 
 | `mnemopi.recallContextTurns`  | `3`                | Prior user-bounded turns included in recall queries.                                                                                                                                                                                                                                   |
 | `mnemopi.recallMaxQueryChars` | `4000`             | Maximum composed recall query length.                                                                                                                                                                                                                                                  |
 | `mnemopi.injectionTokenLimit` | `5000`             | Approximate token budget for memory prompt injection.                                                                                                                                                                                                                                  |
+| `mnemopi.tier2Days`           | env/`30`           | Age in days at which an episodic memory is cut to its first 800 characters and loses its vector. `0` never cuts. Unset keeps `MNEMOPI_TIER2_DAYS` (default `30`). |
+| `mnemopi.tier3Days`           | env/`180`          | Age in days at which a tier 2 memory is cut to its key sentences (300 characters). `0` never cuts. Unset keeps `MNEMOPI_TIER3_DAYS` (default `180`). |
+| `mnemopi.graphLinkWindow`     | env/`200`          | Newest memories a new episodic summary is linked against when consolidation runs (session start does). `0` links against every memory, at a cost that grows with history. Negative or non-numeric reads as unset; unset keeps `MNEMOPI_GRAPH_LINK_WINDOW`. |
 | `mnemopi.debug`               | `false`            | Enable debug logging for backend failures.                                                                                                                                                                                                                                             |
 | `mnemopi.noEmbeddings`        | `false`            | Pass `noEmbeddings` to `Mnemopi` and force FTS-only recall.                                                                                                                                                                                                                            |
+| `mnemopi.allowModelDownload`  | `true`             | `true` keeps the first-use install and download of the local embedding model; `false` never downloads or installs: the model is used only if it is already cached, otherwise the run uses keyword search and logs one warning. See Embedding downloads and unattended runs. |
 | `mnemopi.embeddingVariant`    | `en`               | Local embedding model variant: `en` = `BAAI/bge-base-en-v1.5` (768d), `multilingual` = `intfloat/multilingual-e5-large` (1024d). `mnemopi.embeddingModel`/`MNEMOPI_EMBEDDING_MODEL` override it; changing it rebuilds stored embeddings on the next writable start.                    |
 | `mnemopi.embeddingModel`      | variant default    | Explicit embedding model id; overrides `mnemopi.embeddingVariant`. Precedence: this setting > `MNEMOPI_EMBEDDING_MODEL` env > variant default; a blank or `null` setting counts as unset.                                                                                                                                         |
 | `mnemopi.embeddingApiUrl`     | env/default        | OpenAI-compatible embedding endpoint passed to `Mnemopi`.                                                                                                                                                                                                                              |
@@ -93,6 +97,12 @@ Recall results carry clipped content previews, not full rows. Content longer tha
 The full row is always reachable by reading `memory://<memory-id>`, which resolves the live working or episodic row and returns its full content behind a small YAML frontmatter header (`id`, `bank`, `store`, `memory_type`, timestamps, `importance`, `veracity`, `session_id`, `metadata`). The coding-agent's model-facing prompts require this read before any `memory_edit update`, since `update` replaces content wholesale and would otherwise discard the unseen tail of a clipped preview.
 
 Retention writes a marker-free transcript projection: when the host supplies an `embedText` override alongside the stored transcript, that projection is used for embedding, working-memory FTS indexing (`COALESCE(embed_text, content)`), and rebuild-reembedding, so retention protocol markers in the stored transcript do not pollute vector and full-text recall.
+
+## Episodic tier cut
+
+`sleep` shrinks old episodic memories so a long-lived database stays small: after `mnemopi.tier2Days` (30) a memory keeps only its first 800 characters and loses its vector (tier 2), and after `mnemopi.tier3Days` (180) a tier 2 memory keeps only about 300 characters of key sentences (tier 3). The cut runs when `sleep` runs, and a cut memory is never re-embedded. Facts or details that sat past the kept prefix are no longer reachable through the episodic row; working-memory rows that were consolidated into it still hold the full text for keyword search.
+
+The setting is per config, so each project or bot can choose its own cut. `0` turns a tier off (`tier2Days: 0` keeps every episodic memory whole; `tier3Days` only applies to memories already at tier 2). Negative values read as unset. When the setting is absent, the `MNEMOPI_TIER2_DAYS` / `MNEMOPI_TIER3_DAYS` environment variables keep working exactly as before; a configured setting wins over them.
 
 ## LLM and embeddings
 
@@ -181,6 +191,27 @@ new Mnemopi({
 });
 ```
 
+## Embedding downloads and unattended runs
+
+With embeddings on (the default), the first run that needs a vector fetches up to two things: the first remember, the first recall, or a session start that finds stored memories without vectors. Nothing else in Mnemopi downloads or installs anything.
+
+1. The fastembed runtime, when it does not resolve from the omp install (the compiled binary and the bundle never carry it): a `bun install` of the pinned fastembed and its dependencies into `~/.omp/cache/fastembed-runtime/<version key>` (about 270 MB of native assets across platforms, plus onnxruntime's own install step).
+2. The model. The default `mnemopi.embeddingVariant: en` is `BAAI/bge-base-en-v1.5`, whose quantized ONNX files come from Hugging Face into `~/.omp/cache/fastembed`.
+
+Both caches live under the home folder, so every bot on one home shares them: the first run that needs them pays, later runs reuse them with no network. That first load has no time limit, and the first-turn recall waits for it, so a cold cache on a slow or blocked network can hold the first turn of an unattended run. Stored memories are never lost to this: a memory saved while no model is available is kept without a vector and is re-embedded the next time the database opens with a working model.
+
+Choose one for a bot:
+
+| Config | A run fetches | Recall |
+| --- | --- | --- |
+| `mnemopi.noEmbeddings: true` | nothing: no worker, no install, no model | keyword (FTS) only |
+| `mnemopi.allowModelDownload: false` | nothing: the cached model is used if both caches below are complete, otherwise embeddings are skipped and one warning is logged | vector plus keyword when cached, keyword only otherwise |
+| defaults | the runtime and the model, on first use | vector plus keyword |
+
+`allowModelDownload: false` checks the disk before it starts the embedding worker: fastembed must resolve (directly, or as `~/.omp/cache/fastembed-runtime/<version key>/node_modules/fastembed/package.json`) and every file of the model must exist under `~/.omp/cache/fastembed/Qdrant_bge-base-en-v1.5-onnx-Q/` (`model_optimized.onnx`, `tokenizer.json`, `tokenizer_config.json`, `config.json`, `special_tokens_map.json`). One gap: if fastembed resolves directly but its native library then fails to load, omp falls back to a runtime install that this setting does not stop.
+
+Warm the cache once, with network, by running a normal hand session with `allowModelDownload` unset and embeddings on, saving one memory and asking one question, then leave it open until the files above exist (print mode stops its embedding worker about 1.5 seconds after the turn, which can cut a download short; the next attempt resumes it). Then set `allowModelDownload: false` in the bot configs.
+
 ## Operational notes
 
 - The default shared database lives under the agent memories directory in `mnemopi/mnemopi.db`; project-scoped banks use sibling database paths under that Mnemopi directory.
@@ -189,6 +220,7 @@ new Mnemopi({
 - `/memory stats` and `/memory diagnose` render backend-specific bank statistics/diagnostics when the Mnemopi backend is active.
 - Subagents do not own separate Mnemopi retain loops; they alias the parent state when a parent Mnemopi state exists, and otherwise remain inert.
 - At primary backend startup, eligible working-memory rows are promoted across owned banks before the first write can TTL-trim them. Promotion failures are logged without disabling the backend.
+- Consolidation links each new episodic summary to the newest 200 known memories in the episodic graph, not to the whole history, so session-start cost stays flat as a database ages (a year of 50 transcript rows a day started in about the same time as the first day). Memories older than the window are linked only by the links made while they were new. `mnemopi.graphLinkWindow` changes the window per config (`MNEMOPI_GRAPH_LINK_WINDOW` is the fallback when it is unset); `0` links against every memory again at a cost that grows with history.
 - Every write also runs Mnemopi's working-memory trim, which never deletes unconsolidated rows. It promotes them to episodic memory with the same consolidation `sleep` uses, in batches: when a row passes the 24-hour TTL, every row `sleep` would take (older than half the TTL, 12 hours by default) is promoted together, so a long session consolidates in groups about every 12 hours; when more than the 1000-row working-memory limit is live, the oldest rows are promoted down to 90% of the limit. A session that stays open longer than the TTL therefore keeps its memories. A failed promotion is logged and retried on the next write.
 - Two sessions creating the same bank database at the same moment both succeed: switching a new database to WAL needs an exclusive lock that SQLite refuses at once (it skips `busy_timeout`), so that switch retries on a busy answer with a backoff of about 1.3 s in total. Other errors are not retried.
 - Backend startup is best-effort. If database/model initialization fails, the session continues with Mnemopi inert and logs a warning; memory tools then report that the backend is not initialized.
@@ -206,3 +238,23 @@ Aliased subagent states do not own or close the shared banks; the parent state o
 Interactive and print exits give this drain 1.5 seconds. If the budget expires, shutdown detaches the in-flight drain and arranges for handles to close when it settles rather than racing writes against closed databases. The process may exit first. Working-memory rows already written remain durable, but promotion or embedding for the last few turns can remain incomplete; earlier turn retention performed at agent end is unaffected.
 
 `/memory enqueue` is the explicit stronger durability boundary: it forces retention, flushes pending extraction, and runs full sleep/consolidation across the owned banks. It does not bypass Mnemopi's age gate: `sleepAllSessions` selects unconsolidated working-memory rows older than `Math.floor(workingMemoryTtlHours / 2)` hours (12 hours with the default 24-hour TTL). Fresh rows therefore remain in working memory after an immediate enqueue. Use the command before exit to force retention and flush pending work, or after the age gate to promote eligible rows; normal shutdown does not promote them.
+
+### Signals and unattended runs
+
+On SIGTERM, SIGINT, SIGHUP or a fatal error the primary state retains the turns it has not retained yet **at the moment the signal lands**, through the process cleanup hook (`postmortem`), without fact extraction and with a 1.5 second SQLite lock wait. The write is synchronous and takes milliseconds. It does not wait behind the session's slower teardown steps (post-prompt drain up to 5 s, extension `session_shutdown` handlers up to 2 s, auto-learn drain up to 3 s, then the 1.5 second Mnemopi drain above), and it also covers a mode that never disposes its session on a signal (RPC). The dispose retention that follows adds only turns that arrived after the signal. From the moment a stop begins, automatic retention schedules no model-backed fact extraction, so a stop never starts a model call. Nothing of this runs when `mnemopi.autoRetain` is off.
+
+What a hard kill still loses: SIGKILL (also an out-of-memory kill or power loss) runs no code. Everything since the last retain is gone: with `mnemopi.retainEveryNTurns = N`, up to N-1 completed user turns plus the running one. A print-mode (`-p`) run is one user turn, so its transcript is retained when the turn ends or when a stop signal arrives, never in between. Rows already written stay durable (SQLite WAL); embeddings and fact extraction still in flight are lost, and embeddings are rebuilt the next time the database opens.
+
+Recommended stop sequence for an unattended runner: send SIGTERM to omp and its descendants, wait up to 10 seconds (omp's own cleanup deadline; retention itself finishes within milliseconds), then SIGKILL the process group. Set `mnemopi.retainEveryNTurns: 1` for multi-turn sessions to shrink the SIGKILL window.
+
+### Backing up a database that is in use
+
+Do not copy a live database with `cp`. Mnemopi runs SQLite in WAL mode, so committed rows sit in `mnemopi.db-wal` until a checkpoint: the main file alone can be missing almost everything (a probe with a busy writer had a 4 KB main file and a 156 MB `-wal`), and copying `db`, `-wal` and `-shm` one after the other can tear. `-shm` is only a rebuildable index; the main file and the `-wal` are one unit. A `.pre_e6_backup` beside the database is the one-time copy the triple-store migration made before it ran; it is an old-format snapshot, not part of the live set.
+
+`mnemopi backup <destination.db>` writes one consistent, standalone file (no `-wal` or `-shm` to carry) while another process writes the database. It reads a single snapshot with `VACUUM INTO` (the writer is never blocked), checks the copy with `PRAGMA integrity_check`, refuses to overwrite an existing file, and leaves no partial file on failure. It backs up `$MNEMOPI_DATA_DIR/mnemopi.db`, like the other `mnemopi` subcommands. The compiled `omp` binary does not carry this CLI; from any program or shell the same call works against the file named by `mnemopi.dbPath`:
+
+```sh
+sqlite3 /path/to/mnemopi.db "VACUUM INTO '/path/to/backup.db'"
+```
+
+Restore by copying the backup to the new database path and deleting any `-wal` / `-shm` found there first: a leftover `-wal` from another database would be replayed into the restored file. Banks other than the shared one (`scoping: per-project` or `per-project-tagged`) are separate files under `<dbDir>/banks/`; back each up the same way, or set `mnemopi.scoping: "global"` so the whole memory is the one file.

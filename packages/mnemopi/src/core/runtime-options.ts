@@ -41,6 +41,12 @@ export interface MnemopiEmbeddingRuntimeOptions {
 	provider?: MnemopiEmbeddingProvider | ((texts: readonly string[]) => EmbeddingOutput | Promise<EmbeddingOutput>);
 	/** Override `MNEMOPI_EMBEDDING_MAX_INPUT_CHARS`. `0` disables the cap. See `config.embeddingMaxInputChars`. */
 	maxInputChars?: number;
+	/**
+	 * `false` never installs fastembed or downloads model files: the local model is used only when both are
+	 * already on disk, otherwise embeddings are skipped (keyword recall only) and a warning is logged once.
+	 * Unset or `true` keeps the first-use install and download.
+	 */
+	allowDownload?: boolean;
 }
 
 export interface MnemopiLlmRuntimeOptions {
@@ -70,6 +76,7 @@ export interface ResolvedMnemopiEmbeddingRuntimeOptions {
 	apiKey?: ApiKey;
 	provider?: MnemopiEmbeddingProvider;
 	maxInputChars?: number;
+	allowDownload?: boolean;
 }
 
 export interface ResolvedMnemopiLlmRuntimeOptions {

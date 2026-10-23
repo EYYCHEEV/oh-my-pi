@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `mnemopi backup <destination.db>` and `backupDatabase()`: a consistent, standalone single-file copy of a database another process is writing (`VACUUM INTO` of one snapshot, integrity-checked, never overwrites, no partial file on failure), instead of copying the main file and the `-wal` by hand
+- Added the `beamConfig` option of `Mnemopi` and the `tier2Days` / `tier3Days` beam settings so one instance can set the episodic tier cut ages (`0` never cuts) instead of only the process-wide `MNEMOPI_TIER2_DAYS` / `MNEMOPI_TIER3_DAYS`; unset keeps the environment defaults
+- Added the `graphLinkWindow` beam setting so one `Mnemopi` instance (`beamConfig`) sets how many of the newest memories a new episodic summary links against; unset keeps `MNEMOPI_GRAPH_LINK_WINDOW`
+- Added the `embeddings.allowDownload` option of `Mnemopi`: `false` never installs fastembed or downloads model files; the local embedding model is used only when it is already on disk, otherwise embeddings are skipped (keyword recall only) and one warning is logged. Unset keeps the first-use install and download
+
 ### Fixed
 
 - Fixed the working-memory trim deleting unconsolidated rows: a session that stayed open past the 24-hour TTL, or wrote more than `workingMemoryLimit` rows, silently lost memories that consolidation had not reached yet. Trim now promotes those rows to episodic memory with the same pipeline as `sleep` instead of deleting them, in batches so a steady writer does not leave one tiny summary per write: when a row passes the TTL it promotes every row `sleep` would take (older than half the TTL), and on count overflow it promotes the oldest rows down to 90% of the limit. A failed promotion is rolled back and logged so the rows stay for the next write.
@@ -9,6 +16,7 @@
 - Fixed `memory_edit invalidate` and `forget` on a working row that `sleep` had already consolidated leaving its episodic summary, and the facts extracted from it, recallable. A summary that covered only that row is now expired (invalidate) or deleted (forget); a summary that also covers other rows is rewritten from their live text and the old one is retired or deleted, so unrelated memories keep their summary and facts; a summary that cannot be rewritten (a caller-supplied digest) is retired or deleted whole. Fact recall also hides facts whose episodic source summary is superseded or expired.
 - Fixed recall previews showing the first 499 characters of a long row even when the query matched far past them, so the fact the query found was missing from the result. When the match lies past the head, the preview is now a window around the matched terms (with `…` on each cut side, within the same `contentPreviewChars` budget), preferring terms that are rare in that row; a match in the head keeps the head preview. `clipRecallContent` accepts the query term groups as an optional third argument.
 - Fixed vector recall reaching only the newest 500 rows of each memory tier: a memory whose embedding matched the query exactly was missed once more than 500 newer rows existed, and only a keyword could find it. The vector pass now compares the newest 5000 rows per tier, which bounds a recall at about 190 ms per tier with 768-dimension embeddings (about 100 ms at 384).
+- Fixed consolidation, and with it session start, getting slower as a database aged: the episodic graph linked every new summary against every known memory (reading and tokenizing all their text), so a year of history cost seconds per start and the edge count grew quadratically. A new memory now links to the newest 200 known memories; `MNEMOPI_GRAPH_LINK_WINDOW` changes the window and `0` restores linking against everything, and `ingestMemory` takes a per-call `linkWindow`
 
 ## [18.5.1] - 2026-10-03
 

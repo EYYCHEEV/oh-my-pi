@@ -180,6 +180,17 @@ export const cfgMnemopiNoEmbeddings = register({
 	},
 });
 
+/**
+ * `false` never installs fastembed or downloads the embedding model during a run: the local model loads
+ * only when both are already on disk, otherwise the run uses keyword search only and logs it once.
+ * `true` keeps the first-use install and download. Ignored when `noEmbeddings` is on.
+ */
+export const cfgMnemopiAllowModelDownload = register({
+	id: "mnemopi.allowModelDownload",
+	type: "boolean",
+	default: true,
+});
+
 export const cfgMnemopiEmbeddingModel = register({
 	id: "mnemopi.embeddingModel",
 	type: "string",
@@ -306,3 +317,28 @@ export const cfgMnemopiInjectionTokenLimit = register({
 });
 
 export const cfgMnemopiDebug = register({ id: "mnemopi.debug", type: "boolean", default: false });
+
+/**
+ * Age in days at which an episodic memory is cut to its first 800 characters (and loses its vector).
+ * `0` never cuts. Unset keeps `MNEMOPI_TIER2_DAYS` (default 30). A per-config setting, so each bot or
+ * project can keep full text without touching the process environment.
+ */
+export const cfgMnemopiTier2Days = register({ id: "mnemopi.tier2Days", type: "number", default: undefined });
+
+/**
+ * Age in days at which a tier 2 episodic memory is cut to its key sentences (300 characters). `0` never
+ * cuts. Unset keeps `MNEMOPI_TIER3_DAYS` (default 180). Only memories already cut by `tier2Days` qualify.
+ */
+export const cfgMnemopiTier3Days = register({ id: "mnemopi.tier3Days", type: "number", default: undefined });
+
+/**
+ * Newest known memories a new episodic summary is linked against during consolidation (which is what
+ * session start runs). `0` links against every memory, at a cost that grows with the history. Unset
+ * keeps `MNEMOPI_GRAPH_LINK_WINDOW` (default 200). A per-config setting, so a bot's own config decides
+ * without touching the process environment.
+ */
+export const cfgMnemopiGraphLinkWindow = register({
+	id: "mnemopi.graphLinkWindow",
+	type: "number",
+	default: undefined,
+});
