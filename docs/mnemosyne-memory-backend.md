@@ -39,6 +39,8 @@ Selecting Mnemopi makes these discoverable tools available:
 
 Read the full content and metadata for a recalled result with `read memory://<memory-id>` before replacing it; clipped recall previews are not safe update payloads. The optional `learn` tool is also able to retain into Mnemopi when `autolearn.enabled: true`.
 
+`memory_edit invalidate` and `forget` on a working row also retire the copies consolidation made of it, so a retired memory does not resurface through its episodic summary or the facts extracted from it. A summary that covered only that row is expired (invalidate) or deleted (forget). A summary that also covers other rows is rewritten from their live text, and the old one is retired or deleted, so the other rows keep their summary and facts. A summary that cannot be rewritten (one written by a caller instead of `sleep`) is retired or deleted whole. `update` does not cascade: a consolidated summary keeps the row's earlier text.
+
 ## Settings
 
 | Setting                       | Default            | Description                                                                                                                                                                                                                                                                            |

@@ -1121,6 +1121,81 @@ export function consolidateWorkingRowsById(beam: BeamMemoryState, ids: readonly 
 	return consolidateWorkingRows(beam, rows, false, false);
 }
 
+/** Build and store the episodic summary of one chunk of same-source working rows, the way `sleep` does. */
+function writeSleepSummary(beam: BeamMemoryState, source: string, chunk: SleepChunk, extra: Metadata = {}): string {
+	const ids = chunk.items.map(item => rowValue(item, "id")).filter((id): id is string => id !== null);
+	let scope = "session";
+	let validUntil: string | null = null;
+	for (const item of chunk.items) {
+		if (rowValue(item, "scope") === "global") scope = "global";
+		const itemValidUntil = rowValue(item, "valid_until");
+		if (itemValidUntil && (validUntil === null || itemValidUntil < validUntil)) validUntil = itemValidUntil;
+	}
+	const sleepSummary = buildSleepSummary(beam, source, chunk);
+	const metadata: Metadata = { original_count: chunk.items.length, source, llm_used: false, ...extra };
+	if (sleepSummary.truncated) {
+		metadata.truncated = true;
+		metadata.original_chars = sleepSummary.originalChars;
+		metadata.max_chars = sleepSummary.maxChars;
+	}
+	return consolidateToEpisodic(beam, sleepSummary.summary, ids, "sleep_consolidation", 0.6, {
+		scope,
+		validUntil,
+		veracity: aggregateEpisodicVeracity(chunk.items.map(item => rowValue(item, "veracity") ?? "unknown")),
+		metadata,
+	});
+}
+
+/** The working-row `source` a `sleep` summary was built from, which its metadata records. */
+function sleepSummarySource(summary: Row): string | null {
+	if (rowValue(summary, "source") !== "sleep_consolidation") return null;
+	try {
+		const metadata: unknown = JSON.parse(rowValue(summary, "metadata_json") ?? "{}");
+		if (typeof metadata !== "object" || metadata === null || !("source" in metadata)) return null;
+		return typeof metadata.source === "string" ? metadata.source : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Rewrite the `sleep` summary `summary` so it covers only the working rows in `keepIds` and their live
+ * text: a row that is retired too (superseded, or past `valid_until`) is left out. Returns the new
+ * summaries' ids (`[]` when no kept row is live), or `null` when the summary cannot be rewritten: it is
+ * a caller-supplied digest with no per-row text to cut, or a kept row is gone from working memory, so
+ * the old summary is the only copy of its text. The new summaries inherit the old one's timestamps, so
+ * recency and tier degradation do not restart. The caller retires or deletes the old summary.
+ */
+export function rebuildSleepSummary(beam: BeamMemoryState, summary: Row, keepIds: readonly string[]): string[] | null {
+	const source = sleepSummarySource(summary);
+	if (source === null) return null;
+	const unique = [...new Set(keepIds)];
+	const rows = asRows(
+		beam.db
+			.query(
+				`SELECT ${WORKING_ROW_COLUMNS}, superseded_by FROM working_memory
+		 WHERE id IN (${unique.map(() => "?").join(",")}) ORDER BY timestamp ASC`,
+			)
+			.all(...unique),
+	);
+	if (rows.length !== unique.length) return null;
+	const now = isoNow();
+	const live = rows.filter(row => {
+		const validUntil = rowValue(row, "valid_until");
+		return rowValue(row, "superseded_by") === null && (validUntil === null || validUntil > now);
+	});
+	const created: string[] = [];
+	for (const chunk of splitSleepItems(beam, source, live)) {
+		const id = writeSleepSummary(beam, source, chunk, { rebuilt_from: rowValue(summary, "id") ?? "" });
+		beam.db.run(
+			"UPDATE episodic_memory SET timestamp = COALESCE(?, timestamp), created_at = COALESCE(?, created_at) WHERE id = ?",
+			[rowValue(summary, "timestamp"), rowValue(summary, "created_at"), id],
+		);
+		created.push(id);
+	}
+	return created;
+}
+
 function consolidateWorkingRows(beam: BeamMemoryState, candidates: Row[], dryRun = false, degrade = true): SleepResult {
 	let rows = candidates;
 	if (rows.length === 0)
@@ -1162,29 +1237,7 @@ function consolidateWorkingRows(beam: BeamMemoryState, candidates: Row[], dryRun
 	for (const [source, items] of grouped) {
 		for (const chunk of splitSleepItems(beam, source, items)) {
 			const ids = chunk.items.map(item => rowValue(item, "id")).filter((id): id is string => id !== null);
-			let scope = "session";
-			let validUntil: string | null = null;
-			for (const item of chunk.items) {
-				if (rowValue(item, "scope") === "global") scope = "global";
-				const itemValidUntil = rowValue(item, "valid_until");
-				if (itemValidUntil && (validUntil === null || itemValidUntil < validUntil)) validUntil = itemValidUntil;
-			}
-			const sleepSummary = buildSleepSummary(beam, source, chunk);
-			const metadata: Metadata = { original_count: chunk.items.length, source, llm_used: false };
-			if (sleepSummary.truncated) {
-				metadata.truncated = true;
-				metadata.original_chars = sleepSummary.originalChars;
-				metadata.max_chars = sleepSummary.maxChars;
-			}
-			const summary = sleepSummary.summary;
-			if (!dryRun) {
-				consolidateToEpisodic(beam, summary, ids, "sleep_consolidation", 0.6, {
-					scope,
-					validUntil,
-					veracity: aggregateEpisodicVeracity(chunk.items.map(item => rowValue(item, "veracity") ?? "unknown")),
-					metadata,
-				});
-			}
+			if (!dryRun) writeSleepSummary(beam, source, chunk);
 			consolidatedIds.push(...ids);
 			summariesCreated++;
 		}
