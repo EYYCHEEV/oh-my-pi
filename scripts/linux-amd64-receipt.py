@@ -260,7 +260,7 @@ def verify_elf(value):
             all(match(r"[A-Za-z0-9_.+-]+", item) for item in value["needed_libraries"]), "Invalid library identity")
 
 
-def verify(directory, commit, tag, release, recipe_commit="", root=None, fork_manifest_sha256=""):
+def verify(directory, commit, tag, release, recipe_commit="", root=None):
     require(not directory.is_symlink() and directory.is_dir(), "A regular asset directory is required")
     require({entry.name for entry in directory.iterdir()} == set(ASSETS), "Only the exact three public assets are permitted")
     require(all((directory / name).is_file() and not (directory / name).is_symlink() for name in ASSETS), "Assets must be regular files")
@@ -331,13 +331,9 @@ def verify(directory, commit, tag, release, recipe_commit="", root=None, fork_ma
         require(not release and manifest["checks"] == {name: "passed" if name == "elf" else "not_run" for name in CHECKS},
                 "Completed qualification is required")
     else:
-        keys(qualification, ("binary_sha256", "source_commit", "recipe_commit", "fork_manifest_sha256", "environment", "checks"))
+        keys(qualification, ("binary_sha256", "source_commit", "recipe_commit", "environment", "checks"))
         require(qualification["binary_sha256"] == asset["sha256"] and qualification["source_commit"] == commit and
                 qualification["recipe_commit"] == source["recipe_commit"], "Qualification tuple differs")
-        # The registry the boundary tests came from is part of the signed record; a caller that knows it must see the same one.
-        require(match(HEX, qualification["fork_manifest_sha256"]) and
-                (not fork_manifest_sha256 or qualification["fork_manifest_sha256"] == fork_manifest_sha256),
-                "Qualification fork manifest differs")
         require(manifest["checks"] == qualification["checks"] == {name: "passed" for name in CHECKS}, "Incomplete qualification")
         environment = qualification["environment"]
         keys(environment, ("execution", "cpu", "glibc", "loader", "runtime_image"))
@@ -353,27 +349,35 @@ def verify(directory, commit, tag, release, recipe_commit="", root=None, fork_ma
     return manifest
 
 
-def attestation_bytes(manifest):
+def attestation_bytes(manifest, fork_manifest_sha256):
     qualification = manifest["qualification"]
     require(qualification is not None and
             manifest["checks"] == qualification["checks"] == {name: "passed" for name in CHECKS},
             "Completed qualification is required")
+    # The registry the boundary tests came from is bound by the private signed record only: the public manifest is read by
+    # the fleet puller with exact key sets and must not carry it.
+    require(match(HEX, fork_manifest_sha256), "Qualification fork manifest differs")
     return canonical_json({
-        "schema": 1, "binary_sha256": manifest["asset"]["sha256"],
+        "schema": 2, "binary_sha256": manifest["asset"]["sha256"],
         "source_commit": manifest["source"]["commit"], "recipe_commit": manifest["source"]["recipe_commit"],
+        "fork_manifest_sha256": fork_manifest_sha256,
         "runtime_image_digest": qualification["environment"]["runtime_image"],
         "mode": "release" if manifest["source"]["recipe_committed"] else "candidate",
         "checks": manifest["checks"], "manifest_sha256": hashlib.sha256(canonical_json(manifest)).hexdigest(),
     })
 
 
-def verify_attestation(manifest, attestation, signers):
+def verify_attestation(manifest, attestation, signers, fork_manifest_sha256=""):
+    """Check the signed private record against the public manifest; a caller that knows the fork manifest hash must see the same one."""
     signature = Path(str(attestation) + ".sig")
     require(all(path.is_file() and not path.is_symlink() and path.stat().st_size > 0
                 for path in (attestation, signature, signers)), "Explicit qualification evidence and public signers are required")
     data = attestation.read_bytes()
     value = strict_json(data)
-    expected = attestation_bytes(manifest)
+    recorded = value.get("fork_manifest_sha256") if isinstance(value, dict) else None
+    require(match(HEX, recorded) and (not fork_manifest_sha256 or recorded == fork_manifest_sha256),
+            "Qualification fork manifest differs")
+    expected = attestation_bytes(manifest, recorded)
     require(canonical_json(value) == data == expected, "Qualification attestation binding differs")
     result = subprocess.run(
         ["ssh-keygen", "-Y", "verify", "-f", str(signers), "-I", ATTESTATION_IDENTITY,
@@ -504,12 +508,13 @@ def main():
         elif args.mode == "create":
             create(args.directory)
         else:
-            manifest = verify(args.directory, args.commit, args.tag, args.release, args.recipe_commit,
-                              fork_manifest_sha256=args.fork_manifest_sha256)
+            require(not args.fork_manifest_sha256 or args.attestation is not None,
+                    "A fork manifest SHA-256 can only be checked against qualification evidence")
+            manifest = verify(args.directory, args.commit, args.tag, args.release, args.recipe_commit)
             if args.release or args.attestation is not None or args.qualification_signers is not None:
                 require(args.attestation is not None and args.qualification_signers is not None,
                         "Explicit qualification evidence and public signers are required")
-                verify_attestation(manifest, args.attestation, args.qualification_signers)
+                verify_attestation(manifest, args.attestation, args.qualification_signers, args.fork_manifest_sha256)
         print("Public linux-amd64 receipt verified.")
     except RouteError as error:
         if args.mode == "check":

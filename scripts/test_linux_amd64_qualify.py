@@ -705,8 +705,8 @@ class CompletionTests(unittest.TestCase):
             completed = receipt.verify(directory, COMMIT, TAG, True, RECIPE, root=False)
             receipt.verify_attestation(completed, self.attestation, self.signers)
             self.assertEqual(receipt.strict_json(self.attestation.read_bytes()), {
-                "schema": 1, "binary_sha256": receipt.digest(directory / receipt.ASSETS[0]),
-                "source_commit": COMMIT, "recipe_commit": RECIPE,
+                "schema": 2, "binary_sha256": receipt.digest(directory / receipt.ASSETS[0]),
+                "source_commit": COMMIT, "recipe_commit": RECIPE, "fork_manifest_sha256": FORK_SHA,
                 "runtime_image_digest": IMAGE_DIGEST, "mode": "release",
                 "checks": {check: "passed" for check in receipt.CHECKS},
                 "manifest_sha256": hashlib.sha256((directory / receipt.ASSETS[1]).read_bytes()).hexdigest(),
@@ -750,7 +750,7 @@ class CompletionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.finalize(directory, manifest, success(manifest), IMAGE_DIGEST, False, COMMIT, "")
 
-    def test_a_result_for_another_registry_never_finalizes_and_the_record_carries_the_registry_hash(self):
+    def test_a_result_for_another_registry_never_finalizes_and_only_the_signed_record_carries_the_registry_hash(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             manifest = fixture(directory)
@@ -760,10 +760,14 @@ class CompletionTests(unittest.TestCase):
             self.assertEqual((directory / receipt.ASSETS[1]).read_bytes(), original)
             self.assertFalse(self.attestation.exists())
             self.finalize(directory, manifest, success(manifest), IMAGE_DIGEST, False, COMMIT, "")
-            completed = receipt.verify(directory, COMMIT, "", False, root=False, fork_manifest_sha256=FORK_SHA)
-            self.assertEqual(completed["qualification"]["fork_manifest_sha256"], FORK_SHA)
+            completed = receipt.verify(directory, COMMIT, "", False, root=False)
+            # The public manifest keeps the fleet puller's exact qualification fields; the hash lives in the signed record only.
+            self.assertNotIn("fork_manifest_sha256", completed["qualification"])
+            self.assertNotIn(FORK_SHA.encode(), (directory / receipt.ASSETS[1]).read_bytes())
+            self.assertEqual(receipt.strict_json(self.attestation.read_bytes())["fork_manifest_sha256"], FORK_SHA)
+            receipt.verify_attestation(completed, self.attestation, self.signers, FORK_SHA)
             with self.assertRaises(ValueError):
-                receipt.verify(directory, COMMIT, "", False, root=False, fork_manifest_sha256="e" * 64)
+                receipt.verify_attestation(completed, self.attestation, self.signers, "e" * 64)
             # The signed attestation binds the whole manifest, so the registry hash cannot change without a new signature.
             evidence = receipt.strict_json(self.attestation.read_bytes())
             self.assertEqual(evidence["manifest_sha256"], hashlib.sha256((directory / receipt.ASSETS[1]).read_bytes()).hexdigest())
@@ -851,8 +855,8 @@ class HostFlowTests(unittest.TestCase):
         def archive(_root, _commit, destination):
             source_fixture(destination)
 
-        with patch.object(receipt, "verify", side_effect=lambda path, commit, tag, release, recipe_commit="", root=None, fork_manifest_sha256="":
-                          real_verify(path, commit, tag, release, recipe_commit, root=False, fork_manifest_sha256=fork_manifest_sha256)), \
+        with patch.object(receipt, "verify", side_effect=lambda path, commit, tag, release, recipe_commit="", root=None:
+                          real_verify(path, commit, tag, release, recipe_commit, root=False)), \
              patch.object(receipt, "assert_recipes") as assert_recipes, \
              patch.object(receipt, "validate_docker", return_value=["docker", "--host", args.docker_socket]), \
              patch.object(receipt, "git_bytes", side_effect=lambda _root, _rev, name: (root / name).read_bytes()), \
@@ -867,8 +871,9 @@ class HostFlowTests(unittest.TestCase):
             else:
                 qualify.qualify(args, root)
                 completed = receipt.strict_json((assets / receipt.ASSETS[1]).read_text())
-                self.assertEqual(completed["qualification"], success(manifest))
-                receipt.verify_attestation(completed, args.attestation, signers)
+                self.assertEqual(completed["qualification"],
+                                 {name: value for name, value in success(manifest).items() if name != "fork_manifest_sha256"})
+                receipt.verify_attestation(completed, args.attestation, signers, FORK_SHA)
                 for name in receipt.ASSETS:
                     self.assertNotIn(b"private-account", (assets / name).read_bytes())
             self.assertEqual(assert_recipes.call_count, int(committed))

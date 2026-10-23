@@ -341,8 +341,8 @@ def attestation_output(directory, key, output):
         require(not path.exists() and not path.is_symlink(), "Qualification evidence already exists")
 
 
-def sign_attestation(manifest, key, output):
-    data = receipt.attestation_bytes(manifest)
+def sign_attestation(manifest, key, output, fork_manifest_sha256):
+    data = receipt.attestation_bytes(manifest, fork_manifest_sha256)
     environment = os.environ.copy()
     for name in ("SSH_AUTH_SOCK", "SSH_AGENT_PID", "SSH_ASKPASS"):
         environment.pop(name, None)
@@ -365,11 +365,13 @@ def finalize(directory, before, result, image, root, commit, recipe_commit, atte
     validate_result(result, before, image, fork_manifest_sha256)
     complete = copy.deepcopy(before)
     complete["checks"] = dict(result["checks"])
-    complete["qualification"] = result
+    # The container echoes the registry hash it ran against; only the private signed record keeps it. The public manifest
+    # keeps the fleet puller's exact qualification fields.
+    complete["qualification"] = {name: value for name, value in result.items() if name != "fork_manifest_sha256"}
     receipt.save_manifest(directory, complete)
-    receipt.verify(directory, commit, before["source"]["tag"] or "", False, recipe_commit, root, fork_manifest_sha256)
+    receipt.verify(directory, commit, before["source"]["tag"] or "", False, recipe_commit, root)
     attestation_output(directory, attestation_key, attestation)
-    sign_attestation(complete, attestation_key, attestation)
+    sign_attestation(complete, attestation_key, attestation, fork_manifest_sha256)
 
 
 def qualify(args, root=None):

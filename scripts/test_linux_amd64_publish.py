@@ -339,15 +339,16 @@ class PublisherTests(unittest.TestCase):
             self.assertIn("rm", command)
             return subprocess.CompletedProcess(command, 0)
 
-        with patch.object(qualifier.receipt, "verify", side_effect=lambda path, commit, tag, release, recipe_commit="", root=None, fork_manifest_sha256="":
-                          verify(path, commit, tag, release, recipe_commit, root=False, fork_manifest_sha256=fork_manifest_sha256)), \
+        with patch.object(qualifier.receipt, "verify", side_effect=lambda path, commit, tag, release, recipe_commit="", root=None:
+                          verify(path, commit, tag, release, recipe_commit, root=False)), \
              patch.object(qualifier.receipt, "assert_recipes"), \
              patch.object(qualifier.receipt, "git_bytes", side_effect=fixture.tree_bytes), \
              patch.object(qualifier.receipt, "validate_docker", return_value=["docker", "--host", args.docker_socket]), \
              patch.object(qualifier, "docker_output", side_effect=["amd64", "amd64", "verified"]), \
              patch.object(qualifier, "export_source", side_effect=lambda _root, _commit, path: path.mkdir()), \
              patch.object(qualifier, "boundary_commands"), \
-             patch.object(qualifier.subprocess, "check_output", return_value=json.dumps(result).encode()), \
+             patch.object(qualifier.subprocess, "check_output",
+                          return_value=json.dumps(dict(result, fork_manifest_sha256=fixture.FORK_SHA)).encode()), \
              patch.object(qualifier.subprocess, "run", side_effect=execute):
             qualifier.qualify(args, root)
         self.contents = {name: (self.args.assets / name).read_bytes() for name in publisher.receipt.ASSETS}
@@ -366,7 +367,7 @@ class PublisherTests(unittest.TestCase):
         publisher.receipt.save_manifest(self.args.assets, manifest)
         # All public fields and attestation bindings agree, but no trusted signer
         # authenticated these new bytes. Keep the old, now invalid signature.
-        self.args.attestation.write_bytes(publisher.receipt.attestation_bytes(manifest))
+        self.args.attestation.write_bytes(publisher.receipt.attestation_bytes(manifest, fixture.FORK_SHA))
         self.rejected()
         self.assertEqual(self.fake.calls, [])
         self.assertIn("attestation", self.events)
