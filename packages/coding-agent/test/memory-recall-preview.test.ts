@@ -66,8 +66,7 @@ function startProcess(): { dir: TempDir; state: MnemopiSessionState } {
 	return { dir, state };
 }
 
-const memoryText = (host: string): string =>
-	`${FILLER.repeat(40)}The deploy host is ${host}. ${FILLER.repeat(40)}`;
+const memoryText = (host: string): string => `${FILLER.repeat(40)}The deploy host is ${host}. ${FILLER.repeat(40)}`;
 
 describe("recall preview of a long memory", () => {
 	it("puts the matched part of a long memory in the first-turn block", async () => {
