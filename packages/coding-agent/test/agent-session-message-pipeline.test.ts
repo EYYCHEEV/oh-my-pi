@@ -2890,6 +2890,7 @@ describe("AgentSession message pipeline", () => {
 			resetConversationTracking() {
 				remembered = false;
 			},
+			beginStop() {},
 			async dispose() {},
 		} as unknown as MnemopiSessionState);
 
@@ -2984,6 +2985,7 @@ describe("AgentSession message pipeline", () => {
 			resetConversationTracking() {
 				remembered = false;
 			},
+			beginStop() {},
 			async dispose() {},
 		} as unknown as MnemopiSessionState);
 
@@ -3082,6 +3084,7 @@ describe("AgentSession message pipeline", () => {
 			resetConversationTracking() {
 				remembered = false;
 			},
+			beginStop() {},
 			async dispose() {},
 		} as unknown as MnemopiSessionState);
 

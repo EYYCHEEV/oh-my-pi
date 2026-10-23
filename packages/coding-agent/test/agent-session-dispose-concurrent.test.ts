@@ -166,6 +166,8 @@ describe("AgentSession concurrent disposal", () => {
 		current.setHindsightSessionState(hindsight);
 
 		const mnemopi: MnemopiSessionState = Object.create(MnemopiSessionState.prototype);
+		// Object.create has no private fields; dispose marks the state as stopping before anything else.
+		vi.spyOn(mnemopi, "beginStop").mockImplementation(() => {});
 		vi.spyOn(mnemopi, "dispose").mockImplementation(async () => {
 			order.push("mnemopi:start");
 			await mnemopiGate.promise;
