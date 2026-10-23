@@ -118,6 +118,9 @@ export function enableWal(db: Database): void {
 export function enablePragmas(db: Database, path?: DatabasePath, pageSize?: SqlitePageSize): void {
 	db.exec("PRAGMA foreign_keys=ON");
 	db.exec("PRAGMA busy_timeout=5000");
+	// Zero what a delete frees, in every page it frees: the default (FAST) only zeroes pages the delete already
+	// rewrites, and a build of SQLite may default to OFF. Without it, `forget` leaves the text in the file.
+	db.exec("PRAGMA secure_delete=ON");
 	if (path !== ":memory:") {
 		applyPageSize(db, path ?? dbPath(), pageSize);
 		enableWal(db);

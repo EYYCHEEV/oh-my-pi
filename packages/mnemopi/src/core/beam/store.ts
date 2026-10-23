@@ -14,6 +14,7 @@ import {
 	rewriteSleepSummary,
 	storeExtractedFactCategories,
 } from "./consolidate";
+import { secureFullTextDeletes, settleForget } from "./forget-durability";
 import {
 	FORGOTTEN_MARK,
 	MIN_SCRUB_CHARS,
@@ -580,9 +581,12 @@ function reembedWorkingRows(beam: BeamMemoryState, ids: readonly string[]): void
  * than `MIN_SCRUB_CHARS`).
  */
 export function scrubForgottenTexts(beam: BeamMemoryState, texts: readonly string[]): number {
-	const scrubbed = transaction(beam.db, () => scrubTranscripts(beam, texts, null));
+	const { value: scrubbed, insecure } = transaction(beam.db, () =>
+		secureFullTextDeletes(beam.db, () => scrubTranscripts(beam, texts, null)),
+	);
 	invalidateCaches(beam);
 	reembedWorkingRows(beam, scrubbed);
+	if (scrubbed.length > 0) settleForget(beam.db, insecure);
 	return scrubbed.length;
 }
 
@@ -1256,22 +1260,25 @@ function derivedTexts(db: BeamMemoryState["db"], memoryId: string): string[] {
  * scrubbed from transcripts: the outcome says so, and one warning names the memory id (never its text).
  */
 export function forgetWorkingDetailed(beam: BeamMemoryState, memoryId: string): ForgetOutcome {
-	const done = transaction(beam.db, () => {
-		const row = beam.db
-			.query("DELETE FROM working_memory WHERE id = ? AND session_id = ? RETURNING content, embed_text")
-			.get(memoryId, beam.sessionId) as { content: string; embed_text: string | null } | null;
-		if (row === null) return null;
-		const tooShort = tooShortToScrub(row.content);
-		const texts = tooShort ? [] : [row.content, row.embed_text ?? "", ...derivedTexts(beam.db, memoryId)];
-		purgeWorkingMemoryArtifacts(beam.db, [memoryId]);
-		// Scrub first, so a summary that lists the forgotten row and a scrubbed one is rewritten once.
-		const scrubbed = tooShort ? [] : scrubTranscripts(beam, texts, memoryId);
-		retireDerivedSummaries(beam, memoryId, { kind: "forget" });
-		return { scrubbed, tooShort, texts };
-	});
+	const { value: done, insecure } = transaction(beam.db, () =>
+		secureFullTextDeletes(beam.db, () => {
+			const row = beam.db
+				.query("DELETE FROM working_memory WHERE id = ? AND session_id = ? RETURNING content, embed_text")
+				.get(memoryId, beam.sessionId) as { content: string; embed_text: string | null } | null;
+			if (row === null) return null;
+			const tooShort = tooShortToScrub(row.content);
+			const texts = tooShort ? [] : [row.content, row.embed_text ?? "", ...derivedTexts(beam.db, memoryId)];
+			purgeWorkingMemoryArtifacts(beam.db, [memoryId]);
+			// Scrub first, so a summary that lists the forgotten row and a scrubbed one is rewritten once.
+			const scrubbed = tooShort ? [] : scrubTranscripts(beam, texts, memoryId);
+			retireDerivedSummaries(beam, memoryId, { kind: "forget" });
+			return { scrubbed, tooShort, texts };
+		}),
+	);
 	if (done === null) return { deleted: false, scrubbedRows: 0, skippedBelowChars: null, forgottenTexts: [] };
 	invalidateCaches(beam);
 	reembedWorkingRows(beam, done.scrubbed);
+	settleForget(beam.db, insecure);
 	if (done.tooShort) {
 		logger.warn("mnemopi: forgotten text too short to scrub from retained transcripts; they keep any copy", {
 			memoryId,
