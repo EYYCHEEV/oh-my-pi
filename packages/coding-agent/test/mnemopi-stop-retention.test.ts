@@ -42,6 +42,7 @@ async function runUntilSigterm(options: {
 	mode: "print" | "bare";
 	cadence: number;
 	slowStep: boolean;
+	autoRetain?: boolean;
 }): Promise<StopRun> {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mnemopi-stop-"));
 	const requests: string[] = [];
@@ -123,6 +124,21 @@ describe("SIGTERM with turns not yet retained (real child process)", () => {
 		expect(run.retainedAfterMs!).toBeLessThan(RETAIN_BUDGET_MS);
 		expect(run.retainedText).toContain("First answer.");
 		expect(run.extractionRequests).toBe(0);
+		expect(run.exitCode).toBe(143);
+	}, 90_000);
+
+	it("print mode with mnemopi.autoRetain off: a stop signal stores no transcript turn", async () => {
+		const run = await runUntilSigterm({ mode: "print", cadence: 100, slowStep: true, autoRetain: false });
+		expect(run.retainedAfterMs).toBeUndefined();
+		expect(run.retainedText).toBe("");
+		expect(run.extractionRequests).toBe(0);
+		expect(run.exitCode).toBe(143);
+	}, 90_000);
+
+	it("a mode whose session is never disposed (RPC) with mnemopi.autoRetain off: the stop hook stores nothing", async () => {
+		const run = await runUntilSigterm({ mode: "bare", cadence: 100, slowStep: false, autoRetain: false });
+		expect(run.retainedAfterMs).toBeUndefined();
+		expect(run.retainedText).toBe("");
 		expect(run.exitCode).toBe(143);
 	}, 90_000);
 });

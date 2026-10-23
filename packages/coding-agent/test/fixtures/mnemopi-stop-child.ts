@@ -24,6 +24,8 @@ interface StopChildConfig {
 	mode: "print" | "bare";
 	/** `mnemopi.retainEveryNTurns`. */
 	cadence: number;
+	/** `mnemopi.autoRetain`; defaults to on. */
+	autoRetain?: boolean;
 	/** A post-prompt task that never settles: dispose waits out its 5 s cap before reaching Mnemopi. */
 	slowStep: boolean;
 	/** OpenAI-compatible endpoint standing in for the model Mnemopi would call to extract facts. */
@@ -40,6 +42,7 @@ const settings = Settings.isolated({
 	"mnemopi.scoping": "global",
 	"mnemopi.dbPath": dbPath,
 	"mnemopi.noEmbeddings": true,
+	"mnemopi.autoRetain": config.autoRetain ?? true,
 	"mnemopi.retainEveryNTurns": config.cadence,
 	"mnemopi.llmMode": "remote",
 	"mnemopi.llmBaseUrl": config.llmBaseUrl,
