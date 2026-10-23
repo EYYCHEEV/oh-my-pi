@@ -136,6 +136,7 @@ An upgrade fails before build or installation if the block is stale, any require
 - `kimi-k3-responses-transport`: Kimi K3 Responses transport
 - `oauth-account-pool-controls`: OAuth account pause and exact-account launch restriction
 - `daemon-completion-delivery-recovery`: Bounded daemon completion delivery recovery
+- `mnemopi-working-memory-retention`: Mnemopi working-memory trim promotes expired rows instead of deleting them
 <!-- stronk-omp:fork-contracts:end -->
 
 ## Upstream alignment
