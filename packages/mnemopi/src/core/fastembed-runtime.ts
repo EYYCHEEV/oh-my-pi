@@ -128,6 +128,31 @@ export function loadFastembed(): Promise<FastembedModule> {
 	return fastembedLoad;
 }
 
+/** The version of the `fastembed` package that resolves from this module, or `undefined` when none does. */
+function resolveDirectFastembedVersion(): unknown {
+	try {
+		const requireDirect = createRequire(import.meta.url);
+		const manifest: { version?: unknown } = requireDirect(requireDirect.resolve("fastembed/package.json"));
+		return manifest.version;
+	} catch {
+		// Not resolvable from here (bundle, compiled binary).
+		return undefined;
+	}
+}
+
+/**
+ * Whether {@link loadFastembed} can load fastembed without installing anything: the pinned version
+ * resolves directly, or the on-demand runtime install is already on disk. Performs no install.
+ * `directVersion` is a test seam for the direct resolution.
+ */
+export async function isFastembedRuntimeInstalled(
+	directVersion: () => unknown = resolveDirectFastembedVersion,
+): Promise<boolean> {
+	if (directVersion() === FASTEMBED_SPEC) return true;
+	const runtimeDir = path.join(getFastembedRuntimeDir(), fastembedRuntimeInstallPlan().versionKey);
+	return Bun.file(path.join(runtimeDir, "node_modules", "fastembed", "package.json")).exists();
+}
+
 async function loadFastembedOnce(): Promise<FastembedModule> {
 	try {
 		const requireDirect = createRequire(import.meta.url);

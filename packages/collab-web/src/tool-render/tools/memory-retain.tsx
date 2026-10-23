@@ -44,7 +44,7 @@ function Body({ args, result }: ToolRenderProps): ReactNode {
 	// so it reads as a status chip.
 	let confirmation: string | null = null;
 	if (result && result.isError !== true) {
-		const text = resultTextOf(result).trim().replace(/\.$/, "");
+		const text = (resultTextOf(result).trim().split("\n")[0] ?? "").replace(/\.$/, "");
 		confirmation = text || (count !== null ? `${count === 1 ? "1 memory" : `${count} memories`} retained` : null);
 	}
 	return (

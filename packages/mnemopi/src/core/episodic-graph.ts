@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { graphLinkWindow } from "../config";
 import { closeQuietly, type DatabasePath, openDatabase, transaction } from "../db";
 
 export interface Gist {
@@ -50,6 +51,11 @@ export interface IngestOptions {
 	readonly linkExisting?: boolean;
 	readonly minLinkScore?: number;
 	readonly extractEntities?: boolean;
+	/**
+	 * Link the new memory against only the newest N known memories. `0` links against every one,
+	 * which makes each ingest cost grow with the whole history. Defaults to `MNEMOPI_GRAPH_LINK_WINDOW` (200).
+	 */
+	readonly linkWindow?: number;
 }
 
 export interface IngestResult {
@@ -513,7 +519,9 @@ export class EpisodicGraph {
 			const edges: GraphEdge[] = [];
 			const timestamp = nowIso();
 
-			const previousMemoryIds = linkExisting ? this.knownMemoryIds(memoryId) : [];
+			const previousMemoryIds = linkExisting
+				? this.knownMemoryIds(memoryId, options.linkWindow ?? graphLinkWindow())
+				: [];
 			this.storeGist(gist, memoryId);
 			const gistEdge = { source: memoryId, target: gist.id, edgeType: "ctx", weight: 1, timestamp };
 			this.addEdge(gistEdge);
@@ -662,7 +670,68 @@ export class EpisodicGraph {
 		return content.slice(0, 100).trim();
 	}
 
-	private knownMemoryIds(exclude: string): string[] {
+	/** Memories a new one may link to: all of them with `window` 0, otherwise the newest `window`. */
+	private knownMemoryIds(exclude: string, window: number): string[] {
+		return window > 0 ? this.newestKnownMemoryIds(exclude, Math.floor(window)) : this.allKnownMemoryIds(exclude);
+	}
+
+	/**
+	 * The newest `window` memories by timestamp across graph gists and live working and episodic rows,
+	 * minus any that a Beam table has retired. Costs a few indexed reads and one liveness check over at
+	 * most `window` ids, however long the history is.
+	 */
+	private newestKnownMemoryIds(exclude: string, window: number): string[] {
+		const now = nowIso();
+		const newest = new Map<string, string>();
+		const note = (rows: readonly { id: string; ts: string | null }[]): void => {
+			for (const row of rows) {
+				const seen = newest.get(row.id);
+				if (seen === undefined || (row.ts ?? "") > seen) newest.set(row.id, row.ts ?? "");
+			}
+		};
+		note(
+			this.db
+				.query(
+					"SELECT memory_id AS id, timestamp AS ts FROM gists WHERE memory_id IS NOT NULL AND memory_id != ? ORDER BY timestamp DESC LIMIT ?",
+				)
+				.all(exclude, window) as { id: string; ts: string | null }[],
+		);
+		for (const table of ["working_memory", "episodic_memory"]) {
+			try {
+				note(
+					this.db
+						.query(
+							`SELECT id, timestamp AS ts FROM ${table} WHERE id != ? AND ${LIVE_MEMORY_SQL} ORDER BY timestamp DESC LIMIT ?`,
+						)
+						.all(exclude, now, window) as { id: string; ts: string | null }[],
+				);
+			} catch {
+				// Standalone graph stores do not have Beam memory tables.
+			}
+		}
+		const candidates = [...newest]
+			.sort((left, right) => (left[1] < right[1] ? 1 : left[1] > right[1] ? -1 : 0))
+			.slice(0, window)
+			.map(([id]) => id);
+		if (candidates.length === 0) return candidates;
+
+		const live = new Set<string>();
+		const retired = new Set<string>();
+		const marks = candidates.map(() => "?").join(", ");
+		for (const table of ["working_memory", "episodic_memory"]) {
+			try {
+				const rows = this.db
+					.query(`SELECT id, ${LIVE_MEMORY_SQL} AS live FROM ${table} WHERE id IN (${marks})`)
+					.all(now, ...candidates) as MemoryLivenessRow[];
+				partitionByLiveness(rows, live, retired);
+			} catch {
+				// Standalone graph stores do not have Beam memory tables.
+			}
+		}
+		return candidates.filter(id => live.has(id) || !retired.has(id));
+	}
+
+	private allKnownMemoryIds(exclude: string): string[] {
 		const now = nowIso();
 		const ids = new Set<string>();
 		const live = new Set<string>();

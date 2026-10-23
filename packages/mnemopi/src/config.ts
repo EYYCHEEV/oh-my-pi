@@ -170,6 +170,14 @@ export function tier3Days(env: Env = process.env): number {
 	return envInt("MNEMOPI_TIER3_DAYS", 180, env);
 }
 
+/**
+ * Newest memories the episodic graph links a new memory against. Linking against all of them made each
+ * consolidation, and so each session start, cost more as history grew. `0` links against every memory.
+ */
+export function graphLinkWindow(env: Env = process.env): number {
+	return envInt("MNEMOPI_GRAPH_LINK_WINDOW", 200, env);
+}
+
 /** Recall-time score multiplier for an episodic row still at degradation tier 1. */
 export function tier1Weight(env: Env = process.env): number {
 	return envFloat("MNEMOPI_TIER1_WEIGHT", 1.0, env);

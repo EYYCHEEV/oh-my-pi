@@ -89,12 +89,38 @@ export function openDatabase(path: DatabasePath = dbPath(), options: OpenDatabas
 	return db;
 }
 
+/**
+ * Backoff between attempts to switch a database to WAL, about 1.3 s in all. Two connections creating
+ * the same database at once both ask for the exclusive lock the switch needs, and SQLite answers the
+ * loser `SQLITE_BUSY` at once instead of running the busy handler (a held read lock cannot be upgraded
+ * while another connection waits for the same lock), so `busy_timeout` does not cover this step.
+ */
+const WAL_RETRY_DELAYS_MS = [5, 10, 20, 40, 80, 160, 250, 250, 250, 250] as const;
+
+function isBusyError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	return ("code" in error && error.code === "SQLITE_BUSY") || /database is locked|SQLITE_BUSY/i.test(error.message);
+}
+
+export function enableWal(db: Database): void {
+	for (let attempt = 0; ; attempt += 1) {
+		try {
+			db.exec("PRAGMA journal_mode=WAL");
+			return;
+		} catch (error) {
+			const delay = WAL_RETRY_DELAYS_MS[attempt];
+			if (delay === undefined || !isBusyError(error)) throw error;
+			Bun.sleepSync(delay);
+		}
+	}
+}
+
 export function enablePragmas(db: Database, path?: DatabasePath, pageSize?: SqlitePageSize): void {
 	db.exec("PRAGMA foreign_keys=ON");
 	db.exec("PRAGMA busy_timeout=5000");
 	if (path !== ":memory:") {
 		applyPageSize(db, path ?? dbPath(), pageSize);
-		db.exec("PRAGMA journal_mode=WAL");
+		enableWal(db);
 	}
 }
 

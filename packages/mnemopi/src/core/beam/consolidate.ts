@@ -8,6 +8,7 @@ import { EpisodicGraph } from "../episodic-graph";
 import { type ExtractedFactCategories, heuristicExtractFacts } from "../extraction";
 import { clampVeracity, VERACITY_WEIGHTS, type Veracity, VeracityConsolidator } from "../veracity-consolidation";
 import { scheduleEmbedding } from "./helpers";
+import { pruneConsolidatedWorkingMemory } from "./prune";
 import type { BeamMemoryState, BeamStats, JsonValue, MemoriaRetrieveResult, Metadata, SleepResult } from "./types";
 
 type Row = Record<string, unknown>;
@@ -478,6 +479,7 @@ function ingestIntoEpisodicGraph(beam: BeamMemoryState, memoryId: string, summar
 			sessionId: sourceSession(beam),
 			linkExisting: true,
 			extractEntities: true,
+			linkWindow: beam.config?.graphLinkWindow,
 		});
 	} catch {
 		// Graph enrichment is best-effort and never blocks consolidation.
@@ -948,24 +950,39 @@ function invalidateEpisodicVectors(beam: BeamMemoryState, memoryId: string): voi
 	beam.db.run("UPDATE episodic_memory SET binary_vector = NULL WHERE id = ?", [memoryId]);
 }
 
+/**
+ * Days after which a tier rolls down: the beam's own setting when it has one (`0` = never, `null`
+ * here), else the `MNEMOPI_TIER*_DAYS` default. A non-finite or negative setting counts as unset.
+ */
+function tierCutDays(configured: number | undefined, fallback: number): number | null {
+	if (configured === undefined || !Number.isFinite(configured) || configured < 0) return fallback;
+	return configured === 0 ? null : configured;
+}
+
 export function degradeEpisodic(beam: BeamMemoryState, dryRun = false): Record<string, JsonValue> {
 	const now = isoNow();
-	const tier2Cutoff = cutoffIso(TIER2_DAYS, 24 * 60 * 60 * 1000);
-	const tier3Cutoff = cutoffIso(TIER3_DAYS, 24 * 60 * 60 * 1000);
-	const tier1Rows = asRows(
-		beam.db
-			.query(
-				`SELECT id, content FROM episodic_memory WHERE tier = 1 AND created_at < ? ORDER BY created_at ASC LIMIT ?`,
-			)
-			.all(tier2Cutoff, DEGRADE_BATCH_SIZE),
-	);
-	const tier2Rows = asRows(
-		beam.db
-			.query(
-				`SELECT id, content FROM episodic_memory WHERE tier = 2 AND created_at < ? ORDER BY created_at ASC LIMIT ?`,
-			)
-			.all(tier3Cutoff, Math.max(1, Math.floor(DEGRADE_BATCH_SIZE / 2))),
-	);
+	const tier2Days = tierCutDays(beam.config?.tier2Days, TIER2_DAYS);
+	const tier3Days = tierCutDays(beam.config?.tier3Days, TIER3_DAYS);
+	const tier1Rows =
+		tier2Days === null
+			? []
+			: asRows(
+					beam.db
+						.query(
+							`SELECT id, content FROM episodic_memory WHERE tier = 1 AND created_at < ? ORDER BY created_at ASC LIMIT ?`,
+						)
+						.all(cutoffIso(tier2Days, 24 * 60 * 60 * 1000), DEGRADE_BATCH_SIZE),
+				);
+	const tier2Rows =
+		tier3Days === null
+			? []
+			: asRows(
+					beam.db
+						.query(
+							`SELECT id, content FROM episodic_memory WHERE tier = 2 AND created_at < ? ORDER BY created_at ASC LIMIT ?`,
+						)
+						.all(cutoffIso(tier3Days, 24 * 60 * 60 * 1000), Math.max(1, Math.floor(DEGRADE_BATCH_SIZE / 2))),
+				);
 	const result = {
 		status: dryRun ? "dry_run" : "degraded",
 		tier1_to_tier2: tier1Rows.length,
@@ -1088,8 +1105,19 @@ function eligibleWorkingRows(beam: BeamMemoryState, sessionId: string): Row[] {
 	);
 }
 
-export function sleep(beam: BeamMemoryState, dryRun = false): SleepResult {
+/** Consolidate this session's eligible rows; no pruning (`sleep` and `sleepAllSessions` prune once, when the setting is on). */
+function sleepSession(beam: BeamMemoryState, dryRun: boolean): SleepResult {
 	return consolidateWorkingRows(beam, eligibleWorkingRows(beam, sourceSession(beam)), dryRun);
+}
+
+/** The sleep result with the pruning step's outcome added; unchanged when `pruneConsolidatedDays` is off. */
+function withPruned(beam: BeamMemoryState, result: SleepResult, dryRun: boolean): SleepResult {
+	const pruned = pruneConsolidatedWorkingMemory(beam, dryRun);
+	return pruned === undefined ? result : { ...result, pruned };
+}
+
+export function sleep(beam: BeamMemoryState, dryRun = false): SleepResult {
+	return withPruned(beam, sleepSession(beam, dryRun), dryRun);
 }
 
 /**
@@ -1119,6 +1147,105 @@ export function consolidateWorkingRowsById(beam: BeamMemoryState, ids: readonly 
 			.all(...batch),
 	);
 	return consolidateWorkingRows(beam, rows, false, false);
+}
+
+/** Build and store the episodic summary of one chunk of same-source working rows, the way `sleep` does. */
+function writeSleepSummary(beam: BeamMemoryState, source: string, chunk: SleepChunk, extra: Metadata = {}): string {
+	const ids = chunk.items.map(item => rowValue(item, "id")).filter((id): id is string => id !== null);
+	let scope = "session";
+	let validUntil: string | null = null;
+	for (const item of chunk.items) {
+		if (rowValue(item, "scope") === "global") scope = "global";
+		const itemValidUntil = rowValue(item, "valid_until");
+		if (itemValidUntil && (validUntil === null || itemValidUntil < validUntil)) validUntil = itemValidUntil;
+	}
+	const sleepSummary = buildSleepSummary(beam, source, chunk);
+	const metadata: Metadata = { original_count: chunk.items.length, source, llm_used: false, ...extra };
+	if (sleepSummary.truncated) {
+		metadata.truncated = true;
+		metadata.original_chars = sleepSummary.originalChars;
+		metadata.max_chars = sleepSummary.maxChars;
+	}
+	return consolidateToEpisodic(beam, sleepSummary.summary, ids, "sleep_consolidation", 0.6, {
+		scope,
+		validUntil,
+		veracity: aggregateEpisodicVeracity(chunk.items.map(item => rowValue(item, "veracity") ?? "unknown")),
+		metadata,
+	});
+}
+
+/** The working-row `source` a `sleep` summary was built from, which its metadata records. */
+function sleepSummarySource(summary: Row): string | null {
+	if (rowValue(summary, "source") !== "sleep_consolidation") return null;
+	try {
+		const metadata: unknown = JSON.parse(rowValue(summary, "metadata_json") ?? "{}");
+		if (typeof metadata !== "object" || metadata === null || !("source" in metadata)) return null;
+		return typeof metadata.source === "string" ? metadata.source : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Rewrite the `sleep` summary `summary` so it covers only the working rows in `keepIds` and their live
+ * text: a row that is retired too (superseded, or past `valid_until`) is left out. Returns the new
+ * summaries' ids (`[]` when no kept row is live), or `null` when the summary cannot be rewritten: it is
+ * a caller-supplied digest with no per-row text to cut, or a kept row is gone from working memory, so
+ * the old summary is the only copy of its text. The new summaries inherit the old one's timestamps, so
+ * recency and tier degradation do not restart. The caller retires or deletes the old summary.
+ */
+export function rebuildSleepSummary(beam: BeamMemoryState, summary: Row, keepIds: readonly string[]): string[] | null {
+	const source = sleepSummarySource(summary);
+	if (source === null) return null;
+	const unique = [...new Set(keepIds)];
+	const rows = asRows(
+		beam.db
+			.query(
+				`SELECT ${WORKING_ROW_COLUMNS}, superseded_by FROM working_memory
+		 WHERE id IN (${unique.map(() => "?").join(",")}) ORDER BY timestamp ASC`,
+			)
+			.all(...unique),
+	);
+	if (rows.length !== unique.length) return null;
+	const now = isoNow();
+	const live = rows.filter(row => {
+		const validUntil = rowValue(row, "valid_until");
+		return rowValue(row, "superseded_by") === null && (validUntil === null || validUntil > now);
+	});
+	const created: string[] = [];
+	for (const chunk of splitSleepItems(beam, source, live)) {
+		const id = writeSleepSummary(beam, source, chunk, { rebuilt_from: rowValue(summary, "id") ?? "" });
+		beam.db.run(
+			"UPDATE episodic_memory SET timestamp = COALESCE(?, timestamp), created_at = COALESCE(?, created_at) WHERE id = ?",
+			[rowValue(summary, "timestamp"), rowValue(summary, "created_at"), id],
+		);
+		created.push(id);
+	}
+	return created;
+}
+
+/**
+ * Replace the `sleep` summary `summary` with one that says `content`: the same rows, scope, validity, veracity,
+ * metadata and timestamps, so it differs only in the text that was cut. Its facts are extracted from the new text
+ * and it is embedded again, as for any summary. Unlike `rebuildSleepSummary` it needs none of the summarized rows,
+ * so it serves a summary whose rows were pruned. Returns the new id, or `null` when `summary` is not a `sleep`
+ * summary. The caller deletes the old one.
+ */
+export function rewriteSleepSummary(beam: BeamMemoryState, summary: Row, content: string): string | null {
+	if (sleepSummarySource(summary) === null) return null;
+	const metadata = JSON.parse(rowValue(summary, "metadata_json") ?? "{}") as Metadata;
+	const sourceIds = (rowValue(summary, "summary_of") ?? "").split(",").filter(id => id.length > 0);
+	const id = consolidateToEpisodic(beam, content, sourceIds, "sleep_consolidation", 0.6, {
+		scope: rowValue(summary, "scope") === "global" ? "global" : "session",
+		validUntil: rowValue(summary, "valid_until"),
+		veracity: clampEpisodicVeracity(rowValue(summary, "veracity")),
+		metadata: { ...metadata, rebuilt_from: rowValue(summary, "id") ?? "" },
+	});
+	beam.db.run(
+		"UPDATE episodic_memory SET timestamp = COALESCE(?, timestamp), created_at = COALESCE(?, created_at) WHERE id = ?",
+		[rowValue(summary, "timestamp"), rowValue(summary, "created_at"), id],
+	);
+	return id;
 }
 
 function consolidateWorkingRows(beam: BeamMemoryState, candidates: Row[], dryRun = false, degrade = true): SleepResult {
@@ -1162,29 +1289,7 @@ function consolidateWorkingRows(beam: BeamMemoryState, candidates: Row[], dryRun
 	for (const [source, items] of grouped) {
 		for (const chunk of splitSleepItems(beam, source, items)) {
 			const ids = chunk.items.map(item => rowValue(item, "id")).filter((id): id is string => id !== null);
-			let scope = "session";
-			let validUntil: string | null = null;
-			for (const item of chunk.items) {
-				if (rowValue(item, "scope") === "global") scope = "global";
-				const itemValidUntil = rowValue(item, "valid_until");
-				if (itemValidUntil && (validUntil === null || itemValidUntil < validUntil)) validUntil = itemValidUntil;
-			}
-			const sleepSummary = buildSleepSummary(beam, source, chunk);
-			const metadata: Metadata = { original_count: chunk.items.length, source, llm_used: false };
-			if (sleepSummary.truncated) {
-				metadata.truncated = true;
-				metadata.original_chars = sleepSummary.originalChars;
-				metadata.max_chars = sleepSummary.maxChars;
-			}
-			const summary = sleepSummary.summary;
-			if (!dryRun) {
-				consolidateToEpisodic(beam, summary, ids, "sleep_consolidation", 0.6, {
-					scope,
-					validUntil,
-					veracity: aggregateEpisodicVeracity(chunk.items.map(item => rowValue(item, "veracity") ?? "unknown")),
-					metadata,
-				});
-			}
+			if (!dryRun) writeSleepSummary(beam, source, chunk);
 			consolidatedIds.push(...ids);
 			summariesCreated++;
 		}
@@ -1226,18 +1331,22 @@ export function sleepAllSessions(beam: BeamMemoryState, dryRun = false): SleepRe
 			.all(cutoff),
 	);
 	if (sessions.length === 0) {
-		return {
-			dry_run: dryRun,
-			status: "no_op",
-			message: "No old working memories to consolidate",
-			sessions_scanned: 0,
-			sessions_consolidated: 0,
-			items_consolidated: 0,
-			summaries_created: 0,
-			llm_used: 0,
-			errors: 0,
-			session_results: [],
-		};
+		return withPruned(
+			beam,
+			{
+				dry_run: dryRun,
+				status: "no_op",
+				message: "No old working memories to consolidate",
+				sessions_scanned: 0,
+				sessions_consolidated: 0,
+				items_consolidated: 0,
+				summaries_created: 0,
+				llm_used: 0,
+				errors: 0,
+				session_results: [],
+			},
+			dryRun,
+		);
 	}
 	const originalSession = beam.sessionId;
 	const results: Row[] = [];
@@ -1248,7 +1357,7 @@ export function sleepAllSessions(beam: BeamMemoryState, dryRun = false): SleepRe
 		const sessionId = rowValue(row, "session_id") ?? "default";
 		const scoped = Object.create(Object.getPrototypeOf(beam)) as BeamMemoryState;
 		Object.assign(scoped, beam, { sessionId, channelId: sessionId });
-		const result = sleep(scoped, dryRun) as Row;
+		const result = sleepSession(scoped, dryRun) as Row;
 		result.session_id = sessionId;
 		result.eligible = row.eligible;
 		results.push(result);
@@ -1257,20 +1366,24 @@ export function sleepAllSessions(beam: BeamMemoryState, dryRun = false): SleepRe
 		summaries += Number(result.summaries_created ?? 0);
 	}
 	const degradation = degradeEpisodic(beam, dryRun);
-	return {
-		dry_run: dryRun,
-		status: dryRun ? "dry_run" : items > 0 ? "consolidated" : "no_op",
-		sessions_scanned: sessions.length,
-		sessions_consolidated: consolidated,
-		items_consolidated: items,
-		summaries_created: summaries,
-		llm_used: 0,
-		errors: 0,
-		error_details: [],
-		session_results: results,
-		degradation,
-		original_session: originalSession,
-	};
+	return withPruned(
+		beam,
+		{
+			dry_run: dryRun,
+			status: dryRun ? "dry_run" : items > 0 ? "consolidated" : "no_op",
+			sessions_scanned: sessions.length,
+			sessions_consolidated: consolidated,
+			items_consolidated: items,
+			summaries_created: summaries,
+			llm_used: 0,
+			errors: 0,
+			error_details: [],
+			session_results: results,
+			degradation,
+			original_session: originalSession,
+		},
+		dryRun,
+	);
 }
 export function getConsolidationLog(beam: BeamMemoryState, limit = 10): Row[] {
 	return asRows(

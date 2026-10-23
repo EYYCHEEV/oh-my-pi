@@ -1,7 +1,8 @@
-import type { Database } from "bun:sqlite";
+import { Database } from "bun:sqlite";
 import {
 	copyFileSync,
 	existsSync,
+	linkSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
@@ -175,6 +176,57 @@ export function createBackup(dbPath?: string | null, backupDir?: string | null):
 	writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`);
 
 	return { backup_path: backupPath, metadata_path: metadataPath, ...metadata };
+}
+
+export interface LiveBackupResult {
+	readonly source: string;
+	readonly destination: string;
+	readonly size: number;
+	readonly integrity_check: true;
+}
+
+/**
+ * A consistent, standalone copy of one database that another process may be writing right now.
+ *
+ * Committed rows of a WAL database live in the `-wal` file until a checkpoint, so copying the
+ * main file alone loses them and copying the three files one by one can tear. `VACUUM INTO` reads
+ * one snapshot inside a single read transaction (it never blocks the writer), and writes a
+ * compact file that needs no `-wal` or `-shm` beside it. The copy is verified, then linked into
+ * place; an existing destination is never overwritten. Bun's `readwrite: false` is not read-only
+ * when `strict` is set, so the source is opened with the explicit `readonly` flag.
+ */
+export function backupDatabase(sourcePath: string, destinationPath: string): LiveBackupResult {
+	if (!existsSync(sourcePath)) throw new FileNotFoundError(`Database not found: ${sourcePath}`);
+	if (existsSync(destinationPath)) throw new Error(`Backup destination already exists: ${destinationPath}`);
+	mkdirSync(dirname(destinationPath), { recursive: true });
+	const tempPath = join(
+		dirname(destinationPath),
+		`.${basename(destinationPath)}.${process.pid}.${nextUniqueToken()}.backup.tmp`,
+	);
+	let source: Database | null = null;
+	try {
+		source = new Database(sourcePath, { readonly: true });
+		source.exec("PRAGMA busy_timeout=5000");
+		source.query("VACUUM INTO ?").run(tempPath);
+		source.close();
+		source = null;
+		if (!verifyIntegrity(tempPath)) throw new Error(`Backup failed integrity check: ${destinationPath}`);
+		try {
+			linkSync(tempPath, destinationPath);
+		} catch (error) {
+			if (hasErrorCode(error, "EEXIST")) throw new Error(`Backup destination already exists: ${destinationPath}`);
+			throw error;
+		}
+		return {
+			source: sourcePath,
+			destination: destinationPath,
+			size: statSync(destinationPath).size,
+			integrity_check: true,
+		};
+	} finally {
+		closeQuietly(source);
+		rmSync(tempPath, { force: true });
+	}
 }
 function isSqliteFile(bytes: Uint8Array): boolean {
 	if (bytes.length < SQLITE_HEADER.length) return false;

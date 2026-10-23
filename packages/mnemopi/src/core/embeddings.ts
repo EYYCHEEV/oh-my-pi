@@ -15,7 +15,8 @@ import {
 } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import type { EmbeddingModel } from "fastembed";
-import { loadFastembed } from "./fastembed-runtime";
+import { isFastembedModelCached } from "./fastembed-model-cache";
+import { isFastembedRuntimeInstalled, loadFastembed } from "./fastembed-runtime";
 import {
 	type EmbeddingOutput,
 	getMnemopiRuntimeOptions,
@@ -56,6 +57,8 @@ let localModelPromise: Promise<LocalEmbeddingModel> | null = null;
 let localModelInitializer: LocalModelInitializer = defaultLocalModelInitializer;
 let apiCallCount = 0;
 const queryCache = new LRUCache<string, Vector>({ max: QUERY_CACHE_MAX });
+/** Models already reported as unavailable offline, so a no-download run logs the fallback once, not per embed. */
+const offlineNotices = new Set<string>();
 
 // Provider identity table for the cache key. Each unique `provider` object/function
 // (configured via `withMnemopiRuntimeOptions`) gets a stable integer id so the cache
@@ -321,6 +324,13 @@ function fastembedModelName(modelName: string): StandardEmbeddingModel | null {
 	return id === undefined ? null : (id as StandardEmbeddingModel);
 }
 
+/** What a run that may not download still lacks to load `modelName` from disk; `null` when nothing is missing. */
+async function missingForOfflineLoad(modelName: string, cacheDir: string): Promise<string | null> {
+	if (!(await isFastembedRuntimeInstalled())) return "the fastembed runtime is not installed";
+	if (!(await isFastembedModelCached(modelName, cacheDir))) return `${modelName} is not in ${cacheDir}`;
+	return null;
+}
+
 async function getLocalModel(): Promise<LocalEmbeddingModel | null> {
 	if (isApiModel(defaultModel()) || embeddingsDisabled() || inTestRuntime()) {
 		return null;
@@ -334,6 +344,19 @@ async function getLocalModel(): Promise<LocalEmbeddingModel | null> {
 		return null;
 	}
 	const cacheDir = getFastembedCacheDir();
+	if (activeEmbeddingOptions()?.allowDownload === false) {
+		const missing = await missingForOfflineLoad(modelName, cacheDir);
+		if (missing !== null) {
+			if (!offlineNotices.has(modelName)) {
+				offlineNotices.add(modelName);
+				logger.warn(
+					"mnemopi: local embedding model not available and downloads are off (mnemopi.allowModelDownload is false); this run uses keyword search only",
+					{ model: modelName, missing },
+				);
+			}
+			return null;
+		}
+	}
 	mkdirSync(cacheDir, { recursive: true });
 	const loading = localModelInitializer({
 		model: modelName,
@@ -446,6 +469,7 @@ export function resetEmbeddingProviderForTests(): void {
 	localModelInitializer = defaultLocalModelInitializer;
 	apiCallCount = 0;
 	queryCache.clear();
+	offlineNotices.clear();
 }
 
 export const resetEmbeddingStateForTests = resetEmbeddingProviderForTests;

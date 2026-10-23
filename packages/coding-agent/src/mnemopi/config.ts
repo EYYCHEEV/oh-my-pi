@@ -6,6 +6,7 @@ import { getMemoriesDir, logger, withLoopPhase } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 
 import {
+	cfgMnemopiAllowModelDownload,
 	cfgMnemopiAutoRecall,
 	cfgMnemopiAutoRetain,
 	cfgMnemopiBank,
@@ -16,6 +17,7 @@ import {
 	cfgMnemopiEmbeddingModel,
 	cfgMnemopiEmbeddingVariant,
 	cfgMnemopiEnhancedRecall,
+	cfgMnemopiGraphLinkWindow,
 	cfgMnemopiInjectionTokenLimit,
 	cfgMnemopiLlmApiKey,
 	cfgMnemopiLlmBaseUrl,
@@ -24,11 +26,14 @@ import {
 	cfgMnemopiNoEmbeddings,
 	cfgMnemopiPolyphonicRecall,
 	cfgMnemopiProactiveLinking,
+	cfgMnemopiPruneConsolidatedDays,
 	cfgMnemopiRecallContextTurns,
 	cfgMnemopiRecallLimit,
 	cfgMnemopiRecallMaxQueryChars,
 	cfgMnemopiRetainEveryNTurns,
 	cfgMnemopiScoping,
+	cfgMnemopiTier2Days,
+	cfgMnemopiTier3Days,
 } from "./settings";
 
 export type MnemopiLlmMode = "none" | "smol" | "remote";
@@ -37,7 +42,7 @@ export type MnemopiScoping = "global" | "per-project" | "per-project-tagged";
 
 export type MnemopiProviderOptions = Pick<
 	MnemopiOptions,
-	"noEmbeddings" | "embeddingModel" | "embeddingApiUrl" | "embeddingApiKey" | "llm" | "debug"
+	"noEmbeddings" | "embeddingModel" | "embeddingApiUrl" | "embeddingApiKey" | "embeddings" | "llm" | "debug"
 >;
 
 export interface MnemopiBackendConfig {
@@ -59,6 +64,13 @@ export interface MnemopiBackendConfig {
 	recallMaxQueryChars: number;
 	injectionTokenLimit: number;
 	debug: boolean;
+	/** Episodic tier cut ages in days; `0` never cuts, `undefined` keeps the `MNEMOPI_TIER*_DAYS` defaults. */
+	tier2Days?: number;
+	tier3Days?: number;
+	/** Newest memories a new summary is linked against; `0` links against all, `undefined` keeps `MNEMOPI_GRAPH_LINK_WINDOW` (200). */
+	graphLinkWindow?: number;
+	/** Days a consolidated working row is kept after it was summarized; `0` or `undefined` keeps every row. */
+	pruneConsolidatedDays?: number;
 	providerOptions: MnemopiProviderOptions;
 	llmMode: MnemopiLlmMode;
 	llmBaseUrl?: string;
@@ -98,6 +110,10 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 		polyphonicRecall: cfgMnemopiPolyphonicRecall.get(settings),
 		enhancedRecall: cfgMnemopiEnhancedRecall.get(settings),
 		proactiveLinking: cfgMnemopiProactiveLinking.get(settings),
+		tier2Days: wholeCount(cfgMnemopiTier2Days.get(settings)),
+		tier3Days: wholeCount(cfgMnemopiTier3Days.get(settings)),
+		graphLinkWindow: wholeCount(cfgMnemopiGraphLinkWindow.get(settings)),
+		pruneConsolidatedDays: wholeCount(cfgMnemopiPruneConsolidatedDays.get(settings)),
 		retainEveryNTurns: Math.max(1, Math.floor(cfgMnemopiRetainEveryNTurns.get(settings))),
 		recallLimit: Math.max(1, Math.floor(cfgMnemopiRecallLimit.get(settings))),
 		recallContextTurns: Math.max(1, Math.floor(cfgMnemopiRecallContextTurns.get(settings))),
@@ -106,6 +122,7 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 		debug: cfgMnemopiDebug.get(settings),
 		providerOptions: {
 			noEmbeddings: cfgMnemopiNoEmbeddings.get(settings),
+			embeddings: cfgMnemopiAllowModelDownload.get(settings) ? undefined : { allowDownload: false },
 			debug: cfgMnemopiDebug.get(settings),
 			embeddingModel,
 			embeddingApiUrl: cfgMnemopiEmbeddingApiUrl.get(settings),
@@ -124,6 +141,11 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 		llmApiKey: cfgMnemopiLlmApiKey.get(settings),
 		llmModel: cfgMnemopiLlmModel.get(settings),
 	};
+}
+
+/** A configured day or memory count as a whole number; unset, negative or non-numeric values read as unset. */
+function wholeCount(value: number | undefined): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined;
 }
 
 const DEFAULT_SHARED_BANK = "default";

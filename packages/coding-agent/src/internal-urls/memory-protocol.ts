@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, isEnoent, withLoopPhase } from "@oh-my-pi/pi-utils";
+import { vetRecalledMemoryText } from "../memory-backend/redact";
 import { getMemoryRoot } from "../memories";
 import { getMnemopiSessionState, type MnemopiScopedMemoryHit, type MnemopiSessionState } from "../mnemopi/state";
 import memoryDoc from "../prompts/internal-urls/memory.md" with { type: "text" };
@@ -285,7 +286,10 @@ function tryResolveMnemopiMemory(id: string): MnemopiScopedMemoryHit | null {
  * Render a mnemopi memory row as text/markdown with a small YAML-front-matter
  * header. The frontmatter carries the metadata an agent needs to reason about
  * a working vs episodic memory (bank, store, timestamps, importance) without
- * having to reconstruct it from the recall preview.
+ * having to reconstruct it from the recall preview. The text gets the same
+ * scan as recall: hidden Unicode stripped, credentials redacted. A row recall
+ * withholds as injection-shaped is still shown here, so it can be inspected
+ * before it is forgotten.
  */
 function renderMnemopiMemory(url: InternalUrl, hit: MnemopiScopedMemoryHit): InternalResource {
 	return withLoopPhase("mnemopi.read", () => {
@@ -305,7 +309,7 @@ function renderMnemopiMemory(url: InternalUrl, hit: MnemopiScopedMemoryHit): Int
 			(row.session_id ? `session_id: ${row.session_id}\n` : "") +
 			meta +
 			"---\n\n";
-		const content = `${header}${row.content}`;
+		const content = vetRecalledMemoryText(`${header}${row.content}`).text;
 		return {
 			url: url.href,
 			content,

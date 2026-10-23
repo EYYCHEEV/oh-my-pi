@@ -67,6 +67,28 @@ export interface BeamConfig {
 	polyphonicRecall?: boolean;
 	/** Per-instance enhanced recall (query cache) gate; `undefined` defers to the process-wide default. */
 	enhancedRecall?: boolean;
+	/**
+	 * Age in days at which a tier 1 episodic row is cut to its first 800 characters (tier 2).
+	 * `0` never cuts. Unset defers to `MNEMOPI_TIER2_DAYS` (30).
+	 */
+	tier2Days?: number;
+	/**
+	 * Age in days at which a tier 2 episodic row is cut to its key sentences (tier 3).
+	 * `0` never cuts. Unset defers to `MNEMOPI_TIER3_DAYS` (180).
+	 */
+	tier3Days?: number;
+	/**
+	 * Days a working row is kept after `sleep` summarized it. Once a row has been consolidated for this
+	 * long, and a live episodic summary lists it in `summary_of`, `sleep` deletes the row and its
+	 * full-text, vector and annotation entries; the summary and the facts extracted from the row stay.
+	 * Unconsolidated and `IMPORTED` rows are never deleted. Unset or `0` keeps every row (the default).
+	 */
+	pruneConsolidatedDays?: number;
+	/**
+	 * Newest known memories a new episodic summary (or proactively linked memory) is linked against.
+	 * `0` links against every memory. Unset defers to `MNEMOPI_GRAPH_LINK_WINDOW` (200).
+	 */
+	graphLinkWindow?: number;
 }
 
 export interface BeamMemoryOptions {
@@ -190,10 +212,11 @@ export interface RecallOptions {
 	mmrLambda?: number;
 	/**
 	 * Maximum characters of `content` returned per {@link RecallResult}. When the
-	 * stored content exceeds this, the preview is clipped and the trailing
-	 * character is replaced with `…` so callers can see it was truncated. The
-	 * full row is always reachable via {@link BeamMemoryState.get}. `0` or a
-	 * negative value disables clipping. Defaults to
+	 * stored content exceeds this, the preview is clipped and each cut side is
+	 * marked with `…` so callers can see it was truncated. The preview is the head
+	 * of the row, or a window around the query's match when the match lies past
+	 * the head. The full row is always reachable via {@link BeamMemoryState.get}.
+	 * `0` or a negative value disables clipping. Defaults to
 	 * {@link RECALL_CONTENT_PREVIEW_CHARS} (500).
 	 */
 	contentPreviewChars?: number;
@@ -267,8 +290,9 @@ export type RecallResult = RecallRowFields & {
 	/**
 	 * True when {@link content} is a clipped preview of the stored row. The
 	 * clip is capped at {@link RecallOptions.contentPreviewChars} (default 500)
-	 * and the last character is replaced with `…`. Fetch the full row via
-	 * `memory://<id>` (mnemopi backend) or the `Mnemopi.get(id)` API.
+	 * and each cut side is replaced with `…`: a leading `…` means the preview
+	 * starts past the head of the row, around what the query matched. Fetch the
+	 * full row via `memory://<id>` (mnemopi backend) or the `Mnemopi.get(id)` API.
 	 */
 	truncated?: boolean;
 	/** Original character count of `content` before {@link truncated} clipping. */
@@ -299,16 +323,43 @@ export interface BeamStats {
 	[key: string]: JsonValue | Record<string, number> | undefined;
 }
 
+/** What `forget` did to one bank. */
+export interface ForgetOutcome {
+	/** The working row existed in this session and is gone. */
+	deleted: boolean;
+	/** Retained transcript rows rewritten to cut the forgotten text out. */
+	scrubbedRows: number;
+	/** Set when the text was too short to scrub from transcripts, to the shortest length that is scrubbed. */
+	skippedBelowChars: number | null;
+	/**
+	 * What the memory said and what the extractor made of it, trimmed, in memory only. A session that forgets a memory
+	 * in one bank hands them to the other banks it recalls from (`scrubForgottenTexts`). Empty when nothing was forgotten
+	 * or the text was too short to scrub.
+	 */
+	forgottenTexts: string[];
+}
+
 export interface MemoriaRetrieveResult {
 	ability: string;
 	query: string;
 	results: unknown[];
 }
 
+/** Outcome of one `pruneConsolidatedWorkingMemory` run. */
+export interface PruneResult {
+	/** `no_op`: nothing was eligible. `dry_run`: `pruned` rows would go. `failed`: logged, rows stay for the next run. */
+	status: "pruned" | "no_op" | "dry_run" | "failed";
+	pruned: number;
+	/** The file was compacted (`VACUUM`) because the run left a quarter of it, and 4 MiB or more, free. */
+	reclaimed: boolean;
+}
+
 export interface SleepResult {
 	dry_run: boolean;
 	sessions?: Record<string, unknown>;
 	items_consolidated?: number;
+	/** Present only when `pruneConsolidatedDays` is set: what the pruning step did in this run. */
+	pruned?: PruneResult;
 	[key: string]: unknown;
 }
 

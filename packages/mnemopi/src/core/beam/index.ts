@@ -25,6 +25,7 @@ import { initBeam } from "./schema";
 import {
 	exportToDict,
 	forgetWorking,
+	forgetWorkingDetailed,
 	get,
 	getContext,
 	getGlobalWorkingStats,
@@ -36,6 +37,7 @@ import {
 	scratchpadClear,
 	scratchpadRead,
 	scratchpadWrite,
+	scrubForgottenTexts,
 	updateWorking,
 } from "./store";
 import type {
@@ -45,6 +47,7 @@ import type {
 	BeamMemoryOptions,
 	BeamMemoryState,
 	BeamStats,
+	ForgetOutcome,
 	ImportStats,
 	MemoriaRetrieveResult,
 	Metadata,
@@ -93,6 +96,10 @@ function normalizeConfig(options: BeamMemoryOptions): BeamConfig {
 		// is consulted at recall time; the env vars still win over both.
 		polyphonicRecall: options.polyphonicRecall ?? configured.polyphonicRecall,
 		enhancedRecall: options.enhancedRecall ?? configured.enhancedRecall,
+		tier2Days: configured.tier2Days,
+		tier3Days: configured.tier3Days,
+		graphLinkWindow: configured.graphLinkWindow,
+		pruneConsolidatedDays: configured.pruneConsolidatedDays,
 	};
 }
 function autoMigrateAnnotations(db: Database, dbPath: string | undefined): void {
@@ -251,6 +258,16 @@ export class BeamMemory implements BeamMemoryState {
 
 	forgetWorking(memoryId: string): boolean {
 		return forgetWorking(this, memoryId);
+	}
+
+	/** `forgetWorking` that also reports the transcript rows it scrubbed, or that the text was too short to scrub. */
+	forgetWorkingDetailed(memoryId: string): ForgetOutcome {
+		return forgetWorkingDetailed(this, memoryId);
+	}
+
+	/** Cut `texts` out of this bank's retained transcripts and what was built from them; deletes no memory. */
+	scrubForgottenTexts(texts: readonly string[]): number {
+		return scrubForgottenTexts(this, texts);
 	}
 
 	consolidateToEpisodic(

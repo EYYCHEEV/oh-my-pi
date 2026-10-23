@@ -137,6 +137,15 @@ An upgrade fails before build or installation if the block is stale, any require
 - `oauth-account-pool-controls`: OAuth account pause and exact-account launch restriction
 - `daemon-completion-delivery-recovery`: Bounded daemon completion delivery recovery
 - `mnemopi-working-memory-retention`: Mnemopi working-memory trim promotes expired rows instead of deleting them
+- `mnemopi-memory-hygiene`: Mnemopi retires consolidated copies, scans memory text in and out, previews the matched part, reaches older vectors, and survives concurrent first creation
+- `mnemopi-live-backup`: Mnemopi can take a consistent single-file backup of a database another process is writing (mnemopi backup, backupDatabase)
+- `mnemopi-tier-days-setting`: Mnemopi episodic tier cut ages are settable per config (mnemopi.tier2Days, mnemopi.tier3Days)
+- `mnemopi-retain-expiry`: The retain tool accepts an expiry that becomes the memory's valid_until (Mnemopi backend only)
+- `mnemopi-stop-signal-retention`: Mnemopi retains pending turns the moment a stop signal lands, and nothing when mnemopi.autoRetain is off
+- `mnemopi-graph-link-window`: Episodic graph linking is bounded to the newest N memories (mnemopi.graphLinkWindow), so session start stays flat as history grows
+- `mnemopi-offline-embeddings`: An unattended run can refuse to install fastembed or download the embedding model (mnemopi.allowModelDownload)
+- `mnemopi-retain-ids`: The retain tool returns the ids of the memories it stored (Mnemopi backend)
+- `mnemopi-prune-consolidated`: Mnemopi bounds database growth by deleting consolidated working rows N days after their summary (mnemopi.pruneConsolidatedDays, off by default)
 <!-- stronk-omp:fork-contracts:end -->
 
 ## Upstream alignment

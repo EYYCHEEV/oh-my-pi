@@ -4,7 +4,7 @@ import type * as MnemopiNs from "@oh-my-pi/pi-mnemopi";
 import type { Mnemopi, RecallResult } from "@oh-my-pi/pi-mnemopi";
 import type * as MnemopiCoreNs from "@oh-my-pi/pi-mnemopi/core";
 import type { LocalModelInitializer } from "@oh-my-pi/pi-mnemopi/core";
-import { logger, prompt, toError, withLoopPhase } from "@oh-my-pi/pi-utils";
+import { logger, postmortem, prompt, toError, withLoopPhase } from "@oh-my-pi/pi-utils";
 import {
 	composeRecallQuery,
 	prepareEmbeddableRetentionTranscript,
@@ -23,7 +23,7 @@ import {
 } from "../memory-backend/recall-entry";
 import { memoryToolRefs } from "../memory-backend/tool-names";
 import type { MemoryPromptPreparation } from "../memory-backend/types";
-import { redactMemorySecrets, redactRememberWrite } from "../memory-backend/redact";
+import { redactMemorySecrets, redactRememberWrite, vetRecalledMemoryText } from "../memory-backend/redact";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import memoryRecallChangesPrompt from "../prompts/system/memory-recall-changes.md" with { type: "text" };
 import mnemopiInstructions from "../prompts/system/mnemopi-instructions.md" with { type: "text" };
@@ -35,6 +35,11 @@ import { cfgMnemopiInjectionTokenLimit } from "./settings";
 interface RecallBlock {
 	text: string;
 	memories: Array<{ id: string; text: string; offset: number }>;
+}
+
+/** A recall result whose text the recall scan refused to show; `content` already holds a notice instead. */
+interface ScopedRecallResult extends RecallResult {
+	withheld?: string;
 }
 
 // The mnemopi package pulls the embeddings stack; keep it off the CLI startup
@@ -129,6 +134,8 @@ export interface MnemopiMemoryEditResult {
 	status: "updated" | "deleted" | "invalidated" | "not_found" | "not_editable";
 	bank?: string;
 	store?: MnemopiMemoryStore;
+	/** Set when `forget` could not scrub the retained transcripts, with the reason. */
+	note?: string;
 }
 
 /** Which mnemopi table a resolved memory id lives in. `fact` rows are
@@ -251,6 +258,18 @@ export interface MnemopiSessionStateOptions {
 	hasRecalledForFirstTurn?: boolean;
 }
 
+/** Cleanup reasons of a process that goes away without a session dispose having to run first. */
+const PROCESS_STOP_REASONS: Partial<Record<postmortem.Reason, true>> = {
+	[postmortem.Reason.SIGINT]: true,
+	[postmortem.Reason.SIGTERM]: true,
+	[postmortem.Reason.SIGHUP]: true,
+	[postmortem.Reason.UNCAUGHT_EXCEPTION]: true,
+	[postmortem.Reason.UNHANDLED_REJECTION]: true,
+};
+
+/** SQLite lock wait for the final write of a stopping process, which has seconds left rather than minutes. */
+const STOP_BUSY_TIMEOUT_MS = 1_500;
+
 export class MnemopiSessionState {
 	sessionId: string;
 	readonly config: MnemopiBackendConfig;
@@ -265,6 +284,9 @@ export class MnemopiSessionState {
 	unsubscribe?: () => void;
 	#retentionCursorLoaded = false;
 	#recallGeneration = 0;
+	#stopping = false;
+	#disposed = false;
+	#cancelStopHook: (() => void) | undefined;
 
 	constructor(options: MnemopiSessionStateOptions) {
 		this.sessionId = options.sessionId;
@@ -404,7 +426,15 @@ export class MnemopiSessionState {
 					continue;
 				}
 				if (op === "forget") {
-					if (target.memory.forget(id)) return { status: "deleted", ...resultContext };
+					const outcome = target.memory.forgetDetailed(id);
+					if (outcome.deleted) {
+						this.#scrubForgottenElsewhere(targets, target, outcome.forgottenTexts);
+						const note =
+							outcome.skippedBelowChars === null
+								? undefined
+								: `Transcripts were not scrubbed: the text is shorter than ${outcome.skippedBelowChars} characters, so retained transcripts may still quote it.`;
+						return { status: "deleted", ...resultContext, ...(note === undefined ? {} : { note }) };
+					}
 					ineligible ??= { status: "not_found", ...resultContext };
 					continue;
 				}
@@ -415,6 +445,31 @@ export class MnemopiSessionState {
 			}
 			return ineligible ?? { status: "not_found" };
 		});
+	}
+
+	/**
+	 * `forget` scrubs the transcripts of the bank the memory lived in. A session also recalls from, and
+	 * retains transcripts into, other banks, which may quote the same text: scrub those too, and leave them the
+	 * tombstones that cut it out of transcripts retained later. The memory is already deleted, so a failure here
+	 * is logged, not thrown.
+	 */
+	#scrubForgottenElsewhere(
+		targets: readonly MnemopiScopedMemory[],
+		forgotten: MnemopiScopedMemory,
+		texts: readonly string[],
+	): void {
+		if (texts.length === 0) return;
+		for (const other of targets) {
+			if (other === forgotten) continue;
+			try {
+				other.memory.scrubForgottenTexts(texts);
+			} catch (error) {
+				logger.warn("Mnemopi: scrubbing forgotten text from transcripts failed", {
+					bank: other.bank,
+					error: toError(error).message,
+				});
+			}
+		}
 	}
 
 	formatScopedRecallWithIds(results: readonly RecallResult[]): string {
@@ -432,7 +487,7 @@ export class MnemopiSessionState {
 		});
 	}
 
-	async collectScopedRecallResults(query: string): Promise<RecallResult[]> {
+	async collectScopedRecallResults(query: string): Promise<ScopedRecallResult[]> {
 		const merged: RecallResult[] = [];
 		const byId = new Map<string, number>();
 		const byContent = new Map<string, number>();
@@ -481,7 +536,7 @@ export class MnemopiSessionState {
 			}
 			merged.sort(compareRecallResults);
 			if (merged.length > this.config.recallLimit) merged.length = this.config.recallLimit;
-			return merged;
+			return merged.map(scanRecalledResult);
 		});
 	}
 
@@ -494,8 +549,9 @@ export class MnemopiSessionState {
 		format: "bullet" | "json" = "bullet",
 	): string | undefined {
 		return withLoopPhase("mnemopi.recall", () => {
-			if (results.length === 0) return undefined;
-			return this.memory.beam.formatContext(results, format);
+			const shown = results.filter(result => !isWithheldResult(result));
+			if (shown.length === 0) return undefined;
+			return this.memory.beam.formatContext(shown, format);
 		});
 	}
 
@@ -537,7 +593,7 @@ export class MnemopiSessionState {
 
 	/** Recalls `query` into a prompt block plus the memories it holds; undefined when aborted. */
 	async #recallBlock(query: string, signal?: AbortSignal): Promise<RecallBlock | undefined> {
-		const results = await this.collectScopedRecallResults(query);
+		const results = (await this.collectScopedRecallResults(query)).filter(result => result.withheld === undefined);
 		if (signal?.aborted) return undefined;
 		if (results.length === 0) return { text: "", memories: [] };
 		const { text, offsets } = formatRecallBlock(results);
@@ -602,12 +658,20 @@ export class MnemopiSessionState {
 			}
 			// Compare what a fresh recall would show: a fact recalls as its object.
 			const content = hit.store === "fact" ? factRecallContent(hit.row.metadata) : hit.row.content;
-			const text = recalledText(clipRecallContent(content).content);
-			// A cut memory changed only if the part the model saw did.
-			if (memory.cut ? text.startsWith(memory.text) : text === memory.text) {
+			// The model saw a clip of the row, a window around the match for a long one, so the row has
+			// changed only if the part that was shown did.
+			if (shownPartUnchanged(memory.text, recalledText(content), memory.cut === true)) {
 				current.push(memory);
 				continue;
 			}
+			// The note shows the row where the old window was, found by the words that window held.
+			const shown = clipRecallContent(content, undefined, shownWordGroups(memory.text)).content;
+			// A memory the recall scan now withholds drops out of a fresh recall like a deleted one.
+			if (vetRecalledMemoryText(shown).withheld !== undefined) {
+				removed.push(quoteMemoryText(memory.text));
+				continue;
+			}
+			const text = recalledText(shown);
 			current.push({ id: memory.id, text });
 			updated.push({ before: quoteMemoryText(memory.text), after: quoteMemoryText(text) });
 		}
@@ -685,6 +749,37 @@ export class MnemopiSessionState {
 		return await this.recallForContext(truncated);
 	}
 
+	/**
+	 * Marks the session as stopping. From here on automatic retention stores text but schedules no
+	 * model-backed fact extraction, so a stop never starts a new model call.
+	 */
+	beginStop(): void {
+		this.#stopping = true;
+	}
+
+	/**
+	 * Graceful-stop retention for a signalled or crashing process (SIGTERM, SIGINT, SIGHUP, fatal
+	 * error): stores the turns not yet retained, without fact extraction, the moment the signal lands.
+	 * The session's own teardown retains them too, but only after its slower steps (post-prompt drain,
+	 * extension shutdown handlers, autolearn drain: up to about 10 s), and a mode without a session
+	 * teardown on signals (RPC) never does. The write itself is synchronous, so it is done before the
+	 * returned promise settles and before the process can be told to exit; `dispose` retains whatever
+	 * arrives after it. Nothing is stored when `mnemopi.autoRetain` is off. SIGKILL cannot run any of this.
+	 */
+	retainOnStop(): Promise<void> {
+		this.beginStop();
+		if (this.aliasOf || this.#disposed || !this.config.autoRetain) return Promise.resolve();
+		try {
+			this.#boundOwnedBusyTimeout(STOP_BUSY_TIMEOUT_MS);
+			return this.forceRetainCurrentSession({ extract: false }).catch((error: unknown) => {
+				this.#logLifecycleFailure("stop retention", [this.scoped.retain.bank], error);
+			});
+		} catch (error) {
+			this.#logLifecycleFailure("stop retention", [this.scoped.retain.bank], error);
+			return Promise.resolve();
+		}
+	}
+
 	async maybeRetainOnAgentEnd(_messages: AgentMessage[]): Promise<void> {
 		if (!this.config.autoRetain || this.aliasOf) return;
 		const userTurns = withLoopPhase("mnemopi.retain", () => {
@@ -699,6 +794,7 @@ export class MnemopiSessionState {
 		});
 		await this.retainMessages(messages, `${this.sessionId}-${Date.now()}`, {
 			retainedThroughUserTurn: userTurns,
+			...(this.#stopping ? { extract: false } : {}),
 		});
 		this.lastRetainedTurn = userTurns;
 	}
@@ -788,6 +884,10 @@ export class MnemopiSessionState {
 					this.#logLifecycleFailure("agent_end retention", [this.scoped.retain.bank], error);
 				});
 			}
+		});
+		this.#cancelStopHook?.();
+		this.#cancelStopHook = postmortem.register(`mnemopi-retain:${this.sessionId}`, reason => {
+			return PROCESS_STOP_REASONS[reason] ? this.retainOnStop() : undefined;
 		});
 	}
 	#logLifecycleFailure(operation: string, banks: readonly string[], error: unknown): void {
@@ -953,6 +1053,10 @@ export class MnemopiSessionState {
 	async dispose(options: { consolidate?: boolean; timeoutMs?: number; retain?: boolean } = {}): Promise<void> {
 		this.#recallGeneration++;
 		this.unsubscribe?.();
+		this.#disposed = true;
+		this.#stopping = true;
+		this.#cancelStopHook?.();
+		this.#cancelStopHook = undefined;
 		this.unsubscribe = undefined;
 		if (this.aliasOf) return;
 		const closeOwned = (): void => {
@@ -1137,6 +1241,12 @@ function createMemory(config: MnemopiBackendConfig, bank: string): Mnemopi {
 		proactiveLinking: config.proactiveLinking,
 		polyphonicRecall: config.polyphonicRecall,
 		enhancedRecall: config.enhancedRecall,
+		beamConfig: {
+			tier2Days: config.tier2Days,
+			tier3Days: config.tier3Days,
+			graphLinkWindow: config.graphLinkWindow,
+			pruneConsolidatedDays: config.pruneConsolidatedDays,
+		},
 	} as ConstructorParameters<typeof Mnemopi>[0]);
 }
 
@@ -1193,14 +1303,65 @@ function formatRecallBlock(results: RecallResult[]): { text: string; offsets: nu
 	return { text: `${text}\n</memories>`, offsets };
 }
 
-/** A recalled memory's text as the recall block shows it. */
+/** A recalled memory's text as the recall block shows it: markers stripped, then neutralised by the recall scan. */
 function recalledText(content: string): string {
-	return stripRetentionProtocolMarkers(content) || content;
+	return vetRecalledMemoryText(stripRetentionProtocolMarkers(content) || content).text;
+}
+
+/**
+ * Runs the recall scan over one result before anything renders it: the text and the source label are
+ * neutralised (hidden Unicode stripped, credentials redacted, a quoted memories tag broken), and a row
+ * that reads as an instruction to the model is replaced by a notice and flagged `withheld`.
+ */
+function scanRecalledResult(result: RecallResult): ScopedRecallResult {
+	const verdict = vetRecalledMemoryText(stripRetentionProtocolMarkers(result.content) || result.content);
+	const sourceVerdict = result.source ? vetRecalledMemoryText(result.source) : undefined;
+	const withheld = verdict.withheld ?? sourceVerdict?.withheld;
+	if (withheld !== undefined) {
+		return {
+			...result,
+			content: `[withheld: ${withheld} pattern; inspect it with memory:// or remove it with memory_edit]`,
+			source: sourceVerdict?.withheld === undefined ? result.source : null,
+			withheld,
+		};
+	}
+	if (verdict.text === result.content && (sourceVerdict === undefined || sourceVerdict.text === result.source)) {
+		return result;
+	}
+	return { ...result, content: verdict.text, ...(sourceVerdict ? { source: sourceVerdict.text } : {}) };
+}
+
+function isWithheldResult(result: RecallResult): boolean {
+	return (result as ScopedRecallResult).withheld !== undefined;
 }
 
 /** Neutralises markup in memory text quoted into a note, so it cannot close or forge the note's tags. */
 function quoteMemoryText(text: string): string {
 	return text.replaceAll("<", "&lt;");
+}
+
+/**
+ * Whether the part of a memory the model saw is still in its current text. `shown` is a recall
+ * preview: the whole row, or a clip with `…` on each cut side, where a clip that starts in `…` is a
+ * window past the head of the row. A memory cut by the prompt budget ends mid-preview, so its tail is
+ * unknown. `now` is the row's current text as recall would render it.
+ */
+function shownPartUnchanged(shown: string, now: string, cut: boolean): boolean {
+	const leading = shown.startsWith("…");
+	const trailing = !cut && shown.endsWith("…");
+	const core = shown.slice(leading ? 1 : 0, trailing ? -1 : undefined);
+	if (leading) return trailing || cut ? now.includes(core) : now.endsWith(core);
+	return trailing || cut ? now.startsWith(core) : now === core;
+}
+
+/** The distinct words of what the model saw, as one-term groups for `clipRecallContent`. */
+function shownWordGroups(shown: string): string[][] {
+	const words = new Set<string>();
+	for (const match of shown.toLowerCase().matchAll(/[\p{L}\p{N}]{3,}/gu)) {
+		words.add(match[0]);
+		if (words.size >= 60) break;
+	}
+	return [...words].map(word => [word]);
 }
 
 /** A fact row's `{subject, predicate, object, source_msg_id}` metadata, or an empty record. */

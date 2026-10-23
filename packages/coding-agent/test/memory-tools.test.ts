@@ -420,7 +420,7 @@ describe("retain.execute (Mnemopi backend)", () => {
 			items: [{ content: "user prefers tabs", context: "editor configuration" }],
 		});
 
-		expect(result.content[0]).toEqual({ type: "text", text: "1 memory stored." });
+		expect((result.content[0] as { text: string }).text).toStartWith("1 memory stored.\nid: ");
 
 		// Verify the memory was actually stored by recalling it
 		const recallTool = MemoryRecallTool.createIf(makeSession(settings))!;
@@ -443,7 +443,7 @@ describe("retain.execute (Mnemopi backend)", () => {
 			],
 		});
 
-		expect(result.content[0]).toEqual({ type: "text", text: "3 memories stored." });
+		expect((result.content[0] as { text: string }).text).toStartWith("3 memories stored.\nids: ");
 
 		// Verify all memories are recallable
 		const recallTool = MemoryRecallTool.createIf(makeSession(settings))!;
@@ -521,7 +521,7 @@ describe("retain.execute (Mnemopi backend)", () => {
 			items: [{ content: "the user prefers zsh across projects", scope: "global" }],
 		});
 
-		expect(result.content[0]).toEqual({ type: "text", text: "1 memory stored." });
+		expect((result.content[0] as { text: string }).text).toStartWith("1 memory stored.\nid: ");
 		const projectRows = state.memory.beam.db.query("SELECT content FROM working_memory").all() as Array<{
 			content: string;
 		}>;
