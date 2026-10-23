@@ -95,9 +95,10 @@ class Client:
 
 
 def create_command(image, run_id):
+    # A fixed, run-scoped name lets the owner prove removal in addition to the exact run label.
     return ["create", "--pull=never", "--cpus=4", "--memory=24g", "--memory-swap=24g", "--pids-limit=1024",
             "--log-driver=none", "--security-opt=no-new-privileges", "--workdir=/src",
-            *receipt.witness_label(run_id), "--entrypoint=/bin/bash", image,
+            *receipt.witness_label(run_id), f"--name=omp-build-{run_id}-prepare", "--entrypoint=/bin/bash", image,
             "/recipe/linux-amd64-build.sh", "prepare-runtime"]
 
 
@@ -123,7 +124,7 @@ def build_command(context, image_file, commit, epoch, run_id, tag="", tag_object
 
 def prepare(args, root=None):
     root = root or Path(__file__).resolve().parent.parent
-    require(args.commit == receipt.APPLICATION_COMMIT, "Wrong application source")
+    require(receipt.match(receipt.OID, args.commit), "A full application commit is required")
     require(receipt.match(receipt.OID, args.recipe_commit), "A full reviewed recipe commit is required")
     require(args.witness_run_id, "A witness run identifier is required")
     receipt.witness_label(args.witness_run_id)
@@ -132,6 +133,8 @@ def prepare(args, root=None):
     require(receipt.capture("git", "-C", str(root), "rev-parse", "HEAD").strip() == args.recipe_commit,
             "The reviewed recipe must be the checked out commit")
     receipt.assert_recipes(root, args.recipe_commit)
+    # Refuse an application this recipe cannot qualify before any daemon contact.
+    qualify.application_preflight(root, args.commit)
     tag = getattr(args, "tag", "")
     allowed, revoked = getattr(args, "allowed_signers", None), getattr(args, "revoked_signers", None)
     tag_object = ""
@@ -235,13 +238,13 @@ def copy_dependencies(source=Path("/src"), prepared=PREPARED / "source"):
 def prepared_metadata(prepared, manifest, bun):
     source = prepared / "source"
     grep = prepared / "native-grep-regression"
-    require(manifest["source"]["commit"] == receipt.APPLICATION_COMMIT, "Prepared application differs")
+    require(receipt.match(receipt.OID, manifest["source"]["commit"]), "Prepared application differs")
     require(receipt.digest(bun) == manifest["build_inputs"]["host_tools"]["bun"]["sha256"], "Prepared Bun bytes differ")
     locks = {name: receipt.digest(source / name) for name in receipt.LOCKS}
     require(locks == manifest["build_inputs"]["locks"], "Prepared locks differ")
     require(grep.is_file() and not grep.is_symlink() and os.access(grep, os.X_OK), "Native regression executable is missing")
     require(receipt.elf(grep)["interpreter"] == "ld-linux-x86-64.so.2", "A GNU amd64 native regression is required")
-    return {"schema": 1, "source_commit": receipt.APPLICATION_COMMIT, "bun_version": "1.4.2", "locks": locks,
+    return {"schema": 1, "source_commit": manifest["source"]["commit"], "bun_version": receipt.BUN_VERSION, "locks": locks,
             "dependency_tree_sha256": qualify.dependency_digest(source), "native_grep_sha256": receipt.digest(grep)}
 
 
@@ -280,6 +283,20 @@ class Parser(argparse.ArgumentParser):
         raise ValueError("Invalid runtime preparation arguments")
 
 
+def parser():
+    result = Parser(description=__doc__)
+    result.add_argument("--commit", required=True)
+    result.add_argument("--recipe-commit", required=True)
+    result.add_argument("--tag", default="")
+    result.add_argument("--allowed-signers", type=Path)
+    result.add_argument("--revoked-signers", type=Path)
+    result.add_argument("--docker-socket", required=True)
+    result.add_argument("--witness-run-id", required=True)
+    result.add_argument("--output", required=True)
+    result.add_argument("--image-id-file", required=True, type=Path)
+    return result
+
+
 def main():
     try:
         if sys.argv[1:] == ["--inside-dependencies"]:
@@ -288,17 +305,7 @@ def main():
         if sys.argv[1:] == ["--inside-prepare"]:
             inside_prepare()
             return
-        parser = Parser(description=__doc__)
-        parser.add_argument("--commit", required=True)
-        parser.add_argument("--recipe-commit", required=True)
-        parser.add_argument("--tag", default="")
-        parser.add_argument("--allowed-signers", type=Path)
-        parser.add_argument("--revoked-signers", type=Path)
-        parser.add_argument("--docker-socket", required=True)
-        parser.add_argument("--witness-run-id", required=True)
-        parser.add_argument("--output", required=True)
-        parser.add_argument("--image-id-file", required=True, type=Path)
-        prepare(parser.parse_args())
+        prepare(parser().parse_args())
     except (ValueError, OSError, KeyError, TypeError, AttributeError, IndexError, UnicodeError, subprocess.SubprocessError, tarfile.TarError):
         raise SystemExit("Linux-amd64 runtime preparation rejected; private status retained; no publication permitted.") from None
 

@@ -2,6 +2,7 @@
 """Allowlisted Linux release provenance and shared local trust boundaries."""
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -15,7 +16,9 @@ import tarfile
 import tempfile
 
 REPOSITORY = "EYYCHEEV/oh-my-pi"
-APPLICATION_COMMIT = "5e43891a87140fb0972c982f3027f0228c4f6378"
+# The application commit is an input, never a constant. Toolchain pins below are the recipe's own.
+BUN_VERSION = "1.4.2"
+BAZEL_VERSION = "9.2.0"
 ASSETS = ("omp-linux-amd64", "RELEASE_MANIFEST.json", "SHA256SUMS.txt")
 RECIPES = ("build-linux-amd64.sh", "linux-amd64.Dockerfile", "linux-amd64-receipt.py",
            "qualify-linux-amd64.sh", "linux-amd64-qualify.py", "linux-amd64-smoke.sh",
@@ -37,9 +40,13 @@ ATTESTATION_NAMESPACE = "stronk-omp-qualification"
 ATTESTATION_IDENTITY = "stronk-omp-qualification"
 
 
+class RouteError(ValueError):
+    """A fixed, path-free refusal that is safe to show to the caller."""
+
+
 def require(condition, message):
     if not condition:
-        raise ValueError(message)
+        raise RouteError(message)
 
 
 def strict_json(data):
@@ -57,8 +64,11 @@ def canonical_json(value):
 
 
 def digest(path):
+    result = hashlib.sha256()
     with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            result.update(chunk)
+    return result.hexdigest()
 
 
 def capture(*args):
@@ -77,6 +87,48 @@ def commit_exists(root, commit):
             "Wrong commit object")
 
 
+def git_has(root, rev, path):
+    require(match(OID, rev), "A full immutable Git object is required")
+    return subprocess.run(["git", "-C", str(root), "cat-file", "-e", f"{rev}:{path}"],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=False).returncode == 0
+
+
+def bun_requirement(spec):
+    # Only an exact pin or a ">=" floor can be judged; anything else fails closed.
+    require(match(r"(?:>=)?[0-9]+\.[0-9]+(?:\.[0-9]+)?", spec),
+            "The application's Bun requirement is neither an exact pin nor a floor; a new recipe commit is required")
+    numbers = tuple(int(part) for part in spec.removeprefix(">=").split("."))
+    pinned = tuple(int(part) for part in BUN_VERSION.split("."))
+    if spec.startswith(">="):
+        satisfied = pinned >= numbers
+    else:
+        satisfied = pinned == numbers + (0,) * (len(pinned) - len(numbers))
+    require(satisfied, f"The application needs Bun {spec} but this recipe pins Bun {BUN_VERSION}; a new recipe commit is required")
+
+
+def check_toolchain(root, commit):
+    """Compare the toolchain this recipe pins with what the application commit declares, before any build."""
+    commit_exists(root, commit)
+    for name in LOCKS:
+        require(git_has(root, commit, name), f"The application commit lacks {name}; a new recipe commit is required")
+    bazel = git_bytes(root, commit, ".bazelversion").decode("ascii", "replace").strip()
+    shown = bazel if match(r"[0-9A-Za-z.+-]{1,32}", bazel) else "an unreadable version"
+    require(bazel == BAZEL_VERSION, f"The application needs Bazel {shown} but this recipe pins Bazel {BAZEL_VERSION}; a new recipe commit is required")
+    package = strict_json(git_bytes(root, commit, "package.json"))
+    manager = package.get("packageManager") if isinstance(package, dict) else None
+    if manager is not None:
+        require(match(r"bun@.{1,32}", manager), "The application uses a package manager other than Bun; a new recipe commit is required")
+        bun_requirement(manager[len("bun@"):])
+    application = strict_json(git_bytes(root, commit, "packages/coding-agent/package.json"))
+    engines = application.get("engines") if isinstance(application, dict) else None
+    if isinstance(engines, dict) and engines.get("bun") is not None:
+        require(isinstance(engines["bun"], str), "The application's Bun engine declaration is unreadable; a new recipe commit is required")
+        bun_requirement(engines["bun"])
+    version = application.get("version") if isinstance(application, dict) else None
+    require(match(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?", version), "The application version is not a release version")
+    return version
+
+
 def assert_recipes(root, recipe_commit):
     commit_exists(root, recipe_commit)
     for name in RECIPES:
@@ -87,7 +139,7 @@ def assert_recipes(root, recipe_commit):
 
 
 def validate_tag(root, commit, tag, allowed_signers, revoked_signers=None):
-    require(commit == APPLICATION_COMMIT and match(TAG, tag), "Wrong fleet source or namespace")
+    require(match(OID, commit) and match(TAG, tag), "A full application commit and a fleet tag name are required")
     commit_exists(root, commit)
     require(allowed_signers is not None and Path(allowed_signers).is_file() and
             Path(allowed_signers).stat().st_size > 0, "Explicit enrolled public signers are required")
@@ -221,7 +273,7 @@ def verify(directory, commit, tag, release, recipe_commit="", root=None):
     require(match(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?", manifest["version"]), "Invalid version")
     source = manifest["source"]
     keys(source, ("commit", "tag", "tag_object", "source_date_epoch", "recipe_committed", "recipe_commit"))
-    require(commit == APPLICATION_COMMIT and source["commit"] == commit, "Wrong exact application commit")
+    require(match(OID, commit) and source["commit"] == commit, "Wrong exact application commit")
     require(source["tag"] == (tag or None) and (not tag or match(TAG, tag)), "Wrong exact source tag")
     require((source["tag_object"] is None and not tag) or (bool(tag) and match(OID, source["tag_object"])), "Invalid tag object")
     require(type(source["recipe_committed"]) is bool and type(source["source_date_epoch"]) is int and source["source_date_epoch"] > 0,
@@ -329,7 +381,6 @@ def verify_attestation(manifest, attestation, signers):
 def build(args):
     root = Path(__file__).resolve().parent.parent
     commit_exists(root, args.commit)
-    require(args.commit == APPLICATION_COMMIT, "The fleet application source is fixed")
     require(match(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.output), "Output must be a new dist child")
     tag_object = ""
     if args.candidate:
@@ -400,25 +451,47 @@ class Parser(argparse.ArgumentParser):
         raise SystemExit("Invalid Linux-amd64 route arguments; no action is permitted.")
 
 
-def main():
-    parser = Parser(description=__doc__)
-    parser.add_argument("mode", choices=("create", "verify", "build"))
-    parser.add_argument("directory", type=Path, nargs="?")
-    parser.add_argument("--commit", default="")
-    parser.add_argument("--recipe-commit", default="")
-    parser.add_argument("--tag", default="")
-    parser.add_argument("--release", action="store_true")
-    parser.add_argument("--allowed-signers", type=Path)
-    parser.add_argument("--revoked-signers", type=Path)
-    parser.add_argument("--attestation", type=Path)
-    parser.add_argument("--qualification-signers", type=Path)
-    parser.add_argument("--docker-socket", default="")
-    parser.add_argument("--candidate", action="store_true")
-    parser.add_argument("--receipts", action="store_true")
-    parser.add_argument("--output", default="linux-amd64")
-    parser.add_argument("--witness-run-id", default="")
-    args = parser.parse_args()
+def parser():
+    result = Parser(description=__doc__)
+    result.add_argument("mode", choices=("create", "verify", "build", "check"))
+    result.add_argument("directory", type=Path, nargs="?")
+    result.add_argument("--commit", default="")
+    result.add_argument("--recipe-commit", default="")
+    result.add_argument("--tag", default="")
+    result.add_argument("--release", action="store_true")
+    result.add_argument("--allowed-signers", type=Path)
+    result.add_argument("--revoked-signers", type=Path)
+    result.add_argument("--attestation", type=Path)
+    result.add_argument("--qualification-signers", type=Path)
+    result.add_argument("--docker-socket", default="")
+    result.add_argument("--candidate", action="store_true")
+    result.add_argument("--receipts", action="store_true")
+    result.add_argument("--output", default="linux-amd64")
+    result.add_argument("--witness-run-id", default="")
+    return result
+
+
+def check(args):
+    # The fork-contract snapshot belongs to the qualifier; load it only for this early refusal.
+    spec = importlib.util.spec_from_file_location("linux_amd64_qualify", Path(__file__).with_name("linux-amd64-qualify.py"))
+    qualifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(qualifier)
     try:
+        version, contracts = qualifier.application_preflight(Path(__file__).resolve().parent.parent, args.commit)
+    except ValueError as error:
+        # The qualifier loads its own copy of this module, so its fixed refusals are another class.
+        if type(error).__name__ == "RouteError":
+            raise RouteError(str(error)) from None
+        raise
+    print(f"Application check passed: omp {version}, Bazel {BAZEL_VERSION}, Bun {BUN_VERSION}, {contracts} fork contracts.")
+
+
+def main():
+    args = parser().parse_args()
+    try:
+        if args.mode == "check":
+            check(args)
+            return
         if args.mode == "build":
             build(args)
         elif args.mode == "create":
@@ -430,7 +503,13 @@ def main():
                         "Explicit qualification evidence and public signers are required")
                 verify_attestation(manifest, args.attestation, args.qualification_signers)
         print("Public linux-amd64 receipt verified.")
+    except RouteError as error:
+        if args.mode == "check":
+            raise SystemExit("Application check failed: " + str(error)) from None
+        raise SystemExit("Public linux-amd64 route rejected; no asset publication is permitted.") from None
     except (ValueError, OSError, KeyError, TypeError, AttributeError, subprocess.SubprocessError, tarfile.TarError):
+        if args.mode == "check":
+            raise SystemExit("Application check failed: the application or recipe objects could not be read.") from None
         raise SystemExit("Public linux-amd64 route rejected; no asset publication is permitted.") from None
 
 

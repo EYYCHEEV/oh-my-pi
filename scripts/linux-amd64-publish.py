@@ -164,7 +164,6 @@ def snapshot(source, destination):
 def publish(args):
     require(args.publish, "Explicit publication approval is required")
     require(re.fullmatch(OID, args.commit) and re.fullmatch(OID, args.recipe_commit) and re.fullmatch(TAG, args.tag), "Exact source, recipe, and tag inputs are required")
-    require(args.commit == receipt.APPLICATION_COMMIT, "Wrong exact application source")
     approved_at = witness(args.immutability_witness)
     receipt.assert_recipes(ROOT, args.recipe_commit)
     tag_object = receipt.validate_tag(ROOT, args.commit, args.tag, args.allowed_signers, args.revoked_signers)

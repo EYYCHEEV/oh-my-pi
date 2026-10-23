@@ -26,6 +26,7 @@ qualify = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(qualify)
 receipt = qualify.receipt
 IMAGE_DIGEST = "sha256:" + "1" * 64
+COMMIT = "5e43891a87140fb0972c982f3027f0228c4f6378"
 IMAGE = "registry.invalid/private-account/runtime@" + IMAGE_DIGEST
 RECIPE = "a" * 40
 TAG = "stronk-omp-s1-2026.10.16.0001"
@@ -40,7 +41,7 @@ def fixture(directory, committed=False):
     native_elf = dict(elf, interpreter=None, glibc_required="2.28")
     manifest = {
         "schema": 2, "repository": receipt.REPOSITORY, "target": "linux-amd64", "version": "18.8.0",
-        "source": {"commit": receipt.APPLICATION_COMMIT, "tag": TAG if committed else None,
+        "source": {"commit": COMMIT, "tag": TAG if committed else None,
                    "tag_object": "b" * 40 if committed else None, "source_date_epoch": 1,
                    "recipe_committed": committed, "recipe_commit": RECIPE if committed else None},
         "build_inputs": {
@@ -161,7 +162,7 @@ class DaemonTests(unittest.TestCase):
                 reference_link.symlink_to("missing")
                 symlink_mode = reference_link.lstat().st_mode & 0o777
                 destination = Path(temporary) / "source"
-                qualify.export_source(Path("/fixture"), receipt.APPLICATION_COMMIT, destination)
+                qualify.export_source(Path("/fixture"), COMMIT, destination)
                 self.assertEqual(destination.stat().st_mode & 0o777, 0o755)
                 for path in (destination / "nested", destination / "nested/deeper",
                              destination / "implicit", destination / "implicit/parents"):
@@ -274,6 +275,46 @@ class BoundaryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 qualify.boundary_commands(source)
 
+    def preflight(self, files, commit="c" * 40):
+        with patch.object(receipt, "check_toolchain", return_value="18.12.6") as toolchain, \
+             patch.object(receipt, "git_has", return_value=True), \
+             patch.object(receipt, "git_bytes", side_effect=lambda _root, _rev, path: files[path]):
+            result = qualify.application_preflight(Path("fixture-tree"), commit)
+        toolchain.assert_called_once_with(Path("fixture-tree"), commit)
+        return result
+
+    def readme(self, names=None):
+        names = list(qualify.BOUNDARIES) if names is None else names
+        block = "\n".join(f"- `{name}`: Fixture" for name in names)
+        return {"README.md": ("<!-- stronk-omp:fork-contracts:start -->\n" + block +
+                              "\n<!-- stronk-omp:fork-contracts:end -->\n").encode()}
+
+    def test_application_preflight_accepts_a_matching_application_without_a_checkout(self):
+        self.assertEqual(self.preflight(self.readme()), ("18.12.6", 27))
+
+    def test_application_preflight_refuses_changed_contracts_or_missing_tests_with_a_clear_reason(self):
+        names = list(qualify.BOUNDARIES)
+        for files, reason in (
+                (self.readme(names[1:]), "fork contracts differ from this recipe's registry snapshot"),
+                (self.readme(names + ["unreviewed-contract"]), "fork contracts differ from this recipe's registry snapshot"),
+                ({"README.md": b"no contract block here\n"}, "Missing immutable boundary map")):
+            with self.subTest(reason=reason), self.assertRaises(receipt.RouteError) as raised:
+                self.preflight(files)
+            self.assertIn(reason, str(raised.exception))
+        with patch.object(receipt, "check_toolchain", return_value="18.12.6"), \
+             patch.object(receipt, "git_has", return_value=False), \
+             patch.object(receipt, "git_bytes", side_effect=lambda _root, _rev, path: self.readme()[path]):
+            with self.assertRaises(receipt.RouteError) as raised:
+                qualify.application_preflight(Path("fixture-tree"), "c" * 40)
+        self.assertIn("missing from the application: packages/coding-agent/test/required-extension-gate.test.ts", str(raised.exception))
+
+    def test_toolchain_mismatch_surfaces_before_any_contract_work(self):
+        with patch.object(receipt, "check_toolchain", side_effect=receipt.RouteError("The application needs Bazel 9.3.0")), \
+             patch.object(receipt, "git_bytes") as read:
+            with self.assertRaises(receipt.RouteError):
+                qualify.application_preflight(Path("fixture-tree"), "c" * 40)
+        read.assert_not_called()
+
 
 class BaselineTests(unittest.TestCase):
     FLAGS = {"ssse3", "sse4_1", "sse4_2", "popcnt", "cx16", "lahf_lm", "pni"}
@@ -346,7 +387,7 @@ class PreparedRuntimeTests(unittest.TestCase):
         manifest["build_inputs"]["host_tools"]["bun"]["sha256"] = receipt.digest(bun)
         grep = prepared / "native-grep-regression"
         grep.write_bytes(b"prebuilt test fixture")
-        metadata = {"schema": 1, "source_commit": receipt.APPLICATION_COMMIT, "bun_version": "1.4.2",
+        metadata = {"schema": 1, "source_commit": COMMIT, "bun_version": "1.4.2",
                     "locks": manifest["build_inputs"]["locks"], "dependency_tree_sha256": qualify.dependency_digest(frozen),
                     "native_grep_sha256": receipt.digest(grep)}
         (prepared / "dependencies.json").write_text(json.dumps(metadata))
@@ -399,13 +440,13 @@ class CompletionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             manifest = fixture(directory)
-            self.finalize(directory, manifest, success(manifest), IMAGE_DIGEST, False, receipt.APPLICATION_COMMIT, "")
-            completed = receipt.verify(directory, receipt.APPLICATION_COMMIT, "", False, root=False)
+            self.finalize(directory, manifest, success(manifest), IMAGE_DIGEST, False, COMMIT, "")
+            completed = receipt.verify(directory, COMMIT, "", False, root=False)
             self.assertIs(completed["source"]["recipe_committed"], False)
             self.assertIsNone(completed["source"]["recipe_commit"])
             self.assertEqual(completed["checks"], {check: "passed" for check in receipt.CHECKS})
             with self.assertRaises(ValueError):
-                receipt.verify(directory, receipt.APPLICATION_COMMIT, "", True, root=False)
+                receipt.verify(directory, COMMIT, "", True, root=False)
             self.assertEqual({item.name for item in directory.iterdir()}, set(receipt.ASSETS))
             receipt.verify_attestation(completed, self.attestation, self.signers)
             evidence = receipt.strict_json(self.attestation.read_bytes())
@@ -419,12 +460,12 @@ class CompletionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             manifest = fixture(directory, committed=True)
-            self.finalize(directory, manifest, success(manifest), IMAGE_DIGEST, False, receipt.APPLICATION_COMMIT, RECIPE)
-            completed = receipt.verify(directory, receipt.APPLICATION_COMMIT, TAG, True, RECIPE, root=False)
+            self.finalize(directory, manifest, success(manifest), IMAGE_DIGEST, False, COMMIT, RECIPE)
+            completed = receipt.verify(directory, COMMIT, TAG, True, RECIPE, root=False)
             receipt.verify_attestation(completed, self.attestation, self.signers)
             self.assertEqual(receipt.strict_json(self.attestation.read_bytes()), {
                 "schema": 1, "binary_sha256": receipt.digest(directory / receipt.ASSETS[0]),
-                "source_commit": receipt.APPLICATION_COMMIT, "recipe_commit": RECIPE,
+                "source_commit": COMMIT, "recipe_commit": RECIPE,
                 "runtime_image_digest": IMAGE_DIGEST, "mode": "release",
                 "checks": {check: "passed" for check in receipt.CHECKS},
                 "manifest_sha256": hashlib.sha256((directory / receipt.ASSETS[1]).read_bytes()).hexdigest(),
@@ -448,7 +489,7 @@ class CompletionTests(unittest.TestCase):
             original = (directory / receipt.ASSETS[1]).read_bytes()
             for result in bad_results:
                 with self.assertRaises(ValueError):
-                    self.finalize(directory, manifest, result, IMAGE_DIGEST, False, receipt.APPLICATION_COMMIT, "")
+                    self.finalize(directory, manifest, result, IMAGE_DIGEST, False, COMMIT, "")
                 self.assertEqual((directory / receipt.ASSETS[1]).read_bytes(), original)
                 self.assertFalse(self.attestation.exists())
                 self.assertFalse(Path(str(self.attestation) + ".sig").exists())
@@ -460,13 +501,13 @@ class CompletionTests(unittest.TestCase):
             with (directory / receipt.ASSETS[0]).open("ab") as binary:
                 binary.write(b"changed")
             with self.assertRaises(ValueError):
-                self.finalize(directory, manifest, success(manifest), IMAGE_DIGEST, False, receipt.APPLICATION_COMMIT, "")
+                self.finalize(directory, manifest, success(manifest), IMAGE_DIGEST, False, COMMIT, "")
             manifest = fixture(directory)
             other = copy.deepcopy(manifest)
             other["source"]["source_date_epoch"] = 2
             receipt.save_manifest(directory, other)
             with self.assertRaises(ValueError):
-                self.finalize(directory, manifest, success(manifest), IMAGE_DIGEST, False, receipt.APPLICATION_COMMIT, "")
+                self.finalize(directory, manifest, success(manifest), IMAGE_DIGEST, False, COMMIT, "")
 
     def test_wrong_tuple_or_environment_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -485,7 +526,7 @@ class CompletionTests(unittest.TestCase):
 
 
 class HostFlowTests(unittest.TestCase):
-    def run_fixture(self, directory, *, committed=False, fail=False, changed=False, duplicate=False, stages=b"", invalid_stages=False):
+    def run_fixture(self, directory, *, committed=False, fail=False, changed=False, duplicate=False, stages=b"", invalid_stages=False, run_id=""):
         assets, root = directory / "assets", directory / "root"
         assets.mkdir()
         (root / "scripts").mkdir(parents=True)
@@ -494,8 +535,8 @@ class HostFlowTests(unittest.TestCase):
             (root / "scripts" / name).write_text("offline recipe fixture\n")
             manifest["build_inputs"]["recipe"][name] = receipt.digest(root / "scripts" / name)
         receipt.save_manifest(assets, manifest)
-        args = argparse.Namespace(commit=receipt.APPLICATION_COMMIT, recipe_commit=RECIPE if committed else "", assets=assets,
-                                  runtime_image=IMAGE, docker_socket="unix:///runtime/docker.sock")
+        args = argparse.Namespace(commit=COMMIT, recipe_commit=RECIPE if committed else "", assets=assets,
+                                  runtime_image=IMAGE, docker_socket="unix:///runtime/docker.sock", witness_run_id=run_id)
         args.attestation_key, signers = signing_fixture(directory)
         args.attestation = directory / "qualification.json"
         cleanup = Mock()
@@ -569,6 +610,15 @@ class HostFlowTests(unittest.TestCase):
             cleanup.assert_called_once()
             self.assertEqual(cleanup.call_args.args[0][-3:-1], ["rm", "--force"])
             self.assertEqual(len(calls), 4)
+            if run_id:
+                # A fixed, run-scoped name lets the owner prove removal; the run label is the sweep key.
+                self.assertEqual(cleanup.call_args.args[0][-1], f"omp-build-{run_id}-qualify")
+                self.assertEqual(calls[3][calls[3].index("--name") + 1], f"omp-build-{run_id}-qualify")
+                self.assertIn("org.stronk.omp-witness=" + run_id, calls[3])
+
+    def test_run_scoped_container_name_is_fixed_and_removed_by_that_name(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            self.run_fixture(Path(temporary), run_id="b20261023153012-3fa9c1d2")
 
     def test_normal_candidate_and_committed_flows_with_fake_daemon(self):
         old = os.umask(0o077)
@@ -598,7 +648,7 @@ class HostFlowTests(unittest.TestCase):
             "qualify-host-inputs", "qualify-host-runtime", "qualify-host-source", "qualify-host-execute"])
 
     def test_cli_sanitizes_subprocess_failures(self):
-        arguments = ["qualify", "--commit", receipt.APPLICATION_COMMIT, "--assets", "/fixture/assets", "--runtime-image", IMAGE,
+        arguments = ["qualify", "--commit", COMMIT, "--assets", "/fixture/assets", "--runtime-image", IMAGE,
                      "--docker-socket", "unix:///runtime/docker.sock",
                      "--attestation-key", "fixture-key", "--attestation", "fixture-attestation"]
         output = io.StringIO()
@@ -639,7 +689,7 @@ class RuntimeStartupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             request = root / "request.json"
-            request.write_text(json.dumps({"manifest": {"source": {"commit": receipt.APPLICATION_COMMIT}},
+            request.write_text(json.dumps({"manifest": {"source": {"commit": COMMIT}},
                                            "runtime_image": IMAGE_DIGEST}))
             cpu = root / "cpuinfo"
             cpu.write_text("flags: ssse3 sse4_1 sse4_2 popcnt cx16 lahf_lm pni\n")

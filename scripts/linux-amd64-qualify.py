@@ -149,36 +149,60 @@ def forward_stages(stream):
         announce_stage(line[:-1])
 
 
-def boundary_commands(source, *, with_stages=False):
-    text = (source / "README.md").read_text()
+def contract_ids(text):
     start, end = "<!-- stronk-omp:fork-contracts:start -->", "<!-- stronk-omp:fork-contracts:end -->"
     require(text.count(start) == text.count(end) == 1, "Missing immutable boundary map")
     block = text.split(start, 1)[1].split(end, 1)[0]
     ids = re.findall(r"^- `([a-z0-9-]+)`:", block, re.MULTILINE)
-    require(len(ids) == len(set(ids)) and set(ids) == set(BOUNDARIES), "Active boundary snapshot differs")
+    require(len(ids) == len(set(ids)) and set(ids) == set(BOUNDARIES),
+            "The application's fork contracts differ from this recipe's registry snapshot; a new recipe commit is required")
+    return ids
+
+
+def registry_command(command):
+    """Split one registry entry into its argv and relative test paths without touching any tree."""
+    args = shlex.split(command)
+    require(args[:2] == ["bun", "test"], "Unsupported boundary command")
+    paths = []
+    index = 2
+    while index < len(args):
+        if args[index] == "--test-name-pattern":
+            require(index + 1 < len(args) and args[index + 1], "Invalid boundary filter")
+            index += 2
+            continue
+        require(args[index].endswith(".test.ts"), "Immutable boundary test is missing")
+        paths.append(args[index])
+        index += 1
+    require(paths, "Boundary command has no tests")
+    return args, paths
+
+
+def boundary_commands(source, *, with_stages=False):
+    ids = contract_ids((source / "README.md").read_text())
     commands = []
     for contract in ids:
         require(bool(BOUNDARIES[contract]), "Active verification is missing")
         for number, command in enumerate(BOUNDARIES[contract], 1):
-            args = shlex.split(command)
-            require(args[:2] == ["bun", "test"], "Unsupported boundary command")
-            paths = []
-            index = 2
-            while index < len(args):
-                if args[index] == "--test-name-pattern":
-                    require(index + 1 < len(args) and args[index + 1], "Invalid boundary filter")
-                    index += 2
-                    continue
-                path = source / args[index]
-                require(args[index].endswith(".test.ts") and path.is_file() and
-                        path.resolve().is_relative_to(source.resolve()), "Immutable boundary test is missing")
-                paths.append(path)
-                index += 1
-            require(paths, "Boundary command has no tests")
+            args, paths = registry_command(command)
+            for relative in paths:
+                path = source / relative
+                require(path.is_file() and path.resolve().is_relative_to(source.resolve()), "Immutable boundary test is missing")
             # Preserve every registry command, including repeated files with distinct filters.
             args.append("--timeout=30000")
             commands.append((f"qualify-boundary-{contract}-{number}", args) if with_stages else args)
     return commands
+
+
+def application_preflight(root, commit):
+    """Refuse an application commit this recipe cannot qualify, before any build or daemon contact."""
+    version = receipt.check_toolchain(root, commit)
+    ids = contract_ids(receipt.git_bytes(root, commit, "README.md").decode("utf-8", "replace"))
+    for contract in ids:
+        for command in BOUNDARIES[contract]:
+            for relative in registry_command(command)[1]:
+                require(receipt.git_has(root, commit, relative),
+                        f"A fork-boundary test this recipe runs is missing from the application: {relative}")
+    return version, len(ids)
 
 
 def docker_output(docker, args, timeout=30):
@@ -308,7 +332,7 @@ def finalize(directory, before, result, image, root, commit, recipe_commit, atte
 def qualify(args, root=None):
     announce_stage("qualify-host-inputs")
     root = root or Path(__file__).resolve().parent.parent
-    require(args.commit == receipt.APPLICATION_COMMIT, "Wrong application source")
+    require(receipt.match(receipt.OID, args.commit), "A full application commit is required")
     require(receipt.match(receipt.IMAGE, args.runtime_image) or receipt.match(receipt.DIGEST, args.runtime_image),
             "Immutable runtime image is required")
     receipt.witness_label(getattr(args, "witness_run_id", ""))
@@ -357,7 +381,9 @@ def qualify(args, root=None):
             require(hashlib.sha256(data).hexdigest() == before["build_inputs"]["recipe"][name], "Invoked recipe differs")
             (recipes / name).write_bytes(data)
             (recipes / name).chmod(0o444)
-        name = "omp-qualification-" + uuid.uuid4().hex
+        run_id = getattr(args, "witness_run_id", "")
+        # A run-scoped fixed name lets a supervisor prove removal; a one-off run keeps a random name.
+        name = f"omp-build-{run_id}-qualify" if run_id else "omp-qualification-" + uuid.uuid4().hex
         try:
             command = container_command(docker, args.runtime_image, work, name, getattr(args, "witness_run_id", ""))
             announce_stage("qualify-host-execute")
@@ -528,7 +554,7 @@ def runtime_main():
     request = receipt.strict_json(Path("/input/assets/request.json").read_text())
     receipt.keys(request, ("manifest", "runtime_image"))
     manifest, image = request["manifest"], request["runtime_image"]
-    require(manifest["source"]["commit"] == receipt.APPLICATION_COMMIT and receipt.match(receipt.DIGEST, image), "Wrong runtime request")
+    require(receipt.match(receipt.OID, manifest["source"]["commit"]) and receipt.match(receipt.DIGEST, image), "Wrong runtime request")
     announce_stage("qualify-cpu", inside=True)
     # Inspect architecture and CPU flags only, never host/network identity.
     flags = re.findall(r"^flags\s*:\s*(.*)$", Path("/proc/cpuinfo").read_text(), re.MULTILINE)
@@ -624,21 +650,25 @@ class PublicParser(argparse.ArgumentParser):
         raise ValueError("Invalid qualification arguments")
 
 
+def parser():
+    result = PublicParser(description=__doc__)
+    result.add_argument("--commit", required=True)
+    result.add_argument("--recipe-commit", default="")
+    result.add_argument("--assets", required=True, type=Path)
+    result.add_argument("--runtime-image", required=True)
+    result.add_argument("--docker-socket", required=True)
+    result.add_argument("--attestation-key", required=True, type=Path)
+    result.add_argument("--attestation", required=True, type=Path)
+    result.add_argument("--witness-run-id", default="")
+    return result
+
+
 def main():
     try:
         if sys.argv[1:] == ["--inside"]:
             runtime_main()
             return
-        parser = PublicParser(description=__doc__)
-        parser.add_argument("--commit", required=True)
-        parser.add_argument("--recipe-commit", default="")
-        parser.add_argument("--assets", required=True, type=Path)
-        parser.add_argument("--runtime-image", required=True)
-        parser.add_argument("--docker-socket", required=True)
-        parser.add_argument("--attestation-key", required=True, type=Path)
-        parser.add_argument("--attestation", required=True, type=Path)
-        parser.add_argument("--witness-run-id", default="")
-        qualify(parser.parse_args())
+        qualify(parser().parse_args())
         print("Linux-amd64 qualification passed; exact public assets finalized.")
     except (ValueError, OSError, KeyError, TypeError, AttributeError, IndexError, subprocess.SubprocessError, tarfile.TarError):
         if sys.argv[1:] == ["--inside"]:

@@ -19,6 +19,7 @@ SPEC.loader.exec_module(runtime)
 receipt = runtime.receipt
 VALIDATE_DOCKER = receipt.validate_docker
 RECIPE = "a" * 40
+COMMIT = "5e43891a87140fb0972c982f3027f0228c4f6378"
 WORKSPACE = "sha256:" + "b" * 64
 IMAGE = "sha256:" + "c" * 64
 CONTAINER = "d" * 64
@@ -67,7 +68,7 @@ class PreparationTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        self.args = argparse.Namespace(commit=receipt.APPLICATION_COMMIT, recipe_commit=RECIPE,
+        self.args = argparse.Namespace(commit=COMMIT, recipe_commit=RECIPE,
                                        docker_socket="unix:///fixture/docker.sock", witness_run_id="offline-fixture",
                                        output="candidate", image_id_file=self.root / "image-id")
         self.client = FakeClient([], self.root)
@@ -83,6 +84,7 @@ class PreparationTests(unittest.TestCase):
         self.verify = self.stack.enter_context(patch.object(receipt, "verify", return_value=self.manifest))
         self.factory = self.stack.enter_context(patch.object(runtime, "Client", return_value=self.client))
         self.stack.enter_context(patch.object(runtime, "export_inputs", side_effect=self.export))
+        self.preflight = self.stack.enter_context(patch.object(runtime.qualify, "application_preflight", return_value=("18.8.0", 27)))
         # A missed fake must fail closed, never contact Docker, Git, or a build.
         self.stack.enter_context(patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected process")))
         self.stack.enter_context(patch.object(subprocess, "run", side_effect=AssertionError("unexpected process")))
@@ -189,8 +191,22 @@ class PreparationTests(unittest.TestCase):
         self.transport.assert_not_called()
         self.factory.assert_not_called()
 
+    def test_any_application_commit_is_built_after_the_early_application_check(self):
+        self.args.commit = "e" * 40
+        self.run_preparation()
+        self.preflight.assert_called_once_with(self.root, "e" * 40)
+        build = next(command for command in self.client.commands if command[0] == "build")
+        self.assertIn("SOURCE_COMMIT=" + "e" * 40, build)
+
+    def test_application_the_recipe_cannot_qualify_is_refused_before_any_daemon(self):
+        self.preflight.side_effect = receipt.RouteError("The application needs Bazel 9.3.0 but this recipe pins Bazel 9.2.0")
+        with self.assertRaises(ValueError):
+            self.run_preparation()
+        self.transport.assert_not_called()
+        self.factory.assert_not_called()
+
     def test_early_input_rejections_never_construct_client(self):
-        cases = ({"commit": "e" * 40}, {"recipe_commit": "short"}, {"witness_run_id": ""},
+        cases = ({"commit": "short"}, {"commit": "E" * 40}, {"recipe_commit": "short"}, {"witness_run_id": ""},
                  {"witness_run_id": "bad label"}, {"witness_run_id": "a" * 49},
                  {"output": "../escape"}, {"output": "/absolute"},
                  {"image_id_file": self.root / "dist/candidate/image-id"})
@@ -299,7 +315,9 @@ class ContractTests(unittest.TestCase):
         for value in ("--cpus=4", "--memory=24g", "--memory-swap=24g", "--pids-limit=1024", "--log-driver=none",
                       "--pull=never", "org.stronk.omp-witness=fixture-run"):
             self.assertIn(value, command)
-        self.assertFalse(any(value.startswith(("--mount", "--volume", "--env", "--secret", "--name")) for value in command))
+        self.assertFalse(any(value.startswith(("--mount", "--volume", "--env", "--secret")) for value in command))
+        # Only the fixed, run-scoped name; the label stays the exact sweep key.
+        self.assertEqual([value for value in command if value.startswith("--name")], ["--name=omp-build-fixture-run-prepare"])
         self.assertEqual(command[-3:], [WORKSPACE, "/recipe/linux-amd64-build.sh", "prepare-runtime"])
         with self.assertRaises(ValueError):
             runtime.create_command(WORKSPACE, "invalid label")
@@ -358,8 +376,8 @@ class ContractTests(unittest.TestCase):
             context = Path(temporary)
             with patch.object(runtime.qualify, "export_source") as source, \
                     patch.object(receipt, "git_bytes", side_effect=lambda _root, _rev, name: name.encode()) as git:
-                runtime.export_inputs(context, receipt.APPLICATION_COMMIT, RECIPE, context)
-            source.assert_called_once_with(context, receipt.APPLICATION_COMMIT, context / "source")
+                runtime.export_inputs(context, COMMIT, RECIPE, context)
+            source.assert_called_once_with(context, COMMIT, context / "source")
             self.assertEqual(git.call_count, len(receipt.RECIPES))
             for name in receipt.RECIPES:
                 self.assertEqual((context / "recipe" / name).read_bytes(), ("scripts/" + name).encode())
@@ -394,7 +412,7 @@ class ContractTests(unittest.TestCase):
             grep.chmod(0o755)
             bun = prepared / "bun"
             bun.write_bytes(b"pinned bun")
-            manifest = {"source": {"commit": receipt.APPLICATION_COMMIT}, "build_inputs": {
+            manifest = {"source": {"commit": COMMIT}, "build_inputs": {
                 "host_tools": {"bun": {"sha256": receipt.digest(bun)}},
                 "locks": {name: receipt.digest(source / name) for name in receipt.LOCKS}}}
             with patch.object(receipt, "elf", return_value={"interpreter": "ld-linux-x86-64.so.2"}), \

@@ -6,10 +6,12 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 from pathlib import Path
 import socket
 import struct
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -18,7 +20,7 @@ from unittest.mock import Mock, patch
 SPEC = importlib.util.spec_from_file_location("receipt", Path(__file__).with_name("linux-amd64-receipt.py"))
 receipt = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(receipt)
-COMMIT = receipt.APPLICATION_COMMIT
+COMMIT = "5e43891a87140fb0972c982f3027f0228c4f6378"
 RECIPE = "a" * 40
 TAG = "stronk-omp-s1-2026.10.16.0001"
 TAG_OID = "b" * 40
@@ -372,6 +374,127 @@ class LocalBoundaryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 receipt.build(args)
             docker.assert_not_called()
+
+
+OTHER = "c" * 40
+
+
+class ApplicationCommitTests(unittest.TestCase):
+    """The application commit is an input; the recipe only checks it against its own pins."""
+
+    def tree(self, bazel="9.2.0\n", manager="bun@>=1.4", engine=">=1.3.14", version="18.12.6", missing=()):
+        files = {name: b"locked\n" for name in receipt.LOCKS if name not in missing}
+        files[".bazelversion"] = bazel.encode()
+        root = {"name": "root"}
+        if manager is not None:
+            root["packageManager"] = manager
+        application = {"version": version}
+        if engine is not None:
+            application["engines"] = {"bun": engine}
+        files["package.json"] = json.dumps(root).encode()
+        files["packages/coding-agent/package.json"] = json.dumps(application).encode()
+        return files
+
+    def check(self, **options):
+        files = self.tree(**options)
+        with patch.object(receipt, "commit_exists"), \
+             patch.object(receipt, "git_has", side_effect=lambda _root, _rev, path: path in files), \
+             patch.object(receipt, "git_bytes", side_effect=lambda _root, _rev, path: files[path]):
+            return receipt.check_toolchain(Path("fixture-tree"), OTHER)
+
+    def test_matching_pins_and_floors_pass_and_report_the_version(self):
+        self.assertEqual(self.check(), "18.12.6")
+        self.assertEqual(self.check(manager="bun@1.4.2", engine="1.4.2"), "18.12.6")
+        self.assertEqual(self.check(manager=None, engine=None), "18.12.6")
+
+    def test_toolchain_mismatches_fail_closed_with_a_clear_reason(self):
+        cases = (
+            ({"bazel": "9.3.0\n"}, "Bazel 9.3.0 but this recipe pins Bazel 9.2.0"),
+            ({"manager": "bun@>=1.5"}, "Bun >=1.5 but this recipe pins Bun 1.4.2"),
+            ({"manager": "bun@1.4.3"}, "Bun 1.4.3 but this recipe pins Bun 1.4.2"),
+            ({"engine": ">=2.0.0"}, "Bun >=2.0.0 but this recipe pins Bun 1.4.2"),
+            ({"manager": "bun@^1.4"}, "neither an exact pin nor a floor"),
+            ({"manager": "pnpm@9.0.0"}, "package manager other than Bun"),
+            ({"missing": ("Cargo.lock",)}, "lacks Cargo.lock"),
+            ({"version": "latest"}, "not a release version"),
+        )
+        for options, reason in cases:
+            with self.subTest(options=options), self.assertRaises(receipt.RouteError) as raised:
+                self.check(**options)
+            self.assertIn(reason, str(raised.exception))
+
+    def test_check_cli_end_to_end_in_a_throwaway_repository(self):
+        environment = {"PATH": os.defpath, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "scripts").mkdir()
+            for name in ("linux-amd64-receipt.py", "linux-amd64-qualify.py"):
+                shutil.copy(Path(__file__).with_name(name), root / "scripts" / name)
+            files = self.tree()
+            files["README.md"] = b"# An application without the fork contract map\n"
+            for name, data in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_bytes(data)
+
+            def git(*arguments):
+                return REAL_RUN(["git", "-C", str(root), "-c", "user.name=fixture", "-c", "user.email=fixture@invalid", *arguments],
+                                capture_output=True, text=True, check=True, timeout=60, env=environment).stdout.strip()
+            git("init", "-q")
+            git("add", "-A")
+            git("commit", "-q", "-m", "application")
+            commit = git("rev-parse", "HEAD")
+            result = REAL_RUN([sys.executable, str(root / "scripts/linux-amd64-receipt.py"), "check", "--commit", commit],
+                              capture_output=True, text=True, timeout=60, env=environment)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("Application check failed: Missing immutable boundary map", result.stderr)
+            self.assertNotIn(temporary, result.stdout + result.stderr)
+
+    def test_unprintable_application_text_never_reaches_the_reason(self):
+        with self.assertRaises(receipt.RouteError) as raised:
+            self.check(bazel="9.9.9\n\x1b[31m$(touch pwn)\n")
+        self.assertNotIn("touch", str(raised.exception))
+        self.assertNotIn("\x1b", str(raised.exception))
+
+    def test_check_mode_prints_only_a_fixed_reason(self):
+        arguments = ["linux-amd64-receipt.py", "check", "--commit", OTHER]
+        for failure, expected in (
+                (receipt.RouteError("The application needs Bazel 9.3.0 but this recipe pins Bazel 9.2.0"),
+                 "Application check failed: The application needs Bazel 9.3.0"),
+                (subprocess.CalledProcessError(128, ["git", "/private/path"]),
+                 "Application check failed: the application or recipe objects could not be read.")):
+            with self.subTest(expected=expected), patch("sys.argv", arguments), patch.object(receipt, "check", side_effect=failure):
+                with self.assertRaises(SystemExit) as raised:
+                    receipt.main()
+                self.assertTrue(str(raised.exception).startswith(expected))
+                self.assertNotIn("private", str(raised.exception))
+        with patch("sys.argv", ["linux-amd64-receipt.py", "verify", "dist/x", "--commit", OTHER]), \
+             patch.object(receipt, "verify", side_effect=receipt.RouteError("detail with /private/path")):
+            with self.assertRaises(SystemExit) as raised:
+                receipt.main()
+            self.assertNotIn("private", str(raised.exception))
+
+    def test_any_application_commit_is_verified_against_its_own_tree(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            manifest = make_assets(directory)
+            manifest["source"]["commit"] = OTHER
+            manifest["qualification"]["source_commit"] = OTHER
+            receipt.save_manifest(directory, manifest)
+            with patch.object(receipt, "git_bytes", side_effect=lambda root, rev, name: tree_bytes(root, COMMIT if rev == OTHER else rev, name)), \
+                 patch.object(receipt, "commit_exists"), patch.object(receipt, "capture", return_value=str(EPOCH)):
+                self.assertEqual(receipt.verify(directory, OTHER, TAG, True, RECIPE, Path("fixture-tree"))["source"]["commit"], OTHER)
+                # The tuple must still name exactly the commit the caller asked for.
+                with self.assertRaises(ValueError):
+                    receipt.verify(directory, COMMIT, TAG, True, RECIPE, Path("fixture-tree"))
+                with self.assertRaises(ValueError):
+                    receipt.verify(directory, "short", TAG, True, RECIPE, Path("fixture-tree"))
+
+    def test_tag_validation_names_only_a_full_commit_and_the_fleet_namespace(self):
+        with patch.object(receipt, "commit_exists") as exists:
+            for commit, tag in (("short", TAG), (OTHER, "stronk-omp-legacy"), (OTHER.upper(), TAG)):
+                with self.subTest(commit=commit, tag=tag), self.assertRaises(ValueError):
+                    receipt.validate_tag(Path("fixture-tree"), commit, tag, Path("public-signers"))
+            exists.assert_not_called()
 
 
 if __name__ == "__main__":
