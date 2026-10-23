@@ -29,6 +29,8 @@ import {
 	cfgMnemopiRecallMaxQueryChars,
 	cfgMnemopiRetainEveryNTurns,
 	cfgMnemopiScoping,
+	cfgMnemopiTier2Days,
+	cfgMnemopiTier3Days,
 } from "./settings";
 
 export type MnemopiLlmMode = "none" | "smol" | "remote";
@@ -59,6 +61,9 @@ export interface MnemopiBackendConfig {
 	recallMaxQueryChars: number;
 	injectionTokenLimit: number;
 	debug: boolean;
+	/** Episodic tier cut ages in days; `0` never cuts, `undefined` keeps the `MNEMOPI_TIER*_DAYS` defaults. */
+	tier2Days?: number;
+	tier3Days?: number;
 	providerOptions: MnemopiProviderOptions;
 	llmMode: MnemopiLlmMode;
 	llmBaseUrl?: string;
@@ -98,6 +103,8 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 		polyphonicRecall: cfgMnemopiPolyphonicRecall.get(settings),
 		enhancedRecall: cfgMnemopiEnhancedRecall.get(settings),
 		proactiveLinking: cfgMnemopiProactiveLinking.get(settings),
+		tier2Days: wholeDays(cfgMnemopiTier2Days.get(settings)),
+		tier3Days: wholeDays(cfgMnemopiTier3Days.get(settings)),
 		retainEveryNTurns: Math.max(1, Math.floor(cfgMnemopiRetainEveryNTurns.get(settings))),
 		recallLimit: Math.max(1, Math.floor(cfgMnemopiRecallLimit.get(settings))),
 		recallContextTurns: Math.max(1, Math.floor(cfgMnemopiRecallContextTurns.get(settings))),
@@ -124,6 +131,11 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 		llmApiKey: cfgMnemopiLlmApiKey.get(settings),
 		llmModel: cfgMnemopiLlmModel.get(settings),
 	};
+}
+
+/** A configured day count as a whole number of days; unset, negative or non-numeric values read as unset. */
+function wholeDays(value: number | undefined): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined;
 }
 
 const DEFAULT_SHARED_BANK = "default";

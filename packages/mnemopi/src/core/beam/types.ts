@@ -67,6 +67,16 @@ export interface BeamConfig {
 	polyphonicRecall?: boolean;
 	/** Per-instance enhanced recall (query cache) gate; `undefined` defers to the process-wide default. */
 	enhancedRecall?: boolean;
+	/**
+	 * Age in days at which a tier 1 episodic row is cut to its first 800 characters (tier 2).
+	 * `0` never cuts. Unset defers to `MNEMOPI_TIER2_DAYS` (30).
+	 */
+	tier2Days?: number;
+	/**
+	 * Age in days at which a tier 2 episodic row is cut to its key sentences (tier 3).
+	 * `0` never cuts. Unset defers to `MNEMOPI_TIER3_DAYS` (180).
+	 */
+	tier3Days?: number;
 }
 
 export interface BeamMemoryOptions {

@@ -306,3 +306,16 @@ export const cfgMnemopiInjectionTokenLimit = register({
 });
 
 export const cfgMnemopiDebug = register({ id: "mnemopi.debug", type: "boolean", default: false });
+
+/**
+ * Age in days at which an episodic memory is cut to its first 800 characters (and loses its vector).
+ * `0` never cuts. Unset keeps `MNEMOPI_TIER2_DAYS` (default 30). A per-config setting, so each bot or
+ * project can keep full text without touching the process environment.
+ */
+export const cfgMnemopiTier2Days = register({ id: "mnemopi.tier2Days", type: "number", default: undefined });
+
+/**
+ * Age in days at which a tier 2 episodic memory is cut to its key sentences (300 characters). `0` never
+ * cuts. Unset keeps `MNEMOPI_TIER3_DAYS` (default 180). Only memories already cut by `tier2Days` qualify.
+ */
+export const cfgMnemopiTier3Days = register({ id: "mnemopi.tier3Days", type: "number", default: undefined });

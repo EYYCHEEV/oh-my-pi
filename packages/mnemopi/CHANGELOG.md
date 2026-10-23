@@ -5,6 +5,7 @@
 ### Added
 
 - Added `mnemopi backup <destination.db>` and `backupDatabase()`: a consistent, standalone single-file copy of a database another process is writing (`VACUUM INTO` of one snapshot, integrity-checked, never overwrites, no partial file on failure), instead of copying the main file and the `-wal` by hand
+- Added the `beamConfig` option of `Mnemopi` and the `tier2Days` / `tier3Days` beam settings so one instance can set the episodic tier cut ages (`0` never cuts) instead of only the process-wide `MNEMOPI_TIER2_DAYS` / `MNEMOPI_TIER3_DAYS`; unset keeps the environment defaults
 
 ### Fixed
 
