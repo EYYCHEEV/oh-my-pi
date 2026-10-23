@@ -7,7 +7,7 @@ import importlib.util
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shlex
 import shutil
@@ -29,76 +29,14 @@ def load_receipt():
 receipt = load_receipt()
 require = receipt.require
 PREPARED = Path("/opt/omp-qualification")
-REGISTRY_SHA256 = "40d36904b1bc31a09381c2fa2b523ea481aa8691801abf80344af18e6227f943"
-# Reviewed active verification snapshot of the workstation-owned fork registry.
-# The recipe commit authenticates this snapshot. Immutable application README IDs
-# and every referenced source file must agree before any command can run.
-BOUNDARIES = {
-    "required-extension-enforcement": [
-        "bun test packages/coding-agent/test/required-extension-gate.test.ts packages/coding-agent/test/sdk-preloaded-extensions-isolation.test.ts packages/coding-agent/test/task/executor-pass-through.test.ts packages/coding-agent/test/acp-mcp-isolation.test.ts packages/coding-agent/test/settings-manager.test.ts packages/coding-agent/test/extensibility/legacy-pi-default-resource-loader.test.ts"],
-    "terminal-eintr-recovery": [
-        "bun test packages/tui/test/process-terminal-input-recovery.test.ts --test-name-pattern 'reopens a Bun-destroyed TTY read stream and delivers the next input'",
-        "bun test packages/tui/test/process-terminal-input-recovery.test.ts --test-name-pattern 'keeps an active input drain on the replacement stream'",
-        "bun test packages/tui/test/process-terminal-input-recovery.test.ts --test-name-pattern 'keeps unrelated stdin errors fatal'",
-        "bun test packages/utils/test/postmortem-cleanup-error.test.ts --test-name-pattern 'keeps unmarked uncaught exceptions fatal'",
-        "bun test packages/utils/test/postmortem-cleanup-error.test.ts --test-name-pattern 'keeps uncaught read EINTR fatal outside its owner'"],
-    "shared-worker-ownership": [
-        "bun test packages/coding-agent/test/agent-session-shared-worker-ownership.test.ts --test-name-pattern 'does not terminate process-global workers when a parked subagent disposes'",
-        "bun test packages/coding-agent/test/agent-session-shared-worker-ownership.test.ts --test-name-pattern 'terminates process-global workers when their primary owner disposes'"],
-    "subagent-policy-inheritance": [
-        "bun test packages/coding-agent/test/task/structured-subagent.test.ts packages/coding-agent/test/task/executor-pass-through.test.ts packages/coding-agent/test/vibe/vibe-runtime.test.ts"],
-    "turn-status-lifecycle": [
-        "bun test packages/coding-agent/test/agent-session-concurrent.test.ts packages/coding-agent/test/extensions-runner.test.ts packages/coding-agent/test/rpc-subagents.test.ts packages/coding-agent/test/rpc-wire/generated.test.ts"],
-    "status-line-extension-state": [
-        "bun test packages/coding-agent/test/modes/controllers/extension-ui-controller.test.ts packages/coding-agent/test/collab/guest-ui-request.test.ts packages/coding-agent/test/tools/ask.test.ts packages/coding-agent/test/status-line-extension-segments.test.ts packages/coding-agent/test/status-line-settings-cache.test.ts packages/coding-agent/test/status-line-overflow.test.ts packages/coding-agent/test/status-line-dispose-async-leak.test.ts"],
-    "goal-objective-skill-picker": ["bun test packages/coding-agent/test/hook-editor.test.ts"],
-    "tool-call-abort-signal": [
-        "bun test packages/coding-agent/test/extensions-runner.test.ts --test-name-pattern 'passes the caller abort signal to the awaited extension gate'",
-        "bun test packages/coding-agent/test/agent-session-message-pipeline.test.ts --test-name-pattern 'forwards the caller signal and input revision through the primary tool-call path'"],
-    "mcp-image-forwarding": ["bun test packages/coding-agent/test/mcp-image-results.test.ts"],
-    "task-delegation-gate": [
-        "bun test packages/coding-agent/test/system-prompt-delegation.test.ts packages/coding-agent/test/system-prompt-model.test.ts packages/coding-agent/test/tools/eval-description.test.ts"],
-    "agent-registry-observation": ["bun test packages/coding-agent/src/registry/__tests__/agent-registry-observation.test.ts"],
-    "outcome-first-scope-control": [
-        "bun test packages/coding-agent/test/system-prompt-inventory.test.ts packages/coding-agent/test/system-prompt-personality.test.ts packages/coding-agent/test/prompt-templates.test.ts packages/coding-agent/test/task/discovery.test.ts packages/coding-agent/test/agent-session-todo-reminder-loop.test.ts packages/coding-agent/test/agent-session-todo-mid-run-nudge.test.ts packages/coding-agent/test/agent-session-magic-keywords.test.ts packages/tui/test/task-yield-shape-render.test.ts packages/coding-agent/test/tools/review.test.ts"],
-    "kimi-usage-account-identity": ["bun test packages/ai/test/kimi-usage.test.ts"],
-    "archive-read-crash-containment": [
-        "bun test packages/utils/test/ar/tar.test.ts packages/utils/test/ar/zip.test.ts",
-        "bun test packages/coding-agent/test/tools.test.ts"],
-    "codex-native-web-run": [
-        "bun test packages/ai/test/apply-patch-freeform.test.ts packages/ai/test/azure-openai-responses-stream.test.ts packages/ai/test/openai-codex.test.ts packages/ai/test/openai-codex-stream.test.ts",
-        "bun test packages/agent/test/agent-loop.test.ts",
-        "bun test packages/coding-agent/test/extensions-runner.test.ts --test-name-pattern 'inherits the wrapper call.s signal and onUpdate for a bare invokeTool'",
-        "bun test packages/coding-agent/test/tools/web-search-codex.test.ts --test-name-pattern 'web.run'"],
-    "codex-web-search-cli-fallback": [
-        "bun test packages/coding-agent/test/tools/web-search-codex.test.ts packages/coding-agent/test/web/search/default-chain.test.ts"],
-    "context-occupancy-projection": [
-        "bun test packages/agent/test/agent.test.ts packages/agent/test/agent-loop.test.ts packages/agent/test/compaction-reserve-provenance.test.ts packages/agent/test/live-steering.test.ts packages/coding-agent/test/compaction-speculation.test.ts packages/coding-agent/test/agent-session-goal-midrun-compaction.test.ts packages/coding-agent/test/agent-session-mid-turn-compaction-dead-end.test.ts packages/coding-agent/test/agent-session-stats.test.ts packages/coding-agent/test/agent-session-retry-recovery.test.ts packages/coding-agent/test/compaction.test.ts"],
-    "local-context-overflow-classification": [
-        "bun test packages/ai/test/overflow-utils.test.ts packages/agent/test/compaction-oversized-input.test.ts"],
-    "terminal-resize-test-harness": [
-        "bun test packages/tui/test/resize-anchor-recovery.test.ts packages/tui/test/overlay-scroll.test.ts packages/tui/test/history-frame-plan.test.ts"],
-    "socket-close-tool-call-recovery": [
-        "bun test packages/agent/test/agent-loop.test.ts --test-name-pattern 'runs completed tool calls after a bun fetch socket-close error'"],
-    "harmony-mitigation-resolved-model-tests": [
-        "bun test packages/ai/test/harmony-leak.test.ts --test-name-pattern 'does not infer policy from the provider when compatibility is absent'",
-        "bun test packages/agent/test/agent-loop.test.ts --test-name-pattern 'harmony leakage reaches the committed assistant message'",
-        "bun test packages/agent/test/soft-tool-requirement.test.ts --test-name-pattern 'reuses the fetched hard tool choice across a Harmony retry'"],
-    "handler-scoped-session-context": [
-        "bun test packages/coding-agent/test/cli-evaluation-policy.test.ts packages/coding-agent/test/evaluation-policy-launch.test.ts packages/coding-agent/test/evaluation-policy-print.test.ts packages/coding-agent/test/extension-context-budget.test.ts packages/coding-agent/test/compiled-evaluation-policy.test.ts packages/coding-agent/test/eval/process-entry-import.test.ts packages/coding-agent/test/eval/process-stdio-capture.test.ts"],
-    "extension-runtime-requirements": [
-        "bun test packages/coding-agent/test/extension-message-receipts.test.ts packages/coding-agent/test/runtime-requirements-startup.test.ts packages/coding-agent/test/runtime-requirements.test.ts packages/coding-agent/test/extension-context-async-jobs.test.ts packages/coding-agent/test/extension-context-project-trust.test.ts packages/coding-agent/test/issue-7955-extension-project-trusted.test.ts packages/coding-agent/test/agent-session-queued-policy.test.ts packages/coding-agent/test/agent-session-auto-compaction-queue.test.ts packages/coding-agent/test/agent-session-cache-warming-runtime.test.ts"],
-    "streamed-tool-call-normalization": [
-        "bun test packages/agent/test/prompt-tools-loop.test.ts packages/coding-agent/test/sdk-dialect.test.ts"],
-    "kimi-k3-responses-transport": [
-        "bun test packages/ai/test/providers/kimi-responses.test.ts packages/ai/test/providers/kimi-code-thinking.test.ts packages/agent/test/kimi-k3-tool-loop.test.ts packages/catalog/test/kimi-code-provider.test.ts"],
-    "oauth-account-pool-controls": [
-        "bun test packages/ai/test/auth-storage-account-pause.test.ts packages/ai/test/auth-storage-oauth-account-restriction.test.ts packages/ai/test/auth-storage-codex-selection.test.ts packages/ai/test/auth-storage-oauth-account-select.test.ts packages/ai/test/auth-storage-claude-reset.test.ts",
-        "bun test packages/coding-agent/test/auth-command.test.ts packages/coding-agent/test/slash-commands/login-manage.test.ts packages/coding-agent/test/modes/components/account-pause-selector.test.ts packages/coding-agent/test/modes/components/oauth-selector.test.ts packages/coding-agent/test/account-pause-session-notice.test.ts packages/coding-agent/test/oauth-account-launch-flag.test.ts packages/coding-agent/test/oauth-account-pool-automatic-readers.test.ts"],
-    "daemon-completion-delivery-recovery": [
-        "bun test packages/coding-agent/test/launch/completion-delivery.test.ts packages/coding-agent/test/launch/service-completion-ownership.test.ts packages/coding-agent/test/launch/broker-metadata-writes.test.ts packages/coding-agent/test/launch/protocol.test.ts packages/coding-agent/test/session/yield-queue.test.ts",
-        "bun test packages/coding-agent/test/agent-session-async-delivery.test.ts --test-name-pattern 'advisor-owned launch completion'"],
-}
+# The fork-contract registry is an input, never part of this recipe. The Mac sends the workstation's fork_boundary.json
+# with the build; its SHA-256 is bound into the signed qualification record. The rules below mirror the updater that
+# owns the file (parse_fork_verification and its README check), strictly and without importing it.
+FORK_MANIFEST_CAP = 1024 * 1024
+README_MARKERS = ("<!-- stronk-omp:fork-contracts:start -->", "<!-- stronk-omp:fork-contracts:end -->")
+CONTRACT_STATUSES = frozenset({"active", "retire_candidate", "retired", "deferred", "maintenance"})
+SHELL_SYNTAX = ("\n", "\r", ";", "&&", "||", "|", "`", "$(", ">", "<")
+STAGE_BYTES = 32768
 NATIVE_GREP_TEST = "grep::tests::oversized_prefix_read_returns_stable_snapshot_after_rewrite"
 TYPECHECK = ["bun", "run", "--cwd", "packages/coding-agent", "check:types"]
 MARKERS = (
@@ -126,83 +64,186 @@ STAGES = (
     "qualify-version", "qualify-help", "qualify-smoke", "qualify-offline-session",
     "qualify-markers", "qualify-native-addon", "qualify-native-grep",
     "qualify-typecheck", "qualify-integrity", "qualify-result",
-) + tuple(f"qualify-boundary-{boundary}-{index}"
-          for boundary, commands in BOUNDARIES.items() for index in range(1, len(commands) + 1))
+)
 
 
-def valid_stage(value):
-    return isinstance(value, str) and receipt.match(r"qualify-[a-z0-9]+(?:-[a-z0-9]+)*", value) and value in STAGES
+def boundary_stage(contract, number):
+    return f"qualify-boundary-{contract}-{number}"
 
 
-def announce_stage(value, *, inside=False):
-    require(valid_stage(value), "Invalid qualification stage")
+def valid_stage(value, boundaries=frozenset()):
+    # Boundary stages come from the supplied registry, so every caller names the exact set it computed.
+    return isinstance(value, str) and (value in STAGES or value in boundaries)
+
+
+def announce_stage(value, *, inside=False, boundaries=frozenset()):
+    require(valid_stage(value, boundaries), "Invalid qualification stage")
     print(value, file=sys.stderr if inside else sys.stdout, flush=True)
 
 
-def forward_stages(stream):
+def forward_stages(stream, boundaries=frozenset()):
     stream.seek(0)
-    data = stream.read(8193)
-    require(len(data) <= 8192, "Invalid qualification stages")
+    data = stream.read(STAGE_BYTES + 1)
+    require(len(data) <= STAGE_BYTES, "Invalid qualification stages")
     lines = data.decode("ascii").splitlines(keepends=True)
-    require(all(line.endswith("\n") and valid_stage(line[:-1]) for line in lines), "Invalid qualification stage")
+    require(all(line.endswith("\n") and valid_stage(line[:-1], boundaries) for line in lines), "Invalid qualification stage")
     for line in lines:
-        announce_stage(line[:-1])
+        announce_stage(line[:-1], boundaries=boundaries)
 
 
-def contract_ids(text):
-    start, end = "<!-- stronk-omp:fork-contracts:start -->", "<!-- stronk-omp:fork-contracts:end -->"
-    require(text.count(start) == text.count(end) == 1, "Missing immutable boundary map")
-    block = text.split(start, 1)[1].split(end, 1)[0]
-    ids = re.findall(r"^- `([a-z0-9-]+)`:", block, re.MULTILINE)
-    require(len(ids) == len(set(ids)) and set(ids) == set(BOUNDARIES),
-            "The application's fork contracts differ from this recipe's registry snapshot; a new recipe commit is required")
-    return ids
+def exact_path(value):
+    """The updater's exact-relative-path rule: no glob, no absolute path, no parent step, already normalised."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    path = PurePosixPath(value)
+    return not path.is_absolute() and ".." not in path.parts and value == path.as_posix() and not any(c in value for c in "*?[")
+
+
+def parse_verification(text):
+    """Mirror of the updater's strict verification rule. Returns argv; nothing is run or touched."""
+    require(isinstance(text, str) and bool(text.strip()), "A fork-contract verification command is empty")
+    require(not any(token in text for token in SHELL_SYNTAX), "A fork-contract verification command contains shell syntax")
+    try:
+        argv = shlex.split(text, posix=True)
+    except ValueError:
+        raise receipt.RouteError("A fork-contract verification command cannot be parsed") from None
+    require(len(argv) >= 3 and argv[:2] in (["bun", "test"], ["cargo", "test"]),
+            "A fork-contract verification command must start with bun test or cargo test")
+    for argument in argv[2:]:
+        candidate = argument.split("=", 1)[1] if argument.startswith("-") and "=" in argument else argument
+        require(re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:(?!:)", candidate) is None,
+                "A fork-contract verification argument names an external URI")
+        path = PurePosixPath(candidate)
+        require(not path.is_absolute() and ".." not in path.parts,
+                "A fork-contract verification argument leaves the application tree")
+        if argument.startswith("-") or not argument.endswith((".ts", ".tsx")):
+            continue
+        require(exact_path(argument), "A fork-contract test path is not an exact relative path")
+    return argv
 
 
 def registry_command(command):
-    """Split one registry entry into its argv and relative test paths without touching any tree."""
-    args = shlex.split(command)
-    require(args[:2] == ["bun", "test"], "Unsupported boundary command")
-    paths = []
-    index = 2
+    """argv and relative test files of one verification command, in the one shape this recipe can run offline."""
+    args = parse_verification(command)
+    require(args[:2] == ["bun", "test"], "A cargo verification command cannot be run by this recipe; a new recipe commit is required")
+    paths, index = [], 2
     while index < len(args):
         if args[index] == "--test-name-pattern":
             require(index + 1 < len(args) and args[index + 1], "Invalid boundary filter")
             index += 2
             continue
-        require(args[index].endswith(".test.ts"), "Immutable boundary test is missing")
+        require(args[index].endswith(".test.ts"),
+                "A verification argument is neither a test file nor a name filter; a new recipe commit is required")
         paths.append(args[index])
         index += 1
     require(paths, "Boundary command has no tests")
     return args, paths
 
 
-def boundary_commands(source, *, with_stages=False):
-    ids = contract_ids((source / "README.md").read_text())
+def parse_fork_manifest(data):
+    try:
+        manifest = receipt.strict_json(data)
+    except (ValueError, RecursionError):
+        raise receipt.RouteError("The fork manifest is not valid JSON") from None
+    require(isinstance(manifest, dict) and type(manifest.get("schemaVersion")) is int and manifest["schemaVersion"] == 1 and
+            manifest.get("requireDeclaredPaths") is False, "The fork manifest has an unsupported schema")
+    readme = manifest.get("readme")
+    require(isinstance(readme, dict) and exact_path(readme.get("path")) and
+            (readme.get("startMarker"), readme.get("endMarker")) == README_MARKERS,
+            "The fork manifest's README declaration is invalid")
+    contracts = manifest.get("contracts")
+    require(isinstance(contracts, list) and bool(contracts), "The fork manifest holds no contracts")
+    seen = set()
+    for contract in contracts:
+        require(isinstance(contract, dict), "A fork contract is not an object")
+        name = contract.get("id")
+        require(receipt.match(r"[a-z0-9]+(?:-[a-z0-9]+)*", name) and name not in seen, "A fork contract id is invalid or repeated")
+        seen.add(name)
+        status, title, verification = contract.get("status"), contract.get("title"), contract.get("verification")
+        require(isinstance(status, str) and status in CONTRACT_STATUSES, f"A fork contract has an invalid status ({name})")
+        require(isinstance(title, str) and bool(title.strip()), f"A fork contract has no title ({name})")
+        require(isinstance(verification, list) and bool(verification), f"A fork contract declares no verification ({name})")
+        if status == "active":
+            for command in verification:
+                try:
+                    registry_command(command)
+                except receipt.RouteError as error:
+                    raise receipt.RouteError(f"{error} ({name})") from None
+    require(bool(active_contracts(manifest)), "The fork manifest has no active contract")
+    return manifest
+
+
+def load_fork_manifest(path, expected_sha256=""):
+    """(manifest, sha256, bytes) of the supplied registry; a missing, oversized, altered or invalid file fails closed."""
+    try:
+        # No link may be followed and a named pipe must never block the open; only a regular file is read.
+        with open(path, "rb", opener=lambda name, flags: os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK)) as stream:
+            require(stat.S_ISREG(os.fstat(stream.fileno()).st_mode), "The fork manifest is missing or unreadable")
+            data = stream.read(FORK_MANIFEST_CAP + 1)
+    except (OSError, TypeError, ValueError):
+        raise receipt.RouteError("The fork manifest is missing or unreadable") from None
+    require(len(data) <= FORK_MANIFEST_CAP, "The fork manifest exceeds its size cap")
+    digest = hashlib.sha256(data).hexdigest()
+    require(not expected_sha256 or (receipt.match(receipt.HEX, expected_sha256) and digest == expected_sha256),
+            "The fork manifest differs from its stated SHA-256")
+    return parse_fork_manifest(data), digest, data
+
+
+def active_contracts(manifest):
+    return [contract for contract in manifest["contracts"] if contract["status"] == "active"]
+
+
+def readme_block(manifest):
+    start, end = README_MARKERS
+    return "\n".join([start, *(f"- `{contract['id']}`: {contract['title']}" for contract in active_contracts(manifest)), end])
+
+
+def check_readme(data, manifest):
+    """The updater's README rule: the block between the markers is exactly the active contracts, in order."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise receipt.RouteError("The application's README is not valid UTF-8") from None
+    start, end = README_MARKERS
+    require(text.count(start) == 1 and text.count(end) == 1,
+            "The application's README must hold exactly one fork-contract start marker and one end marker")
+    first, last = text.index(start), text.index(end)
+    require(last > first, "The application's README fork-contract markers are reversed")
+    require(text[first:last + len(end)] == readme_block(manifest),
+            "The application's fork-contract block differs from the manifest's active contracts or their order; regenerate it from the manifest")
+
+
+def boundary_commands(source, manifest, *, with_stages=False):
+    readme = source / manifest["readme"]["path"]
+    require(readme.is_file() and readme.resolve().is_relative_to(source.resolve()), "The application's README is missing")
+    check_readme(readme.read_bytes(), manifest)
     commands = []
-    for contract in ids:
-        require(bool(BOUNDARIES[contract]), "Active verification is missing")
-        for number, command in enumerate(BOUNDARIES[contract], 1):
+    for contract in active_contracts(manifest):
+        for number, command in enumerate(contract["verification"], 1):
             args, paths = registry_command(command)
             for relative in paths:
                 path = source / relative
-                require(path.is_file() and path.resolve().is_relative_to(source.resolve()), "Immutable boundary test is missing")
+                require(path.is_file() and path.resolve().is_relative_to(source.resolve()),
+                        f"A fork-boundary test named by the manifest is missing from the application: {relative}")
             # Preserve every registry command, including repeated files with distinct filters.
             args.append("--timeout=30000")
-            commands.append((f"qualify-boundary-{contract}-{number}", args) if with_stages else args)
+            commands.append((boundary_stage(contract["id"], number), args) if with_stages else args)
     return commands
 
 
-def application_preflight(root, commit):
-    """Refuse an application commit this recipe cannot qualify, before any build or daemon contact."""
+def application_preflight(root, commit, manifest):
+    """Refuse an application commit this recipe cannot qualify under the supplied registry, before any daemon contact."""
     version = receipt.check_toolchain(root, commit)
-    ids = contract_ids(receipt.git_bytes(root, commit, "README.md").decode("utf-8", "replace"))
-    for contract in ids:
-        for command in BOUNDARIES[contract]:
+    readme = manifest["readme"]["path"]
+    require(receipt.git_has(root, commit, readme), "The application commit has no README for its fork contracts")
+    check_readme(receipt.git_bytes(root, commit, readme), manifest)
+    contracts = active_contracts(manifest)
+    for contract in contracts:
+        for command in contract["verification"]:
             for relative in registry_command(command)[1]:
                 require(receipt.git_has(root, commit, relative),
-                        f"A fork-boundary test this recipe runs is missing from the application: {relative}")
-    return version, len(ids)
+                        f"A fork-boundary test named by the manifest is missing from the application: {relative}")
+    return version, len(contracts)
 
 
 def docker_output(docker, args, timeout=30):
@@ -268,11 +309,13 @@ def export_source(root, commit, destination):
                 child.chmod((stat.S_IMODE(mode) | 0o444) & ~0o022, follow_symlinks=False)
 
 
-def validate_result(result, manifest, image):
-    receipt.keys(result, ("binary_sha256", "source_commit", "recipe_commit", "environment", "checks"))
+def validate_result(result, manifest, image, fork_manifest_sha256):
+    receipt.keys(result, ("binary_sha256", "source_commit", "recipe_commit", "fork_manifest_sha256", "environment", "checks"))
     require(result["binary_sha256"] == manifest["asset"]["sha256"] and
             result["source_commit"] == manifest["source"]["commit"] and
             result["recipe_commit"] == manifest["source"]["recipe_commit"], "Qualified tuple differs")
+    require(receipt.match(receipt.HEX, fork_manifest_sha256) and result["fork_manifest_sha256"] == fork_manifest_sha256,
+            "Qualified fork manifest differs")
     require(result["checks"] == {check: "passed" for check in receipt.CHECKS}, "Qualification checks are incomplete")
     environment = result["environment"]
     receipt.keys(environment, ("execution", "cpu", "glibc", "loader", "runtime_image"))
@@ -314,17 +357,17 @@ def sign_attestation(manifest, key, output):
             stream.write(content)
 
 
-def finalize(directory, before, result, image, root, commit, recipe_commit, attestation_key, attestation):
+def finalize(directory, before, result, image, root, commit, recipe_commit, attestation_key, attestation, *, fork_manifest_sha256):
     # Recheck the actual host bytes and complete tuple after execution, not just
     # the copied binary or metadata returned by the runtime.
     after = receipt.verify(directory, commit, before["source"]["tag"] or "", False, recipe_commit, root)
     require(after == before, "Assets changed during qualification")
-    validate_result(result, before, image)
+    validate_result(result, before, image, fork_manifest_sha256)
     complete = copy.deepcopy(before)
     complete["checks"] = dict(result["checks"])
     complete["qualification"] = result
     receipt.save_manifest(directory, complete)
-    receipt.verify(directory, commit, before["source"]["tag"] or "", False, recipe_commit, root)
+    receipt.verify(directory, commit, before["source"]["tag"] or "", False, recipe_commit, root, fork_manifest_sha256)
     attestation_output(directory, attestation_key, attestation)
     sign_attestation(complete, attestation_key, attestation)
 
@@ -335,6 +378,8 @@ def qualify(args, root=None):
     require(receipt.match(receipt.OID, args.commit), "A full application commit is required")
     require(receipt.match(receipt.IMAGE, args.runtime_image) or receipt.match(receipt.DIGEST, args.runtime_image),
             "Immutable runtime image is required")
+    require(receipt.match(receipt.HEX, args.fork_manifest_sha256), "A fork manifest SHA-256 is required")
+    fork, fork_sha, fork_data = load_fork_manifest(args.fork_manifest, args.fork_manifest_sha256)
     receipt.witness_label(getattr(args, "witness_run_id", ""))
     directory = args.assets
     require(directory.is_dir() and not directory.is_symlink() and
@@ -365,7 +410,7 @@ def qualify(args, root=None):
         image_digest = approved_daemon(docker, args.runtime_image)
         announce_stage("qualify-host-source")
         export_source(root, args.commit, work / "source")
-        boundary_commands(work / "source")
+        known = frozenset(name for name, _ in boundary_commands(work / "source", fork, with_stages=True))
         inputs, recipes = work / "input", work / "recipe"
         inputs.mkdir(mode=0o755)
         recipes.mkdir(mode=0o755)
@@ -374,8 +419,11 @@ def qualify(args, root=None):
         shutil.copyfile(directory / receipt.ASSETS[0], inputs / receipt.ASSETS[0])
         (inputs / receipt.ASSETS[0]).chmod(0o555)
         require(receipt.digest(inputs / receipt.ASSETS[0]) == before["asset"]["sha256"], "Copied binary differs")
-        (inputs / "request.json").write_text(json.dumps({"manifest": before, "runtime_image": image_digest}))
+        (inputs / "request.json").write_text(json.dumps({"manifest": before, "runtime_image": image_digest,
+                                                         "fork_manifest_sha256": fork_sha}))
         (inputs / "request.json").chmod(0o444)
+        (inputs / "fork_boundary.json").write_bytes(fork_data)
+        (inputs / "fork_boundary.json").chmod(0o444)
         for name in ("linux-amd64-receipt.py", "linux-amd64-qualify.py", "linux-amd64-smoke.sh"):
             data = receipt.git_bytes(root, args.recipe_commit, f"scripts/{name}") if args.recipe_commit else (root / "scripts" / name).read_bytes()
             require(hashlib.sha256(data).hexdigest() == before["build_inputs"]["recipe"][name], "Invoked recipe differs")
@@ -391,7 +439,7 @@ def qualify(args, root=None):
                 try:
                     output = subprocess.check_output(command, stderr=stages, timeout=3600)
                 finally:
-                    forward_stages(stages)
+                    forward_stages(stages, known)
             require(len(output) <= 8192, "Invalid runtime summary")
             result = receipt.strict_json(output)
         finally:
@@ -400,7 +448,7 @@ def qualify(args, root=None):
                            stderr=subprocess.DEVNULL, timeout=30, check=False)
         announce_stage("qualify-host-finalize")
         finalize(directory, before, result, image_digest, root, args.commit, args.recipe_commit,
-                 args.attestation_key, args.attestation)
+                 args.attestation_key, args.attestation, fork_manifest_sha256=fork_sha)
 
 
 class Runtime:
@@ -552,9 +600,11 @@ def offline_session(runtime, binary, cwd, agent):
 def runtime_main():
     announce_stage("qualify-request", inside=True)
     request = receipt.strict_json(Path("/input/assets/request.json").read_text())
-    receipt.keys(request, ("manifest", "runtime_image"))
+    receipt.keys(request, ("manifest", "runtime_image", "fork_manifest_sha256"))
     manifest, image = request["manifest"], request["runtime_image"]
-    require(receipt.match(receipt.OID, manifest["source"]["commit"]) and receipt.match(receipt.DIGEST, image), "Wrong runtime request")
+    require(receipt.match(receipt.OID, manifest["source"]["commit"]) and receipt.match(receipt.DIGEST, image) and
+            receipt.match(receipt.HEX, request["fork_manifest_sha256"]), "Wrong runtime request")
+    fork, fork_sha, _ = load_fork_manifest(Path("/input/assets/fork_boundary.json"), request["fork_manifest_sha256"])
     announce_stage("qualify-cpu", inside=True)
     # Inspect architecture and CPU flags only, never host/network identity.
     flags = re.findall(r"^flags\s*:\s*(.*)$", Path("/proc/cpuinfo").read_text(), re.MULTILINE)
@@ -580,7 +630,8 @@ def runtime_main():
     shutil.copytree("/input/source", source, symlinks=True)
     require({name: receipt.digest(source / name) for name in receipt.LOCKS} == manifest["build_inputs"]["locks"], "Runtime source locks differ")
     require(receipt.strict_json((source / "packages/coding-agent/package.json").read_text())["version"] == manifest["version"], "Runtime source version differs")
-    commands = boundary_commands(source, with_stages=True)
+    commands = boundary_commands(source, fork, with_stages=True)
+    known = frozenset(name for name, _ in commands)
     grep = prepare_dependencies(source, manifest, runtime)
     announce_stage("qualify-binary", inside=True)
     binary = Path("/workspace/omp")
@@ -616,7 +667,7 @@ def runtime_main():
         "PI_TEST_RUNTIME": "1", "BUN_JSC_useConcurrentGC": "0", "BUN_JSC_numberOfGCMarkers": "1",
     })
     for stage, command in commands:
-        announce_stage(stage, inside=True)
+        announce_stage(stage, inside=True, boundaries=known)
         output, error = runtime.run(command, source)
         combined = output + b"\n" + error
         require(re.search(rb"\b[1-9][0-9]* pass\b", combined) is not None and
@@ -636,12 +687,12 @@ def runtime_main():
     announce_stage("qualify-result", inside=True)
     result = {
         "binary_sha256": receipt.digest(binary), "source_commit": manifest["source"]["commit"],
-        "recipe_commit": manifest["source"]["recipe_commit"],
+        "recipe_commit": manifest["source"]["recipe_commit"], "fork_manifest_sha256": fork_sha,
         "environment": {"execution": "native-amd64", "cpu": "x86-64-v2", "glibc": libc,
                         "loader": "ld-linux-x86-64.so.2", "runtime_image": image},
         "checks": {name: "passed" for name in receipt.CHECKS},
     }
-    validate_result(result, manifest, image)
+    validate_result(result, manifest, image, fork_sha)
     print(json.dumps(result, sort_keys=True))
 
 
@@ -660,6 +711,8 @@ def parser():
     result.add_argument("--attestation-key", required=True, type=Path)
     result.add_argument("--attestation", required=True, type=Path)
     result.add_argument("--witness-run-id", default="")
+    result.add_argument("--fork-manifest", required=True, type=Path)
+    result.add_argument("--fork-manifest-sha256", required=True)
     return result
 
 

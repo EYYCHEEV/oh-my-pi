@@ -133,8 +133,10 @@ def prepare(args, root=None):
     require(receipt.capture("git", "-C", str(root), "rev-parse", "HEAD").strip() == args.recipe_commit,
             "The reviewed recipe must be the checked out commit")
     receipt.assert_recipes(root, args.recipe_commit)
-    # Refuse an application this recipe cannot qualify before any daemon contact.
-    qualify.application_preflight(root, args.commit)
+    # Refuse an application this recipe cannot qualify under the supplied fork manifest before any daemon contact.
+    require(receipt.match(receipt.HEX, args.fork_manifest_sha256), "A fork manifest SHA-256 is required")
+    fork, _, _ = qualify.load_fork_manifest(args.fork_manifest, args.fork_manifest_sha256)
+    qualify.application_preflight(root, args.commit, fork)
     tag = getattr(args, "tag", "")
     allowed, revoked = getattr(args, "allowed_signers", None), getattr(args, "revoked_signers", None)
     tag_object = ""
@@ -292,6 +294,8 @@ def parser():
     result.add_argument("--revoked-signers", type=Path)
     result.add_argument("--docker-socket", required=True)
     result.add_argument("--witness-run-id", required=True)
+    result.add_argument("--fork-manifest", required=True, type=Path)
+    result.add_argument("--fork-manifest-sha256", required=True)
     result.add_argument("--output", required=True)
     result.add_argument("--image-id-file", required=True, type=Path)
     return result

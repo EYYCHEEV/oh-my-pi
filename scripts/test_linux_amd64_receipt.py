@@ -29,6 +29,12 @@ TREE = {name: b"immutable-application-input\n" for name in receipt.LOCKS}
 TREE["packages/coding-agent/package.json"] = b'{"version":"18.8.0"}'
 RECIPE_TREE = {"scripts/" + name: ("reviewed-recipe:" + name).encode() for name in receipt.RECIPES}
 REAL_RUN = subprocess.run
+START, END = "<!-- stronk-omp:fork-contracts:start -->", "<!-- stronk-omp:fork-contracts:end -->"
+FORK_DATA = json.dumps({
+    "schemaVersion": 1, "requireDeclaredPaths": False, "readme": {"path": "README.md", "startMarker": START, "endMarker": END},
+    "contracts": [{"id": "fixture-contract", "title": "Fixture contract", "status": "active",
+                   "verification": ["bun test packages/fixture/test/fixture.test.ts"]}]}, indent=2).encode() + b"\n"
+FORK_SHA = hashlib.sha256(FORK_DATA).hexdigest()
 
 
 def signing_fixture(directory):
@@ -91,7 +97,7 @@ def make_assets(directory, qualified=True, candidate=False):
                 "qualification": None}
     if qualified:
         manifest["qualification"] = {"binary_sha256": manifest["asset"]["sha256"], "source_commit": COMMIT,
-                                     "recipe_commit": manifest["source"]["recipe_commit"],
+                                     "recipe_commit": manifest["source"]["recipe_commit"], "fork_manifest_sha256": FORK_SHA,
                                      "environment": {"execution": "native-amd64", "cpu": "x86-64-v2", "glibc": "2.41",
                                                      "loader": "ld-linux-x86-64.so.2", "runtime_image": "sha256:" + "c" * 64},
                                      "checks": dict(manifest["checks"])}
@@ -119,6 +125,27 @@ class ReceiptTests(unittest.TestCase):
 
     def test_qualified_exact_tuple_is_accepted(self):
         self.assertEqual(self.verify()["source"]["recipe_commit"], RECIPE)
+
+    def test_the_qualification_names_the_registry_it_ran_and_a_caller_may_insist_on_it(self):
+        self.assertEqual(self.verify()["qualification"]["fork_manifest_sha256"], FORK_SHA)
+        self.assertEqual(receipt.verify(self.directory, COMMIT, TAG, True, RECIPE, Path("fixture-tree"),
+                                        fork_manifest_sha256=FORK_SHA)["version"], "18.8.0")
+        with self.assertRaisesRegex(ValueError, "Qualification fork manifest differs"):
+            receipt.verify(self.directory, COMMIT, TAG, True, RECIPE, Path("fixture-tree"), fork_manifest_sha256="e" * 64)
+        original = copy.deepcopy(self.manifest)
+        for name, edit in {"absent": lambda value: value["qualification"].pop("fork_manifest_sha256"),
+                           "empty": lambda value: value["qualification"].update(fork_manifest_sha256=""),
+                           "short": lambda value: value["qualification"].update(fork_manifest_sha256=FORK_SHA[:-1]),
+                           "upper case": lambda value: value["qualification"].update(fork_manifest_sha256=FORK_SHA.upper()),
+                           "not text": lambda value: value["qualification"].update(fork_manifest_sha256=7)}.items():
+            with self.subTest(defect=name):
+                self.manifest = copy.deepcopy(original)
+                edit(self.manifest)
+                self.rewrite()
+                with self.assertRaises(ValueError):
+                    self.verify()
+                with self.assertRaises(ValueError):
+                    self.verify(release=False)
 
     def test_manifest_bytes_must_be_canonical_with_valid_checksums(self):
         path = self.directory / receipt.ASSETS[1]
@@ -426,12 +453,14 @@ class ApplicationCommitTests(unittest.TestCase):
     def test_check_cli_end_to_end_in_a_throwaway_repository(self):
         environment = {"PATH": os.defpath, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "scripts").mkdir()
+            root = Path(temporary) / "repository"
+            (root / "scripts").mkdir(parents=True)
             for name in ("linux-amd64-receipt.py", "linux-amd64-qualify.py"):
                 shutil.copy(Path(__file__).with_name(name), root / "scripts" / name)
             files = self.tree()
-            files["README.md"] = b"# An application without the fork contract map\n"
+            readme = "# Application\n\n" + START + "\n- `fixture-contract`: Fixture contract\n" + END + "\n"
+            files["README.md"] = readme.encode()
+            files["packages/fixture/test/fixture.test.ts"] = b"// fixture\n"
             for name, data in files.items():
                 (root / name).parent.mkdir(parents=True, exist_ok=True)
                 (root / name).write_bytes(data)
@@ -443,11 +472,54 @@ class ApplicationCommitTests(unittest.TestCase):
             git("add", "-A")
             git("commit", "-q", "-m", "application")
             commit = git("rev-parse", "HEAD")
-            result = REAL_RUN([sys.executable, str(root / "scripts/linux-amd64-receipt.py"), "check", "--commit", commit],
-                              capture_output=True, text=True, timeout=60, env=environment)
-            self.assertEqual(result.returncode, 1)
-            self.assertIn("Application check failed: Missing immutable boundary map", result.stderr)
-            self.assertNotIn(temporary, result.stdout + result.stderr)
+            manifest = Path(temporary) / "fork_boundary.json"
+            manifest.write_bytes(FORK_DATA)
+
+            def check(*arguments, repository=root):
+                return REAL_RUN([sys.executable, str(repository / "scripts/linux-amd64-receipt.py"), "check", "--commit", commit, *arguments],
+                                capture_output=True, text=True, timeout=60, env=environment)
+            passed = check("--fork-manifest", str(manifest), "--fork-manifest-sha256", FORK_SHA)
+            self.assertEqual(passed.returncode, 0, passed.stderr)
+            self.assertEqual(passed.stdout.strip(), "Application check passed: omp 18.12.6, Bazel 9.2.0, Bun 1.4.2, 1 fork contracts, manifest "
+                             + FORK_SHA[:12] + ".")
+            self.assertEqual(check("--fork-manifest", str(manifest)).returncode, 0)  # the hash is optional for the early check
+            stale = Path(temporary) / "stale.json"
+            stale.write_bytes(FORK_DATA.replace(b"Fixture contract", b"Another title"))
+            oversized = Path(temporary) / "oversized.json"
+            oversized.write_bytes(FORK_DATA + b" " * (1024 * 1024))
+            unsafe = Path(temporary) / "unsafe.json"
+            unsafe.write_bytes(FORK_DATA.replace(b"bun test packages/fixture/test/fixture.test.ts", b"sh -c 'bun test packages/fixture/test/fixture.test.ts'"))
+            piped = Path(temporary) / "piped.json"
+            piped.write_bytes(FORK_DATA.replace(b"fixture.test.ts\"", b"fixture.test.ts | cat\""))
+            absolute = Path(temporary) / "absolute.json"
+            absolute.write_bytes(FORK_DATA.replace(b"bun test packages", b"bun test /packages"))
+            gone = Path(temporary) / "gone.json"
+            gone.write_bytes(FORK_DATA.replace(b"fixture.test.ts", b"deleted.test.ts"))
+            for arguments, reason in (
+                    ((), "The fork manifest is missing or unreadable"),
+                    (("--fork-manifest", str(Path(temporary) / "absent.json")), "The fork manifest is missing or unreadable"),
+                    (("--fork-manifest", str(manifest), "--fork-manifest-sha256", "0" * 64), "differs from its stated SHA-256"),
+                    (("--fork-manifest", str(stale)), "fork-contract block differs from the manifest's active contracts"),
+                    (("--fork-manifest", str(oversized)), "exceeds its size cap"),
+                    (("--fork-manifest", str(unsafe)), "must start with bun test or cargo test (fixture-contract)"),
+                    (("--fork-manifest", str(piped)), "contains shell syntax (fixture-contract)"),
+                    (("--fork-manifest", str(absolute)), "leaves the application tree (fixture-contract)"),
+                    (("--fork-manifest", str(gone)), "missing from the application: packages/fixture/test/deleted.test.ts")):
+                with self.subTest(reason=reason, arguments=arguments[:1]):
+                    result = check(*arguments)
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn("Application check failed: ", result.stderr)
+                    self.assertIn(reason, result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertNotIn(temporary, result.stdout + result.stderr)
+            (root / "README.md").write_text("# An application without the fork contract map\n")
+            git("add", "-A")
+            git("commit", "-q", "-m", "no contract block")
+            commit = git("rev-parse", "HEAD")
+            missing = check("--fork-manifest", str(manifest), "--fork-manifest-sha256", FORK_SHA)
+            self.assertEqual(missing.returncode, 1)
+            self.assertIn("Application check failed: The application's README must hold exactly one fork-contract start marker", missing.stderr)
+            self.assertNotIn(temporary, missing.stdout + missing.stderr)
 
     def test_unprintable_application_text_never_reaches_the_reason(self):
         with self.assertRaises(receipt.RouteError) as raised:

@@ -5,6 +5,7 @@ import contextlib
 import hashlib
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -23,6 +24,13 @@ COMMIT = "5e43891a87140fb0972c982f3027f0228c4f6378"
 WORKSPACE = "sha256:" + "b" * 64
 IMAGE = "sha256:" + "c" * 64
 CONTAINER = "d" * 64
+FORK_DATA = json.dumps({
+    "schemaVersion": 1, "requireDeclaredPaths": False,
+    "readme": {"path": "README.md", "startMarker": "<!-- stronk-omp:fork-contracts:start -->",
+               "endMarker": "<!-- stronk-omp:fork-contracts:end -->"},
+    "contracts": [{"id": "fixture-contract", "title": "Fixture contract", "status": "active",
+                   "verification": ["bun test packages/fixture/test/fixture.test.ts"]}]}).encode()
+FORK_SHA = hashlib.sha256(FORK_DATA).hexdigest()
 
 
 def recipe_bytes(name):
@@ -68,9 +76,11 @@ class PreparationTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        (self.root / "fork_boundary.json").write_bytes(FORK_DATA)
         self.args = argparse.Namespace(commit=COMMIT, recipe_commit=RECIPE,
                                        docker_socket="unix:///fixture/docker.sock", witness_run_id="offline-fixture",
-                                       output="candidate", image_id_file=self.root / "image-id")
+                                       output="candidate", image_id_file=self.root / "image-id",
+                                       fork_manifest=self.root / "fork_boundary.json", fork_manifest_sha256=FORK_SHA)
         self.client = FakeClient([], self.root)
         self.manifest = {"build_inputs": {"recipe": {
             name: hashlib.sha256(recipe_bytes(name)).hexdigest() for name in receipt.RECIPES}}}
@@ -194,7 +204,9 @@ class PreparationTests(unittest.TestCase):
     def test_any_application_commit_is_built_after_the_early_application_check(self):
         self.args.commit = "e" * 40
         self.run_preparation()
-        self.preflight.assert_called_once_with(self.root, "e" * 40)
+        self.preflight.assert_called_once()
+        self.assertEqual(self.preflight.call_args.args[:2], (self.root, "e" * 40))
+        self.assertEqual(self.preflight.call_args.args[2]["contracts"][0]["id"], "fixture-contract")
         build = next(command for command in self.client.commands if command[0] == "build")
         self.assertIn("SOURCE_COMMIT=" + "e" * 40, build)
 
@@ -202,6 +214,20 @@ class PreparationTests(unittest.TestCase):
         self.preflight.side_effect = receipt.RouteError("The application needs Bazel 9.3.0 but this recipe pins Bazel 9.2.0")
         with self.assertRaises(ValueError):
             self.run_preparation()
+        self.transport.assert_not_called()
+        self.factory.assert_not_called()
+
+    def test_a_missing_altered_or_unstated_registry_is_refused_before_any_daemon(self):
+        swapped = self.root / "swapped.json"
+        swapped.write_bytes(FORK_DATA.replace(b"fixture.test.ts", b"weaker.test.ts"))
+        for updates in ({"fork_manifest": self.root / "absent.json"}, {"fork_manifest": swapped},
+                        {"fork_manifest_sha256": "0" * 64}, {"fork_manifest_sha256": ""}, {"fork_manifest_sha256": "short"},
+                        {"fork_manifest": None}):
+            with self.subTest(updates={key: str(value)[-12:] for key, value in updates.items()}):
+                args = argparse.Namespace(**(vars(self.args) | updates))
+                with self.assertRaises(ValueError):
+                    runtime.prepare(args, self.root)
+        self.preflight.assert_not_called()
         self.transport.assert_not_called()
         self.factory.assert_not_called()
 

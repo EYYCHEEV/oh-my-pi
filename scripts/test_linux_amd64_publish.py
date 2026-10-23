@@ -324,9 +324,12 @@ class PublisherTests(unittest.TestCase):
         (root / "scripts").mkdir(parents=True)
         for name, data in fixture.RECIPE_TREE.items():
             (root / name).write_bytes(data)
+        fork = self.directory / "fork_boundary.json"
+        fork.write_bytes(fixture.FORK_DATA)
         args = argparse.Namespace(commit=COMMIT, recipe_commit=RECIPE, assets=self.args.assets,
                                   runtime_image="registry.invalid/private-account/runtime@" + result["environment"]["runtime_image"],
-                                  docker_socket="unix:///fixture.sock", attestation_key=self.key, attestation=self.args.attestation)
+                                  docker_socket="unix:///fixture.sock", attestation_key=self.key, attestation=self.args.attestation,
+                                  fork_manifest=fork, fork_manifest_sha256=fixture.FORK_SHA)
         verify = qualifier.receipt.verify
 
         def execute(command, **kwargs):
@@ -336,8 +339,8 @@ class PublisherTests(unittest.TestCase):
             self.assertIn("rm", command)
             return subprocess.CompletedProcess(command, 0)
 
-        with patch.object(qualifier.receipt, "verify", side_effect=lambda path, commit, tag, release, recipe_commit="", root=None:
-                          verify(path, commit, tag, release, recipe_commit, root=False)), \
+        with patch.object(qualifier.receipt, "verify", side_effect=lambda path, commit, tag, release, recipe_commit="", root=None, fork_manifest_sha256="":
+                          verify(path, commit, tag, release, recipe_commit, root=False, fork_manifest_sha256=fork_manifest_sha256)), \
              patch.object(qualifier.receipt, "assert_recipes"), \
              patch.object(qualifier.receipt, "git_bytes", side_effect=fixture.tree_bytes), \
              patch.object(qualifier.receipt, "validate_docker", return_value=["docker", "--host", args.docker_socket]), \

@@ -58,27 +58,72 @@ def fixture(directory, committed=False):
     return manifest
 
 
+START, END = "<!-- stronk-omp:fork-contracts:start -->", "<!-- stronk-omp:fork-contracts:end -->"
+# Shapes taken from the workstation's real registry: several files per command and filters with odd characters.
+FORK_CONTRACTS = {
+    "alpha-contract": ["bun test packages/a/test/alpha.test.ts",
+                       "bun test packages/a/test/alpha.test.ts --test-name-pattern 'inherits the wrapper call.s signal'"],
+    "beta-contract": ["bun test packages/b/test/beta.test.ts packages/b/test/nested/gamma.test.ts"],
+}
+
+
+def fork_manifest(contracts=None, edit=None):
+    """A registry in the updater's shape, with an inactive contract the recipe must ignore entirely."""
+    contracts = FORK_CONTRACTS if contracts is None else contracts
+    entries = [{"id": name, "title": f"Title of {name}", "status": "active", "verification": list(commands)}
+               for name, commands in contracts.items()]
+    entries.insert(1, {"id": "retired-contract", "title": "Retired", "status": "retired", "verification": ["sh -c 'ignored'"]})
+    value = {"schemaVersion": 1, "requireDeclaredPaths": False,
+             "readme": {"path": "README.md", "startMarker": START, "endMarker": END}, "contracts": entries}
+    if edit:
+        edit(value)
+    return json.dumps(value, indent=2).encode() + b"\n"
+
+
+FORK_DATA = fork_manifest()
+FORK_SHA = hashlib.sha256(FORK_DATA).hexdigest()
+
+
+def fork_file(directory, data=FORK_DATA):
+    path = Path(directory) / "fork_boundary.json"
+    path.write_bytes(data)
+    return path
+
+
+def active(data=FORK_DATA):
+    return [item for item in json.loads(data)["contracts"] if item["status"] == "active"]
+
+
+def readme_text(data=FORK_DATA, ids=None, titles=None):
+    chosen = [item["id"] for item in active(data)] if ids is None else ids
+    names = {item["id"]: item["title"] for item in json.loads(data)["contracts"]} | (titles or {})
+    lines = "".join(f"- `{name}`: {names.get(name, 'Unreviewed')}\n" for name in chosen)
+    return f"# Fixture application\n\nText before.\n\n{START}\n{lines}{END}\n\nText after.\n"
+
+
 def success(manifest):
     return {
         "binary_sha256": manifest["asset"]["sha256"], "source_commit": manifest["source"]["commit"],
-        "recipe_commit": manifest["source"]["recipe_commit"],
+        "recipe_commit": manifest["source"]["recipe_commit"], "fork_manifest_sha256": FORK_SHA,
         "environment": {"execution": "native-amd64", "cpu": "x86-64-v2", "glibc": "2.41", "loader": "ld-linux-x86-64.so.2", "runtime_image": IMAGE_DIGEST},
         "checks": {check: "passed" for check in receipt.CHECKS},
     }
 
 
-def source_fixture(source, boundaries=None):
-    boundaries = qualify.BOUNDARIES if boundaries is None else boundaries
+def source_fixture(source, data=FORK_DATA, readme=None):
     source.mkdir(parents=True, exist_ok=True)
-    block = "\n".join(f"- `{name}`: Fixture" for name in boundaries)
-    (source / "README.md").write_text("<!-- stronk-omp:fork-contracts:start -->\n" + block + "\n<!-- stronk-omp:fork-contracts:end -->\n")
-    for commands in boundaries.values():
-        for command in commands:
+    (source / "README.md").write_text(readme_text(data) if readme is None else readme)
+    for contract in active(data):
+        for command in contract["verification"]:
             for item in shlex.split(command):
                 if item.endswith(".test.ts"):
                     path = source / item
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_text("// offline fixture\n")
+
+
+def fork_commands(data=FORK_DATA):
+    return [[*shlex.split(command), "--timeout=30000"] for contract in active(data) for command in contract["verification"]]
 
 
 class DaemonTests(unittest.TestCase):
@@ -224,95 +269,291 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual(command[-3:], ["--entrypoint=/bin/sh", IMAGE, "/recipe/linux-amd64-smoke.sh"])
 
 
+class ForkManifestTests(unittest.TestCase):
+    def load(self, data, expected=None):
+        with tempfile.TemporaryDirectory() as temporary:
+            return qualify.load_fork_manifest(fork_file(temporary, data), hashlib.sha256(data).hexdigest() if expected is None else expected)
+
+    def refuses(self, data, fragment, expected=None):
+        with self.assertRaises(receipt.RouteError) as raised:
+            self.load(data, expected)
+        self.assertIn(fragment, str(raised.exception))
+
+    def test_a_valid_registry_loads_with_its_hash_and_exact_bytes(self):
+        manifest, digest, data = self.load(FORK_DATA)
+        self.assertEqual((digest, data), (FORK_SHA, FORK_DATA))
+        self.assertEqual([item["id"] for item in qualify.active_contracts(manifest)], ["alpha-contract", "beta-contract"])
+        with tempfile.TemporaryDirectory() as temporary:  # the check mode may run without a stated hash
+            self.assertEqual(qualify.load_fork_manifest(fork_file(temporary))[1], FORK_SHA)
+
+    def test_a_missing_unreadable_or_irregular_registry_is_refused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            real = fork_file(directory)
+            (directory / "link.json").symlink_to(real)
+            for path in (directory / "missing.json", directory, directory / "link.json", None):
+                with self.subTest(path=str(path)), self.assertRaises(receipt.RouteError) as raised:
+                    qualify.load_fork_manifest(path, FORK_SHA)
+                self.assertIn("The fork manifest is missing or unreadable", str(raised.exception))
+                self.assertNotIn(temporary, str(raised.exception))
+
+    def test_a_registry_over_the_fixed_cap_is_refused_and_one_at_the_cap_is_accepted(self):
+        cap = qualify.FORK_MANIFEST_CAP
+        self.refuses(FORK_DATA + b" " * cap, "exceeds its size cap")
+        self.refuses(b"x" * (cap + 1), "exceeds its size cap")
+        padded = FORK_DATA + b" " * (cap - len(FORK_DATA))
+        self.assertEqual(len(padded), cap)
+        self.assertEqual(self.load(padded)[1], hashlib.sha256(padded).hexdigest())
+
+    def test_a_registry_swapped_after_it_was_hashed_is_refused(self):
+        weaker = fork_manifest({"alpha-contract": ["bun test packages/a/test/alpha.test.ts"], "beta-contract": ["bun test packages/b/test/beta.test.ts"]})
+        self.assertNotEqual(weaker, FORK_DATA)
+        self.refuses(weaker, "differs from its stated SHA-256", expected=FORK_SHA)
+        for malformed in ("abc", FORK_SHA.upper(), FORK_SHA[:-1], "x" * 64):
+            with self.subTest(expected=malformed[:8]):
+                self.refuses(FORK_DATA, "differs from its stated SHA-256", expected=malformed)
+
+    def test_a_registry_that_is_not_the_updaters_shape_is_refused(self):
+        def contract(index, **changes):
+            return lambda value: value["contracts"][index].update(changes)
+
+        def drop(index, key):
+            return lambda value: value["contracts"][index].pop(key)
+
+        cases = {
+            "wrong schema": (lambda value: value.update(schemaVersion=2), "unsupported schema"),
+            "boolean schema": (lambda value: value.update(schemaVersion=True), "unsupported schema"),
+            "declared paths required": (lambda value: value.update(requireDeclaredPaths=True), "unsupported schema"),
+            "foreign marker": (lambda value: value["readme"].update(startMarker="<!-- other -->"), "README declaration"),
+            "absolute readme": (lambda value: value["readme"].update(path="/etc/passwd"), "README declaration"),
+            "parent readme": (lambda value: value["readme"].update(path="../README.md"), "README declaration"),
+            "no readme": (lambda value: value.pop("readme"), "README declaration"),
+            "no contracts": (lambda value: value.update(contracts=[]), "holds no contracts"),
+            "no active contract": (lambda value: [item.update(status="deferred") for item in value["contracts"]], "no active contract"),
+            "repeated id": (contract(2, id="alpha-contract"), "invalid or repeated"),
+            "id with capitals": (contract(0, id="Alpha_Contract"), "invalid or repeated"),
+            "unknown status": (contract(0, status="enabled"), "invalid status (alpha-contract)"),
+            "unhashable status": (contract(0, status=["active"]), "invalid status (alpha-contract)"),
+            "blank title": (contract(0, title="  "), "no title (alpha-contract)"),
+            "no verification": (drop(0, "verification"), "declares no verification (alpha-contract)"),
+            "empty verification": (contract(0, verification=[]), "declares no verification (alpha-contract)"),
+            "contract not an object": (lambda value: value["contracts"].append("alpha"), "not an object"),
+        }
+        for name, (edit, fragment) in cases.items():
+            with self.subTest(case=name):
+                self.refuses(fork_manifest(edit=edit), fragment)
+        for name, data in {"not json": b"{", "empty": b"", "a list": b"[]", "invalid UTF-8": b"\xff\xfe",
+                           "repeated key": FORK_DATA.replace(b'"schemaVersion": 1', b'"schemaVersion": 1, "schemaVersion": 1', 1)}.items():
+            with self.subTest(case=name):
+                self.refuses(data, "not valid JSON" if name in ("not json", "empty", "invalid UTF-8", "repeated key") else "unsupported schema")
+
+    def test_only_active_contracts_are_judged(self):
+        # An inactive entry may name anything; it is neither parsed nor run.
+        manifest, _, _ = self.load(fork_manifest(edit=lambda value: value["contracts"][1].update(verification=["rm -rf / | sh"])))
+        self.assertEqual(len(qualify.active_contracts(manifest)), 2)
+
+
+class VerificationRuleTests(unittest.TestCase):
+    """The updater's parse_fork_verification, mirrored: argv only, never a shell, never outside the application tree."""
+
+    def test_accepted_shapes_become_plain_argv(self):
+        self.assertEqual(qualify.parse_verification("bun test packages/a/test/alpha.test.ts"),
+                         ["bun", "test", "packages/a/test/alpha.test.ts"])
+        self.assertEqual(qualify.parse_verification("bun test a.test.ts --test-name-pattern 'inherits the wrapper call.s signal'")[-1],
+                         "inherits the wrapper call.s signal")
+        self.assertEqual(qualify.parse_verification("cargo test -p crate some::test"), ["cargo", "test", "-p", "crate", "some::test"])
+
+    def test_every_unsafe_or_malformed_command_is_refused_with_a_fixed_reason(self):
+        cases = {
+            "sh -c 'bun test a.test.ts'": "must start with bun test or cargo test",
+            "bash -lc 'bun test a.test.ts'": "must start with bun test or cargo test",
+            "bun install": "must start with bun test or cargo test",
+            "bun test": "must start with bun test or cargo test",
+            "npm test a.test.ts": "must start with bun test or cargo test",
+            "bun test a.test.ts | tee out": "contains shell syntax",
+            "bun test a.test.ts || true": "contains shell syntax",
+            "bun test a.test.ts && id": "contains shell syntax",
+            "bun test a.test.ts; id": "contains shell syntax",
+            "bun test a.test.ts > out": "contains shell syntax",
+            "bun test a.test.ts < in": "contains shell syntax",
+            "bun test $(id).test.ts": "contains shell syntax",
+            "bun test `id`.test.ts": "contains shell syntax",
+            "bun test a.test.ts\nid": "contains shell syntax",
+            "bun test /etc/passwd.test.ts": "leaves the application tree",
+            "bun test ../outside.test.ts": "leaves the application tree",
+            "bun test dir/../../outside.test.ts": "leaves the application tree",
+            "bun test a.test.ts --preload=/abs/hook.ts": "leaves the application tree",
+            "bun test https://example.invalid/a.test.ts": "names an external URI",
+            "bun test a.test.ts --preload=file:hook": "names an external URI",
+            "bun test ./a.test.ts": "not an exact relative path",
+            "bun test dir//a.test.ts": "not an exact relative path",
+            "bun test dir/*.test.ts": "not an exact relative path",
+            "bun test dir/[a].test.ts": "not an exact relative path",
+            "bun test 'unterminated": "cannot be parsed",
+            "": "is empty",
+            "   ": "is empty",
+            None: "is empty",
+            7: "is empty",
+        }
+        for command, reason in cases.items():
+            with self.subTest(command=command), self.assertRaises(receipt.RouteError) as raised:
+                qualify.parse_verification(command)
+            self.assertIn(reason, str(raised.exception))
+
+    def test_the_recipe_only_runs_bun_test_files_and_name_filters(self):
+        args, paths = qualify.registry_command("bun test a.test.ts b/c.test.ts --test-name-pattern 'first filter'")
+        self.assertEqual((args, paths), (["bun", "test", "a.test.ts", "b/c.test.ts", "--test-name-pattern", "first filter"],
+                                          ["a.test.ts", "b/c.test.ts"]))
+        for command, reason in {"cargo test -p crate": "cannot be run by this recipe",
+                                "bun test a.test.ts --timeout=5": "neither a test file nor a name filter",
+                                "bun test a.test.ts --bail": "neither a test file nor a name filter",
+                                "bun test a.ts": "neither a test file nor a name filter",
+                                "bun test --test-name-pattern x": "has no tests",
+                                "bun test a.test.ts --test-name-pattern": "Invalid boundary filter"}.items():
+            with self.subTest(command=command), self.assertRaises(receipt.RouteError) as raised:
+                qualify.registry_command(command)
+            self.assertIn(reason, str(raised.exception))
+
+    def test_a_registry_whose_active_contract_has_an_unsafe_command_is_refused_naming_only_the_contract(self):
+        for command in ("sh -c 'bun test packages/a/test/alpha.test.ts'", "bun test packages/a/test/alpha.test.ts | cat",
+                        "bun test /abs/alpha.test.ts", "cargo test -p natives"):
+            data = fork_manifest(edit=lambda value, command=command: value["contracts"][0]["verification"].append(command))
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as temporary, self.assertRaises(receipt.RouteError) as raised:
+                qualify.load_fork_manifest(fork_file(temporary, data), hashlib.sha256(data).hexdigest())
+            self.assertTrue(str(raised.exception).endswith("(alpha-contract)"), str(raised.exception))
+            self.assertNotIn(command, str(raised.exception))
+
+
 class BoundaryTests(unittest.TestCase):
-    def test_every_active_snapshot_command_runs_in_order_without_shell(self):
+    def manifest(self, data=FORK_DATA):
+        return qualify.parse_fork_manifest(data)
+
+    def test_every_active_registry_command_runs_in_order_without_shell(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary)
             source_fixture(source)
-            commands = qualify.boundary_commands(source)
-            expected = [[*shlex.split(command), "--timeout=30000"] for group in qualify.BOUNDARIES.values() for command in group]
-            self.assertEqual(commands, expected)
-            self.assertEqual(len(qualify.BOUNDARIES), 27)
-            self.assertEqual(len(commands), 41)
-            self.assertEqual(len(qualify.REGISTRY_SHA256), 64)
-            self.assertTrue(all(command[:2] == ["bun", "test"] for command in commands))
+            self.assertEqual(qualify.boundary_commands(source, self.manifest()), fork_commands())
+            staged = qualify.boundary_commands(source, self.manifest(), with_stages=True)
+            self.assertEqual([name for name, _ in staged], [
+                "qualify-boundary-alpha-contract-1", "qualify-boundary-alpha-contract-2", "qualify-boundary-beta-contract-1"])
+            self.assertTrue(all(command[:2] == ["bun", "test"] and command[-1] == "--timeout=30000" for _, command in staged))
+            self.assertTrue(all(qualify.valid_stage(name, frozenset(name for name, _ in staged)) for name, _ in staged))
 
-    def test_missing_active_id_or_file_fails_closed(self):
+    def test_the_registry_alone_decides_which_contracts_run(self):
+        data = fork_manifest({"gamma-contract": ["bun test packages/g/test/gamma.test.ts"]})
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            source_fixture(source, data)
+            self.assertEqual(qualify.boundary_commands(source, self.manifest(data)),
+                             [["bun", "test", "packages/g/test/gamma.test.ts", "--timeout=30000"]])
+
+    def test_a_readme_block_that_is_not_exactly_the_active_contracts_in_order_is_refused(self):
+        stale = "fork-contract block differs from the manifest's active contracts or their order"
+        ids = ["alpha-contract", "beta-contract"]
+        cases = {
+            "a missing id": (readme_text(ids=ids[1:]), stale),
+            "an extra id": (readme_text(ids=ids + ["unreviewed-contract"]), stale),
+            "a repeated id": (readme_text(ids=ids + ["alpha-contract"]), stale),
+            "a reordered pair": (readme_text(ids=ids[::-1]), stale),
+            "an inactive contract listed": (readme_text(ids=["alpha-contract", "retired-contract", "beta-contract"]), stale),
+            "a changed title": (readme_text(titles={"beta-contract": "Another title"}), stale),
+            "an empty block": (readme_text(ids=[]), stale),
+            "no markers": ("# Fixture\n\nno contract block here\n", "exactly one fork-contract start marker and one end marker"),
+            "two blocks": (readme_text() + readme_text(), "exactly one fork-contract start marker and one end marker"),
+            "reversed markers": (readme_text().replace(START, "@@").replace(END, START).replace("@@", END),
+                                 "markers are reversed"),
+        }
+        for name, (readme, reason) in cases.items():
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as temporary:
+                source = Path(temporary)
+                source_fixture(source, readme=readme)
+                with self.assertRaises(receipt.RouteError) as raised:
+                    qualify.boundary_commands(source, self.manifest())
+                self.assertIn(reason, str(raised.exception))
+        with tempfile.TemporaryDirectory() as temporary:  # the control: the same text around the exact block is fine
+            source = Path(temporary)
+            source_fixture(source, readme=readme_text() + "\nMore text after the block.\n")
+            self.assertEqual(len(qualify.boundary_commands(source, self.manifest())), 3)
+
+    def test_an_active_contract_whose_test_file_is_missing_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary)
             source_fixture(source)
-            readme = source / "README.md"
-            readme.write_text(readme.read_text().replace("- `required-extension-enforcement`: Fixture\n", ""))
-            with self.assertRaises(ValueError):
-                qualify.boundary_commands(source)
-            source_fixture(source)
-            next(source.glob("packages/coding-agent/test/required-extension-gate.test.ts")).unlink()
-            with self.assertRaises(ValueError):
-                qualify.boundary_commands(source)
+            (source / "packages/b/test/nested/gamma.test.ts").unlink()
+            with self.assertRaises(receipt.RouteError) as raised:
+                qualify.boundary_commands(source, self.manifest())
+            self.assertIn("missing from the application: packages/b/test/nested/gamma.test.ts", str(raised.exception))
+            self.assertNotIn(temporary, str(raised.exception))
 
-    def test_duplicate_or_unrecognized_active_id_rejected(self):
+    def test_a_readme_or_test_that_is_a_link_out_of_the_tree_is_refused(self):
+        with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as outside:
+            source = Path(temporary)
+            source_fixture(source)
+            (Path(outside) / "alpha.test.ts").write_text("// outside\n")
+            (source / "packages/a/test/alpha.test.ts").unlink()
+            (source / "packages/a/test/alpha.test.ts").symlink_to(Path(outside) / "alpha.test.ts")
+            with self.assertRaises(receipt.RouteError):
+                qualify.boundary_commands(source, self.manifest())
+            source_fixture(source)
+            (source / "README.md").unlink()
+            (source / "README.md").symlink_to(Path(outside) / "alpha.test.ts")
+            with self.assertRaises(receipt.RouteError):
+                qualify.boundary_commands(source, self.manifest())
+
+    def test_filters_are_preserved_for_repeated_files(self):
+        data = fork_manifest({"fixture": ["bun test fixture.test.ts --test-name-pattern 'first filter'",
+                                          "bun test fixture.test.ts --test-name-pattern 'second filter'"]})
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary)
-            source_fixture(source)
-            readme = source / "README.md"
-            for item in ("required-extension-enforcement", "unreviewed-contract"):
-                original = readme.read_text()
-                readme.write_text(original.replace("<!-- stronk-omp:fork-contracts:end -->", f"- `{item}`: Fixture\n<!-- stronk-omp:fork-contracts:end -->"))
-                with self.assertRaises(ValueError):
-                    qualify.boundary_commands(source)
-                readme.write_text(original)
-
-    def test_filters_preserved_and_unsupported_commands_rejected(self):
-        boundaries = {"fixture": ["bun test fixture.test.ts --test-name-pattern 'first filter'", "bun test fixture.test.ts --test-name-pattern 'second filter'"]}
-        with tempfile.TemporaryDirectory() as temporary, patch.object(qualify, "BOUNDARIES", boundaries):
-            source = Path(temporary)
-            source_fixture(source, boundaries)
-            self.assertEqual(qualify.boundary_commands(source), [
+            source_fixture(source, data)
+            self.assertEqual(qualify.boundary_commands(source, self.manifest(data)), [
                 ["bun", "test", "fixture.test.ts", "--test-name-pattern", "first filter", "--timeout=30000"],
                 ["bun", "test", "fixture.test.ts", "--test-name-pattern", "second filter", "--timeout=30000"],
             ])
-            boundaries["fixture"] = ["bun install"]
-            with self.assertRaises(ValueError):
-                qualify.boundary_commands(source)
 
-    def preflight(self, files, commit="c" * 40):
+    def files(self, data=FORK_DATA, readme=None):
+        files = {"README.md": (readme_text(data) if readme is None else readme).encode()}
+        for contract in active(data):
+            for command in contract["verification"]:
+                files.update({item: b"" for item in shlex.split(command) if item.endswith(".test.ts")})
+        return files
+
+    def preflight(self, files, data=FORK_DATA, commit="c" * 40):
         with patch.object(receipt, "check_toolchain", return_value="18.12.6") as toolchain, \
-             patch.object(receipt, "git_has", return_value=True), \
+             patch.object(receipt, "git_has", side_effect=lambda _root, _rev, path: path in files), \
              patch.object(receipt, "git_bytes", side_effect=lambda _root, _rev, path: files[path]):
-            result = qualify.application_preflight(Path("fixture-tree"), commit)
+            result = qualify.application_preflight(Path("fixture-tree"), commit, self.manifest(data))
         toolchain.assert_called_once_with(Path("fixture-tree"), commit)
         return result
 
-    def readme(self, names=None):
-        names = list(qualify.BOUNDARIES) if names is None else names
-        block = "\n".join(f"- `{name}`: Fixture" for name in names)
-        return {"README.md": ("<!-- stronk-omp:fork-contracts:start -->\n" + block +
-                              "\n<!-- stronk-omp:fork-contracts:end -->\n").encode()}
-
     def test_application_preflight_accepts_a_matching_application_without_a_checkout(self):
-        self.assertEqual(self.preflight(self.readme()), ("18.12.6", 27))
+        self.assertEqual(self.preflight(self.files()), ("18.12.6", 2))
+        data = fork_manifest({"only-contract": ["bun test x/only.test.ts"]})
+        self.assertEqual(self.preflight(self.files(data), data), ("18.12.6", 1))
 
-    def test_application_preflight_refuses_changed_contracts_or_missing_tests_with_a_clear_reason(self):
-        names = list(qualify.BOUNDARIES)
+    def test_application_preflight_refuses_a_changed_block_or_a_missing_test_with_a_clear_reason(self):
+        ids = ["alpha-contract", "beta-contract"]
         for files, reason in (
-                (self.readme(names[1:]), "fork contracts differ from this recipe's registry snapshot"),
-                (self.readme(names + ["unreviewed-contract"]), "fork contracts differ from this recipe's registry snapshot"),
-                ({"README.md": b"no contract block here\n"}, "Missing immutable boundary map")):
+                (self.files(readme=readme_text(ids=ids[1:])), "fork-contract block differs from the manifest's active contracts"),
+                (self.files(readme=readme_text(ids=ids + ["unreviewed-contract"])), "fork-contract block differs"),
+                (self.files(readme=readme_text(ids=ids[::-1])), "fork-contract block differs"),
+                ({**self.files(), "README.md": b"no contract block here\n"}, "exactly one fork-contract start marker"),
+                ({**self.files(), "README.md": b"\xff\xfe"}, "not valid UTF-8"),
+                ({name: data for name, data in self.files().items() if name != "README.md"}, "has no README")):
             with self.subTest(reason=reason), self.assertRaises(receipt.RouteError) as raised:
                 self.preflight(files)
             self.assertIn(reason, str(raised.exception))
-        with patch.object(receipt, "check_toolchain", return_value="18.12.6"), \
-             patch.object(receipt, "git_has", return_value=False), \
-             patch.object(receipt, "git_bytes", side_effect=lambda _root, _rev, path: self.readme()[path]):
-            with self.assertRaises(receipt.RouteError) as raised:
-                qualify.application_preflight(Path("fixture-tree"), "c" * 40)
-        self.assertIn("missing from the application: packages/coding-agent/test/required-extension-gate.test.ts", str(raised.exception))
+        files = self.files()
+        del files["packages/b/test/nested/gamma.test.ts"]
+        with self.assertRaises(receipt.RouteError) as raised:
+            self.preflight(files)
+        self.assertIn("missing from the application: packages/b/test/nested/gamma.test.ts", str(raised.exception))
 
     def test_toolchain_mismatch_surfaces_before_any_contract_work(self):
         with patch.object(receipt, "check_toolchain", side_effect=receipt.RouteError("The application needs Bazel 9.3.0")), \
              patch.object(receipt, "git_bytes") as read:
             with self.assertRaises(receipt.RouteError):
-                qualify.application_preflight(Path("fixture-tree"), "c" * 40)
+                qualify.application_preflight(Path("fixture-tree"), "c" * 40, self.manifest())
         read.assert_not_called()
 
 
@@ -433,8 +674,8 @@ class CompletionTests(unittest.TestCase):
         self.key, self.signers = signing_fixture(directory)
         self.attestation = directory / "qualification.json"
 
-    def finalize(self, *args):
-        qualify.finalize(*args, self.key, self.attestation)
+    def finalize(self, *args, fork=FORK_SHA):
+        qualify.finalize(*args, self.key, self.attestation, fork_manifest_sha256=fork)
 
     def test_candidate_can_qualify_but_can_never_publish(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -509,20 +750,39 @@ class CompletionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.finalize(directory, manifest, success(manifest), IMAGE_DIGEST, False, COMMIT, "")
 
+    def test_a_result_for_another_registry_never_finalizes_and_the_record_carries_the_registry_hash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            manifest = fixture(directory)
+            original = (directory / receipt.ASSETS[1]).read_bytes()
+            with self.assertRaises(ValueError):
+                self.finalize(directory, manifest, success(manifest), IMAGE_DIGEST, False, COMMIT, "", fork="e" * 64)
+            self.assertEqual((directory / receipt.ASSETS[1]).read_bytes(), original)
+            self.assertFalse(self.attestation.exists())
+            self.finalize(directory, manifest, success(manifest), IMAGE_DIGEST, False, COMMIT, "")
+            completed = receipt.verify(directory, COMMIT, "", False, root=False, fork_manifest_sha256=FORK_SHA)
+            self.assertEqual(completed["qualification"]["fork_manifest_sha256"], FORK_SHA)
+            with self.assertRaises(ValueError):
+                receipt.verify(directory, COMMIT, "", False, root=False, fork_manifest_sha256="e" * 64)
+            # The signed attestation binds the whole manifest, so the registry hash cannot change without a new signature.
+            evidence = receipt.strict_json(self.attestation.read_bytes())
+            self.assertEqual(evidence["manifest_sha256"], hashlib.sha256((directory / receipt.ASSETS[1]).read_bytes()).hexdigest())
+
     def test_wrong_tuple_or_environment_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             manifest = fixture(Path(temporary))
-            for field, replacement in (("binary_sha256", "f" * 64), ("source_commit", "c" * 40), ("recipe_commit", RECIPE)):
+            for field, replacement in (("binary_sha256", "f" * 64), ("source_commit", "c" * 40), ("recipe_commit", RECIPE),
+                                       ("fork_manifest_sha256", "f" * 64), ("fork_manifest_sha256", "short")):
                 result = success(manifest)
                 result[field] = replacement
                 with self.assertRaises(ValueError):
-                    qualify.validate_result(result, manifest, IMAGE_DIGEST)
+                    qualify.validate_result(result, manifest, IMAGE_DIGEST, FORK_SHA)
             for field, replacement in (("execution", "emulated"), ("cpu", "x86-64-v3"), ("glibc", "2.17"),
                                        ("loader", "other.so"), ("runtime_image", "qualification/runtime:mutable")):
                 result = success(manifest)
                 result["environment"][field] = replacement
                 with self.assertRaises(ValueError):
-                    qualify.validate_result(result, manifest, IMAGE_DIGEST)
+                    qualify.validate_result(result, manifest, IMAGE_DIGEST, FORK_SHA)
 
 
 class HostFlowTests(unittest.TestCase):
@@ -536,7 +796,8 @@ class HostFlowTests(unittest.TestCase):
             manifest["build_inputs"]["recipe"][name] = receipt.digest(root / "scripts" / name)
         receipt.save_manifest(assets, manifest)
         args = argparse.Namespace(commit=COMMIT, recipe_commit=RECIPE if committed else "", assets=assets,
-                                  runtime_image=IMAGE, docker_socket="unix:///runtime/docker.sock", witness_run_id=run_id)
+                                  runtime_image=IMAGE, docker_socket="unix:///runtime/docker.sock", witness_run_id=run_id,
+                                  fork_manifest=fork_file(directory), fork_manifest_sha256=FORK_SHA)
         args.attestation_key, signers = signing_fixture(directory)
         args.attestation = directory / "qualification.json"
         cleanup = Mock()
@@ -570,6 +831,10 @@ class HostFlowTests(unittest.TestCase):
             request = receipt.strict_json((Path(command[command.index("--config") + 1]).parent / "input/request.json").read_bytes())
             self.assertEqual(request["runtime_image"], IMAGE_DIGEST)
             self.assertNotIn(b"private-account", json.dumps(request).encode())
+            # The exact registry bytes the host hashed reach the container beside the request, read-only.
+            self.assertEqual(request["fork_manifest_sha256"], FORK_SHA)
+            self.assertEqual((work / "input/fork_boundary.json").read_bytes(), FORK_DATA)
+            self.assertEqual((work / "input/fork_boundary.json").stat().st_mode & 0o777, 0o444)
             kwargs["stderr"].write(stages)
             if fail:
                 raise subprocess.CalledProcessError(1, command, output=b"private fixture diagnostics")
@@ -586,8 +851,8 @@ class HostFlowTests(unittest.TestCase):
         def archive(_root, _commit, destination):
             source_fixture(destination)
 
-        with patch.object(receipt, "verify", side_effect=lambda path, commit, tag, release, recipe_commit="", root=None:
-                          real_verify(path, commit, tag, release, recipe_commit, root=False)), \
+        with patch.object(receipt, "verify", side_effect=lambda path, commit, tag, release, recipe_commit="", root=None, fork_manifest_sha256="":
+                          real_verify(path, commit, tag, release, recipe_commit, root=False, fork_manifest_sha256=fork_manifest_sha256)), \
              patch.object(receipt, "assert_recipes") as assert_recipes, \
              patch.object(receipt, "validate_docker", return_value=["docker", "--host", args.docker_socket]), \
              patch.object(receipt, "git_bytes", side_effect=lambda _root, _rev, name: (root / name).read_bytes()), \
@@ -647,10 +912,38 @@ class HostFlowTests(unittest.TestCase):
         self.assertEqual(output.getvalue().splitlines(), [
             "qualify-host-inputs", "qualify-host-runtime", "qualify-host-source", "qualify-host-execute"])
 
+    def test_a_boundary_stage_is_forwarded_only_when_the_registry_names_it(self):
+        with tempfile.TemporaryDirectory() as temporary, contextlib.redirect_stdout(io.StringIO()) as output:
+            self.run_fixture(Path(temporary), fail=True, stages=b"qualify-boundary-alpha-contract-2\nqualify-smoke\n")
+        self.assertEqual(output.getvalue().splitlines()[-2:], ["qualify-boundary-alpha-contract-2", "qualify-smoke"])
+        for stage in (b"qualify-boundary-alpha-contract-9\n", b"qualify-boundary-unknown-contract-1\n",
+                      b"qualify-boundary-retired-contract-1\n", b"qualify-boundary-alpha-contract-1 extra\n"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temporary, contextlib.redirect_stdout(io.StringIO()) as output:
+                self.run_fixture(Path(temporary), stages=stage, invalid_stages=True)
+            self.assertNotIn("qualify-boundary", output.getvalue())
+
+    def test_a_missing_altered_or_unstated_registry_is_refused_before_any_daemon_contact(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            good = fork_file(directory)
+            swapped = directory / "swapped.json"
+            swapped.write_bytes(fork_manifest({"alpha-contract": ["bun test packages/a/test/alpha.test.ts"]}))
+            for path, digest in ((directory / "missing.json", FORK_SHA), (swapped, FORK_SHA), (good, "0" * 64), (good, ""), (good, "short")):
+                args = argparse.Namespace(commit=COMMIT, recipe_commit="", assets=directory / "assets", runtime_image=IMAGE,
+                                          docker_socket="unix:///runtime/docker.sock", witness_run_id="",
+                                          fork_manifest=path, fork_manifest_sha256=digest)
+                with self.subTest(path=path.name, digest=digest[:6]), contextlib.redirect_stdout(io.StringIO()), \
+                     patch.object(subprocess, "check_output", side_effect=AssertionError("contacted")), \
+                     patch.object(subprocess, "run", side_effect=AssertionError("contacted")), \
+                     patch.object(subprocess, "Popen", side_effect=AssertionError("contacted")):
+                    with self.assertRaises(ValueError):
+                        qualify.qualify(args, directory)
+
     def test_cli_sanitizes_subprocess_failures(self):
         arguments = ["qualify", "--commit", COMMIT, "--assets", "/fixture/assets", "--runtime-image", IMAGE,
                      "--docker-socket", "unix:///runtime/docker.sock",
-                     "--attestation-key", "fixture-key", "--attestation", "fixture-attestation"]
+                     "--attestation-key", "fixture-key", "--attestation", "fixture-attestation",
+                     "--fork-manifest", "/fixture/fork_boundary.json", "--fork-manifest-sha256", FORK_SHA]
         output = io.StringIO()
         with patch.object(qualify.sys, "argv", arguments), patch.object(qualify, "qualify", side_effect=subprocess.CalledProcessError(1, "fixture", output=b"private diagnostics")), \
              contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
@@ -690,11 +983,12 @@ class RuntimeStartupTests(unittest.TestCase):
             root = Path(temporary)
             request = root / "request.json"
             request.write_text(json.dumps({"manifest": {"source": {"commit": COMMIT}},
-                                           "runtime_image": IMAGE_DIGEST}))
+                                           "runtime_image": IMAGE_DIGEST, "fork_manifest_sha256": FORK_SHA}))
             cpu = root / "cpuinfo"
             cpu.write_text("flags: ssse3 sse4_1 sse4_2 popcnt cx16 lahf_lm pni\n")
             runtime = root / "runtime"
-            paths = {"/input/assets/request.json": request, "/proc/cpuinfo": cpu, "/runtime": runtime}
+            paths = {"/input/assets/request.json": request, "/input/assets/fork_boundary.json": fork_file(root),
+                     "/proc/cpuinfo": cpu, "/runtime": runtime}
 
             def path(value):
                 return paths.get(str(value), Path(value))
@@ -737,17 +1031,19 @@ class RuntimeStartupTests(unittest.TestCase):
             manifest = fixture(assets)
             source = root / "source"
             source_fixture(source)
+            (source / "packages/coding-agent").mkdir(parents=True, exist_ok=True)
             (source / "packages/coding-agent/package.json").write_text('{"version":"18.8.0"}')
             for name in receipt.LOCKS:
                 (source / name).write_text("fixture lock")
                 manifest["build_inputs"]["locks"][name] = receipt.digest(source / name)
             request = root / "request.json"
-            request.write_text(json.dumps({"manifest": manifest, "runtime_image": IMAGE_DIGEST}))
+            request.write_text(json.dumps({"manifest": manifest, "runtime_image": IMAGE_DIGEST, "fork_manifest_sha256": FORK_SHA}))
             cpu = root / "cpuinfo"
             cpu.write_text("flags: ssse3 sse4_1 sse4_2 popcnt cx16 lahf_lm pni\n")
             native = root / "native.node"
             native.write_bytes(b"fixture native")
-            paths = {"/input/assets/request.json": request, "/proc/cpuinfo": cpu,
+            paths = {"/input/assets/request.json": request, "/input/assets/fork_boundary.json": fork_file(root),
+                     "/proc/cpuinfo": cpu,
                      "/runtime": root / "runtime", "/workspace/source": source,
                      "/workspace/omp": root / "omp", "/input/assets/omp-linux-amd64": assets / receipt.ASSETS[0]}
             real_copyfile = shutil.copyfile
@@ -767,11 +1063,8 @@ class RuntimeStartupTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "boundary fixture complete"):
                     qualify.runtime_main()
             boundaries = [call for call in calls if call[0][:2] == ["bun", "test"]]
-            self.assertEqual([call[0] for call in boundaries], [
-                [*shlex.split(command), "--timeout=30000"]
-                for group in qualify.BOUNDARIES.values() for command in group
-            ])
-            self.assertEqual(len(boundaries), 41)
+            self.assertEqual([call[0] for call in boundaries], fork_commands())
+            self.assertEqual(len(boundaries), 3)
             controls = {"PI_TEST_RUNTIME": "1", "BUN_JSC_useConcurrentGC": "0", "BUN_JSC_numberOfGCMarkers": "1"}
             for _command, environment, seconds in boundaries:
                 self.assertEqual({key: environment.get(key) for key in controls}, controls)
@@ -792,7 +1085,7 @@ class StageTests(unittest.TestCase):
 
     def test_runtime_stage_forwarding_validates_all_bytes_before_emitting_anything(self):
         for payload in (b"qualify-smoke\nqualify-unknown\n", b"qualify-smoke\nprivate diagnostic\n",
-                        b"qualify-smoke \n", b"\xff\n", b"x" * 8193):
+                        b"qualify-smoke \n", b"\xff\n", b"x" * 32769):
             with self.subTest(payload=payload), contextlib.redirect_stdout(io.StringIO()) as output:
                 with self.assertRaises(ValueError):
                     qualify.forward_stages(io.BytesIO(payload))
@@ -800,6 +1093,19 @@ class StageTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as output:
             qualify.forward_stages(io.BytesIO(b"qualify-help\nqualify-smoke\n"))
         self.assertEqual(output.getvalue(), "qualify-help\nqualify-smoke\n")
+
+    def test_boundary_stage_names_are_valid_only_for_the_exact_set_the_caller_computed(self):
+        names = frozenset({"qualify-boundary-alpha-contract-1"})
+        self.assertTrue(qualify.valid_stage("qualify-boundary-alpha-contract-1", names))
+        self.assertFalse(qualify.valid_stage("qualify-boundary-alpha-contract-1"))
+        self.assertFalse(qualify.valid_stage("qualify-boundary-alpha-contract-2", names))
+        self.assertFalse(qualify.valid_stage("qualify-boundary-alpha-contract-1\n", names))
+        self.assertFalse(qualify.valid_stage(None, names))
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            qualify.forward_stages(io.BytesIO(b"qualify-boundary-alpha-contract-1\nqualify-smoke\n"), names)
+            with self.assertRaises(ValueError):
+                qualify.forward_stages(io.BytesIO(b"qualify-boundary-alpha-contract-2\n"), names)
+        self.assertEqual(output.getvalue(), "qualify-boundary-alpha-contract-1\nqualify-smoke\n")
 
 
 if __name__ == "__main__":

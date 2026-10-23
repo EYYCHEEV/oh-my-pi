@@ -260,7 +260,7 @@ def verify_elf(value):
             all(match(r"[A-Za-z0-9_.+-]+", item) for item in value["needed_libraries"]), "Invalid library identity")
 
 
-def verify(directory, commit, tag, release, recipe_commit="", root=None):
+def verify(directory, commit, tag, release, recipe_commit="", root=None, fork_manifest_sha256=""):
     require(not directory.is_symlink() and directory.is_dir(), "A regular asset directory is required")
     require({entry.name for entry in directory.iterdir()} == set(ASSETS), "Only the exact three public assets are permitted")
     require(all((directory / name).is_file() and not (directory / name).is_symlink() for name in ASSETS), "Assets must be regular files")
@@ -331,9 +331,13 @@ def verify(directory, commit, tag, release, recipe_commit="", root=None):
         require(not release and manifest["checks"] == {name: "passed" if name == "elf" else "not_run" for name in CHECKS},
                 "Completed qualification is required")
     else:
-        keys(qualification, ("binary_sha256", "source_commit", "recipe_commit", "environment", "checks"))
+        keys(qualification, ("binary_sha256", "source_commit", "recipe_commit", "fork_manifest_sha256", "environment", "checks"))
         require(qualification["binary_sha256"] == asset["sha256"] and qualification["source_commit"] == commit and
                 qualification["recipe_commit"] == source["recipe_commit"], "Qualification tuple differs")
+        # The registry the boundary tests came from is part of the signed record; a caller that knows it must see the same one.
+        require(match(HEX, qualification["fork_manifest_sha256"]) and
+                (not fork_manifest_sha256 or qualification["fork_manifest_sha256"] == fork_manifest_sha256),
+                "Qualification fork manifest differs")
         require(manifest["checks"] == qualification["checks"] == {name: "passed" for name in CHECKS}, "Incomplete qualification")
         environment = qualification["environment"]
         keys(environment, ("execution", "cpu", "glibc", "loader", "runtime_image"))
@@ -468,22 +472,25 @@ def parser():
     result.add_argument("--receipts", action="store_true")
     result.add_argument("--output", default="linux-amd64")
     result.add_argument("--witness-run-id", default="")
+    result.add_argument("--fork-manifest", type=Path)
+    result.add_argument("--fork-manifest-sha256", default="")
     return result
 
 
 def check(args):
-    # The fork-contract snapshot belongs to the qualifier; load it only for this early refusal.
+    # The fork-contract rules belong to the qualifier; load it only for this early refusal.
     spec = importlib.util.spec_from_file_location("linux_amd64_qualify", Path(__file__).with_name("linux-amd64-qualify.py"))
     qualifier = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(qualifier)
     try:
-        version, contracts = qualifier.application_preflight(Path(__file__).resolve().parent.parent, args.commit)
+        manifest, digest, _ = qualifier.load_fork_manifest(args.fork_manifest, args.fork_manifest_sha256)
+        version, contracts = qualifier.application_preflight(Path(__file__).resolve().parent.parent, args.commit, manifest)
     except ValueError as error:
         # The qualifier loads its own copy of this module, so its fixed refusals are another class.
         if type(error).__name__ == "RouteError":
             raise RouteError(str(error)) from None
         raise
-    print(f"Application check passed: omp {version}, Bazel {BAZEL_VERSION}, Bun {BUN_VERSION}, {contracts} fork contracts.")
+    print(f"Application check passed: omp {version}, Bazel {BAZEL_VERSION}, Bun {BUN_VERSION}, {contracts} fork contracts, manifest {digest[:12]}.")
 
 
 def main():
@@ -497,7 +504,8 @@ def main():
         elif args.mode == "create":
             create(args.directory)
         else:
-            manifest = verify(args.directory, args.commit, args.tag, args.release, args.recipe_commit)
+            manifest = verify(args.directory, args.commit, args.tag, args.release, args.recipe_commit,
+                              fork_manifest_sha256=args.fork_manifest_sha256)
             if args.release or args.attestation is not None or args.qualification_signers is not None:
                 require(args.attestation is not None and args.qualification_signers is not None,
                         "Explicit qualification evidence and public signers are required")
