@@ -6,7 +6,7 @@ import { closeQuietly } from "../db";
 import type { MemoryInput, Metadata } from "../types";
 import { AnnotationStore } from "./annotations";
 import { BankManager } from "./banks";
-import { BeamMemory, initBeam } from "./beam/index";
+import { BeamMemory, type ForgetOutcome, initBeam } from "./beam/index";
 import { reconcileEmbeddingModel } from "./beam/store";
 import type { BeamConfig, RecallEnhancedOptions, RecallOptions, RecallResult, SleepResult } from "./beam/types";
 import { EpisodicGraph } from "./episodic-graph";
@@ -534,6 +534,20 @@ export class Mnemopi {
 
 	forget(memoryId: string): boolean {
 		return this.#withRuntimeOptions(() => this.beam.forgetWorking(memoryId));
+	}
+
+	/** `forget` that also reports the transcript rows it scrubbed, or that the text was too short to scrub. */
+	forgetDetailed(memoryId: string): ForgetOutcome {
+		return this.#withRuntimeOptions(() => this.beam.forgetWorkingDetailed(memoryId));
+	}
+
+	/**
+	 * Cut `text` out of this bank's retained transcripts and the summaries and facts built from them, without
+	 * deleting any memory. `forget` does this for its own bank; call it on the other banks a session recalls
+	 * from. Returns the number of transcript rows rewritten.
+	 */
+	scrubForgottenText(text: string): number {
+		return this.#withRuntimeOptions(() => this.beam.scrubForgottenText(text));
 	}
 
 	update(memoryId: string, content: string | null = null, importance: number | null = null): boolean {

@@ -117,6 +117,8 @@ export interface MnemopiMemoryEditResult {
 	status: "updated" | "deleted" | "invalidated" | "not_found" | "not_editable";
 	bank?: string;
 	store?: MnemopiMemoryStore;
+	/** Set when `forget` could not scrub the retained transcripts, with the reason. */
+	note?: string;
 }
 
 /** Which mnemopi table a resolved memory id lives in. `fact` rows are
@@ -394,7 +396,15 @@ export class MnemopiSessionState {
 				continue;
 			}
 			if (op === "forget") {
-				if (target.memory.forget(id)) return { status: "deleted", ...resultContext };
+				const outcome = target.memory.forgetDetailed(id);
+				if (outcome.deleted) {
+					this.#scrubForgottenElsewhere(targets, target, typeof row.content === "string" ? row.content : "");
+					const note =
+						outcome.skippedBelowChars === null
+							? undefined
+							: `Transcripts were not scrubbed: the text is shorter than ${outcome.skippedBelowChars} characters, so retained transcripts may still quote it.`;
+					return { status: "deleted", ...resultContext, ...(note === undefined ? {} : { note }) };
+				}
 				ineligible ??= { status: "not_found", ...resultContext };
 				continue;
 			}
@@ -404,6 +414,30 @@ export class MnemopiSessionState {
 			ineligible ??= { status: "not_found", ...resultContext };
 		}
 		return ineligible ?? { status: "not_found" };
+	}
+
+	/**
+	 * `forget` scrubs the transcripts of the bank the memory lived in. A session also recalls from, and
+	 * retains transcripts into, other banks, which may quote the same text: scrub those too. The memory is
+	 * already deleted, so a failure here is logged, not thrown.
+	 */
+	#scrubForgottenElsewhere(
+		targets: readonly MnemopiScopedMemory[],
+		forgotten: MnemopiScopedMemory,
+		text: string,
+	): void {
+		if (text.trim() === "") return;
+		for (const other of targets) {
+			if (other === forgotten) continue;
+			try {
+				other.memory.scrubForgottenText(text);
+			} catch (error) {
+				logger.warn("Mnemopi: scrubbing forgotten text from transcripts failed", {
+					bank: other.bank,
+					error: toError(error).message,
+				});
+			}
+		}
 	}
 
 	formatScopedRecallWithIds(results: readonly RecallResult[]): string {

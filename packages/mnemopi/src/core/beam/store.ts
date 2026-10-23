@@ -18,6 +18,7 @@ import type {
 	BeamEvent,
 	BeamMemoryState,
 	BeamStats,
+	ForgetOutcome,
 	ImportStats,
 	Metadata,
 	RememberBatchItem,
@@ -187,9 +188,14 @@ const MEMORIA_SOURCE_TABLES = [
  *
  * Idempotent and schema-tolerant: `gists` / `graph_edges` only exist once an
  * `EpisodicGraph` has initialised, so they are guarded. Callers own the
- * transaction and the base `working_memory` delete.
+ * transaction and the base `working_memory` delete. `keepAnnotations` leaves the annotations of rows that
+ * stay: they record dates and sources, not text.
  */
-function purgeWorkingMemoryArtifacts(db: BeamMemoryState["db"], ids: readonly string[]): void {
+function purgeWorkingMemoryArtifacts(
+	db: BeamMemoryState["db"],
+	ids: readonly string[],
+	options: { keepAnnotations?: boolean } = {},
+): void {
 	if (ids.length === 0) return;
 	const placeholders = ids.map(() => "?").join(", ");
 
@@ -204,7 +210,8 @@ function purgeWorkingMemoryArtifacts(db: BeamMemoryState["db"], ids: readonly st
 		db.run(`DELETE FROM facts WHERE source_msg_id IN (${placeholders})`, [...ids]);
 	}
 
-	db.run(`DELETE FROM annotations WHERE memory_id IN (${placeholders})`, [...ids]);
+	if (options.keepAnnotations !== true)
+		db.run(`DELETE FROM annotations WHERE memory_id IN (${placeholders})`, [...ids]);
 	db.run(`DELETE FROM memory_embeddings WHERE memory_id IN (${placeholders})`, [...ids]);
 	for (const table of MEMORIA_SOURCE_TABLES) {
 		db.run(`DELETE FROM ${table} WHERE source_memory_id IN (${placeholders})`, [...ids]);
@@ -248,8 +255,7 @@ function retireDerivedSummaries(beam: BeamMemoryState, sourceId: string, retirem
 	const now = toUtcIso();
 	for (const summary of statement.all(`,${sourceId},`) as Row[]) {
 		const id = String(summary.id);
-		const validUntil = summary.valid_until;
-		const retired = summary.superseded_by != null || (typeof validUntil === "string" && validUntil <= now);
+		const retired = isRetiredSummary(summary, now);
 		if (retired && retirement.kind === "invalidate") continue;
 		let supersededBy = retirement.kind === "invalidate" ? retirement.replacementId : null;
 		if (!retired) {
@@ -267,16 +273,167 @@ function retireDerivedSummaries(beam: BeamMemoryState, sourceId: string, retirem
 			]);
 			continue;
 		}
-		if (vecAvailable(beam.db)) {
-			try {
-				beam.db.run("DELETE FROM vec_episodes WHERE rowid = ?", [Number(summary.rowid)]);
-			} catch {
-				// sqlite-vec cleanup is best-effort, as in import: the row delete takes precedence.
-			}
-		}
-		beam.db.run("DELETE FROM episodic_memory WHERE id = ?", [id]);
-		purgeWorkingMemoryArtifacts(beam.db, [id]);
+		deleteEpisodicSummary(beam, summary);
 	}
+}
+
+/** A summary that is superseded or past its `valid_until`: recall no longer shows it. */
+function isRetiredSummary(summary: Row, now: string): boolean {
+	const validUntil = summary.valid_until;
+	return summary.superseded_by != null || (typeof validUntil === "string" && validUntil <= now);
+}
+
+/** Delete an episodic summary for good: its vector, facts, graph links and full-text row go with it. */
+function deleteEpisodicSummary(beam: BeamMemoryState, summary: Row): void {
+	if (vecAvailable(beam.db)) {
+		try {
+			beam.db.run("DELETE FROM vec_episodes WHERE rowid = ?", [Number(summary.rowid)]);
+		} catch {
+			// sqlite-vec cleanup is best-effort, as in import: the row delete takes precedence.
+		}
+	}
+	const id = String(summary.id);
+	beam.db.run("DELETE FROM episodic_memory WHERE id = ?", [id]);
+	purgeWorkingMemoryArtifacts(beam.db, [id]);
+}
+
+/** The `source` the coding-agent retains session transcripts under. */
+const TRANSCRIPT_SOURCE = "coding-agent-transcript";
+/** Stands in for scrubbed text, so a reader can see that something was cut. */
+const FORGOTTEN_MARK = "[forgotten]";
+/** Rows per purge: it binds each id and its fact ids twice, so one bank-wide scrub must not bind them all at once. */
+const SCRUB_BATCH_SIZE = 200;
+/** Rows read per step of a scrub, so a bank-wide rewrite holds a bounded amount of text at a time. */
+const SCRUB_READ_BATCH = 100;
+/**
+ * A forgotten text shorter than this (trimmed) is not cut out of transcripts: so short a text is a common word or
+ * number, and cutting it would damage rows that say something else. The caller is told (`ForgetOutcome`).
+ */
+export const MIN_SCRUB_CHARS = 8;
+/** A character that continues a word, in any script. */
+const WORD_CHAR = "[\\p{L}\\p{N}_]";
+
+function escapeRegExp(text: string): string {
+	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Replace each whole occurrence of each of `texts` with `[forgotten]` in the transcript rows, in `content` and in
+ * the `embed_text` projection, and return the ids of the rows that changed. An occurrence is whole when a non-word
+ * character or the edge of the text stands on both sides, so a text that is a word inside a longer word is left
+ * there. Matching is literal and case-sensitive; a text shorter than `MIN_SCRUB_CHARS` is ignored. `instr` finds
+ * the candidate rows in SQL, the rewrite runs on them in bounded batches. The `fts_working` row follows through
+ * the `wm_au` trigger.
+ */
+function scrubTranscriptRows(beam: BeamMemoryState, texts: readonly string[]): string[] {
+	// Longest first, so a text that contains another is cut whole before its part is.
+	const spans = [...new Set(texts.map(text => text.trim()).filter(text => text.length >= MIN_SCRUB_CHARS))].sort(
+		(a, b) => b.length - a.length,
+	);
+	if (spans.length === 0) return [];
+	const patterns = spans.map(span => new RegExp(`(?<!${WORD_CHAR})${escapeRegExp(span)}(?!${WORD_CHAR})`, "gu"));
+	const cut = (value: string): string =>
+		patterns.reduce((cutValue, pattern) => cutValue.replace(pattern, () => FORGOTTEN_MARK), value);
+	const holdsText = spans.map(() => "instr(content, ?) > 0 OR instr(embed_text, ?) > 0").join(" OR ");
+	using find = beam.db.prepare(`SELECT id FROM working_memory WHERE source = ? AND (${holdsText})`);
+	const candidates = (find.all(TRANSCRIPT_SOURCE, ...spans.flatMap(span => [span, span])) as { id: string }[]).map(
+		row => row.id,
+	);
+	using update = beam.db.prepare("UPDATE working_memory SET content = ?, embed_text = ? WHERE id = ?");
+	const scrubbed: string[] = [];
+	for (let start = 0; start < candidates.length; start += SCRUB_READ_BATCH) {
+		const batch = candidates.slice(start, start + SCRUB_READ_BATCH);
+		using read = beam.db.prepare(
+			`SELECT id, content, embed_text FROM working_memory WHERE id IN (${batch.map(() => "?").join(", ")})`,
+		);
+		for (const row of read.all(...batch) as { id: string; content: string; embed_text: string | null }[]) {
+			const content = cut(row.content);
+			const embedText = row.embed_text === null ? null : cut(row.embed_text);
+			if (content === row.content && embedText === row.embed_text) continue;
+			update.run(content, embedText, row.id);
+			scrubbed.push(row.id);
+		}
+	}
+	return scrubbed;
+}
+
+/**
+ * Rewrite every summary that lists a scrubbed row from the rows' scrubbed text, and delete the old one with its
+ * facts, as `retireDerivedSummaries` does for a forgotten row. One scan serves the whole set, so a summary that
+ * lists many scrubbed rows is rewritten once. A summary that cannot be rewritten (a caller-written digest) goes
+ * whole. `droppedId` is a forgotten row that is already gone: it is left out of the rewrite.
+ */
+function rebuildScrubbedSummaries(
+	beam: BeamMemoryState,
+	scrubbed: ReadonlySet<string>,
+	droppedId: string | null,
+): void {
+	using statement = beam.db.prepare(
+		`SELECT id, rowid, source, summary_of, metadata_json, timestamp, created_at, valid_until, superseded_by
+		 FROM episodic_memory WHERE summary_of != ''`,
+	);
+	const now = toUtcIso();
+	for (const summary of statement.all() as Row[]) {
+		const kept = String(summary.summary_of)
+			.split(",")
+			.filter(part => part.length > 0 && part !== droppedId);
+		if (!kept.some(part => scrubbed.has(part))) continue;
+		if (!isRetiredSummary(summary, now)) rebuildSleepSummary(beam, summary, kept);
+		deleteEpisodicSummary(beam, summary);
+	}
+}
+
+/**
+ * Cut forgotten text out of the retained session transcripts. The coding-agent retains whole transcripts that
+ * quote a memory verbatim: the session that stored it, and any later session whose recall showed it. Forgetting
+ * the memory alone leaves its text recallable through them, so `texts` (what the memory said) is removed there
+ * too, and everything built from the old text of a scrubbed row goes with it:
+ * - Transcript rows keep everything but the whole-word occurrences of the text, which become `[forgotten]`.
+ * - Their facts, memoria rows, graph links and vector are dropped, because they were extracted from the old text.
+ *   Annotations stay. The vector is rebuilt after the commit (`reembedWorkingRows`).
+ * - The summaries `sleep` made from them are rewritten from the scrubbed text and the old ones deleted, which
+ *   also replaces the facts extracted from them.
+ * Runs in the caller's transaction and returns the ids of the rows it rewrote.
+ */
+function scrubTranscripts(beam: BeamMemoryState, texts: readonly string[], droppedId: string | null): string[] {
+	const ids = scrubTranscriptRows(beam, texts);
+	if (ids.length === 0) return ids;
+	for (let start = 0; start < ids.length; start += SCRUB_BATCH_SIZE) {
+		purgeWorkingMemoryArtifacts(beam.db, ids.slice(start, start + SCRUB_BATCH_SIZE), { keepAnnotations: true });
+	}
+	rebuildScrubbedSummaries(beam, new Set(ids), droppedId);
+	return ids;
+}
+
+/** Embed scrubbed rows again, as `remember` embeds a new row, so vector recall sees their new text. */
+function reembedWorkingRows(beam: BeamMemoryState, ids: readonly string[]): void {
+	if (ids.length === 0 || embeddingsDisabled()) return;
+	for (let start = 0; start < ids.length; start += EMBED_REBUILD_BATCH) {
+		const batch = ids.slice(start, start + EMBED_REBUILD_BATCH);
+		using statement = beam.db.prepare(
+			`SELECT id AS memoryId, COALESCE(embed_text, content) AS content FROM working_memory
+			 WHERE id IN (${batch.map(() => "?").join(", ")})`,
+		);
+		scheduleEmbedding(beam, statement.all(...batch) as EmbedItem[]);
+	}
+}
+
+/**
+ * Cut `text` out of this bank's transcript rows, summaries and facts without deleting any memory. A session that
+ * forgets a memory in one bank calls it on the other banks it recalls from, whose transcripts may quote the same
+ * text. Returns the number of transcript rows rewritten (0 for a text shorter than `MIN_SCRUB_CHARS`).
+ */
+export function scrubForgottenText(beam: BeamMemoryState, text: string): number {
+	const scrubbed = transaction(beam.db, () => scrubTranscripts(beam, [text], null));
+	if (scrubbed.length > 0) invalidateCaches(beam);
+	reembedWorkingRows(beam, scrubbed);
+	return scrubbed.length;
+}
+
+/** True when `text` has content but too little of it to scrub from transcripts without hitting unrelated words. */
+function tooShortToScrub(text: string): boolean {
+	const length = text.trim().length;
+	return length > 0 && length < MIN_SCRUB_CHARS;
 }
 
 /**
@@ -730,6 +887,10 @@ export function getContext(beam: BeamMemoryState, limit = 10): Row[] {
 	return (statement.all(beam.sessionId, now, limit) as Row[]).map(rowToDict);
 }
 
+/**
+ * Invalidating keeps history: the row stays readable by id, and the retained transcripts that quote it stay as
+ * they were, so recall can still show what was said and when. Only `forgetWorking` scrubs transcripts.
+ */
 export function invalidate(beam: BeamMemoryState, memoryId: string, replacementId: string | null = null): boolean {
 	const now = toUtcIso();
 	let retiredWorking = false;
@@ -896,21 +1057,43 @@ function getFact(beam: BeamMemoryState, memoryId: string): Row | null {
 	};
 }
 
-export function forgetWorking(beam: BeamMemoryState, memoryId: string): boolean {
-	let deleted = 0;
-	transaction(beam.db, () => {
-		const result = beam.db.run("DELETE FROM working_memory WHERE id = ? AND session_id = ?", [
-			memoryId,
-			beam.sessionId,
-		]);
-		deleted = result.changes;
-		if (deleted > 0) {
-			purgeWorkingMemoryArtifacts(beam.db, [memoryId]);
-			retireDerivedSummaries(beam, memoryId, { kind: "forget" });
-		}
+/**
+ * Delete a working row for good, with everything derived from it, and scrub its text out of the retained
+ * transcripts and the summaries and facts built from them (`scrubTranscripts`). A text shorter than
+ * `MIN_SCRUB_CHARS` is not scrubbed from transcripts: the outcome says so, and one warning names the memory id
+ * (never its text).
+ */
+export function forgetWorkingDetailed(beam: BeamMemoryState, memoryId: string): ForgetOutcome {
+	const done = transaction(beam.db, () => {
+		const row = beam.db
+			.query("DELETE FROM working_memory WHERE id = ? AND session_id = ? RETURNING content, embed_text")
+			.get(memoryId, beam.sessionId) as { content: string; embed_text: string | null } | null;
+		if (row === null) return null;
+		purgeWorkingMemoryArtifacts(beam.db, [memoryId]);
+		const tooShort = tooShortToScrub(row.content);
+		// Scrub first, so a summary that lists the forgotten row and a scrubbed one is rewritten once.
+		const scrubbed = tooShort ? [] : scrubTranscripts(beam, [row.content, row.embed_text ?? ""], memoryId);
+		retireDerivedSummaries(beam, memoryId, { kind: "forget" });
+		return { scrubbed, tooShort };
 	});
-	if (deleted > 0) invalidateCaches(beam);
-	return deleted > 0;
+	if (done === null) return { deleted: false, scrubbedRows: 0, skippedBelowChars: null };
+	invalidateCaches(beam);
+	reembedWorkingRows(beam, done.scrubbed);
+	if (done.tooShort) {
+		logger.warn("mnemopi: forgotten text too short to scrub from retained transcripts; they keep any copy", {
+			memoryId,
+			minChars: MIN_SCRUB_CHARS,
+		});
+	}
+	return {
+		deleted: true,
+		scrubbedRows: done.scrubbed.length,
+		skippedBelowChars: done.tooShort ? MIN_SCRUB_CHARS : null,
+	};
+}
+
+export function forgetWorking(beam: BeamMemoryState, memoryId: string): boolean {
+	return forgetWorkingDetailed(beam, memoryId).deleted;
 }
 
 export function scratchpadWrite(beam: BeamMemoryState, content: string): string {
