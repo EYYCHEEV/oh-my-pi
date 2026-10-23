@@ -5,6 +5,7 @@
 ### Added
 
 - Added the `AccountPauseSelectorComponent` overlay for `/login manage`, a `manage` mode for the OAuth provider selector, and `(paused)` marking in the session account selector.
+
 ## [18.12.6] - 2026-10-21
 
 ### Changed

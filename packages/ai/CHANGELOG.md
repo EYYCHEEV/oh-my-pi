@@ -9,6 +9,8 @@
 ### Fixed
 
 - Kimi Code K3 and K3-256k now use the native Responses API for tool-calling turns while preserving explicit Chat Completions and Anthropic overrides.
+- Fixed Codex Ultrafast and Fast service tiers in multi-account pools: the tier sent now follows what the serving account advertises (`shouldSendServiceTierForAccount`), so a priority-only account no longer receives `ultrafast` because another account was listed first, and an Ultrafast-capable account is no longer denied it.
+
 ## [18.12.5] - 2026-10-21
 
 ### Added
@@ -375,7 +377,6 @@
 ### Fixed
 
 - Fixed Codex Fast (`priority`) and Ultrafast usage being recorded, billed, and reported as Standard when the backend echoed a default service tier; the requested tier is now preserved in usage and performance records.
-- Fixed Codex Ultrafast and Fast service tiers in multi-account pools: the tier sent now follows what the serving account advertises (`shouldSendServiceTierForAccount`), so a priority-only account no longer receives `ultrafast` because another account was listed first, and an Ultrafast-capable account is no longer denied it.
 
 ## [18.8.0] - 2026-10-07
 
