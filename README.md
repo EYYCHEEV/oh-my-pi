@@ -137,6 +137,7 @@ An upgrade fails before build or installation if the block is stale, any require
 - `oauth-account-pool-controls`: OAuth account pause and exact-account launch restriction
 - `daemon-completion-delivery-recovery`: Bounded daemon completion delivery recovery
 - `mnemopi-working-memory-retention`: Mnemopi working-memory trim promotes expired rows instead of deleting them
+- `mnemopi-memory-hygiene`: Mnemopi retires consolidated copies, scans memory text in and out, previews the matched part, reaches older vectors, and survives concurrent first creation
 <!-- stronk-omp:fork-contracts:end -->
 
 ## Upstream alignment
