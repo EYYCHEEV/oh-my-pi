@@ -3,11 +3,11 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { toUtcIso } from "../../util/datetime";
 
 /**
- * Making a forget reach the bytes on disk, not only the rows a query returns. SQLite keeps what a delete freed
+ * Making a forget reach the bytes on disk, not only the rows a query returns. SQLite keeps what a delete frees
  * in the free space of the main file (cleared by `PRAGMA secure_delete`, set on every connection), in the
  * write-ahead log until a checkpoint copies it over and truncates it (`settleForget`), and, for a full-text
- * index, in the segments the deleted row was indexed in (cleared by the FTS5 `secure-delete` option, or by
- * merging the segments when the SQLite build has no such option).
+ * index, in the segments the deleted row was indexed in (cleared by the FTS5 `secure-delete` option while the
+ * forget runs, or by merging the segments when the SQLite build has no such option).
  */
 
 /** The full-text indexes of a bank. */
@@ -32,24 +32,36 @@ function ftsDeletesSecurely(db: Database, table: string): boolean {
 }
 
 /**
- * Tell each full-text index to clear the terms of a deleted row from its segments. A build of SQLite whose FTS5
- * does not know the option is left as it is: `settleForget` merges those indexes after a forget instead.
+ * Run `fn`, which deletes rows, with every full-text index clearing the terms of what it deletes from its
+ * segments, and return what `fn` returned with the indexes that could not (an FTS5 without the option): the
+ * caller has `settleForget` merge those. Call it inside the transaction that deletes, so the setting is put back
+ * with the same commit; it stays off otherwise, because a secure delete rewrites segment pages, which made a
+ * 5000-row prune about 30 times slower (0.25 s to 8.5 s).
  */
-export function enableSecureFullText(db: Database): void {
+export function secureFullTextDeletes<T>(db: Database, fn: () => T): { value: T; insecure: string[] } {
+	const insecure: string[] = [];
+	const restore: { table: string; value: 0 | 1 }[] = [];
 	for (const table of FTS_TABLES) {
-		if (ftsDeletesSecurely(db, table)) continue;
+		const previous = ftsDeletesSecurely(db, table) ? 1 : 0;
 		try {
 			db.run(`INSERT INTO ${table}(${table}, rank) VALUES('secure-delete', 1)`);
+			restore.push({ table, value: previous });
 		} catch (error) {
+			insecure.push(table);
 			logger.debug("mnemopi: full-text index cannot delete securely", { table, error: String(error) });
 		}
+	}
+	try {
+		return { value: fn(), insecure };
+	} finally {
+		for (const { table, value } of restore)
+			db.run(`INSERT INTO ${table}(${table}, rank) VALUES('secure-delete', ${value})`);
 	}
 }
 
 /** A merge rewrites every segment and frees the old ones, which `secure_delete` then zeroes. */
-function mergeInsecureIndexes(db: Database): void {
-	for (const table of FTS_TABLES) {
-		if (ftsDeletesSecurely(db, table)) continue;
+function mergeIndexes(db: Database, tables: readonly string[]): void {
+	for (const table of tables) {
 		try {
 			db.run(`INSERT INTO ${table}(${table}) VALUES('optimize')`);
 		} catch (error) {
@@ -90,14 +102,15 @@ function hasPending(db: Database): boolean {
 }
 
 /**
- * Finish what a forget owes the file. Call it after the delete has committed, outside any transaction.
- * A checkpoint that cannot finish is recorded in the database (`forget_checkpoint_pending`), so the next
- * process to open, `sleep` or close the bank finishes it, whichever process forgot. Never throws: the memory is
- * already forgotten, and a failure here only means the old bytes stay a little longer.
+ * Finish what a forget owes the file: merge the indexes that could not delete securely (`insecure`, from
+ * `secureFullTextDeletes`), then checkpoint. Call it after the delete has committed, outside any transaction.
+ * A checkpoint that cannot finish is recorded in the database (`forget_checkpoint_pending`), so the next process
+ * to open, `sleep` or close the bank finishes it, whichever process forgot. Never throws: the memory is already
+ * forgotten, and a failure here only means the old bytes stay a little longer.
  */
-export function settleForget(db: Database): void {
+export function settleForget(db: Database, insecure: readonly string[] = []): void {
 	try {
-		mergeInsecureIndexes(db);
+		mergeIndexes(db, insecure);
 		if (checkpoint(db)) {
 			if (hasPending(db)) db.run("DELETE FROM forget_checkpoint_pending");
 		} else {

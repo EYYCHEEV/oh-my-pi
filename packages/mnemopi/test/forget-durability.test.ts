@@ -161,14 +161,6 @@ describe("every connection zeroes what it deletes", () => {
 
 		expect(memory.beam.db.query("PRAGMA secure_delete").get()).toEqual({ secure_delete: 1 });
 	});
-
-	it("tells each full-text index to delete securely, so a deleted term does not stay in a segment", () => {
-		const db = openBank(bankPath()).beam.db;
-
-		for (const table of ["fts_working", "fts_episodes", "fts_facts"]) {
-			expect(db.query(`SELECT v FROM ${table}_config WHERE k = 'secure-delete'`).get()).toEqual({ v: 1 });
-		}
-	});
 });
 
 describe("forget leaves nothing of the text in the database files", () => {
@@ -323,28 +315,70 @@ describe("a checkpoint that cannot finish is kept pending and retried", () => {
 	});
 });
 
-describe("a full-text index that cannot delete securely is merged after a forget", () => {
-	const mergesAfterForget = async (secure: boolean): Promise<string[]> => {
-		const memory = openBank(bankPath());
-		const note = await seedBank(memory);
-		if (!secure) {
-			// A build of SQLite whose FTS5 does not know the `secure-delete` option is an index that has it off.
-			for (const table of ["fts_working", "fts_episodes", "fts_facts"]) {
-				memory.beam.db.run(`INSERT INTO ${table}(${table}, rank) VALUES('secure-delete', 0)`);
-			}
-		}
-		const run = spyOn(memory.beam.db, "run");
-		expect(memory.forget(note)).toBe(true);
-		return run.mock.calls.map(call => String(call[0])).filter(sql => sql.includes("'optimize'"));
-	};
+describe("the full-text indexes delete securely only while a forget runs", () => {
+	const TABLES = ["fts_working", "fts_episodes", "fts_facts"];
 
-	it("runs the optimize of each index when the index does not delete securely", async () => {
-		const merges = await mergesAfterForget(false);
+	/** Every statement `db.run` gets, with the `secure-delete` setting refused when asked, as an FTS5 without the option does. */
+	function observe(db: Db, options: { refuse: boolean }): string[] {
+		const statements: string[] = [];
+		const run = db.run.bind(db) as (sql: string, ...rest: unknown[]) => unknown;
+		spyOn(db, "run").mockImplementation(((sql: string, ...rest: unknown[]) => {
+			statements.push(sql);
+			if (options.refuse && sql.includes("'secure-delete'")) throw new Error("SQL logic error");
+			return run(sql, ...rest);
+		}) as unknown as typeof db.run);
+		return statements;
+	}
+	const setting = (statements: string[], value: 0 | 1): string[] =>
+		statements.filter(sql => sql.includes(`'secure-delete', ${value})`));
+	const merges = (statements: string[]): string[] => statements.filter(sql => sql.includes("'optimize'"));
+	const configOf = (db: Db, table: string): unknown =>
+		db.query(`SELECT v FROM ${table}_config WHERE k = 'secure-delete'`).get();
 
-		expect(merges.map(sql => /fts_\w+/.exec(sql)?.[0]).sort()).toEqual(["fts_episodes", "fts_facts", "fts_working"]);
+	it("leaves every index on the default after open, because a secure delete made a 5000-row prune 30 times slower", () => {
+		const db = openBank(bankPath()).beam.db;
+
+		for (const table of TABLES) expect(configOf(db, table)).toBeNull();
 	});
 
-	it("does not merge a secure index, which would rewrite it for nothing", async () => {
-		expect(await mergesAfterForget(true)).toEqual([]);
+	it("turns the setting on for each index around the deletes of a forget and off again, with no merge", async () => {
+		const memory = openBank(bankPath());
+		const note = await seedBank(memory);
+		const statements = observe(memory.beam.db, { refuse: false });
+
+		expect(memory.forget(note)).toBe(true);
+
+		expect(setting(statements, 1).map(sql => /fts_\w+/.exec(sql)?.[0])).toEqual(TABLES);
+		expect(setting(statements, 0).map(sql => /fts_\w+/.exec(sql)?.[0])).toEqual(TABLES);
+		const lastOn = statements.findLastIndex(sql => sql.includes("'secure-delete', 1)"));
+		const firstOff = statements.findIndex(sql => sql.includes("'secure-delete', 0)"));
+		expect(lastOn).toBeLessThan(firstOff);
+		expect(merges(statements)).toEqual([]);
+		for (const table of TABLES) expect(configOf(memory.beam.db, table)).toEqual({ v: 0 });
+	});
+
+	it("changes nothing for a memory that is not there: no merge, no stored checkpoint, the setting off", async () => {
+		const memory = openBank(bankPath());
+		await seedBank(memory);
+		const statements = observe(memory.beam.db, { refuse: false });
+
+		expect(memory.forget("no-such-memory")).toBe(false);
+
+		expect(merges(statements)).toEqual([]);
+		expect(pendingFlags(memory.beam.db)).toBe(0);
+		for (const table of TABLES) expect(configOf(memory.beam.db, table)).not.toEqual({ v: 1 });
+	});
+
+	it("merges each index after a forget when the SQLite build refuses the setting, and the files are still clean", async () => {
+		const file = bankPath();
+		const memory = openBank(file);
+		const note = await seedBank(memory);
+		memory.beam.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+		const statements = observe(memory.beam.db, { refuse: true });
+
+		expect(memory.forget(note)).toBe(true);
+
+		expect(merges(statements).map(sql => /fts_\w+/.exec(sql)?.[0])).toEqual(TABLES);
+		expect(leaks(file)).toEqual({});
 	});
 });

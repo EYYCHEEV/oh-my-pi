@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import { enableSecureFullText, finishPendingForget } from "./forget-durability";
+import { finishPendingForget } from "./forget-durability";
 
 type PragmaTableInfoRow = {
 	name: string;
@@ -439,11 +439,10 @@ export function initBeam(db: Database): void {
 	`);
 
 	// A checkpoint a `forget` could not finish while a reader held the log (see `forget-durability.ts`): at most
-	// one row. The full-text indexes delete securely, and what an earlier forget still owes the file is finished
-	// here, in the one place every open of a bank passes through.
+	// one row. What an earlier forget still owes the file is finished here, in the one place every open of a
+	// bank passes through.
 	db.run(
 		"CREATE TABLE IF NOT EXISTS forget_checkpoint_pending (id INTEGER PRIMARY KEY CHECK (id = 1), at TEXT NOT NULL)",
 	);
-	enableSecureFullText(db);
 	finishPendingForget(db);
 }
