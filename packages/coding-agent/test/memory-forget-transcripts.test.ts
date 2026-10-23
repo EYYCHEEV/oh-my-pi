@@ -187,4 +187,23 @@ describe("memory_edit forget also scrubs the retained transcripts", () => {
 		expect(shown.map(row => row.source)).toContain("coding-agent-transcript");
 		expect(shown.map(row => row.content).join("\n")).toContain(MARKER);
 	});
+
+	it("leaves transcripts alone and says so when the forgotten text is too short to scrub", async () => {
+		const { state, edit } = startState("global");
+		const id = retain(state, "ok");
+		await state.retainMessages(
+			[
+				{ role: "user", content: "ok let us go ahead with the staging deploy" },
+				{ role: "assistant", content: "ok, starting the staging deploy now" },
+			],
+			"session-1",
+			{ extract: false },
+		);
+
+		const result = await edit.execute("call", { op: "forget", id });
+
+		expect(result.details).toMatchObject({ status: "deleted", note: expect.stringContaining("not scrubbed") });
+		expect(JSON.stringify(result.content)).toContain("not scrubbed");
+		expect(await recalled(state, "staging deploy")).toContain("ok let us go ahead with the staging deploy");
+	});
 });

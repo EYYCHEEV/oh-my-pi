@@ -301,6 +301,16 @@ export interface BeamStats {
 	[key: string]: JsonValue | Record<string, number> | undefined;
 }
 
+/** What `forget` did to one bank. */
+export interface ForgetOutcome {
+	/** The working row existed in this session and is gone. */
+	deleted: boolean;
+	/** Retained transcript rows rewritten to cut the forgotten text out. */
+	scrubbedRows: number;
+	/** Set when the text was too short to scrub from transcripts, to the shortest length that is scrubbed. */
+	skippedBelowChars: number | null;
+}
+
 export interface MemoriaRetrieveResult {
 	ability: string;
 	query: string;

@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { Mnemopi } from "@oh-my-pi/pi-mnemopi/core/memory";
+import { logger } from "@oh-my-pi/pi-utils";
 
 // Embeddings install on demand; these tests never run an embedding model.
 beforeEach(() => {
@@ -328,6 +329,86 @@ describe("forget scrubs the forgotten text out of retained transcripts", () => {
 		expect(rows(db, "SELECT content FROM working_memory WHERE id = ?", [stored])[0]).not.toContain(MARKER);
 		expect(memory.scrubForgottenText(SECRET)).toBe(0);
 		expect(memory.scrubForgottenText("  ")).toBe(0);
+	});
+});
+
+describe("the scrub only cuts whole words of a text long enough to be specific", () => {
+	const transcriptText = (db: Db, id: string): string =>
+		rows(db, "SELECT content || '|' || COALESCE(embed_text, '') FROM working_memory WHERE id = ?", [id])[0] ?? "";
+
+	it("leaves transcripts untouched when the forgotten text is shorter than 8 characters", () => {
+		const memory = makeMemory("scrub-short");
+		const db = memory.beam.db;
+		for (const text of ["ok", "abcdefg", "  abcdefg  "]) {
+			const note = memory.remember(text, { source: "coding-agent-retain" });
+			const id = retainTranscript(memory, [
+				["user", `${text.trim()} let us go, ${text.trim()}`],
+				["assistant", `Noted: ${text.trim()}.`],
+			]);
+			const before = transcriptText(db, id);
+
+			expect(memory.forget(note)).toBe(true);
+
+			expect(transcriptText(db, id)).toBe(before);
+			expect(before).toContain(text.trim());
+		}
+	});
+
+	it("reports a skipped scrub by memory id, never by the text, and scrubs from 8 characters up", () => {
+		const memory = makeMemory("scrub-skip-report");
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const short = memory.remember("abcdefg", { source: "coding-agent-retain" });
+			retainTranscript(memory, [["user", "abcdefg is the word"]]);
+			expect(memory.forgetDetailed(short)).toEqual({ deleted: true, scrubbedRows: 0, skippedBelowChars: 8 });
+			expect(warn).toHaveBeenCalledTimes(1);
+			expect(warn.mock.calls[0]?.[1]).toEqual({ memoryId: short, minChars: 8 });
+
+			warn.mockClear();
+			const long = memory.remember("abcdefgh", { source: "coding-agent-retain" });
+			retainTranscript(memory, [["user", "abcdefgh is the word"]]);
+			expect(memory.forgetDetailed(long)).toEqual({ deleted: true, scrubbedRows: 1, skippedBelowChars: null });
+			expect(warn).not.toHaveBeenCalled();
+			expect(memory.forgetDetailed(long)).toEqual({ deleted: false, scrubbedRows: 0, skippedBelowChars: null });
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("does not rewrite a longer word that contains the forgotten word", () => {
+		const memory = makeMemory("scrub-boundary");
+		const db = memory.beam.db;
+		const note = memory.remember("password", { source: "coding-agent-retain" });
+		const mixed = retainTranscript(memory, [
+			["user", "The password is hunter42. Rotate the passwords monthly, not passwordless_flow or password2."],
+			["assistant", "Not my_password, nor épassword or passwordé: (password), password"],
+		]);
+		const onlyLonger = retainTranscript(memory, [["user", "Rotate the passwords monthly, passwordless_flow."]]);
+		const onlyLongerBefore = transcriptText(db, onlyLonger);
+
+		expect(memory.forget(note)).toBe(true);
+
+		expect(rows(db, "SELECT embed_text FROM working_memory WHERE id = ?", [mixed])).toEqual([
+			"The [forgotten] is hunter42. Rotate the passwords monthly, not passwordless_flow or password2.\n\nNot my_password, nor épassword or passwordé: ([forgotten]), [forgotten]",
+		]);
+		// A row whose only matches sit inside longer words is not rewritten.
+		expect(transcriptText(db, onlyLonger)).toBe(onlyLongerBefore);
+	});
+
+	it("cuts the text where a non-word character or the edge of the row stands on both sides", () => {
+		const memory = makeMemory("scrub-edges");
+		const db = memory.beam.db;
+		const note = memory.remember("Quetzalbolt-7731", { source: "coding-agent-retain" });
+		const id = retainTranscript(memory, [
+			["user", "Quetzalbolt-7731"],
+			["assistant", '"Quetzalbolt-7731", Quetzalbolt-7731; (Quetzalbolt-7731) Quetzalbolt-77319 xQuetzalbolt-7731'],
+		]);
+
+		expect(memory.forget(note)).toBe(true);
+
+		expect(rows(db, "SELECT embed_text FROM working_memory WHERE id = ?", [id])).toEqual([
+			'[forgotten]\n\n"[forgotten]", [forgotten]; ([forgotten]) Quetzalbolt-77319 xQuetzalbolt-7731',
+		]);
 	});
 });
 

@@ -18,6 +18,7 @@ import type {
 	BeamEvent,
 	BeamMemoryState,
 	BeamStats,
+	ForgetOutcome,
 	ImportStats,
 	Metadata,
 	RememberBatchItem,
@@ -302,30 +303,58 @@ const TRANSCRIPT_SOURCE = "coding-agent-transcript";
 const FORGOTTEN_MARK = "[forgotten]";
 /** Rows per purge: it binds each id and its fact ids twice, so one bank-wide scrub must not bind them all at once. */
 const SCRUB_BATCH_SIZE = 200;
+/** Rows read per step of a scrub, so a bank-wide rewrite holds a bounded amount of text at a time. */
+const SCRUB_READ_BATCH = 100;
+/**
+ * A forgotten text shorter than this (trimmed) is not cut out of transcripts: so short a text is a common word or
+ * number, and cutting it would damage rows that say something else. The caller is told (`ForgetOutcome`).
+ */
+export const MIN_SCRUB_CHARS = 8;
+/** A character that continues a word, in any script. */
+const WORD_CHAR = "[\\p{L}\\p{N}_]";
+
+function escapeRegExp(text: string): string {
+	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 /**
- * Replace every occurrence of each of `texts` with `[forgotten]` in the transcript rows, in `content` and in the
- * `embed_text` projection, and return the ids of the rows that changed. Matching is literal and case-sensitive.
- * The `fts_working` row follows through the `wm_au` trigger.
+ * Replace each whole occurrence of each of `texts` with `[forgotten]` in the transcript rows, in `content` and in
+ * the `embed_text` projection, and return the ids of the rows that changed. An occurrence is whole when a non-word
+ * character or the edge of the text stands on both sides, so a text that is a word inside a longer word is left
+ * there. Matching is literal and case-sensitive; a text shorter than `MIN_SCRUB_CHARS` is ignored. `instr` finds
+ * the candidate rows in SQL, the rewrite runs on them in bounded batches. The `fts_working` row follows through
+ * the `wm_au` trigger.
  */
 function scrubTranscriptRows(beam: BeamMemoryState, texts: readonly string[]): string[] {
 	// Longest first, so a text that contains another is cut whole before its part is.
-	const spans = [...new Set(texts.map(text => text.trim()).filter(text => text !== ""))].sort(
+	const spans = [...new Set(texts.map(text => text.trim()).filter(text => text.length >= MIN_SCRUB_CHARS))].sort(
 		(a, b) => b.length - a.length,
 	);
-	const scrubbed = new Set<string>();
-	for (const span of spans) {
-		const rows = beam.db
-			.query(
-				`UPDATE working_memory
-				 SET content = replace(content, ?1, ?2), embed_text = replace(embed_text, ?1, ?2)
-				 WHERE source = ?3 AND (instr(content, ?1) > 0 OR instr(embed_text, ?1) > 0)
-				 RETURNING id`,
-			)
-			.all(span, FORGOTTEN_MARK, TRANSCRIPT_SOURCE) as { id: string }[];
-		for (const row of rows) scrubbed.add(row.id);
+	if (spans.length === 0) return [];
+	const patterns = spans.map(span => new RegExp(`(?<!${WORD_CHAR})${escapeRegExp(span)}(?!${WORD_CHAR})`, "gu"));
+	const cut = (value: string): string =>
+		patterns.reduce((cutValue, pattern) => cutValue.replace(pattern, () => FORGOTTEN_MARK), value);
+	const holdsText = spans.map(() => "instr(content, ?) > 0 OR instr(embed_text, ?) > 0").join(" OR ");
+	using find = beam.db.prepare(`SELECT id FROM working_memory WHERE source = ? AND (${holdsText})`);
+	const candidates = (find.all(TRANSCRIPT_SOURCE, ...spans.flatMap(span => [span, span])) as { id: string }[]).map(
+		row => row.id,
+	);
+	using update = beam.db.prepare("UPDATE working_memory SET content = ?, embed_text = ? WHERE id = ?");
+	const scrubbed: string[] = [];
+	for (let start = 0; start < candidates.length; start += SCRUB_READ_BATCH) {
+		const batch = candidates.slice(start, start + SCRUB_READ_BATCH);
+		using read = beam.db.prepare(
+			`SELECT id, content, embed_text FROM working_memory WHERE id IN (${batch.map(() => "?").join(", ")})`,
+		);
+		for (const row of read.all(...batch) as { id: string; content: string; embed_text: string | null }[]) {
+			const content = cut(row.content);
+			const embedText = row.embed_text === null ? null : cut(row.embed_text);
+			if (content === row.content && embedText === row.embed_text) continue;
+			update.run(content, embedText, row.id);
+			scrubbed.push(row.id);
+		}
 	}
-	return [...scrubbed];
+	return scrubbed;
 }
 
 /**
@@ -359,7 +388,7 @@ function rebuildScrubbedSummaries(
  * quote a memory verbatim: the session that stored it, and any later session whose recall showed it. Forgetting
  * the memory alone leaves its text recallable through them, so `texts` (what the memory said) is removed there
  * too, and everything built from the old text of a scrubbed row goes with it:
- * - Transcript rows keep everything but the exact text, which becomes `[forgotten]`.
+ * - Transcript rows keep everything but the whole-word occurrences of the text, which become `[forgotten]`.
  * - Their facts, memoria rows, graph links and vector are dropped, because they were extracted from the old text.
  *   Annotations stay. The vector is rebuilt after the commit (`reembedWorkingRows`).
  * - The summaries `sleep` made from them are rewritten from the scrubbed text and the old ones deleted, which
@@ -392,13 +421,19 @@ function reembedWorkingRows(beam: BeamMemoryState, ids: readonly string[]): void
 /**
  * Cut `text` out of this bank's transcript rows, summaries and facts without deleting any memory. A session that
  * forgets a memory in one bank calls it on the other banks it recalls from, whose transcripts may quote the same
- * text. Returns the number of transcript rows rewritten.
+ * text. Returns the number of transcript rows rewritten (0 for a text shorter than `MIN_SCRUB_CHARS`).
  */
 export function scrubForgottenText(beam: BeamMemoryState, text: string): number {
 	const scrubbed = transaction(beam.db, () => scrubTranscripts(beam, [text], null));
 	if (scrubbed.length > 0) invalidateCaches(beam);
 	reembedWorkingRows(beam, scrubbed);
 	return scrubbed.length;
+}
+
+/** True when `text` has content but too little of it to scrub from transcripts without hitting unrelated words. */
+function tooShortToScrub(text: string): boolean {
+	const length = text.trim().length;
+	return length > 0 && length < MIN_SCRUB_CHARS;
 }
 
 /**
@@ -1023,23 +1058,41 @@ function getFact(beam: BeamMemoryState, memoryId: string): Row | null {
 
 /**
  * Delete a working row for good, with everything derived from it, and scrub its text out of the retained
- * transcripts and the summaries and facts built from them (`scrubTranscripts`).
+ * transcripts and the summaries and facts built from them (`scrubTranscripts`). A text shorter than
+ * `MIN_SCRUB_CHARS` is not scrubbed from transcripts: the outcome says so, and one warning names the memory id
+ * (never its text).
  */
-export function forgetWorking(beam: BeamMemoryState, memoryId: string): boolean {
-	const { deleted, scrubbed } = transaction(beam.db, () => {
+export function forgetWorkingDetailed(beam: BeamMemoryState, memoryId: string): ForgetOutcome {
+	const done = transaction(beam.db, () => {
 		const row = beam.db
 			.query("DELETE FROM working_memory WHERE id = ? AND session_id = ? RETURNING content, embed_text")
 			.get(memoryId, beam.sessionId) as { content: string; embed_text: string | null } | null;
-		if (row === null) return { deleted: false, scrubbed: [] };
+		if (row === null) return null;
 		purgeWorkingMemoryArtifacts(beam.db, [memoryId]);
+		const tooShort = tooShortToScrub(row.content);
 		// Scrub first, so a summary that lists the forgotten row and a scrubbed one is rewritten once.
-		const scrubbed = scrubTranscripts(beam, [row.content, row.embed_text ?? ""], memoryId);
+		const scrubbed = tooShort ? [] : scrubTranscripts(beam, [row.content, row.embed_text ?? ""], memoryId);
 		retireDerivedSummaries(beam, memoryId, { kind: "forget" });
-		return { deleted: true, scrubbed };
+		return { scrubbed, tooShort };
 	});
-	if (deleted) invalidateCaches(beam);
-	reembedWorkingRows(beam, scrubbed);
-	return deleted;
+	if (done === null) return { deleted: false, scrubbedRows: 0, skippedBelowChars: null };
+	invalidateCaches(beam);
+	reembedWorkingRows(beam, done.scrubbed);
+	if (done.tooShort) {
+		logger.warn("mnemopi: forgotten text too short to scrub from retained transcripts; they keep any copy", {
+			memoryId,
+			minChars: MIN_SCRUB_CHARS,
+		});
+	}
+	return {
+		deleted: true,
+		scrubbedRows: done.scrubbed.length,
+		skippedBelowChars: done.tooShort ? MIN_SCRUB_CHARS : null,
+	};
+}
+
+export function forgetWorking(beam: BeamMemoryState, memoryId: string): boolean {
+	return forgetWorkingDetailed(beam, memoryId).deleted;
 }
 
 export function scratchpadWrite(beam: BeamMemoryState, content: string): string {

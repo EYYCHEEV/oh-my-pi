@@ -25,6 +25,7 @@ import { initBeam } from "./schema";
 import {
 	exportToDict,
 	forgetWorking,
+	forgetWorkingDetailed,
 	get,
 	getContext,
 	getGlobalWorkingStats,
@@ -46,6 +47,7 @@ import type {
 	BeamMemoryOptions,
 	BeamMemoryState,
 	BeamStats,
+	ForgetOutcome,
 	ImportStats,
 	MemoriaRetrieveResult,
 	Metadata,
@@ -252,6 +254,11 @@ export class BeamMemory implements BeamMemoryState {
 
 	forgetWorking(memoryId: string): boolean {
 		return forgetWorking(this, memoryId);
+	}
+
+	/** `forgetWorking` that also reports the transcript rows it scrubbed, or that the text was too short to scrub. */
+	forgetWorkingDetailed(memoryId: string): ForgetOutcome {
+		return forgetWorkingDetailed(this, memoryId);
 	}
 
 	/** Cut `text` out of this bank's retained transcripts and what was built from them; deletes no memory. */

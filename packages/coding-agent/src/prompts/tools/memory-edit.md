@@ -2,7 +2,7 @@ Edit Mnemopi long-term memories by id. Only ids returned by `{{toolRefs.recall}}
 
 Operations:
 - `update`: working memory; replace content and/or importance.
-- `forget`: permanently delete working memory, and cut its exact text out of retained session transcripts and the summaries and facts built from them.
+- `forget`: permanently delete working memory, and cut its exact text (whole words, 8+ characters) out of retained session transcripts and the summaries and facts built from them.
 - `invalidate`: softly supersede working or episodic memory; optional `replacement_id`. Retained transcripts that quote it stay as history.
 
 Fact ids — `{{toolRefs.recall}}` results marked `[facts]`: read-only. Inspect with `read memory://<id>`; any edit op → `not_editable`.

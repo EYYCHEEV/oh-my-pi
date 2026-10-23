@@ -60,7 +60,7 @@ export class MemoryEditTool implements AgentTool<typeof memoryEditSchema> {
 				? `Memory ${params.id} was not found${location}.`
 				: result.status === "not_editable"
 					? `Memory ${params.id} is a read-only fact${location}; it cannot be edited. Read it with memory://${params.id}.`
-					: `Memory ${params.id} ${result.status}${location}.`;
+					: `Memory ${params.id} ${result.status}${location}.${result.note === undefined ? "" : ` ${result.note}`}`;
 		return {
 			content: [{ type: "text", text }],
 			details: result,

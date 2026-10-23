@@ -117,6 +117,8 @@ export interface MnemopiMemoryEditResult {
 	status: "updated" | "deleted" | "invalidated" | "not_found" | "not_editable";
 	bank?: string;
 	store?: MnemopiMemoryStore;
+	/** Set when `forget` could not scrub the retained transcripts, with the reason. */
+	note?: string;
 }
 
 /** Which mnemopi table a resolved memory id lives in. `fact` rows are
@@ -379,9 +381,14 @@ export class MnemopiSessionState {
 				continue;
 			}
 			if (op === "forget") {
-				if (target.memory.forget(id)) {
+				const outcome = target.memory.forgetDetailed(id);
+				if (outcome.deleted) {
 					this.#scrubForgottenElsewhere(targets, target, typeof row.content === "string" ? row.content : "");
-					return { status: "deleted", ...resultContext };
+					const note =
+						outcome.skippedBelowChars === null
+							? undefined
+							: `Transcripts were not scrubbed: the text is shorter than ${outcome.skippedBelowChars} characters, so retained transcripts may still quote it.`;
+					return { status: "deleted", ...resultContext, ...(note === undefined ? {} : { note }) };
 				}
 				ineligible ??= { status: "not_found", ...resultContext };
 				continue;

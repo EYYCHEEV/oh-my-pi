@@ -8,7 +8,7 @@ import { AnnotationStore } from "./annotations";
 import { BankManager } from "./banks";
 import { BeamMemory, initBeam } from "./beam/index";
 import { reconcileEmbeddingModel } from "./beam/store";
-import type { RecallEnhancedOptions, RecallOptions, RecallResult, SleepResult } from "./beam/types";
+import type { ForgetOutcome, RecallEnhancedOptions, RecallOptions, RecallResult, SleepResult } from "./beam/types";
 import { EpisodicGraph } from "./episodic-graph";
 import {
 	isPiAiModel,
@@ -525,6 +525,11 @@ export class Mnemopi {
 
 	forget(memoryId: string): boolean {
 		return this.#withRuntimeOptions(() => this.beam.forgetWorking(memoryId));
+	}
+
+	/** `forget` that also reports the transcript rows it scrubbed, or that the text was too short to scrub. */
+	forgetDetailed(memoryId: string): ForgetOutcome {
+		return this.#withRuntimeOptions(() => this.beam.forgetWorkingDetailed(memoryId));
 	}
 
 	/**
