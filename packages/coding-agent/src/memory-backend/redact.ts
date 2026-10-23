@@ -142,10 +142,119 @@ function redactJwts(input: string): string {
 	return copied === 0 ? input : out + input.slice(copied);
 }
 
+// PEM private keys span lines, which the single-pass token scanners cannot see. A block cut off before
+// its footer (a truncated paste) is redacted to the end of the text: what follows the header is key.
+const PEM_PRIVATE_KEY =
+	/-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----|$)/g;
+
+// `Authorization: Bearer <token>`. The scheme word stays; a run of 16+ token characters after it goes
+// when it looks like a credential (digits, mixed case or very long), so prose that only mentions the
+// scheme is left alone.
+const BEARER_TOKEN = /\b(Bearer\s{1,8})([A-Za-z0-9._~+/=-]{16,})/gi;
+
+// `password=...`, `"api_key": "..."`, `client_secret: ...`. The key and its separator stay. The value is a
+// quoted literal (spaces allowed) or an unquoted run.
+const CREDENTIAL_ASSIGNMENT =
+	/((?:password|passwd|passphrase|secret|api[_-]?key|access[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|private[_-]?key|token)["']?[ \t]{0,3}[:=][ \t]{0,3})(?:"([^"\n]{4,200})"|'([^'\n]{4,200})'|([^\s"'`,;&)}\]]{6,}))/gi;
+
+const MIN_ASSIGNED_LETTERS_VALUE = 16;
+
+function looksLikeBearerCredential(token: string): boolean {
+	return /\d/.test(token) || (/[a-z]/.test(token) && /[A-Z]/.test(token)) || token.length >= 32;
+}
+
+/**
+ * Whether the value of `password=...` is a literal credential rather than a reference or placeholder:
+ * a quoted literal, a value with a digit or symbol, or a long run of letters. Template markers
+ * (`${X}`, `<x>`, `{{x}}`, `%x%`, `$x`), `None`-style words and masks stay readable.
+ */
+function looksLikeAssignedCredential(value: string, quoted: boolean): boolean {
+	if (/^(?:\[REDACTED\]|[$<{%*]|none$|null$|nil$|undefined$|true$|false$)/i.test(value)) return false;
+	if (quoted) return true;
+	return /[\d!@#^+/=~]/.test(value) || value.length >= MIN_ASSIGNED_LETTERS_VALUE;
+}
+
+function redactStructuredSecrets(input: string): string {
+	return input
+		.replace(PEM_PRIVATE_KEY, "[REDACTED]")
+		.replace(BEARER_TOKEN, (match, scheme: string, token: string) =>
+			looksLikeBearerCredential(token) ? `${scheme}[REDACTED]` : match,
+		)
+		.replace(
+			CREDENTIAL_ASSIGNMENT,
+			(match, key: string, double: string | undefined, single: string | undefined, bare: string | undefined) => {
+				const quote = double !== undefined ? '"' : single !== undefined ? "'" : "";
+				const value = double ?? single ?? bare ?? "";
+				return looksLikeAssignedCredential(value, quote !== "") ? `${key}${quote}[REDACTED]${quote}` : match;
+			},
+		);
+}
+
 export function redactMemorySecrets(input: string): string {
-	let out = redactJwts(redactKeywordSecrets(input));
+	let out = redactJwts(redactKeywordSecrets(redactStructuredSecrets(input)));
 	for (const pattern of PATTERNS) out = out.replace(pattern, "[REDACTED]");
 	return out;
+}
+
+// Recalled text is scanned again on the way out: rows written before redaction existed, by another
+// tool or by hand in SQLite never saw the write-side scrub. The rule families match the scan the
+// stronk-bot journal runs on every entry it shows: injection phrases, hidden Unicode, credentials,
+// and a download piped into a shell.
+
+/** Soft hyphen, zero-width and bidirectional-control characters, the byte order mark and invisible tag characters. */
+const HIDDEN_UNICODE = /[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF\u{E0000}-\u{E007F}]/gu;
+
+// A memory that quotes `</memories>` would end the recall block early and let the rest read as
+// prompt text. Escaping the `<` keeps the characters and breaks the tag. Only the block's own tags
+// are escaped: other markup in a memory stays as written.
+const FORGED_TAG = /<(?=\/?(?:memories|mental_models)\b)/gi;
+
+// An override verb needs a qualifier that marks the target as the model's own instructions ("ignore the
+// previous instructions"); a bare "ignore the lint rules" is ordinary advice and stays readable.
+// "instructions", "prompts" and "directives" are model-facing nouns, so any qualifier word is enough
+// ("ignore all instructions"). "rules" and "guidelines" are everyday nouns ("ignore all rules marked
+// deprecated"), so they additionally need a word that points at the model's own side: "your", "previous",
+// "above", "system" and the like.
+const OVERRIDE_VERB = "(?:ignore|disregard|forget|override|bypass)";
+const DETERMINER = "(?:the|my|these|those)";
+const SCOPE_WORD = "(?:all|any|every)";
+const TARGET_WORD = "(?:your|previous|prior|earlier|above|preceding|system|developer|safety|original)";
+const INJECTION_PATTERN = new RegExp(
+	[
+		`\\b${OVERRIDE_VERB}\\s+(?:${DETERMINER}\\s+)*(?:(?:${SCOPE_WORD}|${TARGET_WORD})\\s+(?:${DETERMINER}\\s+)*){1,5}(?:instructions?|prompts?|directives)\\b`,
+		`\\b${OVERRIDE_VERB}\\s+(?:${DETERMINER}\\s+)*(?:${SCOPE_WORD}\\s+(?:${DETERMINER}\\s+)*)*${TARGET_WORD}\\s+(?:${DETERMINER}\\s+)*(?:(?:${SCOPE_WORD}|${TARGET_WORD})\\s+(?:${DETERMINER}\\s+)*){0,4}(?:rules|guidelines)\\b`,
+		"\\b(?:do\\s+not|don'?t)\\s+tell\\s+the\\s+user\\b",
+		"\\bsystem\\s+prompt\\s+override\\b",
+		"\\b(?:reveal|print|repeat|output|leak)\\s+(?:\\w+\\s+){0,3}(?:system|developer)\\s+prompt\\b",
+	].join("|"),
+	"i",
+);
+const WITHHOLD_RULES: readonly { name: string; pattern: RegExp }[] = [
+	{ name: "prompt injection", pattern: INJECTION_PATTERN },
+	{
+		name: "download piped into a shell",
+		pattern: /\b(?:curl|wget)\b[^\n|]{0,300}\|\s*(?:sudo\s+)?(?:ba|z|da|k|c|a)?sh\b/i,
+	},
+];
+
+export interface RecalledTextVerdict {
+	/** The text to show: hidden characters stripped, credentials redacted, forged tags broken. */
+	text: string;
+	/** The scan rule that matched when the text must not be shown at all. */
+	withheld?: string;
+}
+
+/**
+ * Scan recalled memory text before it is rendered into a prompt. Hidden characters, credentials and
+ * forged tags are neutralised in place. Text that reads as an instruction to the model, or as a
+ * download piped into a shell, is flagged `withheld`: rewriting it reliably is not possible, so the
+ * caller shows a notice instead. Hidden characters go first, so they cannot split a phrase past the scan.
+ */
+export function vetRecalledMemoryText(input: string): RecalledTextVerdict {
+	const visible = input.replace(HIDDEN_UNICODE, "");
+	const text = redactMemorySecrets(visible).replace(FORGED_TAG, "&lt;");
+	const rule = WITHHOLD_RULES.find(candidate => candidate.pattern.test(visible));
+	return rule ? { text, withheld: rule.name } : { text };
 }
 
 /**

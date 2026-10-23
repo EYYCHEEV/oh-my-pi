@@ -10,6 +10,7 @@ import { getMnemopiRuntimeOptions, withMnemopiRuntimeOptions } from "../runtime-
 import {
 	consolidateEligibleWorkingRows,
 	consolidateWorkingRowsById,
+	rebuildSleepSummary,
 	storeExtractedFactCategories,
 } from "./consolidate";
 import { type EmbedItem, scheduleEmbedding, vecAvailable, vecInsert } from "./helpers";
@@ -179,8 +180,8 @@ const MEMORIA_SOURCE_TABLES = [
 ] as const;
 
 /**
- * Remove every artifact linked to the given `working_memory` ids so no deletion
- * path leaves orphans behind. Covers annotations, embeddings, extracted facts
+ * Remove every artifact linked to the given `working_memory` (or `episodic_memory`) ids so no
+ * deletion path leaves orphans behind. Covers annotations, embeddings, extracted facts
  * (`facts.source_msg_id`), memoria projections (`*.source_memory_id`), episodic
  * gists, and the graph edges tied to those memory / gist / fact node ids.
  *
@@ -219,6 +220,62 @@ function purgeWorkingMemoryArtifacts(db: BeamMemoryState["db"], ids: readonly st
 			...refs,
 			...refs,
 		]);
+	}
+}
+
+type SummaryRetirement = { kind: "invalidate"; at: string; replacementId: string | null } | { kind: "forget" };
+
+/**
+ * A working row that `memory_edit invalidate` or `forget` retires must leave the episodic summaries
+ * `sleep` built from it, otherwise the retirement is undone as soon as the working row drops out of
+ * recall: the summary, and the facts extracted from its text, keep surfacing the same words. Each
+ * summary whose `summary_of` lists the row gets the narrowest cut that hides the row's text:
+ * - It covered only that row: invalidate expires it the same way, forget deletes it.
+ * - It also covers other rows: it is rewritten from their live text (`rebuildSleepSummary`) and the old
+ *   one is retired or deleted, so the other rows keep a summary and the facts extracted from it. One
+ *   summary mixes many rows, so retiring it whole would hide unrelated memories.
+ * - It cannot be rewritten (a caller-supplied digest, or another row exists only inside it): it is
+ *   retired or deleted whole. Text in a row we cannot cut must not stay recallable.
+ * Facts extracted from a retired summary stop surfacing through the source check in `recall`.
+ * A summary that is already retired needs nothing on invalidate; forget deletes it anyway, because the
+ * forgotten text has to go.
+ */
+function retireDerivedSummaries(beam: BeamMemoryState, sourceId: string, retirement: SummaryRetirement): void {
+	using statement = beam.db.prepare(
+		`SELECT id, rowid, source, summary_of, metadata_json, timestamp, created_at, valid_until, superseded_by
+		 FROM episodic_memory WHERE instr(',' || summary_of || ',', ?) > 0`,
+	);
+	const now = toUtcIso();
+	for (const summary of statement.all(`,${sourceId},`) as Row[]) {
+		const id = String(summary.id);
+		const validUntil = summary.valid_until;
+		const retired = summary.superseded_by != null || (typeof validUntil === "string" && validUntil <= now);
+		if (retired && retirement.kind === "invalidate") continue;
+		let supersededBy = retirement.kind === "invalidate" ? retirement.replacementId : null;
+		if (!retired) {
+			const others = String(summary.summary_of)
+				.split(",")
+				.filter(part => part.length > 0 && part !== sourceId);
+			const rewritten = others.length > 0 ? rebuildSleepSummary(beam, summary, others) : null;
+			if (rewritten !== null) supersededBy = rewritten[0] ?? supersededBy;
+		}
+		if (retirement.kind === "invalidate") {
+			beam.db.run("UPDATE episodic_memory SET valid_until = ?, superseded_by = ? WHERE id = ?", [
+				retirement.at,
+				supersededBy,
+				id,
+			]);
+			continue;
+		}
+		if (vecAvailable(beam.db)) {
+			try {
+				beam.db.run("DELETE FROM vec_episodes WHERE rowid = ?", [Number(summary.rowid)]);
+			} catch {
+				// sqlite-vec cleanup is best-effort, as in import: the row delete takes precedence.
+			}
+		}
+		beam.db.run("DELETE FROM episodic_memory WHERE id = ?", [id]);
+		purgeWorkingMemoryArtifacts(beam.db, [id]);
 	}
 }
 
@@ -674,15 +731,21 @@ export function getContext(beam: BeamMemoryState, limit = 10): Row[] {
 
 export function invalidate(beam: BeamMemoryState, memoryId: string, replacementId: string | null = null): boolean {
 	const now = toUtcIso();
-	const working = beam.db.run(
-		`
+	let retiredWorking = false;
+	transaction(beam.db, () => {
+		const working = beam.db.run(
+			`
 			UPDATE working_memory
 			SET valid_until = ?, superseded_by = ?
 			WHERE id = ? AND (session_id = ? OR scope = 'global')
 		`,
-		[now, replacementId, memoryId, beam.sessionId],
-	);
-	if (working.changes > 0) {
+			[now, replacementId, memoryId, beam.sessionId],
+		);
+		if (working.changes === 0) return;
+		retiredWorking = true;
+		retireDerivedSummaries(beam, memoryId, { kind: "invalidate", at: now, replacementId });
+	});
+	if (retiredWorking) {
 		// Recall filters `valid_until`/`superseded_by` in SQL, but the enhanced path consults the
 		// query cache BEFORE it reaches SQL. Without this the row a caller just retired keeps being
 		// served to an identical query for the rest of the cache TTL -- the one thing an explicit
@@ -842,6 +905,7 @@ export function forgetWorking(beam: BeamMemoryState, memoryId: string): boolean 
 		deleted = result.changes;
 		if (deleted > 0) {
 			purgeWorkingMemoryArtifacts(beam.db, [memoryId]);
+			retireDerivedSummaries(beam, memoryId, { kind: "forget" });
 		}
 	});
 	if (deleted > 0) invalidateCaches(beam);

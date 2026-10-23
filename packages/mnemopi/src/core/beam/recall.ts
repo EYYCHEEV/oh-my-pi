@@ -82,26 +82,173 @@ const VERACITY_WEIGHTS: Record<string, number> = {
  */
 export const RECALL_CONTENT_PREVIEW_CHARS = 500;
 
+type QueryGroups = readonly (readonly string[])[];
+
+interface QueryHit {
+	start: number;
+	end: number;
+	group: number;
+}
+
+/** Hits kept across all query terms; each term keeps an equal share, so a common word cannot crowd out a rare one. */
+const PREVIEW_MAX_HITS = 200;
+const PREVIEW_MIN_HITS_PER_TERM = 8;
+const PREVIEW_MAX_SEARCH_STEPS = 400;
+/** How far a preview edge may move to land on a word boundary. */
+const PREVIEW_SNAP_CHARS = 24;
+const PREVIEW_WORD_CHAR = /[\p{L}\p{N}]/u;
+
+function isPreviewWordCharAt(text: string, index: number): boolean {
+	return index >= 0 && index < text.length && PREVIEW_WORD_CHAR.test(text.charAt(index));
+}
+
+/** Whole-word occurrences of the query terms in `content`, by position. */
+function findQueryHits(content: string, groups: QueryGroups): QueryHit[] {
+	const lowered = content.toLowerCase();
+	// A few characters change length when lowercased, which would misalign every index below.
+	if (lowered.length !== content.length) return [];
+	const termCount = groups.reduce((total, group) => total + group.length, 0);
+	const perTerm = Math.max(PREVIEW_MIN_HITS_PER_TERM, Math.floor(PREVIEW_MAX_HITS / Math.max(1, termCount)));
+	const hits: QueryHit[] = [];
+	groups.forEach((group, index) => {
+		for (const term of group) {
+			if (term.length === 0) continue;
+			const cjk = hasCjk(term);
+			let found = 0;
+			let steps = 0;
+			for (
+				let at = lowered.indexOf(term);
+				at >= 0 && found < perTerm && steps < PREVIEW_MAX_SEARCH_STEPS;
+				at = lowered.indexOf(term, at + 1)
+			) {
+				steps += 1;
+				const end = at + term.length;
+				if (!cjk && (isPreviewWordCharAt(lowered, at - 1) || isPreviewWordCharAt(lowered, end))) continue;
+				hits.push({ start: at, end, group: index });
+				found += 1;
+			}
+		}
+	});
+	return hits.sort((left, right) => left.start - right.start);
+}
+
 /**
- * Clip `content` to at most `limit` characters, replacing the tail with `…`
- * when truncated so agents can distinguish a preview from a full row. Returns
- * the original string (and `truncated: false`) when the limit is 0/negative or
- * the content already fits. The single `…` occupies one character of the cap,
- * so a 500-char cap yields at most 499 real characters plus the marker.
+ * The start of the `width`-character window with the highest total weight of distinct query terms
+ * (earliest on a tie), and that weight. Candidate windows begin `lead` characters before a hit, so the
+ * match keeps some context; hits are sorted, so one sweep with two pointers covers every candidate.
+ */
+function bestPreviewWindow(
+	hits: readonly QueryHit[],
+	weights: readonly number[],
+	width: number,
+	lead: number,
+): { start: number; score: number } {
+	const counts = weights.map(() => 0);
+	let score = 0;
+	let left = 0;
+	let right = 0;
+	let best = { start: 0, score: 0 };
+	for (const anchor of hits) {
+		const start = Math.max(0, anchor.start - lead);
+		for (let hit = hits[right]; hit !== undefined && hit.end <= start + width; hit = hits[++right]) {
+			counts[hit.group] = (counts[hit.group] ?? 0) + 1;
+			if (counts[hit.group] === 1) score += weights[hit.group] ?? 0;
+		}
+		for (let hit = hits[left]; left < right && hit !== undefined && hit.start < start; hit = hits[++left]) {
+			counts[hit.group] = (counts[hit.group] ?? 0) - 1;
+			if (counts[hit.group] === 0) score -= weights[hit.group] ?? 0;
+		}
+		if (score > best.score) best = { start, score };
+	}
+	return best;
+}
+
+/**
+ * A preview of `content` around the part the query matched, or `null` when the head preview is as
+ * good: no term occurs, or the head already shows terms that weigh as much as any window's. A term
+ * that occurs rarely in the row weighs more than one that is everywhere, so the window goes where the
+ * query is specific. The window keeps the length budget: `…` replaces each cut side, so `limit - 2`
+ * real characters fit when both sides are cut.
+ */
+function matchedPreview(content: string, limit: number, groups: QueryGroups): string | null {
+	const width = limit - 2;
+	if (width < 8) return null;
+	const hits = findQueryHits(content, groups);
+	if (hits.length === 0) return null;
+	const occurrences = groups.map(() => 0);
+	for (const hit of hits) occurrences[hit.group] = (occurrences[hit.group] ?? 0) + 1;
+	const weights = occurrences.map(count => 1 / (1 + Math.log(1 + count)));
+	let headScore = 0;
+	const inHead = new Set<number>();
+	for (const hit of hits) {
+		if (hit.end <= limit - 1 && !inHead.has(hit.group)) {
+			inHead.add(hit.group);
+			headScore += weights[hit.group] ?? 0;
+		}
+	}
+	const lead = Math.min(Math.floor(width / 4), 120);
+	const best = bestPreviewWindow(hits, weights, width, lead);
+	if (best.score <= headScore + 1e-9) return null;
+
+	// Move the edges to word boundaries without cutting a hit the window was chosen for.
+	const snap = Math.min(PREVIEW_SNAP_CHARS, Math.floor(lead / 2));
+	let start = best.start;
+	for (let i = start; i < start + snap && start > 0; i += 1) {
+		if (!isPreviewWordCharAt(content, i - 1)) {
+			start = i;
+			break;
+		}
+	}
+	let end = Math.min(content.length, start + width);
+	if (end < content.length) {
+		const lastHitEnd = Math.max(0, ...hits.filter(hit => hit.start >= start && hit.end <= end).map(hit => hit.end));
+		for (let i = end; i > end - snap && i > lastHitEnd; i -= 1) {
+			if (!isPreviewWordCharAt(content, i - 1) || !isPreviewWordCharAt(content, i)) {
+				end = i;
+				break;
+			}
+		}
+	}
+	const body = content.slice(start, end).trim();
+	return `${start > 0 ? "…" : ""}${body}${end < content.length ? "…" : ""}`;
+}
+
+/**
+ * Clip `content` to at most `limit` characters, marking each cut side with `…` so agents can
+ * distinguish a preview from a full row. Returns the original string (and `truncated: false`) when
+ * the limit is 0/negative or the content already fits.
+ *
+ * Without `queryGroups` the preview is the head of the row: the single `…` occupies one character of
+ * the cap, so a 500-char cap yields at most 499 real characters plus the marker. With them (one array
+ * of interchangeable terms per query word, lowercase) a row whose match lies past the head is shown
+ * as a window around the match instead, with `…` on each cut side, so the fact the query found is in
+ * the preview. A match already in the head keeps the head preview.
  */
 export function clipRecallContent(
 	content: string,
 	limit: number = RECALL_CONTENT_PREVIEW_CHARS,
+	queryGroups?: QueryGroups,
 ): { content: string; truncated: boolean; fullLength: number } {
 	const fullLength = content.length;
 	if (limit <= 0 || fullLength <= limit) {
 		return { content, truncated: false, fullLength };
 	}
+	const centred =
+		queryGroups === undefined || queryGroups.length === 0 ? null : matchedPreview(content, limit, queryGroups);
+	if (centred !== null) return { content: centred, truncated: true, fullLength };
 	const head = content.slice(0, Math.max(0, limit - 1));
 	return { content: `${head}…`, truncated: true, fullLength };
 }
 
 const DEFAULT_LIMIT = 500;
+/**
+ * Most rows per tier (newest first) whose stored embeddings a vector recall compares with the query.
+ * Each row costs one JSON parse of its embedding, about 25 µs at 768 dimensions (the default model),
+ * so the bound caps a recall at roughly 190 ms per tier however far the bank grows, instead of the
+ * cost scaling with its history. A row older than the newest `VECTOR_SCAN_LIMIT` of its tier is
+ * reachable by keyword only.
+ */
+const VECTOR_SCAN_LIMIT = 5000;
 const STOP_WORDS = new Set([
 	"a",
 	"an",
@@ -410,14 +557,21 @@ function factVisibilityWhere(beam: BeamMemoryState, tableAlias: string): { where
 	const scope = factsHaveScopeColumn(beam)
 		? `(${prefix}session_id = ? OR ${prefix}scope = 'global')`
 		: `${prefix}session_id = ?`;
-	// A fact is a derivative of the working_memory row it was extracted from: once that row is
-	// explicitly superseded (`memory_edit invalidate`) or has expired, the fact must stop
-	// surfacing — otherwise an explicit invalidation is silently defeated at the fact layer.
+	// A fact is a derivative of the memory row it was extracted from: the working_memory row for
+	// facts the extractor stored at `remember` time, the episodic_memory summary for facts
+	// consolidation extracted from its text. Once that source is explicitly superseded
+	// (`memory_edit invalidate`) or has expired, the fact must stop surfacing — otherwise an
+	// explicit invalidation is silently defeated at the fact layer.
 	// Correlated EXISTS probes the source's primary key (same shape as the fts_working /
 	// fts_episodes visibility predicates). Facts whose source row no longer exists stay
 	// visible: nothing contradicts them.
-	const sourceSuperseded = `NOT EXISTS (SELECT 1 FROM working_memory w WHERE w.id = ${prefix}source_msg_id AND (w.superseded_by IS NOT NULL OR (w.valid_until IS NOT NULL AND w.valid_until <= ?)))`;
-	return { where: `${scope} AND ${sourceSuperseded}`, params: [beam.sessionId, nowIso()] };
+	const sourceSuperseded = (table: "working_memory" | "episodic_memory", alias: string): string =>
+		`NOT EXISTS (SELECT 1 FROM ${table} ${alias} WHERE ${alias}.id = ${prefix}source_msg_id AND (${alias}.superseded_by IS NOT NULL OR (${alias}.valid_until IS NOT NULL AND ${alias}.valid_until <= ?)))`;
+	const now = nowIso();
+	return {
+		where: `${scope} AND ${sourceSuperseded("working_memory", "w")} AND ${sourceSuperseded("episodic_memory", "e")}`,
+		params: [beam.sessionId, now, now],
+	};
 }
 
 function buildWhere(
@@ -598,7 +752,7 @@ function allVisibleIds(
 	const { where, params } = buildWhere(beam, "", options);
 	const rows = queryAll(beam, `SELECT id FROM ${table} WHERE ${where} ORDER BY timestamp DESC LIMIT ?`, [
 		...params,
-		DEFAULT_LIMIT,
+		VECTOR_SCAN_LIMIT,
 	]);
 	return rows.map(row => asString(row.id)).filter(Boolean);
 }
@@ -720,7 +874,7 @@ function scoreCandidate(
 		score *= tierWeight;
 	}
 	score *= veracityWeight * currentContentAdjustment(searchableContent, options.currentSensitive === true);
-	const preview = clipRecallContent(content, options.contentPreviewChars ?? RECALL_CONTENT_PREVIEW_CHARS);
+	const preview = clipRecallContent(content, options.contentPreviewChars ?? RECALL_CONTENT_PREVIEW_CHARS, queryGroups);
 	const result: RecallResult = {
 		...candidate.row,
 		id: asString(candidate.row.id),
@@ -1119,6 +1273,7 @@ async function polyphonicRecallEnhanced(
 		contextBudget: Number.POSITIVE_INFINITY,
 	});
 	const previewChars = options.contentPreviewChars ?? RECALL_CONTENT_PREVIEW_CHARS;
+	const previewGroups = expandedTokenGroups(query, options.useSynonyms !== false);
 	const results: RecallResult[] = [];
 	for (const result of fused) {
 		if (results.length >= topK) break;
@@ -1129,7 +1284,7 @@ async function polyphonicRecallEnhanced(
 		};
 		// Rows reached only through the graph/fact/temporal/vector voices are hydrated in full.
 		if (typeof mapped.truncated !== "boolean") {
-			const preview = clipRecallContent(mapped.content, previewChars);
+			const preview = clipRecallContent(mapped.content, previewChars, previewGroups);
 			mapped.content = preview.content;
 			mapped.truncated = preview.truncated;
 			mapped.full_length = preview.fullLength;

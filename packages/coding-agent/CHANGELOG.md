@@ -28,6 +28,9 @@
 - Fixed late provider-request growth stopping at the budget gate when OMP could safely compact and retry.
 - Added awaitable extension custom-message admission receipts and session-scoped persistence barriers, without changing existing message-send completion behavior.
 - Added generic session-wide runtime requirements with durable obligations, fresh loader-backed attachment checks, `session_ready`, startup `requiredRuntimeExtensions`, and the `--require-runtime-contract=1` support assertion. Refused execution preserves queued work and keeps saved history readable; recovery guidance is bounded and display-only.
+- Fixed the first-turn memory block, the `recall` tool and the `reflect` tool showing only the first 499 characters of a long recalled Mnemopi memory even when the query matched far past them: they now show the part the query matched, with `…` on each cut side
+- Fixed memory write redaction letting PEM private-key blocks (whole or cut off), `Bearer` tokens and `password=` / `api_key=` style assignments through to the store; the key name stays and the value becomes `[REDACTED]`
+- Fixed recalled Mnemopi memories reaching the prompt unscanned. Recall now strips hidden Unicode, redacts credentials and breaks a quoted `</memories>` tag in every row and source label it renders, and withholds rows that read as a prompt-injection instruction or a download piped into a shell: the first-turn block, the pre-compaction recall and the `reflect` tool drop them, and the `recall` tool and memory search list them as `[withheld: ...]` with their id. `read memory://<id>` applies the same hidden-Unicode and credential scrub but still shows a withheld row, so it can be inspected before it is forgotten
 
 ### Fixed
 

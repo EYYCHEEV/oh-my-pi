@@ -39,6 +39,10 @@ Selecting Mnemopi makes these discoverable tools available:
 
 Read the full content and metadata for a recalled result with `read memory://<memory-id>` before replacing it; clipped recall previews are not safe update payloads. The optional `learn` tool is also able to retain into Mnemopi when `autolearn.enabled: true`.
 
+`memory_edit invalidate` and `forget` on a working row also retire the copies consolidation made of it, so a retired memory does not resurface through its episodic summary or the facts extracted from it. A summary that covered only that row is expired (invalidate) or deleted (forget). A summary that also covers other rows is rewritten from their live text, and the old one is retired or deleted, so the other rows keep their summary and facts. A summary that cannot be rewritten (one written by a caller instead of `sleep`) is retired or deleted whole. `update` does not cascade: a consolidated summary keeps the row's earlier text.
+
+Memory text is scanned on the way in and on the way out. Writes redact provider tokens, PEM private-key blocks, `Bearer` tokens and `password=` / `api_key=` style assignments (the key name stays, the value becomes `[REDACTED]`). Recalled text is scanned again before it is rendered, because rows written earlier, by another tool or by hand never saw the write scrub: hidden Unicode characters are stripped, credentials are redacted, and a quoted `</memories>` tag is broken so a memory cannot close the recall block. A row that reads as an instruction to the model (`ignore all previous instructions`) or as a download piped into a shell is withheld: the first-turn block, the pre-compaction recall and `reflect` omit it, and `recall` and the memory search list it as `[withheld: ...]` with its id so you can inspect it with `read memory://<id>` or remove it with `memory_edit`. The scan is a list of patterns, not a guarantee; withheld rows stay in the store.
+
 ## Settings
 
 | Setting                       | Default            | Description                                                                                                                                                                                                                                                                            |
@@ -84,7 +88,7 @@ The combined project-plus-global behavior lives in the wrapper. The `@oh-my-pi/p
 
 ## Recall previews and full-row reads
 
-Recall results carry clipped content previews, not full rows. Content longer than the preview cap is truncated with a trailing `…`; the result also sets `truncated: true` and `full_length` (original character count), so callers can detect clipping without parsing the marker. The cap is `RecallOptions.contentPreviewChars` (default `500`; `0` disables clipping).
+Recall results carry clipped content previews, not full rows. Content longer than the preview cap is truncated with `…` on each cut side; the result also sets `truncated: true` and `full_length` (original character count), so callers can detect clipping without parsing the marker. The cap is `RecallOptions.contentPreviewChars` (default `500`; `0` disables clipping). The preview is the head of the row, unless the query matched only past the head: then it is a window around the match (a leading `…` marks it), preferring the query terms that are rare in that row, so a fact buried deep in a long row appears in the recall result instead of its first 499 characters.
 
 The full row is always reachable by reading `memory://<memory-id>`, which resolves the live working or episodic row and returns its full content behind a small YAML frontmatter header (`id`, `bank`, `store`, `memory_type`, timestamps, `importance`, `veracity`, `session_id`, `metadata`). The coding-agent's model-facing prompts require this read before any `memory_edit update`, since `update` replaces content wholesale and would otherwise discard the unseen tail of a clipped preview.
 
@@ -93,6 +97,8 @@ Retention writes a marker-free transcript projection: when the host supplies an 
 ## LLM and embeddings
 
 FTS and embedding paths use the settings below. `llmMode: smol` resolves the `memory` role and its configured retry chain, fetching credentials at call time. When unset, the role reuses `tiny`, then the fast (`smol`) defaults. It supports both local-inference and online models. `llmMode: remote` uses the OpenAI-compatible endpoint settings; `llmMode: none` disables LLM calls. If no usable model or credential resolves, Mnemopi continues without LLM-backed work. The legacy `providers.memoryModel` setting is migrated into the `memory` role.
+
+Vector recall (the default ranking whenever embeddings are on) compares the query embedding with the stored embeddings of the newest 5000 rows of each memory tier, so a purely semantic match is still found when thousands of newer memories were written after it. The bound keeps a recall near 190 ms per tier with the default 768-dimension model (about 100 ms at 384 dimensions); a row older than the newest 5000 of its tier is found by keyword only.
 
 FTS-only:
 
@@ -184,6 +190,7 @@ new Mnemopi({
 - Subagents do not own separate Mnemopi retain loops; they alias the parent state when a parent Mnemopi state exists, and otherwise remain inert.
 - At primary backend startup, eligible working-memory rows are promoted across owned banks before the first write can TTL-trim them. Promotion failures are logged without disabling the backend.
 - Every write also runs Mnemopi's working-memory trim, which never deletes unconsolidated rows. It promotes them to episodic memory with the same consolidation `sleep` uses, in batches: when a row passes the 24-hour TTL, every row `sleep` would take (older than half the TTL, 12 hours by default) is promoted together, so a long session consolidates in groups about every 12 hours; when more than the 1000-row working-memory limit is live, the oldest rows are promoted down to 90% of the limit. A session that stays open longer than the TTL therefore keeps its memories. A failed promotion is logged and retried on the next write.
+- Two sessions creating the same bank database at the same moment both succeed: switching a new database to WAL needs an exclusive lock that SQLite refuses at once (it skips `busy_timeout`), so that switch retries on a busy answer with a backoff of about 1.3 s in total. Other errors are not retried.
 - Backend startup is best-effort. If database/model initialization fails, the session continues with Mnemopi inert and logs a warning; memory tools then report that the backend is not initialized.
 
 ## Shutdown and durability
