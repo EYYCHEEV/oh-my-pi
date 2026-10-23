@@ -398,7 +398,7 @@ export class MnemopiSessionState {
 			if (op === "forget") {
 				const outcome = target.memory.forgetDetailed(id);
 				if (outcome.deleted) {
-					this.#scrubForgottenElsewhere(targets, target, typeof row.content === "string" ? row.content : "");
+					this.#scrubForgottenElsewhere(targets, target, outcome.forgottenTexts);
 					const note =
 						outcome.skippedBelowChars === null
 							? undefined
@@ -418,19 +418,20 @@ export class MnemopiSessionState {
 
 	/**
 	 * `forget` scrubs the transcripts of the bank the memory lived in. A session also recalls from, and
-	 * retains transcripts into, other banks, which may quote the same text: scrub those too. The memory is
-	 * already deleted, so a failure here is logged, not thrown.
+	 * retains transcripts into, other banks, which may quote the same text: scrub those too, and leave them the
+	 * tombstones that cut it out of transcripts retained later. The memory is already deleted, so a failure here
+	 * is logged, not thrown.
 	 */
 	#scrubForgottenElsewhere(
 		targets: readonly MnemopiScopedMemory[],
 		forgotten: MnemopiScopedMemory,
-		text: string,
+		texts: readonly string[],
 	): void {
-		if (text.trim() === "") return;
+		if (texts.length === 0) return;
 		for (const other of targets) {
 			if (other === forgotten) continue;
 			try {
-				other.memory.scrubForgottenText(text);
+				other.memory.scrubForgottenTexts(texts);
 			} catch (error) {
 				logger.warn("Mnemopi: scrubbing forgotten text from transcripts failed", {
 					bank: other.bank,

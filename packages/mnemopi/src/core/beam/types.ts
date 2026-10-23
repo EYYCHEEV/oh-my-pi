@@ -331,6 +331,12 @@ export interface ForgetOutcome {
 	scrubbedRows: number;
 	/** Set when the text was too short to scrub from transcripts, to the shortest length that is scrubbed. */
 	skippedBelowChars: number | null;
+	/**
+	 * What the memory said and what the extractor made of it, trimmed, in memory only. A session that forgets a memory
+	 * in one bank hands them to the other banks it recalls from (`scrubForgottenTexts`). Empty when nothing was forgotten
+	 * or the text was too short to scrub.
+	 */
+	forgottenTexts: string[];
 }
 
 export interface MemoriaRetrieveResult {

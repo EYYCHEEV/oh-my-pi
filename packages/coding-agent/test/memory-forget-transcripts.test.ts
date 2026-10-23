@@ -33,7 +33,10 @@ afterEach(async () => {
 	for (const dir of dirs.splice(0)) await dir.remove();
 });
 
-function startState(scoping: "global" | "per-project-tagged"): { state: MnemopiSessionState; edit: MemoryEditTool } {
+function startState(
+	scoping: "global" | "per-project-tagged",
+	options: { prune?: boolean } = {},
+): { state: MnemopiSessionState; edit: MemoryEditTool } {
 	const dir = TempDir.createSync("@memory-forget-transcripts-");
 	dirs.push(dir);
 	const sessionManager = SessionManager.create(dir.path(), dir.join("sessions"));
@@ -43,6 +46,7 @@ function startState(scoping: "global" | "per-project-tagged"): { state: MnemopiS
 		"mnemopi.dbPath": dir.join("mnemopi.db"),
 		"mnemopi.noEmbeddings": true,
 		"mnemopi.llmMode": "none",
+		...(options.prune ? { "mnemopi.pruneConsolidatedDays": 1 } : {}),
 	});
 	const session = {
 		sessionId: sessionManager.getSessionId(),
@@ -160,6 +164,40 @@ describe("memory_edit forget also scrubs the retained transcripts", () => {
 		expect(await recalled(state, "2027-05-09")).toContain("2027-05-09");
 	});
 
+	it("returns the forgotten text 0 times once pruning deleted the transcript rows, from the summaries and facts left", async () => {
+		const { state, edit } = startState("global", { prune: true });
+		const id = retain(state, MEMORY);
+		await retainTranscripts(state);
+		age(state, 13);
+		state.memory.sleep(false);
+		// The transcripts were summarized three days ago: the next sleep deletes their rows.
+		const longAgo = new Date(Date.now() - 3 * 86_400_000).toISOString();
+		const db = state.memory.beam.db;
+		db.run("UPDATE working_memory SET consolidated_at = ? WHERE source = 'coding-agent-transcript'", [longAgo]);
+		state.memory.sleep(false);
+		expect(
+			db.query("SELECT COUNT(*) AS n FROM working_memory WHERE source = 'coding-agent-transcript'").get(),
+		).toMatchObject({
+			n: 0,
+		});
+		// Only the summary of the pruned transcripts quotes the text now.
+		expect(await recalled(state, MARKER)).toContain(MARKER);
+
+		const result = await edit.execute("call", { op: "forget", id });
+
+		expect(result.details).toMatchObject({ status: "deleted" });
+		for (const query of [MARKER, "staging deploy token", "2027-04-01"]) {
+			expect(await recalled(state, query)).not.toContain(MARKER);
+			expect(await recalled(state, query)).not.toContain("2027-04-01");
+		}
+		expect(
+			db.query("SELECT COUNT(*) AS n FROM episodic_memory WHERE content LIKE ?").get(`%${MARKER}%`),
+		).toMatchObject({ n: 0 });
+		// What the summary said about everything else is still recallable.
+		expect(await recalled(state, "quokka migration")).toContain("Quokka migration");
+		expect(await recalled(state, "2027-05-09")).toContain("2027-05-09");
+	});
+
 	it("scrubs the project bank's transcripts when the forgotten memory lives in the shared bank", async () => {
 		const { state, edit } = startState("per-project-tagged");
 		const id = retain(state, MEMORY, true);
@@ -172,6 +210,28 @@ describe("memory_edit forget also scrubs the retained transcripts", () => {
 		expect(await recalled(state, MARKER)).not.toContain(MARKER);
 		expect(await recalled(state, "staging deploy token")).not.toContain(MARKER);
 		expect(await recalled(state, "quokka migration")).toContain(UNRELATED);
+	});
+
+	it("keeps cutting the text out of transcripts retained after the forget, in every bank the session retains into", async () => {
+		const { state, edit } = startState("per-project-tagged");
+		const id = retain(state, MEMORY, true);
+		await retainTranscripts(state);
+		const result = await edit.execute("call", { op: "forget", id });
+		expect(result.details).toMatchObject({ status: "deleted" });
+
+		// The session that forgot the memory ends after the forget: its transcript quotes the text it forgot.
+		await state.retainMessages(
+			[
+				{ role: "user", content: "Forget the staging deploy token." },
+				{ role: "assistant", content: `Forgotten: ${MEMORY}. Anything else?` },
+			],
+			"session-4",
+			{ extract: false },
+		);
+
+		expect(await recalled(state, MARKER)).not.toContain(MARKER);
+		expect(await recalled(state, "Forgotten")).toContain("Forgotten: [forgotten].");
+		expect(await recalled(state, "forget the staging deploy token")).toContain("Forget the staging deploy token.");
 	});
 
 	it("keeps the transcripts as history when the memory is only invalidated", async () => {

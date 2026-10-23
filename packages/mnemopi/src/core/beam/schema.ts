@@ -423,4 +423,17 @@ export function initBeam(db: Database): void {
 		"CREATE INDEX IF NOT EXISTS idx_triples_object ON triples(object)",
 		"CREATE INDEX IF NOT EXISTS idx_triples_valid_from ON triples(valid_from)",
 	]);
+
+	// What `forget` leaves behind to cut the forgotten text out of transcripts retained later: salted hashes of
+	// word windows, never the text (see `forget-windows.ts`).
+	db.run("CREATE TABLE IF NOT EXISTS forget_tombstone_salt (salt TEXT NOT NULL)");
+	db.run(`
+		CREATE TABLE IF NOT EXISTS forget_tombstones (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			ntokens INTEGER NOT NULL,
+			roll INTEGER NOT NULL,
+			digest TEXT NOT NULL UNIQUE,
+			created_at TEXT NOT NULL
+		)
+	`);
 }
