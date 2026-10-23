@@ -15,7 +15,7 @@ import {
 } from "../hindsight/content";
 import { countUserTurns, extractMessages } from "../hindsight/transcript";
 import type { MemoryPromptPreparation } from "../memory-backend/types";
-import { redactMemorySecrets, redactRememberWrite } from "../memory-backend/redact";
+import { redactMemorySecrets, redactRememberWrite, vetRecalledMemoryText } from "../memory-backend/redact";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import type { MnemopiBackendConfig, MnemopiScoping } from "./config";
 import { mnemopiEmbedClient } from "./embed-client";
@@ -99,6 +99,11 @@ interface MnemopiScopedResources {
 
 type MnemopiRememberInput = Parameters<Mnemopi["remember"]>[0];
 type MnemopiRememberOptions = Parameters<Mnemopi["remember"]>[1];
+
+/** A recall result whose text the recall scan refused to show; `content` already holds a notice instead. */
+interface ScopedRecallResult extends RecallResult {
+	withheld?: string;
+}
 
 export type MnemopiMemoryEditOperation = "update" | "forget" | "invalidate";
 
@@ -399,7 +404,7 @@ export class MnemopiSessionState {
 		return lines.join("\n\n");
 	}
 
-	async collectScopedRecallResults(query: string): Promise<RecallResult[]> {
+	async collectScopedRecallResults(query: string): Promise<ScopedRecallResult[]> {
 		const merged: RecallResult[] = [];
 		const byId = new Map<string, number>();
 		const byContent = new Map<string, number>();
@@ -445,22 +450,23 @@ export class MnemopiSessionState {
 		}
 		merged.sort(compareRecallResults);
 		if (merged.length > this.config.recallLimit) merged.length = this.config.recallLimit;
-		return merged;
+		return merged.map(scanRecalledResult);
 	}
 
-	recallResultsScoped(query: string): Promise<RecallResult[]> {
+	recallResultsScoped(query: string): Promise<ScopedRecallResult[]> {
 		return this.collectScopedRecallResults(query);
 	}
 
 	formatScopedRecallContext(
-		results: readonly RecallResult[],
+		results: readonly ScopedRecallResult[],
 		format: "bullet" | "json" = "bullet",
 	): string | undefined {
-		if (results.length === 0) return undefined;
-		return this.memory.beam.formatContext(results, format);
+		const shown = results.filter(result => result.withheld === undefined);
+		if (shown.length === 0) return undefined;
+		return this.memory.beam.formatContext(shown, format);
 	}
 
-	formatContextScoped(results: readonly RecallResult[], format: "bullet" | "json" = "bullet"): string {
+	formatContextScoped(results: readonly ScopedRecallResult[], format: "bullet" | "json" = "bullet"): string {
 		return this.formatScopedRecallContext(results, format) ?? "";
 	}
 
@@ -491,7 +497,7 @@ export class MnemopiSessionState {
 	}
 
 	async recallForContext(query: string, signal?: AbortSignal): Promise<string | undefined> {
-		const results = await this.collectScopedRecallResults(query);
+		const results = (await this.collectScopedRecallResults(query)).filter(result => result.withheld === undefined);
 		if (signal?.aborted) return undefined;
 		if (results.length === 0) return undefined;
 		return formatRecallBlock(results);
@@ -993,6 +999,29 @@ function compareRecallResults(left: RecallResult, right: RecallResult): number {
 		(right.timestamp ?? "").localeCompare(left.timestamp ?? "") ||
 		left.content.localeCompare(right.content)
 	);
+}
+
+/**
+ * Runs the recall scan over one result before anything renders it: the text and the source label are
+ * neutralised (hidden Unicode stripped, credentials redacted, a quoted memories tag broken), and a row
+ * that reads as an instruction to the model is replaced by a notice and flagged `withheld`.
+ */
+function scanRecalledResult(result: RecallResult): ScopedRecallResult {
+	const verdict = vetRecalledMemoryText(stripRetentionProtocolMarkers(result.content) || result.content);
+	const sourceVerdict = result.source ? vetRecalledMemoryText(result.source) : undefined;
+	const withheld = verdict.withheld ?? sourceVerdict?.withheld;
+	if (withheld !== undefined) {
+		return {
+			...result,
+			content: `[withheld: ${withheld} pattern; inspect it with memory:// or remove it with memory_edit]`,
+			source: sourceVerdict?.withheld === undefined ? result.source : null,
+			withheld,
+		};
+	}
+	if (verdict.text === result.content && (sourceVerdict === undefined || sourceVerdict.text === result.source)) {
+		return result;
+	}
+	return { ...result, content: verdict.text, ...(sourceVerdict ? { source: sourceVerdict.text } : {}) };
 }
 
 function formatRecallBlock(results: RecallResult[]): string {
