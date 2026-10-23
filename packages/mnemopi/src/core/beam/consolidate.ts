@@ -1070,13 +1070,16 @@ export function health(
 	};
 }
 
+const WORKING_ROW_COLUMNS =
+	"id, COALESCE(embed_text, content) AS content, source, timestamp, importance, metadata_json, scope, valid_until, veracity";
+
 function eligibleWorkingRows(beam: BeamMemoryState, sessionId: string): Row[] {
 	const ttl = beam.config?.workingMemoryTtlHours ?? 24;
 	const cutoff = cutoffIso(Math.floor(ttl / 2), 60 * 60 * 1000);
 	return asRows(
 		beam.db
 			.query(
-				`SELECT id, COALESCE(embed_text, content) AS content, source, timestamp, importance, metadata_json, scope, valid_until, veracity
+				`SELECT ${WORKING_ROW_COLUMNS}
 		 FROM working_memory
 		 WHERE COALESCE(session_id, 'default') = ? AND timestamp < ? AND consolidated_at IS NULL
 		 ORDER BY timestamp ASC LIMIT ?`,
@@ -1086,7 +1089,30 @@ function eligibleWorkingRows(beam: BeamMemoryState, sessionId: string): Row[] {
 }
 
 export function sleep(beam: BeamMemoryState, dryRun = false): SleepResult {
-	let rows = eligibleWorkingRows(beam, sourceSession(beam));
+	return consolidateWorkingRows(beam, eligibleWorkingRows(beam, sourceSession(beam)), dryRun);
+}
+
+/**
+ * Promote working rows the caller already selected, using the same pipeline as `sleep`. The
+ * working-memory trim uses it so rows it would otherwise drop are consolidated first. It skips
+ * `degradeEpisodic`: tier compression is `sleep` maintenance and must not run on every write.
+ */
+export function consolidateWorkingRowsById(beam: BeamMemoryState, ids: readonly string[]): SleepResult {
+	const batch = ids.slice(0, SLEEP_BATCH_SIZE);
+	const placeholders = batch.map(() => "?").join(",");
+	const rows = asRows(
+		beam.db
+			.query(
+				`SELECT ${WORKING_ROW_COLUMNS} FROM working_memory
+		 WHERE id IN (${placeholders}) AND consolidated_at IS NULL ORDER BY timestamp ASC`,
+			)
+			.all(...batch),
+	);
+	return consolidateWorkingRows(beam, rows, false, false);
+}
+
+function consolidateWorkingRows(beam: BeamMemoryState, candidates: Row[], dryRun = false, degrade = true): SleepResult {
+	let rows = candidates;
 	if (rows.length === 0)
 		return { dry_run: dryRun, status: "no_op", message: "No old working memories to consolidate" };
 	if (!dryRun) {
@@ -1164,7 +1190,7 @@ export function sleep(beam: BeamMemoryState, dryRun = false): SleepResult {
 			],
 		);
 	}
-	const degradation = degradeEpisodic(beam, dryRun);
+	const degradation = degrade ? degradeEpisodic(beam, dryRun) : undefined;
 	return {
 		dry_run: dryRun,
 		status: dryRun ? "dry_run" : "consolidated",

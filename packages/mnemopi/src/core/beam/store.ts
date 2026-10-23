@@ -7,7 +7,7 @@ import { currentEmbeddingModel, embeddingsDisabled } from "../embeddings";
 import { EpisodicGraph } from "../episodic-graph";
 import { countExtractedFactCategories, extractFactCategoriesSafe } from "../extraction";
 import { getMnemopiRuntimeOptions, withMnemopiRuntimeOptions } from "../runtime-options";
-import { storeExtractedFactCategories } from "./consolidate";
+import { consolidateWorkingRowsById, storeExtractedFactCategories } from "./consolidate";
 import { type EmbedItem, scheduleEmbedding, vecAvailable, vecInsert } from "./helpers";
 import type {
 	BeamEvent,
@@ -219,12 +219,13 @@ function purgeWorkingMemoryArtifacts(db: BeamMemoryState["db"], ids: readonly st
 }
 
 /**
- * TTL / overflow trim for transient working memory. Only genuine scratch is
- * eligible: `consolidated_at IS NULL` no longer suffices on its own, since
- * restored or imported durable rows legitimately carry a NULL consolidation
- * marker with an old event timestamp (issue #4819). Rows flagged `IMPORTED`
- * are treated as durable and never trimmed, and trimmed rows cascade all linked
- * artifacts via `purgeWorkingMemoryArtifacts`.
+ * TTL / overflow guard for transient working memory. It never deletes an unconsolidated row:
+ * each row older than `workingMemoryTtlHours`, or beyond `workingMemoryLimit`, is promoted to
+ * episodic memory by the same consolidation `sleep` runs, so a session that stays open past the
+ * TTL keeps its memories even though session-start consolidation only runs once (#10770).
+ * `consolidated_at IS NULL` alone does not mark scratch: restored or imported durable rows carry a
+ * NULL marker with an old event timestamp (issue #4819), so rows flagged `IMPORTED` are skipped.
+ * A failed promotion is rolled back and logged; every row stays unconsolidated for the next write.
  */
 function trimWorkingMemory(beam: BeamMemoryState): void {
 	const limit = beam.config.workingMemoryLimit;
@@ -251,12 +252,20 @@ function trimWorkingMemory(beam: BeamMemoryState): void {
 			row => row.id,
 		);
 		if (ids.length === 0) return;
-		const placeholders = ids.map(() => "?").join(", ");
-		beam.db.run(`DELETE FROM working_memory WHERE id IN (${placeholders}) AND session_id = ?`, [
-			...ids,
-			beam.sessionId,
-		]);
-		purgeWorkingMemoryArtifacts(beam.db, ids);
+		// A savepoint, so a failure cannot leave rows claimed but unconsolidated, even when this runs
+		// inside `rememberBatch`'s transaction.
+		beam.db.run("SAVEPOINT promote_working_memory");
+		try {
+			consolidateWorkingRowsById(beam, ids);
+			beam.db.run("RELEASE promote_working_memory");
+		} catch (error) {
+			beam.db.run("ROLLBACK TO promote_working_memory");
+			beam.db.run("RELEASE promote_working_memory");
+			logger.warn("mnemopi: working-memory promotion failed; rows stay unconsolidated", {
+				sessionId: beam.sessionId,
+				error: String(error),
+			});
+		}
 	});
 }
 

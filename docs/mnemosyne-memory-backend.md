@@ -183,6 +183,7 @@ new Mnemopi({
 - `/memory stats` and `/memory diagnose` render backend-specific bank statistics/diagnostics when the Mnemopi backend is active.
 - Subagents do not own separate Mnemopi retain loops; they alias the parent state when a parent Mnemopi state exists, and otherwise remain inert.
 - At primary backend startup, eligible working-memory rows are promoted across owned banks before the first write can TTL-trim them. Promotion failures are logged without disabling the backend.
+- Every write also runs Mnemopi's working-memory trim, which never deletes unconsolidated rows: a row older than the 24-hour TTL, or beyond the 1000-row working-memory limit, is first promoted to episodic memory with the same consolidation `sleep` uses. A session that stays open longer than the TTL therefore keeps its memories. A failed promotion is logged and retried on the next write.
 - Backend startup is best-effort. If database/model initialization fails, the session continues with Mnemopi inert and logs a warning; memory tools then report that the backend is not initialized.
 
 ## Shutdown and durability
