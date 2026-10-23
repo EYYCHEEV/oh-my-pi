@@ -31,7 +31,7 @@
 
 | Field | Type | Required | Description |
 |---|---|---:|---|
-| `items` | `Array<{ content: string; context?: string; scope?: "project" \| "global" }>` | Yes | One or more memories to store. `minItems: 1`. Each item must be self-contained; `context` is optional per-item provenance. `scope` is in the schema and tool description only when `memory.backend = "mnemopi"` and `mnemopi.scoping` is `global` or `per-project-tagged`; omitted means `project`. |
+| `items` | `Array<{ content: string; context?: string; scope?: "project" \| "global"; expires?: string }>` | Yes | One or more memories to store. `minItems: 1`. Each item must be self-contained; `context` is optional per-item provenance. `scope` is in the schema and tool description only when `memory.backend = "mnemopi"` and `mnemopi.scoping` is `global` or `per-project-tagged`; omitted means `project`. `expires` is in the schema and tool description only when `memory.backend = "mnemopi"`: an ISO date (`2026-12-01`, valid through the end of that UTC day), an ISO date-time with an explicit UTC offset, or a duration from now (`<n>` plus `m`, `h`, `d` or `w`, for example `90m`, `12h`, `30d`, `2w`). It becomes the memory's `valid_until`, and recall skips the memory from that instant on; the row stays in the database. |
 
 ## Outputs
 The output depends on the active `memory.backend`.
@@ -53,13 +53,14 @@ Mnemopi:
 2. `execute(...)` re-reads `memory.backend` and dispatches to the matching session state.
 3. If the backend is `mnemopi`:
    - it fetches `session.getMnemopiSessionState()` and throws if the backend was not started;
+   - it resolves every item's `expires` to a UTC ISO timestamp before storing anything; a malformed value, an offset-less date-time, or a moment that is not in the future throws `Invalid expires for item <i> of <n>: ... Nothing was stored.`;
    - if any item has `scope: "global"`, it resolves `state.getGlobalRetainTarget()` first; under `per-project` scoping that throws `Mnemopi global scope requires global or per-project-tagged scoping.` and nothing in the batch is stored;
    - for each item, it calls `state.rememberScoped(item.content, ...)` with `source: "coding-agent-retain"`, `importance: 0.75`, `scope: "bank"`, `extract: true`, `extractEntities: true`, `veracity: "tool"`, `memoryType: "fact"`, and metadata `{ session_id, cwd, context, tool: "retain" }`;
    - project items go to the scoped retain bank and global items to the global target (passed as `rememberScoped`'s third argument); exact duplicate content in the same session updates the existing working-memory row in the Mnemopi core.
    - content and options are passed through `redactRememberWrite(...)` before storage.
 4. If the backend is `hindsight`:
    - it fetches `session.getHindsightSessionState()` and throws if the backend was not started;
-   - any `scope: "global"` item rejects the batch with `Global memory scope is only available with the Mnemopi backend.` before anything is queued (untagged Hindsight retains are not supported yet);
+   - any `scope: "global"` item rejects the batch with `Global memory scope is only available with the Mnemopi backend.`, and any `expires` rejects it with `Expiry is only available with the Mnemopi backend.`, before anything is queued (untagged Hindsight retains are not supported yet);
    - each input item is handed to `HindsightSessionState.enqueueRetain(...)`;
    - `HindsightRetainQueue.enqueue(...)` appends the item and either flushes immediately when the queue reaches `RETAIN_FLUSH_BATCH_SIZE`, or starts a debounce timer for `RETAIN_FLUSH_INTERVAL_MS`;
    - on flush, `HindsightRetainQueue.#doFlush(...)` verifies ownership, best-effort ensures the bank exists via `ensureBankExists(...)`, maps items to `MemoryItemInput` with `context ?? config.retainContext`, `metadata.session_id`, and bank-scope tags, then sends one async `retainBatch(...)` request.
