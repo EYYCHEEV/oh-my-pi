@@ -6063,6 +6063,9 @@ export class AgentSession implements SettingsScope {
 	}
 
 	async #doDispose(options: AgentSessionDisposeOptions = {}): Promise<void> {
+		// A signal can land mid-turn: the abort below ends it with an `agent_end`, and the memory
+		// backend must not start a model-backed extraction for that late event while we stop.
+		this.getMnemopiSessionState()?.beginStop();
 		this.beginDispose();
 		// Stop cache warming before the drain windows below: an armed tick firing
 		// mid-dispose would issue a paid warm request and persist usage into the

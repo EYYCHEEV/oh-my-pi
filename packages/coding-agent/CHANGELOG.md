@@ -28,6 +28,7 @@
 - Fixed completed mid-turn compaction replaying a cached copy of the old conversation in the next request.
 - Fixed budget refusals hanging automatic retries or printing an earlier answer as success in text mode.
 - Fixed late provider-request growth stopping at the budget gate when OMP could safely compact and retry.
+- Fixed Mnemopi losing the turns it had not retained yet when a run was stopped by a signal: SIGTERM, SIGINT, SIGHUP and fatal exits now retain them at once without fact extraction, instead of waiting behind the slower session teardown steps (up to about 10 s) or, in RPC mode, never retaining them; a stopping session no longer schedules fact extraction on a late `agent_end`
 - Added awaitable extension custom-message admission receipts and session-scoped persistence barriers, without changing existing message-send completion behavior.
 - Added generic session-wide runtime requirements with durable obligations, fresh loader-backed attachment checks, `session_ready`, startup `requiredRuntimeExtensions`, and the `--require-runtime-contract=1` support assertion. Refused execution preserves queued work and keeps saved history readable; recovery guidance is bounded and display-only.
 

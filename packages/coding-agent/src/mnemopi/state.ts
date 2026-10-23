@@ -4,7 +4,7 @@ import type * as MnemopiNs from "@oh-my-pi/pi-mnemopi";
 import type { Mnemopi, RecallResult } from "@oh-my-pi/pi-mnemopi";
 import type * as MnemopiCoreNs from "@oh-my-pi/pi-mnemopi/core";
 import type { LocalModelInitializer } from "@oh-my-pi/pi-mnemopi/core";
-import { logger, toError } from "@oh-my-pi/pi-utils";
+import { logger, postmortem, toError } from "@oh-my-pi/pi-utils";
 import {
 	composeRecallQuery,
 	prepareEmbeddableRetentionTranscript,
@@ -230,6 +230,18 @@ export interface MnemopiSessionStateOptions {
 	hasRecalledForFirstTurn?: boolean;
 }
 
+/** Cleanup reasons of a process that goes away without a session dispose having to run first. */
+const PROCESS_STOP_REASONS: Partial<Record<postmortem.Reason, true>> = {
+	[postmortem.Reason.SIGINT]: true,
+	[postmortem.Reason.SIGTERM]: true,
+	[postmortem.Reason.SIGHUP]: true,
+	[postmortem.Reason.UNCAUGHT_EXCEPTION]: true,
+	[postmortem.Reason.UNHANDLED_REJECTION]: true,
+};
+
+/** SQLite lock wait for the final write of a stopping process, which has seconds left rather than minutes. */
+const STOP_BUSY_TIMEOUT_MS = 1_500;
+
 export class MnemopiSessionState {
 	sessionId: string;
 	readonly config: MnemopiBackendConfig;
@@ -244,6 +256,9 @@ export class MnemopiSessionState {
 	unsubscribe?: () => void;
 	#retentionCursorLoaded = false;
 	#recallGeneration = 0;
+	#stopping = false;
+	#disposed = false;
+	#cancelStopHook: (() => void) | undefined;
 
 	constructor(options: MnemopiSessionStateOptions) {
 		this.sessionId = options.sessionId;
@@ -530,6 +545,37 @@ export class MnemopiSessionState {
 		return await this.recallForContext(truncated);
 	}
 
+	/**
+	 * Marks the session as stopping. From here on automatic retention stores text but schedules no
+	 * model-backed fact extraction, so a stop never starts a new model call.
+	 */
+	beginStop(): void {
+		this.#stopping = true;
+	}
+
+	/**
+	 * Graceful-stop retention for a signalled or crashing process (SIGTERM, SIGINT, SIGHUP, fatal
+	 * error): stores the turns not yet retained, without fact extraction, the moment the signal lands.
+	 * The session's own teardown retains them too, but only after its slower steps (post-prompt drain,
+	 * extension shutdown handlers, autolearn drain: up to about 10 s), and a mode without a session
+	 * teardown on signals (RPC) never does. The write itself is synchronous, so it is done before the
+	 * returned promise settles and before the process can be told to exit; `dispose` retains whatever
+	 * arrives after it. Nothing is stored when `mnemopi.autoRetain` is off. SIGKILL cannot run any of this.
+	 */
+	retainOnStop(): Promise<void> {
+		this.beginStop();
+		if (this.aliasOf || this.#disposed || !this.config.autoRetain) return Promise.resolve();
+		try {
+			this.#boundOwnedBusyTimeout(STOP_BUSY_TIMEOUT_MS);
+			return this.forceRetainCurrentSession({ extract: false }).catch((error: unknown) => {
+				this.#logLifecycleFailure("stop retention", [this.scoped.retain.bank], error);
+			});
+		} catch (error) {
+			this.#logLifecycleFailure("stop retention", [this.scoped.retain.bank], error);
+			return Promise.resolve();
+		}
+	}
+
 	async maybeRetainOnAgentEnd(_messages: AgentMessage[]): Promise<void> {
 		if (!this.config.autoRetain || this.aliasOf) return;
 		this.#restoreRetainedTurnCursor();
@@ -540,7 +586,10 @@ export class MnemopiSessionState {
 		await this.retainMessages(
 			sliceUnretainedMessages(flat, this.lastRetainedTurn),
 			`${this.sessionId}-${Date.now()}`,
-			{ retainedThroughUserTurn: userTurns },
+			{
+				retainedThroughUserTurn: userTurns,
+				...(this.#stopping ? { extract: false } : {}),
+			},
 		);
 		this.lastRetainedTurn = userTurns;
 	}
@@ -624,6 +673,10 @@ export class MnemopiSessionState {
 					this.#logLifecycleFailure("agent_end retention", [this.scoped.retain.bank], error);
 				});
 			}
+		});
+		this.#cancelStopHook?.();
+		this.#cancelStopHook = postmortem.register(`mnemopi-retain:${this.sessionId}`, reason => {
+			return PROCESS_STOP_REASONS[reason] ? this.retainOnStop() : undefined;
 		});
 	}
 	#logLifecycleFailure(operation: string, banks: readonly string[], error: unknown): void {
@@ -779,6 +832,10 @@ export class MnemopiSessionState {
 	async dispose(options: { consolidate?: boolean; timeoutMs?: number; retain?: boolean } = {}): Promise<void> {
 		this.#recallGeneration++;
 		this.unsubscribe?.();
+		this.#disposed = true;
+		this.#stopping = true;
+		this.#cancelStopHook?.();
+		this.#cancelStopHook = undefined;
 		this.unsubscribe = undefined;
 		if (this.aliasOf) return;
 		const closeOwned = (): void => {
