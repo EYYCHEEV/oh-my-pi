@@ -5,7 +5,7 @@ import { resetOAuthAccountRestrictions } from "@oh-my-pi/pi-ai/auth/eligibility"
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/registry/oauth/types";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { resolveCodexDiscoveryAccounts } from "@oh-my-pi/pi-coding-agent/config/model-provider-discovery";
+import { resolveOAuthDiscoveryAccounts } from "@oh-my-pi/pi-coding-agent/config/model-provider-discovery";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { selectSecurityAuth, selectSecurityOAuthAccount } from "@oh-my-pi/pi-coding-agent/security/auth";
@@ -68,7 +68,7 @@ describe("automatic OAuth readers skip paused accounts", () => {
 
 	it("Codex model discovery never resolves a paused account, so its failure cannot freeze discovery", async () => {
 		storage.credentials.pause(PROVIDER, ids.b!);
-		const accounts = await resolveCodexDiscoveryAccounts(storage, "api-acct-a");
+		const accounts = await resolveOAuthDiscoveryAccounts(storage, "openai-codex", "api-acct-a");
 		expect(accounts).not.toBeNull();
 		expect(accounts!.map(account => account.accountId)).toEqual(["acct-a"]);
 		expect(resolved).not.toContain("acct-b");
@@ -79,7 +79,7 @@ describe("automatic OAuth readers skip paused accounts", () => {
 		try {
 			await other.credentials.reload();
 			other.credentials.pause(PROVIDER, ids.b!);
-			const accounts = await resolveCodexDiscoveryAccounts(storage, "api-acct-a");
+			const accounts = await resolveOAuthDiscoveryAccounts(storage, "openai-codex", "api-acct-a");
 			expect(accounts?.map(account => account.accountId)).toEqual(["acct-a"]);
 			expect(resolved).not.toContain("acct-b");
 		} finally {

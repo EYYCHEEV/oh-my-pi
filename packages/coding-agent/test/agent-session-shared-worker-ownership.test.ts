@@ -79,7 +79,9 @@ describe("AgentSession shared worker ownership", () => {
 
 		await owner.dispose();
 
-		expect(tinyTerminate).toHaveBeenCalledTimes(1);
+		// Upstream's SDK wrapper releases the tiny-model client once, for the top-level session only
+		// (covered by sdk-tiny-client-dispose.test.ts), so AgentSession itself must not terminate it again.
+		expect(tinyTerminate).not.toHaveBeenCalled();
 		expect(mnemopiTerminate).toHaveBeenCalledTimes(1);
 	});
 });
