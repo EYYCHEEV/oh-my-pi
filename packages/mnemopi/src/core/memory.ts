@@ -6,9 +6,9 @@ import { closeQuietly } from "../db";
 import type { MemoryInput, Metadata } from "../types";
 import { AnnotationStore } from "./annotations";
 import { BankManager } from "./banks";
-import { BeamMemory, initBeam } from "./beam/index";
+import { BeamMemory, type ForgetOutcome, initBeam } from "./beam/index";
 import { reconcileEmbeddingModel } from "./beam/store";
-import type { ForgetOutcome, RecallEnhancedOptions, RecallOptions, RecallResult, SleepResult } from "./beam/types";
+import type { RecallEnhancedOptions, RecallOptions, RecallResult, SleepResult } from "./beam/types";
 import { EpisodicGraph } from "./episodic-graph";
 import {
 	isPiAiModel,
