@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""Build the stronk-omp Linux amd64 binary on ci-001 through its forced-command door, then verify what returns.
+
+The Mac only drives: it bundles two commits, calls the door through an ssh alias, polls, fetches and verifies.
+It never signs and never publishes. The key path and any host address are redacted from everything it prints.
+Exit codes: 0 verified, 1 the remote build failed, 2 refused or bad input, 3 verification failed, 4 transport failure.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import time
+
+OID = r"[0-9a-f]{40}"
+TAG = r"stronk-omp-s1-[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]{4}"
+RUN = r"b[0-9]{14}-[0-9a-f]{8}"
+ASSETS = ("omp-linux-amd64", "RELEASE_MANIFEST.json", "SHA256SUMS.txt")
+EVIDENCE = ("qualification.json", "qualification.json.sig", "qualification-signers")
+CHECKS = ("elf", "cli", "native_runtime", "resources_workers", "builtin_smoke", "offline_session",
+          "fork_boundaries", "native_grep", "coding_agent_typecheck")
+IDENTITY = NAMESPACE = "stronk-omp-qualification"
+BUNDLE_CAP = 256 * 1024**2  # The door's own cap; its measured realistic bundle is about 78 MB.
+LIMITS = {ASSETS[0]: 1024**3, ASSETS[1]: 1024**2, ASSETS[2]: 4096, EVIDENCE[0]: 1024**2, EVIDENCE[1]: 65536, EVIDENCE[2]: 4096}
+DEFAULT_ALIAS = "cdm-ci-001-ompbuild"
+DEFAULT_KEY = "~/.ssh/omp-ci001-build"
+GIT_ENVIRONMENT = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"}
+
+
+class Failure(Exception):
+    def __init__(self, message, code):
+        super().__init__(message)
+        self.code = code
+
+
+class Redactor:
+    """Replace the key path and anything address-shaped, line by line, in everything shown to the operator."""
+    ADDRESS = re.compile(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b|(?<![0-9A-Za-z:])(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|"
+                         r"(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?)(?![0-9A-Za-z:])")
+
+    def __init__(self, secrets):
+        names = sorted({item for item in secrets if item}, key=len, reverse=True)
+        self.secrets = re.compile("|".join(re.escape(name) for name in names)) if names else None
+
+    def __call__(self, text):
+        if self.secrets is not None:
+            text = self.secrets.sub("[redacted]", text)
+        return self.ADDRESS.sub("[address]", text)
+
+
+def git(repo, *arguments, check=True):
+    result = subprocess.run(["git", "-C", str(repo), *arguments], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            env={**os.environ, **GIT_ENVIRONMENT}, timeout=120, check=False)
+    if check and result.returncode != 0:
+        raise Failure("a git query failed; check the repository and the commits", 2)
+    return result.stdout.decode("utf-8", "replace").strip() if result.returncode == 0 else None
+
+
+def resolve(repo, revision, label):
+    commit = git(repo, "rev-parse", "--verify", "--end-of-options", revision + "^{commit}", check=False)
+    if commit is None or re.fullmatch(OID, commit) is None:
+        raise Failure(f"the {label} must resolve to a full commit in this repository", 2)
+    return commit
+
+
+def make_bundle(repo, app, recipe, tag, directory):
+    """A bundle of exactly the two commits (and the tag), without their history: about 78 MB, not 640 MB."""
+    objects = git(repo, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+    bare = Path(directory) / "source.git"
+    git(Path(directory), "init", "-q", "--bare", str(bare))
+    (bare / "objects" / "info").mkdir(parents=True, exist_ok=True)
+    (bare / "objects" / "info" / "alternates").write_text(objects + "\n")
+    (bare / "shallow").write_text(f"{app}\n{recipe}\n")
+    refs = [("refs/omp/app", app), ("refs/omp/recipe", recipe)]
+    if tag:
+        tag_object = git(repo, "rev-parse", "--verify", "--end-of-options", "refs/tags/" + tag, check=False)
+        kind = git(repo, "cat-file", "-t", tag_object, check=False) if tag_object else None
+        direct = git(repo, "rev-parse", "--verify", "--end-of-options", tag + "^{commit}", check=False)
+        if kind != "tag" or direct != app:
+            raise Failure("the tag must be an annotated tag naming exactly the application commit", 2)
+        refs.append(("refs/tags/" + tag, tag_object))
+    for name, value in refs:
+        git(bare, "update-ref", name, value)
+    bundle = Path(directory) / "source.bundle"
+    git(bare, "bundle", "create", str(bundle), *[name for name, _ in refs])
+    if bundle.stat().st_size > BUNDLE_CAP:
+        raise Failure("the bundle exceeds the door's size cap", 2)
+    return bundle
+
+
+class Door:
+    def __init__(self, alias, key, redact):
+        self.alias, self.key, self.redact = alias, key, redact
+
+    def command(self, text):
+        return ["ssh", "-i", self.key, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "ControlPath=none",
+                self.alias, text]
+
+    def start(self, text, stdin=None):
+        try:
+            process = subprocess.Popen(self.command(text), stdin=stdin if stdin is not None else subprocess.DEVNULL,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except OSError:
+            raise Failure("could not start ssh", 4) from None
+        process.relay = threading.Thread(target=self.relay, args=(process.stderr,), daemon=True)
+        process.relay.start()
+        return process
+
+    def finish(self, process):
+        """Wait for the process and for its last diagnostic line to be shown (redacted)."""
+        status = process.wait()
+        process.relay.join(10)
+        return status
+
+    def abort(self, process):
+        process.kill()
+        process.wait()
+        process.relay.join(10)
+
+    def relay(self, stream):
+        for raw in iter(lambda: stream.readline(65536), b""):
+            print(self.redact(raw.decode("utf-8", "replace").rstrip("\n")), file=sys.stderr, flush=True)
+
+    def lines(self, text, stdin=None):
+        """Run one command; yield its stdout lines as they arrive; return the exit status."""
+        process = self.start(text, stdin)
+        for raw in iter(lambda: process.stdout.readline(65536), b""):
+            yield self.redact(raw.decode("utf-8", "replace").rstrip("\n"))
+        return self.finish(process)
+
+
+def run_command(door, text, stdin=None):
+    """Collect (lines, status) for a short command."""
+    collected = []
+    generator = door.lines(text, stdin)
+    try:
+        while True:
+            collected.append(next(generator))
+    except StopIteration as done:
+        return collected, done.value
+
+
+def show(lines):
+    for line in lines:
+        print(line, flush=True)
+
+
+def keyed(lines):
+    values = {}
+    for line in lines:
+        key, separator, value = line.partition(": ")
+        if separator:
+            values[key] = value
+    return values
+
+
+def upload_and_follow(door, command, bundle):
+    """Upload the bundle and stream progress. Returns (run id, final state or None when the stream was cut)."""
+    run_id, final = None, None
+    with open(bundle, "rb") as stream:
+        generator = door.lines(command, stream)
+        status = None
+        try:
+            while True:
+                line = next(generator)
+                found = re.fullmatch(rf"run ({RUN})", line)
+                if found and run_id is None:
+                    run_id = found[1]
+                found = re.fullmatch(r"state: (succeeded|failed|timeout|cancelled)", line)
+                if found:
+                    final = found[1]
+                print(line, flush=True)
+        except StopIteration as done:
+            status = done.value
+    if run_id is None:
+        raise Failure("the door refused the build" if status in (2, None) else "the door could not be reached", 2 if status == 2 else 4)
+    return run_id, final
+
+
+def wait_for_run(door, run_id, interval, deadline):
+    while True:
+        lines, status = run_command(door, f"status {run_id}")
+        values = keyed(lines)
+        state = values.get("state")
+        if status == 2:
+            raise Failure("the door refused the status query", 2)
+        if status == 255 or state is None:
+            if time.monotonic() > deadline:
+                raise Failure("could not reach the door before the deadline", 4)
+        elif state == "running":
+            print(f"state: running ({values.get('phase', '')})", flush=True)
+        elif state in ("succeeded", "failed", "timeout", "cancelled"):
+            return state, values
+        if time.monotonic() > deadline:
+            raise Failure(f"the run {run_id} is still going at the deadline; resume it with --resume {run_id}", 4)
+        time.sleep(interval)
+
+
+def receive(door, run_id, destination):
+    """Stream the door's tar and keep exactly the six expected regular files, never trusting any name or size."""
+    process = door.start(f"fetch {run_id}")
+    wanted = {name: name for name in ASSETS} | {"evidence/" + name: name for name in EVIDENCE}
+    kept = set()
+    try:
+        with tarfile.open(fileobj=process.stdout, mode="r|") as archive:
+            for member in archive:
+                name = member.name
+                if name not in wanted or name in kept or not member.isreg():
+                    raise Failure("the door returned an unexpected archive member", 3)
+                limit = LIMITS[wanted[name]]
+                if member.size > limit:
+                    raise Failure("the door returned an oversized file", 3)
+                target = destination / wanted[name] if not name.startswith("evidence/") else destination / "evidence" / wanted[name]
+                target.parent.mkdir(mode=0o700, exist_ok=True)
+                with archive.extractfile(member) as source, open(target, "xb") as output:
+                    shutil.copyfileobj(source, output, 1 << 20)
+                kept.add(name)
+    except (tarfile.TarError, EOFError, OSError):
+        door.abort(process)
+        raise Failure("the fetched archive could not be read", 3) from None
+    except Failure:
+        door.abort(process)
+        raise
+    status = door.finish(process)
+    if status != 0 or kept != set(wanted):
+        raise Failure("the door did not return a complete qualified result", 3)
+
+
+def sha256(path):
+    result = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            result.update(chunk)
+    return result.hexdigest()
+
+
+def canonical(value):
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n").encode()
+
+
+def unique_pairs(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("repeated key")
+        value[key] = item
+    return value
+
+
+def verify(directory, app, recipe, tag, version):
+    """Independent of the recipe's own code: bytes, checks, architecture, identity and the signed attestation."""
+    assets = directory
+    binary, manifest_path = assets / ASSETS[0], assets / ASSETS[1]
+    fail = lambda message: Failure("verification failed: " + message, 3)
+    evidence = assets / "evidence"
+    regular = lambda path: path.is_file() and not path.is_symlink()
+    if not evidence.is_dir() or evidence.is_symlink() or \
+            sorted(path.name for path in assets.iterdir()) != sorted(ASSETS + ("evidence",)) or \
+            sorted(path.name for path in evidence.iterdir()) != sorted(EVIDENCE) or \
+            not all(regular(assets / name) for name in ASSETS) or not all(regular(evidence / name) for name in EVIDENCE):
+        raise fail("unexpected files")
+    expected = "".join(f"{sha256(assets / name)}  {name}\n" for name in ASSETS[:2])
+    if (assets / ASSETS[2]).read_text() != expected:
+        raise fail("SHA256SUMS.txt does not match the files")
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = json.loads(manifest_bytes, object_pairs_hook=unique_pairs)
+        if manifest_bytes != canonical(manifest):
+            raise ValueError("not canonical")
+        source, asset, qualification = manifest["source"], manifest["asset"], manifest["qualification"]
+        complete = {name: "passed" for name in CHECKS}
+        if type(manifest["schema"]) is not int or manifest["schema"] != 2:
+            raise fail("the manifest is not schema 2")
+        if manifest["target"] != "linux-amd64":
+            raise fail("the target is not linux-amd64")
+        if asset["name"] != ASSETS[0] or asset["sha256"] != sha256(binary) or asset["size"] != binary.stat().st_size:
+            raise fail("the manifest does not describe the binary")
+        if manifest["checks"] != complete:
+            raise fail("not all nine checks passed")
+        if not isinstance(qualification, dict) or qualification["checks"] != complete or \
+                qualification["binary_sha256"] != asset["sha256"]:
+            raise fail("the qualification record is incomplete")
+        if source["commit"] != app or qualification["source_commit"] != app:
+            raise fail("the application commit differs")
+        if source["tag"] != (tag or None):
+            raise fail("the source tag differs")
+        if source["recipe_committed"] is not bool(tag) or source["recipe_commit"] != (recipe if tag else None) or \
+                qualification["recipe_commit"] != source["recipe_commit"]:
+            raise fail("the recipe identity differs")
+        if manifest["version"] != version:
+            raise fail("the omp version differs from the application commit")
+        binding = canonical({
+            "schema": 1, "binary_sha256": asset["sha256"], "source_commit": source["commit"],
+            "recipe_commit": source["recipe_commit"], "runtime_image_digest": qualification["environment"]["runtime_image"],
+            "mode": "release" if source["recipe_committed"] else "candidate", "checks": manifest["checks"],
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest()})
+    except (KeyError, TypeError, ValueError, OSError):
+        raise fail("the manifest is unreadable or inconsistent") from None
+    with open(binary, "rb") as stream:
+        header = stream.read(20)
+    if len(header) != 20 or header[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", header, 18)[0] != 62:
+        raise fail("the binary is not an ELF64 x86-64 executable")
+    if (evidence / EVIDENCE[0]).read_bytes() != binding:
+        raise fail("the attestation does not bind this manifest")
+    verified = subprocess.run(
+        ["ssh-keygen", "-Y", "verify", "-f", str(evidence / EVIDENCE[2]), "-I", IDENTITY, "-n", NAMESPACE,
+         "-s", str(evidence / EVIDENCE[1])], input=binding, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        timeout=60, check=False, env={"PATH": os.environ.get("PATH", os.defpath)})
+    if verified.returncode != 0:
+        raise fail("the attestation signature does not verify")
+    return manifest
+
+
+def drive(args, redact):
+    repo = Path(args.repo or ".").resolve()
+    top = git(repo, "rev-parse", "--show-toplevel", check=False)
+    if top is None:
+        raise Failure("run this inside the fork repository or pass --repo", 2)
+    app, recipe = resolve(top, args.app, "application commit"), resolve(top, args.recipe, "recipe commit")
+    tag = args.tag or ""
+    if tag and re.fullmatch(TAG, tag) is None:
+        raise Failure("the tag must be a stronk-omp-s1 fleet tag", 2)
+    package = git(top, "show", f"{app}:packages/coding-agent/package.json", check=False)
+    try:
+        version = json.loads(package)["version"]
+    except (TypeError, ValueError, KeyError):
+        raise Failure("the application commit has no readable omp version", 2) from None
+    output = Path(args.output).expanduser().absolute()
+    if output.exists() or output.is_symlink() or not output.parent.is_dir():
+        raise Failure("--output must be a new folder inside an existing one", 2)
+    door = Door(args.alias, args.key, redact)
+    deadline = time.monotonic() + args.timeout
+    with tempfile.TemporaryDirectory(prefix=".omp-remote-", dir=output.parent) as temporary:
+        os.chmod(temporary, 0o700)
+        if args.resume:
+            run_id, state = args.resume, None
+        else:
+            bundle = make_bundle(top, app, recipe, tag, temporary)
+            print(f"bundle: {bundle.stat().st_size} bytes; app {app[:12]} recipe {recipe[:12]}" + (f" tag {tag}" if tag else ""), flush=True)
+            run_id, state = upload_and_follow(door, " ".join(["build", app, recipe, tag]).strip(), bundle)
+            bundle.unlink()
+        if state is None:
+            state, values = wait_for_run(door, run_id, args.poll, deadline)
+        if state != "succeeded":
+            lines, _ = run_command(door, f"status {run_id}")
+            print(f"the remote build did not succeed ({state}): {keyed(lines).get('reason', 'no reason recorded')}", file=sys.stderr)
+            raise Failure("the remote build did not succeed", 1)
+        stage = Path(temporary) / "received"
+        stage.mkdir(mode=0o700)
+        receive(door, run_id, stage)
+        manifest = verify(stage, app, recipe, tag, version)
+        public = Path(temporary) / "result"
+        (public / "assets").mkdir(parents=True, mode=0o700)
+        (public / "evidence").mkdir(mode=0o700)
+        for name in ASSETS:
+            shutil.move(stage / name, public / "assets" / name)
+        for name in EVIDENCE:
+            shutil.move(stage / "evidence" / name, public / "evidence" / name)
+        (public / "assets" / ASSETS[0]).chmod(0o755)
+        os.rename(public, output)
+    print(f"verified: omp {manifest['version']} linux-amd64, {manifest['asset']['size']} bytes, sha256 {manifest['asset']['sha256']}")
+    print(f"qualified: all nine checks passed on the builder; tag {tag or 'none (candidate, never publishable)'}")
+    if not args.keep_remote:
+        lines, status = run_command(door, f"cleanup {run_id}")
+        show(lines)
+        if status != 0:
+            print("warning: the remote run folder was not removed; ask Main to clean it up", file=sys.stderr)
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--app", required=True, help="application commit (any revision git can resolve)")
+    parser.add_argument("--recipe", required=True, help="recipe commit holding scripts/linux-amd64-*")
+    parser.add_argument("--tag", help="signed stronk-omp-s1 tag naming the application commit (release build)")
+    parser.add_argument("--output", required=True, help="new folder: assets/ and evidence/ are written inside")
+    parser.add_argument("--alias", default=DEFAULT_ALIAS, help="ssh alias of the door (default %(default)s)")
+    parser.add_argument("--key", default=DEFAULT_KEY, help="dedicated private key (never printed)")
+    parser.add_argument("--repo", help="fork repository (default: the current one)")
+    parser.add_argument("--poll", type=float, default=20, help="seconds between status polls")
+    parser.add_argument("--timeout", type=float, default=21600, help="give up waiting after this many seconds")
+    parser.add_argument("--resume", metavar="RUN", help="continue an earlier run instead of uploading again")
+    parser.add_argument("--keep-remote", action="store_true", help="leave the run on the builder")
+    args = parser.parse_args(argv)
+    key = os.path.expanduser(args.key)
+    redact = Redactor({args.key, key, os.path.abspath(key)})
+    if args.resume and re.fullmatch(RUN, args.resume) is None:
+        parser.error("--resume needs a run id")
+    args.key = key
+    try:
+        return drive(args, redact)
+    except Failure as failure:
+        print(redact(f"error: {failure}"), file=sys.stderr)
+        return failure.code
+    except subprocess.TimeoutExpired:
+        print("error: a local command timed out", file=sys.stderr)
+        return 4
+
+
+if __name__ == "__main__":
+    sys.exit(main())

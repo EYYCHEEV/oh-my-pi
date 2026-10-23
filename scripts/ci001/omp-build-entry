@@ -1,0 +1,987 @@
+#!/bin/sh
+# Forced command for the dedicated stronk-omp Linux amd64 build key on ci-001.
+# Main installs this one standalone file root-owned, mode 0755; see docs/ci001-build-door.md.
+#
+# SSH_ORIGINAL_COMMAND is matched in full against exactly one of these and never evaluated by a shell:
+#   build <app-40hex> <recipe-40hex> [<stronk-omp-s1-YYYY.MM.DD.NNNN>]   a git bundle on standard input
+#   status <run-id>    fetch <run-id>    cleanup <run-id>
+# Exit codes: 0 done, 1 failed, 2 refused, 3 still running (status only).
+set -eu
+# The loader reads this file's embedded Python from "#PY" to the end; -I ignores PYTHON* and user site folders.
+exec python3 -I -c 'import sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    text = stream.read()
+sys.argv = sys.argv[1:]
+exec(compile(text.split("\n#PY\n", 1)[1], path, "exec"), {"__name__": "__main__", "__file__": path})' "$0" "$@"
+exit 127
+#PY
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import select
+import shutil
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import tarfile
+import time
+
+if sys.version_info < (3, 10, 12):
+    print("refused: the build account needs Python 3.10.12 or newer", flush=True)
+    sys.exit(2)
+
+# sshd always sets SSH_CONNECTION, so a remote caller can never reach the test-only overrides below.
+TESTING = "SSH_CONNECTION" not in os.environ
+
+
+def setting(name, default):
+    if TESTING and name in os.environ:
+        return type(default)(os.environ[name])
+    return default
+
+
+STATE = setting("OMP_BUILD_STATE_DIR", Path("/srv/omp-ci/state"))
+DATA = setting("OMP_BUILD_DATA_ROOT", Path("/srv/omp-ci"))
+LOGS = setting("OMP_BUILD_LOG_DIR", Path("/var/log/omp-build"))
+ETC = setting("OMP_BUILD_ETC_DIR", Path("/etc/omp-build"))
+SOCKET = setting("OMP_BUILD_SOCKET", f"/run/user/{os.geteuid()}/docker.sock")
+PLAIN_DATA = setting("OMP_BUILD_PLAIN_DATA", 0)
+# 78 MB measured for a shallow app-plus-recipe bundle of the 18.8.0 tree; the cap leaves over three times that.
+BUNDLE_CAP = setting("OMP_BUILD_MAX_BUNDLE_BYTES", 256 * 1024**2)
+UPLOAD_SECONDS = setting("OMP_BUILD_UPLOAD_SECONDS", 1200.0)
+# Observed on devbox-s1: about 20 minutes. The recipe's own prepare deadline is 4 hours.
+RUN_SECONDS = setting("OMP_BUILD_RUN_SECONDS", 14400.0)
+CANCEL_SECONDS = setting("OMP_BUILD_CANCEL_SECONDS", 120.0)
+RUN_BYTES = setting("OMP_BUILD_RUN_MAX_BYTES", 6 * 1024**3)
+RUN_ENTRIES = setting("OMP_BUILD_RUN_MAX_ENTRIES", 150_000)
+# Estimated peak 40-120 GiB (never measured), 2.9 GB of BuildKit cache left by a failure.
+FREE_START = setting("OMP_BUILD_FREE_START_BYTES", 150 * 1024**3)
+FREE_RUNNING = setting("OMP_BUILD_FREE_RUNNING_BYTES", 12 * 1024**3)
+MEMORY_MIN = setting("OMP_BUILD_MEMORY_BYTES", 32 * 1024**3)
+SCAN_SECONDS = setting("OMP_BUILD_SCAN_SECONDS", 5.0)
+TICK_SECONDS = setting("OMP_BUILD_TICK_SECONDS", 1.0)
+FOLLOW_SECONDS = setting("OMP_BUILD_FOLLOW_SECONDS", 0.5)
+MEMINFO = setting("OMP_BUILD_MEMINFO", Path("/proc/meminfo"))
+KEEP_RUNS = 3
+KEEP_SECONDS = 7 * 86400
+SAFE_PATH = "/usr/local/bin:/usr/bin:/bin"
+PATH = os.environ.get("PATH", SAFE_PATH) if TESTING else SAFE_PATH
+os.environ["PATH"] = PATH
+ENTRY = os.path.abspath(sys.argv[0])
+
+LABEL = "org.stronk.omp-witness"
+OID = r"[0-9a-f]{40}"
+TAG = r"stronk-omp-s1-[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]{4}"
+RUN = r"b[0-9]{14}-[0-9a-f]{8}"
+BUILD_COMMAND = re.compile(rf"build ({OID}) ({OID})(?: ({TAG}))?")
+RUN_COMMAND = re.compile(rf"(status|fetch|cleanup) ({RUN})")
+ASSETS = ("omp-linux-amd64", "RELEASE_MANIFEST.json", "SHA256SUMS.txt")
+EVIDENCE = ("qualification.json", "qualification.json.sig", "qualification-signers")
+CHECKS = ("elf", "cli", "native_runtime", "resources_workers", "builtin_smoke", "offline_session",
+          "fork_boundaries", "native_grep", "coding_agent_typecheck")
+IDENTITY = NAMESPACE = "stronk-omp-qualification"
+TERMINAL = ("succeeded", "failed", "timeout", "cancelled")
+SAFE_TEXT = r"[A-Za-z0-9 ,.;:()+=<>/'_-]"
+# Only these fixed shapes ever leave a build step; raw logs, paths and addresses never do.
+PROGRESS = re.compile(rf"Phase: {SAFE_TEXT}{{1,160}}|qualify-[a-z0-9]+(?:-[a-z0-9]+)*|"
+                      rf"Application check (?:passed|failed): {SAFE_TEXT}{{1,300}}")
+ADDRESS = re.compile(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}|[0-9A-Fa-f]{0,4}:[0-9A-Fa-f]{0,4}:")
+STOP = {"signal": 0}
+
+
+class Refused(Exception):
+    """A fixed, path-free refusal that is safe to show to the caller."""
+
+
+class Stop(Exception):
+    def __init__(self, state, reason):
+        super().__init__(reason)
+        self.state, self.reason = state, reason
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def say(text):
+    try:
+        os.write(1, (text + "\n").encode("ascii", "replace"))
+        return True
+    except OSError:
+        return False  # A disconnected client cannot receive more.
+
+
+def private_directory(path):
+    path.mkdir(parents=True, exist_ok=True)
+    metadata = path.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+        raise Refused("state folders must be real directories owned by the build account")
+    path.chmod(0o700)
+    return path
+
+
+def canonical(value):
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n").encode()
+
+
+def strict_json(data):
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("repeated key")
+            value[key] = item
+        return value
+    return json.loads(data, object_pairs_hook=unique)
+
+
+def sha256(path):
+    result = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            result.update(chunk)
+    return result.hexdigest()
+
+
+# ---- run records, liveness and the log --------------------------------------------------------------
+
+def write_state(run_dir, state):
+    state["updated"] = now()
+    temporary = run_dir / "state.json.tmp"
+    with open(temporary, "w") as stream:
+        json.dump(state, stream, sort_keys=True)
+    os.replace(temporary, run_dir / "state.json")
+
+
+def read_state(run_dir):
+    try:
+        with open(run_dir / "state.json") as stream:
+            state = json.load(stream)
+    except (OSError, ValueError):
+        raise Refused("the run record is unreadable") from None
+    if not isinstance(state, dict) or state.get("schema") != 1 or not isinstance(state.get("state"), str):
+        raise Refused("the run record is unreadable")
+    return state
+
+
+def supervisor_alive(run_dir):
+    """The supervisor holds an exclusive lock on its run for its whole life, so a shared probe proves life."""
+    try:
+        descriptor = os.open(run_dir / "lock", os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return False
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(descriptor)
+
+
+def existing_run(run_id):
+    run_dir = STATE / "runs" / run_id
+    if not run_dir.is_dir() or run_dir.is_symlink():
+        raise Refused("no such run")
+    return run_dir
+
+
+def log_line(started, command, run_id, status, seconds, app="-", recipe="-", mode="-"):
+    try:
+        LOGS.mkdir(parents=True, exist_ok=True)
+        with open(LOGS / "runs.log", "a") as log:
+            fcntl.flock(log, fcntl.LOCK_EX)
+            log.write(f"{started} {command} {run_id or '-'} {status} {seconds:.1f} {app[:12]} {recipe[:12]} {mode}\n")
+    except OSError:
+        say("error: could not append the run log")
+
+
+# ---- Docker -----------------------------------------------------------------------------------------
+
+class Docker:
+    def __init__(self):
+        config = STATE / "docker-client"
+        config.mkdir(mode=0o700, exist_ok=True)
+        self.command = ["docker", "--host", "unix://" + SOCKET, "--config", str(config)]
+        self.environment = {"PATH": PATH, "HOME": str(STATE), "LANG": "C"}
+        if TESTING:
+            self.environment.update({key: value for key, value in os.environ.items() if key.startswith("OMP_TEST_")})
+
+    def run(self, *arguments, timeout=60):
+        return subprocess.run(self.command + list(arguments), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, env=self.environment, timeout=timeout, check=False)
+
+    def lines(self, *arguments, pattern):
+        result = self.run(*arguments)
+        if result.returncode != 0:
+            raise OSError("docker query failed")
+        values = result.stdout.decode("ascii", "replace").split()
+        if not all(re.fullmatch(pattern, value) for value in values):
+            raise OSError("docker returned an unexpected identity")
+        return values
+
+
+def run_containers(docker, run_id):
+    # A substring name filter also covers slash-prefixed names; extra matches fail closed in the sweep.
+    found = set()
+    for selector in (f"label={LABEL}={run_id}", f"name=omp-build-{run_id}-"):
+        found.update(docker.lines("ps", "--all", "--quiet", "--no-trunc", "--filter", selector, pattern=r"[0-9a-f]{64}"))
+    return found
+
+
+def run_images(docker, run_id):
+    return docker.lines("image", "ls", "--all", "--quiet", "--no-trunc", "--filter", f"label={LABEL}={run_id}",
+                        pattern=r"sha256:[0-9a-f]{64}")
+
+
+def remove_run_resources(run_id):
+    """Remove one run's containers and images by exact run label and fixed name; True only with proof."""
+    try:
+        docker = Docker()
+        for container in sorted(run_containers(docker, run_id)):
+            docker.run("rm", "--force", container)
+        images = sorted(set(run_images(docker, run_id)))
+
+        def created(image):
+            result = docker.run("image", "inspect", "--format", "{{.Created}}", image)
+            return result.stdout.decode("ascii", "replace").strip()
+
+        # Newer descendants first, never forced and never pruning unchecked parents implicitly.
+        for image in sorted(images, key=created, reverse=True):
+            docker.run("image", "rm", "--no-prune", image)
+        proven = not run_containers(docker, run_id) and not run_images(docker, run_id)
+        # The daemon is this account's own, so its build cache never belongs to anyone else.
+        docker.run("builder", "prune", "--all", "--force", timeout=300)
+        return proven
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+
+
+# ---- host preflight ---------------------------------------------------------------------------------
+
+def available_memory():
+    for line in MEMINFO.read_text().splitlines():
+        fields = line.split()
+        if fields[:1] == ["MemAvailable:"] and len(fields) == 3 and fields[1].isdigit() and fields[2] == "kB":
+            return int(fields[1]) * 1024
+    raise Refused("available memory cannot be established")
+
+
+def preflight():
+    if os.geteuid() == 0:
+        raise Refused("the build door must not run as root")
+    for tool in ("git", "ssh-keygen", "docker"):
+        if shutil.which(tool, path=PATH) is None:
+            raise Refused(f"{tool} is not available to the build account")
+    if not PLAIN_DATA and not os.path.ismount(DATA):
+        raise Refused("the build data filesystem is not mounted")
+    try:
+        metadata = os.stat(SOCKET)
+    except OSError:
+        raise Refused("the rootless Docker socket is unavailable") from None
+    if not stat.S_ISSOCK(metadata.st_mode) or metadata.st_uid != os.geteuid():
+        raise Refused("the rootless Docker socket is unavailable")
+    docker = Docker()
+    try:
+        result = docker.run("info", "--format", "{{json .}}", timeout=30)
+        info = json.loads(result.stdout) if result.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        info = None
+    if not isinstance(info, dict):
+        raise Refused("Docker did not answer")
+    version = re.match(r"([0-9]+)\.", str(info.get("ServerVersion", "")))
+    if version is None or int(version[1]) < 27:
+        raise Refused("Docker is older than the supported floor")
+    if info.get("Architecture") != "x86_64" or info.get("OSType") != "linux":
+        raise Refused("a native amd64 Linux daemon is required")
+    if str(info.get("CgroupVersion")) != "2":
+        raise Refused("cgroup v2 is required")
+    if "name=rootless" not in (info.get("SecurityOptions") or []):
+        raise Refused("the daemon is not in rootless mode")
+    # SwapLimit is not required: Ubuntu often lacks swap accounting, and the recipe's memory-swap setting then only warns.
+    if not all(info.get(key) is True for key in ("MemoryLimit", "PidsLimit", "CpuCfsQuota")):
+        raise Refused("the rootless daemon cannot enforce container limits")
+    root = Path(os.path.realpath(str(info.get("DockerRootDir") or "/")))
+    if DATA.resolve() not in (root, *root.parents):
+        raise Refused("Docker data is not on the build data folder")
+    try:
+        if docker.run("buildx", "version", timeout=30).returncode != 0:
+            raise Refused("BuildKit (buildx) is not available")
+    except (OSError, subprocess.SubprocessError):
+        raise Refused("BuildKit (buildx) is not available") from None
+    if shutil.disk_usage(DATA).free < FREE_START:
+        raise Refused("free space on the build data folder is below the start floor")
+    if available_memory() < MEMORY_MIN:
+        raise Refused("available memory is below the start floor")
+
+
+# ---- bundle intake ----------------------------------------------------------------------------------
+
+def receive_bundle(path):
+    deadline = time.monotonic() + UPLOAD_SECONDS
+    total = 0
+    with open(path, "xb") as stream:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Refused("the bundle upload took too long")
+            if not select.select([0], [], [], min(remaining, 5))[0]:
+                continue
+            chunk = os.read(0, min(1 << 16, BUNDLE_CAP + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > BUNDLE_CAP:
+                raise Refused("the bundle exceeds the size cap")
+            stream.write(chunk)
+    if total == 0:
+        raise Refused("a git bundle is required on standard input")
+
+
+def validate_bundle(path, app, recipe, tag):
+    """Accept only a prerequisite-free bundle whose refs are exactly the requested commits (and tag)."""
+    with open(path, "rb") as stream:
+        head = stream.read(16384)
+    end = head.find(b"\n\n")
+    if end < 0:
+        raise Refused("the input is not a git bundle")
+    try:
+        lines = head[:end].decode("ascii").split("\n")
+    except UnicodeDecodeError:
+        raise Refused("the input is not a git bundle") from None
+    if lines[0] not in ("# v2 git bundle", "# v3 git bundle"):
+        raise Refused("the input is not a git bundle")
+    refs = {}
+    for line in lines[1:]:
+        if line == "@object-format=sha1" and lines[0] == "# v3 git bundle":
+            continue
+        found = re.fullmatch(rf"({OID}) (refs/[A-Za-z0-9/._-]{{1,200}})", line)
+        if found is None or found[2] in refs:
+            raise Refused("the bundle carries unexpected content")
+        refs[found[2]] = found[1]
+    expected = {"refs/omp/app": app, "refs/omp/recipe": recipe}
+    if tag:
+        expected["refs/tags/" + tag] = None
+    if set(refs) != set(expected) or any(want is not None and refs[name] != want for name, want in expected.items()):
+        raise Refused("the bundle does not carry exactly the requested commits")
+    if head[end + 2:end + 6] != b"PACK":
+        raise Refused("the input is not a git bundle")
+
+
+# ---- run-folder watch -------------------------------------------------------------------------------
+
+def check_run_usage(directory):
+    total = count = 0
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(directory, flags)
+    scans = [(descriptor, os.scandir(descriptor))]
+    try:
+        while scans:
+            parent, entries = scans[-1]
+            try:
+                entry = next(entries)
+            except StopIteration:
+                entries.close()
+                os.close(parent)
+                scans.pop()
+                continue
+            count += 1
+            if count > RUN_ENTRIES:
+                raise Refused("the run folder exceeds its entry limit")
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            total += metadata.st_size
+            if total > RUN_BYTES:
+                raise Refused("the run folder exceeds its disk limit")
+            if stat.S_ISDIR(metadata.st_mode):
+                try:
+                    child = os.open(entry.name, flags, dir_fd=parent)
+                except OSError:
+                    continue
+                try:
+                    scans.append((child, os.scandir(child)))
+                except BaseException:
+                    os.close(child)
+                    raise
+    finally:
+        for descriptor, entries in scans:
+            entries.close()
+            os.close(descriptor)
+
+
+class Watch:
+    """Checked about once a second: signals, the whole-run deadline, the run folder and the free space."""
+    def __init__(self, run_dir, deadline):
+        self.run_dir, self.deadline, self.next_scan = run_dir, deadline, 0
+
+    def tick(self):
+        if STOP["signal"]:
+            raise Stop("cancelled", "cancelled by the owner")
+        current = time.monotonic()
+        if current >= self.deadline:
+            raise Stop("timeout", "the whole-run timeout expired")
+        if current >= self.next_scan:
+            self.next_scan = current + SCAN_SECONDS
+            try:
+                check_run_usage(self.run_dir)
+            except Refused as refusal:
+                raise Stop("failed", str(refusal)) from None
+            if shutil.disk_usage(DATA).free < FREE_RUNNING:
+                raise Stop("failed", "free space on the build data folder fell below the floor")
+
+
+# ---- the supervisor ---------------------------------------------------------------------------------
+
+class Run:
+    def __init__(self, directory, state):
+        self.dir, self.state, self.progress_bytes = directory, state, 0
+        self.environment = {
+            "PATH": PATH, "HOME": str(directory / "home"), "TMPDIR": str(directory / "tmp"), "LANG": "C", "LC_ALL": "C",
+            "TZ": "UTC", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0",
+            "PYTHONDONTWRITEBYTECODE": "1"}
+        if TESTING:
+            self.environment.update({key: value for key, value in os.environ.items() if key.startswith("OMP_TEST_")})
+
+    def note(self, text):
+        if self.progress_bytes < 262144:
+            self.progress_bytes += len(text) + 1
+            with open(self.dir / "progress.log", "a") as stream:
+                stream.write(text + "\n")
+
+    def phase(self, name):
+        self.state["phase"] = name
+        write_state(self.dir, self.state)
+        self.note(f"Phase: door {name}.")
+
+    def forward(self, line):
+        try:
+            text = line.decode("ascii")
+        except UnicodeDecodeError:
+            return
+        if PROGRESS.fullmatch(text) and not ADDRESS.search(text):
+            self.note(text)
+
+
+def kill_group(process):
+    for signum, grace in ((signal.SIGTERM, 5), (signal.SIGKILL, 5)):
+        try:
+            os.killpg(process.pid, signum)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=grace)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    try:
+        os.killpg(process.pid, signal.SIGKILL)  # stragglers of the same step
+    except ProcessLookupError:
+        pass
+
+
+def step(run, watch, argv, *, cwd, reason, forward=True, merge=False):
+    """Run one owned child in its own process group, forward only allowlisted lines and obey the watch."""
+    process = subprocess.Popen(argv, cwd=cwd, env=run.environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT if merge else subprocess.DEVNULL, start_new_session=True)
+    pending = b""
+    descriptor = process.stdout.fileno()
+    os.set_blocking(descriptor, False)
+    open_stream = True
+    try:
+        while True:
+            if open_stream:
+                if select.select([descriptor], [], [], TICK_SECONDS)[0] or process.poll() is not None:
+                    try:
+                        chunk = os.read(descriptor, 65536)
+                    except BlockingIOError:
+                        chunk = None
+                    if chunk == b"" or (chunk is None and process.poll() is not None):
+                        open_stream = False
+                    elif chunk:
+                        pending += chunk
+                        *lines, pending = pending.split(b"\n")
+                        if len(pending) > 8192:
+                            pending = b""
+                        for line in lines if forward else ():
+                            run.forward(line)
+            elif process.poll() is not None:
+                break
+            else:
+                time.sleep(0.2)
+            watch.tick()
+    finally:
+        kill_group(process)
+        process.stdout.close()
+    if process.returncode != 0:
+        raise Stop("failed", reason)
+
+
+def unpack(run, watch, state):
+    app, recipe, tag = state["app"], state["recipe"], state["tag"]
+    repo = run.dir / "repo"
+    for name in ("home", "tmp", "evidence"):
+        (run.dir / name).mkdir(mode=0o700)
+    git = ["git", "-C", str(repo), "-c", "core.hooksPath=/dev/null", "-c", "fetch.fsckObjects=true",
+           "-c", "transfer.fsckObjects=true"]
+    step(run, watch, ["git", "init", "-q", str(repo)], cwd=run.dir, reason="the bundle could not be unpacked", forward=False)
+    # Only the two commits (and the tag) travel, without their history; mark them as shallow roots.
+    (repo / ".git" / "shallow").write_text(f"{app}\n{recipe}\n")
+    refspecs = ["refs/omp/app:refs/omp/app", "refs/omp/recipe:refs/omp/recipe"]
+    if tag:
+        refspecs.append(f"refs/tags/{tag}:refs/tags/{tag}")
+    step(run, watch, git + ["fetch", "-q", "--no-tags", str(run.dir / "in.bundle"), *refspecs], cwd=run.dir,
+         reason="the bundle could not be unpacked", forward=False)
+    for name, oid in (("refs/omp/app", app), ("refs/omp/recipe", recipe)):
+        found = subprocess.run(git + ["rev-parse", "--verify", name + "^{commit}"], stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, env=run.environment, timeout=60, check=False)
+        if found.returncode != 0 or found.stdout.decode("ascii", "replace").strip() != oid:
+            raise Stop("failed", "the bundle commits differ from the request")
+    step(run, watch, git + ["update-ref", "--no-deref", "HEAD", recipe], cwd=run.dir,
+         reason="the bundle could not be unpacked", forward=False)
+    archive = run.dir / "tmp" / "scripts.tar"
+    step(run, watch, git + ["archive", "--format=tar", "-o", str(archive), recipe, "scripts"], cwd=run.dir,
+         reason="the recipe commit has no scripts", forward=False)
+    with tarfile.open(archive) as tar:
+        tar.extractall(repo, filter="data")
+    archive.unlink()
+    for name in ("linux-amd64-receipt.py", "linux-amd64-runtime.py", "linux-amd64-qualify.py"):
+        if not (repo / "scripts" / name).is_file():
+            raise Stop("failed", "the recipe commit lacks the build scripts")
+
+
+def generate_qualification_key(run, watch):
+    key = run.dir / "evidence" / "qualification-key"
+    step(run, watch, ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "omp-qualification", "-f", str(key)],
+         cwd=run.dir, reason="the qualification key could not be made", forward=False)
+    fields = (run.dir / "evidence" / "qualification-key.pub").read_text().split()
+    (run.dir / "evidence" / "qualification-signers").write_text(
+        f'{IDENTITY} namespaces="{NAMESPACE}" {fields[0]} {fields[1]}\n')
+
+
+def copy_regular(source, destination):
+    if not stat.S_ISREG(os.lstat(source).st_mode):
+        raise Stop("failed", "the build produced an irregular output")
+    shutil.copyfile(source, destination)
+    destination.chmod(0o700 if destination.name == ASSETS[0] else 0o600)
+
+
+def collect(run, mode):
+    out = run.dir / "out"
+    for name in ("assets", "evidence"):
+        (out / name).mkdir(mode=0o700, parents=True)
+    for name in ASSETS:
+        copy_regular(run.dir / "repo" / "dist" / mode / name, out / "assets" / name)
+    for name in EVIDENCE:
+        copy_regular(run.dir / "evidence" / name, out / "evidence" / name)
+
+
+def pipeline(run, watch):
+    state = run.state
+    app, recipe, tag = state["app"], state["recipe"], state["tag"]
+    mode = state["mode"]
+    repo, evidence = run.dir / "repo", run.dir / "evidence"
+    socket = "unix://" + SOCKET
+    python = sys.executable
+    assets = f"dist/{mode}"
+    identity = ["--tag", tag, "--recipe-commit", recipe] if tag else []
+    run.phase("unpack")
+    unpack(run, watch, state)
+    run.phase("check")
+    step(run, watch, [python, "scripts/linux-amd64-receipt.py", "check", "--commit", app], cwd=repo,
+         reason="the application does not match this recipe", merge=True)
+    run.phase("prepare")
+    prepare = [python, "scripts/linux-amd64-runtime.py", "--commit", app, "--recipe-commit", recipe,
+               "--docker-socket", socket, "--witness-run-id", run.dir.name, "--output", mode,
+               "--image-id-file", str(evidence / "runtime-image-id")]
+    if tag:
+        prepare += ["--tag", tag, "--allowed-signers", str(ETC / "source-allowed-signers"),
+                    "--revoked-signers", str(ETC / "source-revoked-signers")]
+    step(run, watch, prepare, cwd=repo, reason="runtime preparation failed")
+    run.phase("verify-candidate")
+    step(run, watch, [python, "scripts/linux-amd64-receipt.py", "verify", assets, "--commit", app, *identity],
+         cwd=repo, reason="pre-qualification verification failed", forward=False)
+    run.phase("qualify")
+    generate_qualification_key(run, watch)
+    image = (evidence / "runtime-image-id").read_text().strip()
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", image) is None:
+        raise Stop("failed", "the prepared runtime image is invalid")
+    qualify = [python, "scripts/linux-amd64-qualify.py", "--commit", app, "--assets", assets,
+               "--docker-socket", socket, "--runtime-image", image, "--witness-run-id", run.dir.name,
+               "--attestation-key", str(evidence / "qualification-key"),
+               "--attestation", str(evidence / "qualification.json")]
+    if tag:
+        qualify += ["--recipe-commit", recipe]
+    step(run, watch, qualify, cwd=repo, reason="qualification failed")
+    run.phase("verify")
+    final = [python, "scripts/linux-amd64-receipt.py", "verify", assets, "--commit", app, *identity,
+             "--attestation", str(evidence / "qualification.json"),
+             "--qualification-signers", str(evidence / "qualification-signers")]
+    step(run, watch, final + (["--release"] if tag else []), cwd=repo, reason="final verification failed", forward=False)
+    run.phase("collect")
+    collect(run, mode)
+    try:
+        verify_outputs(run.dir / "out", state)
+    except Refused:
+        raise Stop("failed", "the door's own verification refused the result") from None
+    state["qualified"] = True
+
+
+def scrub(run, keep_outputs):
+    removed = True
+    for name in ("repo", "tmp", "home", "in.bundle", "evidence") + (() if keep_outputs else ("out",)):
+        path = run.dir / name
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            elif path.exists() or path.is_symlink():
+                path.unlink()
+        except OSError:
+            removed = False
+    return removed
+
+
+def supervise(run_id, build_descriptor, run_descriptor):
+    """Detached owner of one run. It inherited both locks and keeps them until it has proved cleanup."""
+    os.umask(0o077)
+    run_dir = STATE / "runs" / run_id
+    state = read_state(run_dir)
+    began = time.monotonic()
+    state["pid"] = os.getpid()
+    write_state(run_dir, state)
+    run = Run(run_dir, state)
+    for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, lambda number, frame: STOP.update(signal=number))
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    terminal, reason = "failed", "unexpected failure"
+    try:
+        pipeline(run, Watch(run_dir, began + RUN_SECONDS))
+        terminal, reason = "succeeded", ""
+    except Stop as stop:
+        terminal, reason = stop.state, stop.reason
+    except Refused as refusal:
+        terminal, reason = "failed", str(refusal)
+    except (OSError, ValueError, subprocess.SubprocessError, tarfile.TarError):
+        terminal, reason = "failed", "a build step could not run"
+    finally:
+        for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+            signal.signal(signum, signal.SIG_IGN)
+        if (run_dir / "state.json").exists():
+            run.phase("cleanup")
+        proven = remove_run_resources(run_id)
+        removed = scrub(run, keep_outputs=terminal == "succeeded")
+        state["cleanup"] = "proven" if proven and removed else "unproven"
+        state["state"], state["reason"] = terminal, reason
+        state["exit"] = {"succeeded": 0, "timeout": 124, "cancelled": 143}.get(terminal, 1)
+        if terminal != "succeeded":
+            state["qualified"] = False
+        write_state(run_dir, state)
+        log_line(state["started"], "build", run_id, state["exit"], time.monotonic() - began,
+                 state["app"], state["recipe"], state["mode"])
+        os.close(run_descriptor)
+        os.close(build_descriptor)
+
+
+# ---- door-side verification (independent of the recipe's own verifier) ------------------------------
+
+def verify_outputs(out, state):
+    """Refuse anything but exactly three public assets plus a signed, complete qualification of this run."""
+    def regular(path):
+        try:
+            return stat.S_ISREG(os.lstat(path).st_mode)
+        except OSError:
+            return False
+    if not (out / "assets").is_dir() or not (out / "evidence").is_dir():
+        raise Refused("the run is not qualified: outputs are missing")
+    if sorted(item.name for item in (out / "assets").iterdir()) != sorted(ASSETS) or \
+            sorted(item.name for item in (out / "evidence").iterdir()) != sorted(EVIDENCE) or \
+            not all(regular(out / "assets" / name) for name in ASSETS) or \
+            not all(regular(out / "evidence" / name) for name in EVIDENCE):
+        raise Refused("the run is not qualified: unexpected output set")
+    binary, manifest_path = out / "assets" / ASSETS[0], out / "assets" / ASSETS[1]
+    expected_sums = "".join(f"{sha256(out / 'assets' / name)}  {name}\n" for name in ASSETS[:2])
+    if (out / "assets" / ASSETS[2]).read_text() != expected_sums:
+        raise Refused("the run is not qualified: checksums differ")
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = strict_json(manifest_bytes)
+        if manifest_bytes != canonical(manifest):
+            raise ValueError("not canonical")
+        source, asset, qualification = manifest["source"], manifest["asset"], manifest["qualification"]
+        mode = state["mode"]
+        sound = (type(manifest["schema"]) is int and manifest["schema"] == 2 and manifest["target"] == "linux-amd64" and
+                 asset["name"] == ASSETS[0] and asset["sha256"] == sha256(binary) and asset["size"] == binary.stat().st_size and
+                 source["commit"] == state["app"] and source["tag"] == state["tag"] and
+                 source["recipe_committed"] is (mode == "release") and
+                 source["recipe_commit"] == (state["recipe"] if mode == "release" else None))
+        complete = {name: "passed" for name in CHECKS}
+        sound = sound and manifest["checks"] == complete and isinstance(qualification, dict) and \
+            qualification["checks"] == complete and qualification["binary_sha256"] == asset["sha256"] and \
+            qualification["source_commit"] == state["app"] and qualification["recipe_commit"] == source["recipe_commit"]
+        if not sound:
+            raise ValueError("not qualified")
+        binding = canonical({
+            "schema": 1, "binary_sha256": asset["sha256"], "source_commit": source["commit"],
+            "recipe_commit": source["recipe_commit"], "runtime_image_digest": qualification["environment"]["runtime_image"],
+            "mode": "release" if source["recipe_committed"] else "candidate", "checks": manifest["checks"],
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest()})
+    except (KeyError, TypeError, ValueError, OSError):
+        raise Refused("the run is not qualified: the manifest is incomplete or inconsistent") from None
+    with open(binary, "rb") as stream:
+        header = stream.read(20)
+    if len(header) != 20 or header[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", header, 18)[0] != 62:
+        raise Refused("the run is not qualified: the binary is not an ELF64 x86-64 executable")
+    if (out / "evidence" / EVIDENCE[0]).read_bytes() != binding:
+        raise Refused("the run is not qualified: the attestation does not bind this result")
+    try:
+        verified = subprocess.run(
+            ["ssh-keygen", "-Y", "verify", "-f", str(out / "evidence" / EVIDENCE[2]), "-I", IDENTITY, "-n", NAMESPACE,
+             "-s", str(out / "evidence" / EVIDENCE[1])], input=binding, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=60, check=False, env={"PATH": PATH}).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        verified = False
+    if not verified:
+        raise Refused("the run is not qualified: the attestation signature does not verify")
+
+
+# ---- commands ---------------------------------------------------------------------------------------
+
+def recover_and_purge(runs):
+    """Under the build lock: close runs whose supervisor vanished, then forget old finished runs."""
+    finished = []
+    for directory in sorted(runs.iterdir()):
+        if re.fullmatch(RUN, directory.name) is None or directory.is_symlink() or not directory.is_dir():
+            continue
+        try:
+            state = read_state(directory)
+        except Refused:
+            state = {"schema": 1, "state": "running", "started": now()}
+        if state["state"] not in TERMINAL and not supervisor_alive(directory):
+            proven = remove_run_resources(directory.name)
+            scrub(Run(directory, state), keep_outputs=False)
+            state.update(state="failed", reason="the supervisor vanished (host restart?)", exit=1, qualified=False,
+                         cleanup="proven" if proven else "unproven")
+            write_state(directory, state)
+        if state.get("cleanup") == "unproven":
+            raise Refused(f"run {directory.name} has unproven container removal; run cleanup for it first")
+        if state["state"] in TERMINAL:
+            finished.append(directory)
+    finished.sort(key=lambda directory: directory.stat().st_mtime, reverse=True)
+    for index, directory in enumerate(finished):
+        if index >= KEEP_RUNS or time.time() - directory.stat().st_mtime > KEEP_SECONDS:
+            shutil.rmtree(directory, ignore_errors=True)
+
+
+def follow(run_dir):
+    """Stream the run's progress lines. A client that goes away leaves the detached build running."""
+    poller = select.poll()
+    poller.register(1, select.POLLERR | select.POLLHUP)
+    offset, lost = 0, 0
+    while True:
+        if poller.poll(0):
+            return None
+        try:
+            state = read_state(run_dir)  # Read first: every line written before a terminal state is then also read below.
+        except Refused:
+            return {"state": "cancelled"}  # The run was cleaned up from another connection.
+        try:
+            with open(run_dir / "progress.log", "rb") as stream:
+                stream.seek(offset)
+                data = stream.read()
+        except OSError:
+            data = b""
+        complete = data[:data.rfind(b"\n") + 1]
+        offset += len(complete)
+        for line in complete.decode("ascii", "replace").splitlines():
+            if not say(line):
+                return None
+        if state["state"] in TERMINAL and not complete:
+            return state
+        if state["state"] not in TERMINAL and not supervisor_alive(run_dir):
+            lost += 1
+            if lost > 6:
+                return dict(state, state="failed")
+        time.sleep(FOLLOW_SECONDS)
+
+
+def supervisor_environment():
+    """The detached supervisor gets a minimal environment; tests also keep their own OMP_ knobs."""
+    environment = {"PATH": PATH}
+    if not TESTING:
+        environment["SSH_CONNECTION"] = "door"  # Marks production: the supervisor must ignore every override too.
+    else:
+        environment.update({key: value for key, value in os.environ.items() if key.startswith("OMP_")})
+    return environment
+
+
+def build(app, recipe, tag):
+    os.umask(0o077)
+    if not PLAIN_DATA and not os.path.ismount(DATA):
+        raise Refused("the build data filesystem is not mounted")
+    runs = private_directory(STATE / "runs")
+    lock = os.open(STATE / "build.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lock)
+        raise Refused("another build is running") from None
+    recover_and_purge(runs)
+    if tag:
+        allowed, revoked = ETC / "source-allowed-signers", ETC / "source-revoked-signers"
+        for path, nonempty in ((allowed, True), (revoked, False)):
+            try:
+                metadata = os.lstat(path)
+            except OSError:
+                metadata = None
+            if metadata is None or not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o022 or \
+                    (nonempty and metadata.st_size == 0):
+                raise Refused("release builds need enrolled source signers on this host")
+    preflight()
+    run_id = "b" + time.strftime("%Y%m%d%H%M%S", time.gmtime()) + "-" + os.urandom(4).hex()
+    run_dir = runs / run_id
+    run_dir.mkdir(mode=0o700)
+    run_lock = os.open(run_dir / "lock", os.O_CREAT | os.O_RDWR | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    fcntl.flock(run_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    state = {"schema": 1, "run": run_id, "app": app, "recipe": recipe, "tag": tag or None,
+             "mode": "release" if tag else "candidate", "state": "running", "phase": "upload", "started": now(),
+             "qualified": False, "cleanup": "pending", "exit": None, "reason": ""}
+    write_state(run_dir, state)
+    try:
+        receive_bundle(run_dir / "in.bundle")
+        validate_bundle(run_dir / "in.bundle", app, recipe, tag)
+    except BaseException:
+        shutil.rmtree(run_dir, ignore_errors=True)
+        raise
+    try:
+        subprocess.Popen(["/bin/sh", ENTRY, "--supervise", run_id, str(lock), str(run_lock)],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         env=supervisor_environment(), start_new_session=True, pass_fds=(lock, run_lock))
+    except OSError:
+        shutil.rmtree(run_dir, ignore_errors=True)
+        raise Refused("the build supervisor could not start") from None
+    finally:
+        os.close(run_lock)
+        os.close(lock)
+    return run_id, run_dir
+
+
+def status(run_id):
+    run_dir = existing_run(run_id)
+    state = read_state(run_dir)
+    lost = state["state"] not in TERMINAL and not supervisor_alive(run_dir)
+    shown = "failed" if lost else state["state"]
+    for key, value in (("run", run_id), ("state", shown), ("phase", state.get("phase", "")),
+                       ("qualified", "yes" if state.get("qualified") else "no"),
+                       ("cleanup", state.get("cleanup", "pending")), ("started", state.get("started", "")),
+                       ("reason", "the supervisor vanished (host restart?)" if lost else state.get("reason", ""))):
+        say(f"{key}: {value}")
+    return 3 if shown == "running" else 0 if shown == "succeeded" else 1
+
+
+def fetch(run_id):
+    run_dir = existing_run(run_id)
+    state = read_state(run_dir)
+    if state["state"] != "succeeded" or supervisor_alive(run_dir):
+        raise Refused("the run is not a finished successful build")
+    out = run_dir / "out"
+    verify_outputs(out, state)
+    members = [(name, out / "assets" / name) for name in ASSETS] + [("evidence/" + name, out / "evidence" / name) for name in EVIDENCE]
+    try:
+        with os.fdopen(os.dup(1), "wb") as stream, tarfile.open(fileobj=stream, mode="w|", format=tarfile.USTAR_FORMAT) as archive:
+            for name, path in members:
+                info = archive.gettarinfo(str(path), arcname=name)
+                info.uid = info.gid = 0
+                info.uname = info.gname = ""
+                info.mode = 0o755 if name == ASSETS[0] else 0o644
+                with open(path, "rb") as source:
+                    archive.addfile(info, source)
+    except OSError:
+        return 1  # The client went away; nothing is lost because fetch never changes the run.
+    return 0
+
+
+def cleanup(run_id):
+    run_dir = existing_run(run_id)
+    if supervisor_alive(run_dir):
+        try:
+            pid = read_state(run_dir).get("pid")
+        except Refused:
+            pid = None
+        if isinstance(pid, int) and pid > 1:
+            os.kill(pid, signal.SIGTERM)
+        deadline = time.monotonic() + CANCEL_SECONDS
+        while supervisor_alive(run_dir) and time.monotonic() < deadline:
+            time.sleep(0.2)
+        if supervisor_alive(run_dir):
+            if isinstance(pid, int) and pid > 1:
+                os.kill(pid, signal.SIGKILL)
+            time.sleep(1)
+            if supervisor_alive(run_dir):
+                raise Refused("the run's supervisor did not stop")
+    if not remove_run_resources(run_id):
+        try:
+            state = read_state(run_dir)
+            state["cleanup"] = "unproven"
+            write_state(run_dir, state)
+        except (Refused, OSError):
+            pass
+        raise Refused("container removal could not be proven; the run is kept")
+    shutil.rmtree(run_dir)
+    say(f"cleaned {run_id}")
+    return 0
+
+
+def main():
+    if sys.argv[1:2] == ["--supervise"]:
+        supervise(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]))
+        return
+    command = os.environ.get("SSH_ORIGINAL_COMMAND", "")
+    built = BUILD_COMMAND.fullmatch(command) if command.isascii() else None
+    other = RUN_COMMAND.fullmatch(command) if command.isascii() else None
+    if built is None and other is None:
+        say("refused: invalid command")  # Invalid command text is never logged.
+        sys.exit(2)
+    started, began = now(), time.monotonic()
+    verb = "build" if built else other[1]
+    run_id = other[2] if other else None
+    status_code, supervised, logged = 2, False, ("-", "-", "-")
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    try:
+        if built:
+            app, recipe, tag = built.groups()
+            logged = (app, recipe, "release" if tag else "candidate")
+            run_id, run_dir = build(app, recipe, tag)
+            supervised = True  # The supervisor writes this command's log line when the run ends.
+            say(f"run {run_id}")
+            final = follow(run_dir)
+            if final is not None:
+                say(f"state: {final['state']}")
+            status_code = 0 if final is None or final["state"] == "succeeded" else 1
+        elif verb == "status":
+            status_code = status(run_id)
+        elif verb == "fetch":
+            status_code = fetch(run_id)
+        else:
+            status_code = cleanup(run_id)
+    except Refused as refusal:
+        say("refused: " + str(refusal))
+        status_code = 2
+    except Exception:
+        say("error: unexpected failure")
+        status_code = 1
+    finally:
+        if not supervised or status_code == 2:
+            log_line(started, verb, run_id, status_code, time.monotonic() - began, *logged)
+    sys.exit(status_code)
+
+
+if __name__ == "__main__":
+    main()
