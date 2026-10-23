@@ -8,6 +8,7 @@ import { EpisodicGraph } from "../episodic-graph";
 import { type ExtractedFactCategories, heuristicExtractFacts } from "../extraction";
 import { clampVeracity, VERACITY_WEIGHTS, type Veracity, VeracityConsolidator } from "../veracity-consolidation";
 import { scheduleEmbedding } from "./helpers";
+import { pruneConsolidatedWorkingMemory } from "./prune";
 import type { BeamMemoryState, BeamStats, JsonValue, MemoriaRetrieveResult, Metadata, SleepResult } from "./types";
 
 type Row = Record<string, unknown>;
@@ -1104,8 +1105,19 @@ function eligibleWorkingRows(beam: BeamMemoryState, sessionId: string): Row[] {
 	);
 }
 
-export function sleep(beam: BeamMemoryState, dryRun = false): SleepResult {
+/** Consolidate this session's eligible rows; no pruning (`sleep` and `sleepAllSessions` prune once, when the setting is on). */
+function sleepSession(beam: BeamMemoryState, dryRun: boolean): SleepResult {
 	return consolidateWorkingRows(beam, eligibleWorkingRows(beam, sourceSession(beam)), dryRun);
+}
+
+/** The sleep result with the pruning step's outcome added; unchanged when `pruneConsolidatedDays` is off. */
+function withPruned(beam: BeamMemoryState, result: SleepResult, dryRun: boolean): SleepResult {
+	const pruned = pruneConsolidatedWorkingMemory(beam, dryRun);
+	return pruned === undefined ? result : { ...result, pruned };
+}
+
+export function sleep(beam: BeamMemoryState, dryRun = false): SleepResult {
+	return withPruned(beam, sleepSession(beam, dryRun), dryRun);
 }
 
 /**
@@ -1295,18 +1307,22 @@ export function sleepAllSessions(beam: BeamMemoryState, dryRun = false): SleepRe
 			.all(cutoff),
 	);
 	if (sessions.length === 0) {
-		return {
-			dry_run: dryRun,
-			status: "no_op",
-			message: "No old working memories to consolidate",
-			sessions_scanned: 0,
-			sessions_consolidated: 0,
-			items_consolidated: 0,
-			summaries_created: 0,
-			llm_used: 0,
-			errors: 0,
-			session_results: [],
-		};
+		return withPruned(
+			beam,
+			{
+				dry_run: dryRun,
+				status: "no_op",
+				message: "No old working memories to consolidate",
+				sessions_scanned: 0,
+				sessions_consolidated: 0,
+				items_consolidated: 0,
+				summaries_created: 0,
+				llm_used: 0,
+				errors: 0,
+				session_results: [],
+			},
+			dryRun,
+		);
 	}
 	const originalSession = beam.sessionId;
 	const results: Row[] = [];
@@ -1317,7 +1333,7 @@ export function sleepAllSessions(beam: BeamMemoryState, dryRun = false): SleepRe
 		const sessionId = rowValue(row, "session_id") ?? "default";
 		const scoped = Object.create(Object.getPrototypeOf(beam)) as BeamMemoryState;
 		Object.assign(scoped, beam, { sessionId, channelId: sessionId });
-		const result = sleep(scoped, dryRun) as Row;
+		const result = sleepSession(scoped, dryRun) as Row;
 		result.session_id = sessionId;
 		result.eligible = row.eligible;
 		results.push(result);
@@ -1326,20 +1342,24 @@ export function sleepAllSessions(beam: BeamMemoryState, dryRun = false): SleepRe
 		summaries += Number(result.summaries_created ?? 0);
 	}
 	const degradation = degradeEpisodic(beam, dryRun);
-	return {
-		dry_run: dryRun,
-		status: dryRun ? "dry_run" : items > 0 ? "consolidated" : "no_op",
-		sessions_scanned: sessions.length,
-		sessions_consolidated: consolidated,
-		items_consolidated: items,
-		summaries_created: summaries,
-		llm_used: 0,
-		errors: 0,
-		error_details: [],
-		session_results: results,
-		degradation,
-		original_session: originalSession,
-	};
+	return withPruned(
+		beam,
+		{
+			dry_run: dryRun,
+			status: dryRun ? "dry_run" : items > 0 ? "consolidated" : "no_op",
+			sessions_scanned: sessions.length,
+			sessions_consolidated: consolidated,
+			items_consolidated: items,
+			summaries_created: summaries,
+			llm_used: 0,
+			errors: 0,
+			error_details: [],
+			session_results: results,
+			degradation,
+			original_session: originalSession,
+		},
+		dryRun,
+	);
 }
 export function getConsolidationLog(beam: BeamMemoryState, limit = 10): Row[] {
 	return asRows(

@@ -78,6 +78,13 @@ export interface BeamConfig {
 	 */
 	tier3Days?: number;
 	/**
+	 * Days a working row is kept after `sleep` summarized it. Once a row has been consolidated for this
+	 * long, and a live episodic summary lists it in `summary_of`, `sleep` deletes the row and its
+	 * full-text, vector and annotation entries; the summary and the facts extracted from the row stay.
+	 * Unconsolidated and `IMPORTED` rows are never deleted. Unset or `0` keeps every row (the default).
+	 */
+	pruneConsolidatedDays?: number;
+	/**
 	 * Newest known memories a new episodic summary (or proactively linked memory) is linked against.
 	 * `0` links against every memory. Unset defers to `MNEMOPI_GRAPH_LINK_WINDOW` (200).
 	 */
@@ -332,10 +339,21 @@ export interface MemoriaRetrieveResult {
 	results: unknown[];
 }
 
+/** Outcome of one `pruneConsolidatedWorkingMemory` run. */
+export interface PruneResult {
+	/** `no_op`: nothing was eligible. `dry_run`: `pruned` rows would go. `failed`: logged, rows stay for the next run. */
+	status: "pruned" | "no_op" | "dry_run" | "failed";
+	pruned: number;
+	/** The file was compacted (`VACUUM`) because the run left a quarter of it, and 4 MiB or more, free. */
+	reclaimed: boolean;
+}
+
 export interface SleepResult {
 	dry_run: boolean;
 	sessions?: Record<string, unknown>;
 	items_consolidated?: number;
+	/** Present only when `pruneConsolidatedDays` is set: what the pruning step did in this run. */
+	pruned?: PruneResult;
 	[key: string]: unknown;
 }
 

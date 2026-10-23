@@ -1056,6 +1056,7 @@ function createMemory(config: MnemopiBackendConfig, bank: string): Mnemopi {
 			tier2Days: config.tier2Days,
 			tier3Days: config.tier3Days,
 			graphLinkWindow: config.graphLinkWindow,
+			pruneConsolidatedDays: config.pruneConsolidatedDays,
 		},
 	} as ConstructorParameters<typeof Mnemopi>[0]);
 }

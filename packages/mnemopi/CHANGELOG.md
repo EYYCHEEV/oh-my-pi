@@ -8,6 +8,7 @@
 - Added the `beamConfig` option of `Mnemopi` and the `tier2Days` / `tier3Days` beam settings so one instance can set the episodic tier cut ages (`0` never cuts) instead of only the process-wide `MNEMOPI_TIER2_DAYS` / `MNEMOPI_TIER3_DAYS`; unset keeps the environment defaults
 - Added the `graphLinkWindow` beam setting so one `Mnemopi` instance (`beamConfig`) sets how many of the newest memories a new episodic summary links against; unset keeps `MNEMOPI_GRAPH_LINK_WINDOW`
 - Added the `embeddings.allowDownload` option of `Mnemopi`: `false` never installs fastembed or downloads model files; the local embedding model is used only when it is already on disk, otherwise embeddings are skipped (keyword recall only) and one warning is logged. Unset keeps the first-use install and download
+- Added the `pruneConsolidatedDays` beam setting (`beamConfig`; unset or `0` is off) to bound a long-lived database: `sleep` and `sleepAllSessions` delete a working row that was summarized that many days ago, with its full-text entry, vector, annotations and graph nodes, and return `pruned: { status, pruned, reclaimed }`. Only consolidated, non-`IMPORTED` rows that a live episodic row lists in `summary_of` qualify; the summary and the facts extracted from the row stay. A run removes at most 5000 rows, and one that frees a quarter of the file (4 MiB or more) compacts it with `VACUUM`, which is safe while other processes read and write a WAL database
 
 ### Fixed
 

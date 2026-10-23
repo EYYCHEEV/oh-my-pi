@@ -17,6 +17,7 @@
 - Added an optional `expires` to the Mnemopi `retain` tool (an ISO date, an ISO date-time with a UTC offset, or a duration such as `30d`) that sets the memory's `valid_until`, so recall stops returning stale facts; a malformed or past value rejects the whole batch
 - Added the `mnemopi.graphLinkWindow` setting so each project or bot config sets how many of the newest memories a new episodic summary links against (`0` links against every memory); unset keeps `MNEMOPI_GRAPH_LINK_WINDOW` (200)
 - Added the `mnemopi.allowModelDownload` setting (default on). Set to `false` so an unattended run never installs fastembed or downloads the embedding model: it uses the cached model when both are already on disk, otherwise keyword search with one log warning. `mnemopi.noEmbeddings` still avoids every fetch
+- Added the `mnemopi.pruneConsolidatedDays` setting (off by default) so an unattended bot's own config bounds its Mnemopi file: session-start consolidation deletes the working rows it summarized that many days ago, with their search, vector and annotation entries, and keeps the episodic summary. Unconsolidated, `IMPORTED` and un-summarized rows are never deleted; `forget` can no longer find a pruned row, only `invalidate` on its summary
 
 ### Changed
 
