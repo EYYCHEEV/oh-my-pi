@@ -26,13 +26,15 @@ afterEach(() => {
 	for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-const MARKER = "OLIVE-MNEMO-6150";
+// Its number word carries a letter on purpose. Ids, digests and rolling hashes are random hex and decimal, so a bare
+// four-digit number sits in about one bank in 200 by chance, and a scan for it reported a leak that was not one.
+const MARKER = "OLIVE-MNEMO-X6150";
 const MEMORY = `The delta bot's locker code for the east door is ${MARKER}.`;
 // The wording the extractor gave the memory: a recall shows this, and a transcript quotes it.
 const FACT = `delta bot east door locker code ${MARKER}`;
 const UNRELATED = "Quokka migration is scheduled for 2027-05-09 with 41 gadgets";
 // The marker as the full-text tokenizer stores it (case-folded, split at the hyphens), and the marker whole.
-const TOKENS = [MARKER.toLowerCase(), "olive", "mnemo", "6150"];
+const TOKENS = [MARKER.toLowerCase(), "olive", "mnemo", "x6150"];
 const hoursAgo = (hours: number): string => new Date(Date.now() - hours * 3_600_000).toISOString();
 
 const complete: MnemopiLlmCompletion = prompt =>
@@ -200,6 +202,22 @@ describe("forget leaves nothing of the text in the database files", () => {
 		// The forgetting session ends after the forget: its transcript quotes what it forgot.
 		await retainTranscript(memory, [["assistant", `Forgot ${MEMORY} (stored as: ${FACT}).`]]);
 		memory.close();
+
+		expect(leaks(file)).toEqual({});
+	});
+
+	it("does not take the digits of a random id, hash or number for the forgotten text", () => {
+		const file = bankPath();
+		const memory = openBank(file);
+		// Ids, digests and rolling hashes are random hex and decimal, so any four digits sit in about one bank in 200 by chance.
+		memory.beam.db.run("INSERT INTO forget_tombstones (ntokens, roll, digest, created_at) VALUES (?, ?, ?, ?)", [
+			3,
+			3_461_502_817,
+			"0a6150c3d5e7f912",
+			"1761501234567",
+		]);
+		memory.beam.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+		expect(readFileSync(file).toString("latin1")).toContain("6150");
 
 		expect(leaks(file)).toEqual({});
 	});
