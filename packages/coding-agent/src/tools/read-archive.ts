@@ -12,6 +12,7 @@ import type { ToolSession } from "../sdk";
 import { truncateHead } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { applyListLimit } from "@oh-my-pi/pi-tui/tools/list-limit";
 import { resolveReadPath } from "./path-utils";
+import { isRacyStat } from "./racy-stamp";
 import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
 import {
 	buildInMemorySelectorResult,
@@ -59,7 +60,10 @@ interface CachedArchiveReader {
  * Recently opened archives, so paging through members does not re-read and
  * re-index the archive per read. Bounded by count and by total indexed entries;
  * an entry is reused only while the file's identity (inode, mtime, ctime, size)
- * holds, so a rewrite or a permission change reopens the archive.
+ * holds, so a rewrite or a permission change reopens the archive. An entry is
+ * stored only for a stat that is not racy (see `isRacyStat`): a coarse Linux
+ * file clock can stamp a same-size rewrite in the same tick as the cached open,
+ * and then nothing in the identity shows it.
  */
 const archiveReaderCache = new LRUCache<string, CachedArchiveReader>({
 	max: 4,
@@ -73,6 +77,8 @@ async function openArchiveCached(absolutePath: string): Promise<ArchiveReader> {
 		.stat()
 		.catch(() => null);
 	if (!stat) return openArchive(absolutePath);
+	// Judged at stat time, before the open, so a slow open cannot age the stamp past the racy window.
+	const racy = isRacyStat(stat);
 	const cached = archiveReaderCache.get(absolutePath);
 	if (
 		cached &&
@@ -84,7 +90,7 @@ async function openArchiveCached(absolutePath: string): Promise<ArchiveReader> {
 		return cached.reader;
 	}
 	const reader = await openArchive(absolutePath);
-	if (!CACHEABLE_ARCHIVE_FORMATS[reader.format]) {
+	if (racy || !CACHEABLE_ARCHIVE_FORMATS[reader.format]) {
 		archiveReaderCache.delete(absolutePath);
 		return reader;
 	}
