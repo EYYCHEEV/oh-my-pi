@@ -44,6 +44,7 @@
 - Added awaitable extension custom-message admission receipts and session-scoped persistence barriers, without changing existing message-send completion behavior.
 - Added generic session-wide runtime requirements with durable obligations, fresh loader-backed attachment checks, `session_ready`, startup `requiredRuntimeExtensions`, and the `--require-runtime-contract=1` support assertion. Refused execution preserves queued work and keeps saved history readable; recovery guidance is bounded and display-only.
 - Prevented custom messages from crossing session changes or disposal while image normalization is pending, for every delivery mode.
+- Fixed the runtime-requirements check running on every prompt, steer, follow-up, compaction, handoff, tool call and title request even when no requirement, declaration or session transition is pending; it is skipped then, as the other call sites already did, which removes extra async turns that reordered the title, branch and handoff races.
 
 ## [18.12.6] - 2026-10-21
 

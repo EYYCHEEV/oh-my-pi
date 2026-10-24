@@ -2176,7 +2176,7 @@ export class AgentSession implements SettingsScope {
 		});
 		this.#detachRuntimeBeforeRun = this.agent.addBeforeRunHook(async signal => {
 			try {
-				await this.#assertRuntimeRequirements(signal);
+				if (this.#runtimeRequirementValidationNeeded()) await this.#assertRuntimeRequirements(signal);
 			} catch (error) {
 				this.#queuedMessageDrainBlocked = true;
 				throw error;
@@ -2184,7 +2184,7 @@ export class AgentSession implements SettingsScope {
 		});
 		this.#detachUsageBeforeQueueDequeue = this.agent.addBeforeQueuedMessageDequeueHook(async signal => {
 			try {
-				await this.#assertRuntimeRequirements(signal);
+				if (this.#runtimeRequirementValidationNeeded()) await this.#assertRuntimeRequirements(signal);
 			} catch (error) {
 				this.#queuedMessageDrainBlocked = true;
 				throw error;
@@ -2202,7 +2202,7 @@ export class AgentSession implements SettingsScope {
 		});
 		this.agent.prepareQueuedMessages = this.#prepareQueuedUserMessages;
 		this.#detachUsageBeforeModelCall = this.agent.addBeforeModelCallHook(async signal => {
-			await this.#assertRuntimeRequirements(signal);
+			if (this.#runtimeRequirementValidationNeeded()) await this.#assertRuntimeRequirements(signal);
 			if (!cfgRetryUsageAwareFallback.get(this.settings)) return;
 			if (this.#usagePreflightReadyForNextModelCall) {
 				const checkedModel = this.#usagePreflightReadyModel;
@@ -2259,7 +2259,7 @@ export class AgentSession implements SettingsScope {
 		this.#transformContext = config.transformContext ?? (messages => messages);
 		const sideStreamFn = config.sideStreamFn ?? streamSimple;
 		this.#sideStreamFn = async (model, context, options) => {
-			await this.#assertRuntimeRequirements(options?.signal);
+			if (this.#runtimeRequirementValidationNeeded()) await this.#assertRuntimeRequirements(options?.signal);
 			return sideStreamFn(model, context, options);
 		};
 		this.#onPayload = config.onPayload;
@@ -5457,7 +5457,7 @@ export class AgentSession implements SettingsScope {
 		coalescedSources: Set<string>,
 	): Promise<AgentContinueOutcome> {
 		try {
-			await this.#assertRuntimeRequirements(signal);
+			if (this.#runtimeRequirementValidationNeeded()) await this.#assertRuntimeRequirements(signal);
 			// During an automatic-retry saga the primary model's selector cooldown
 			// can expire while a chain-tail fallback is still mid-backoff. Restoring
 			// the primary then would reset the retry budget and re-enter a model
@@ -5809,7 +5809,7 @@ export class AgentSession implements SettingsScope {
 	 * execution still emit there).
 	 */
 	async #beforeToolCall(ctx: BeforeToolCallContext, signal?: AbortSignal): Promise<BeforeToolCallResult | undefined> {
-		await this.#assertRuntimeRequirements(signal);
+		if (this.#runtimeRequirementValidationNeeded()) await this.#assertRuntimeRequirements(signal);
 		const runner = this.#extensionRunner;
 		runner?.markLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
 		const ttsrResult = await this.#ttsr.beforeToolCall(ctx);
@@ -7486,7 +7486,7 @@ export class AgentSession implements SettingsScope {
 
 	/** Compact the active session history. */
 	async compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
-		await this.#assertRuntimeRequirements();
+		if (this.#runtimeRequirementValidationNeeded()) await this.#assertRuntimeRequirements();
 		return this.#maintenance.compact(customInstructions, options);
 	}
 
@@ -8336,7 +8336,7 @@ export class AgentSession implements SettingsScope {
 				text = expandSlashCommand(text, this.#slashCommands);
 			}
 		}
-		await this.#assertRuntimeRequirements();
+		if (this.#runtimeRequirementValidationNeeded()) await this.#assertRuntimeRequirements();
 
 		// Expand file-based prompt templates if requested
 		const templated = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
@@ -8605,7 +8605,7 @@ export class AgentSession implements SettingsScope {
 		outcome: PromptDispatchOutcome,
 	): Promise<boolean> {
 		denyEvaluationIngress("custom prompt");
-		await this.#assertRuntimeRequirements();
+		if (this.#runtimeRequirementValidationNeeded()) await this.#assertRuntimeRequirements();
 		const textContent =
 			typeof message.content === "string"
 				? message.content
@@ -8921,7 +8921,7 @@ export class AgentSession implements SettingsScope {
 		const setupAbort = new AbortController();
 		this.#promptSetupAbortController = setupAbort;
 		try {
-			await this.#assertRuntimeRequirements();
+			if (this.#runtimeRequirementValidationNeeded()) await this.#assertRuntimeRequirements();
 			options?.onPromptAdmitted?.();
 			await this.#recovery.maybeRestoreRetryFallbackPrimary();
 			// Auto-prewalk: return from the previous task's handoff before the usage preflight checks the model,
@@ -8930,7 +8930,7 @@ export class AgentSession implements SettingsScope {
 			if (autoPrewalkTask) await this.#prewalk.beginAutoTask();
 			const autoPrewalk = autoPrewalkTask ? this.#prewalk.classifyAuto(expandedText, setupAbort.signal) : undefined;
 			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return false;
-			await this.#assertRuntimeRequirements();
+			if (this.#runtimeRequirementValidationNeeded()) await this.#assertRuntimeRequirements();
 			// Flush any pending bash messages before the new prompt
 			await this.#bash.flushPending();
 			this.#eval.flushPending();
@@ -9364,7 +9364,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	async steer(text: string, images?: ImageContent[], options?: SteerOptions): Promise<void> {
 		denyEvaluationIngress("steering input");
-		await this.#assertRuntimeRequirements();
+		if (this.#runtimeRequirementValidationNeeded()) await this.#assertRuntimeRequirements();
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -9389,7 +9389,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	async followUp(text: string, images?: ImageContent[], options?: FollowUpOptions): Promise<void> {
 		denyEvaluationIngress("follow-up input");
-		await this.#assertRuntimeRequirements();
+		if (this.#runtimeRequirementValidationNeeded()) await this.#assertRuntimeRequirements();
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -10008,7 +10008,7 @@ export class AgentSession implements SettingsScope {
 		if (this.#pendingNextTurnMessages.length === 0) {
 			return;
 		}
-		await this.#assertRuntimeRequirements();
+		if (this.#runtimeRequirementValidationNeeded()) await this.#assertRuntimeRequirements();
 		const sessionGeneration = this.#sessionGeneration;
 		const sessionId = this.sessionId;
 
@@ -10111,7 +10111,7 @@ export class AgentSession implements SettingsScope {
 		};
 		try {
 			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return false;
-			await this.#assertRuntimeRequirements();
+			if (this.#runtimeRequirementValidationNeeded()) await this.#assertRuntimeRequirements();
 			if (
 				(await this.#sessionGenerationChanged(options.expectedSessionGeneration)) ||
 				this.#sessionGeneration !== options.expectedSessionGeneration
@@ -10570,7 +10570,7 @@ export class AgentSession implements SettingsScope {
 		// Captured before the normalization await below — see #sessionGeneration's doc comment.
 		const sessionGeneration = this.#sessionGeneration;
 		const sessionId = this.sessionManager.getSessionId();
-		await this.#assertRuntimeRequirements();
+		if (this.#runtimeRequirementValidationNeeded()) await this.#assertRuntimeRequirements();
 		const admit = onAdmission
 			? (location: "queue" | "context") =>
 					onAdmission({ sessionId, admitted: true, location, deliverAs: options?.deliverAs ?? "steer" })
@@ -11410,7 +11410,7 @@ export class AgentSession implements SettingsScope {
 		if (titleSignal.aborted) return null;
 		// Validate before model/key selection can return a fallback title without dispatch.
 		// The generator callback below repeats the check at the actual inference boundary.
-		await this.#assertRuntimeRequirements(titleSignal);
+		if (this.#runtimeRequirementValidationNeeded()) await this.#assertRuntimeRequirements(titleSignal);
 		// Title requests obey both credential redaction and the owning runtime's requirements.
 		const title = await withCredentialRedaction(cfgSecretsEnabled.get(this.settings), () =>
 			generateSessionTitle(
@@ -12339,7 +12339,7 @@ export class AgentSession implements SettingsScope {
 	 * @returns The handoff document text, or undefined if cancelled/failed
 	 */
 	async handoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined> {
-		await this.#assertRuntimeRequirements();
+		if (this.#runtimeRequirementValidationNeeded()) await this.#assertRuntimeRequirements();
 		return this.#maintenance.handoff(customInstructions, options);
 	}
 
