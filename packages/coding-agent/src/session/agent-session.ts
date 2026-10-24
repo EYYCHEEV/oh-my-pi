@@ -202,6 +202,7 @@ import type { DaemonCompletionNotification } from "../launch/protocol";
 import { MEMORY_RECALL_CHANGES_MESSAGE_TYPE } from "../memory-backend/recall-entry";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
+import { getMnemopiStartupFailure, type MnemopiStartupFailure } from "../mnemopi/startup-failure";
 import { MAGIC_KEYWORDS, type MagicKeywordContext, type MagicKeywordId } from "../modes/magic-keywords";
 import { containsMagicKeyword } from "@oh-my-pi/pi-tui/prompt/magic-keywords";
 import { theme } from "@oh-my-pi/pi-tui/theme";
@@ -3243,6 +3244,11 @@ export class AgentSession implements SettingsScope {
 
 	getMnemopiSessionState(): MnemopiSessionState | undefined {
 		return getMnemopiSessionState(this);
+	}
+
+	/** Why this session runs without Mnemopi, when its startup failed (or its parent's did). */
+	getMnemopiStartupFailure(): MnemopiStartupFailure | undefined {
+		return getMnemopiStartupFailure(this);
 	}
 
 	/** TTSR manager for time-traveling stream rules */

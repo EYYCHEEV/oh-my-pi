@@ -45,6 +45,14 @@ import {
 	requireMnemopiCore,
 	setMnemopiSessionState,
 } from "./state";
+import {
+	clearMnemopiStartupFailure,
+	describeMnemopiStartupFailure,
+	getMnemopiStartupFailure,
+	inheritMnemopiStartupFailure,
+	mnemopiNotInitialisedMessage,
+	recordMnemopiStartupFailure,
+} from "./startup-failure";
 
 import { cfgMemoryBackend } from "../memory-backend/settings";
 import { cfgMnemopiInjectionTokenLimit } from "./settings";
@@ -106,12 +114,39 @@ async function installMnemopiState(
 		// Promote age-eligible working memory to episodic before the session's
 		// first write can TTL-trim unconsolidated retain/learn rows (#10770).
 		state.promoteEligibleWorkingMemory();
+		clearMnemopiStartupFailure(session);
 		return state;
 	} catch (error) {
 		setMnemopiSessionState(session, undefined);
 		await state.dispose({ consolidate: false });
 		throw error;
 	}
+}
+
+/**
+ * Remembers why `session` runs without Mnemopi, so startup can announce it once and the memory
+ * tools can name it. `config` is unknown when loading it was what failed; the database list is
+ * then empty and the record names only the error. Never throws.
+ */
+function recordStartupFailure(
+	session: AgentSession,
+	error: unknown,
+	agentDir: string,
+	settings: MemoryBackendStartOptions["settings"],
+	config?: MnemopiBackendConfig,
+): void {
+	let dbPaths: readonly string[] = [];
+	try {
+		const resolved = config ?? loadMnemopiConfig(settings, agentDir);
+		try {
+			dbPaths = getMnemopiScopedDbPaths(resolved);
+		} catch {
+			dbPaths = [resolved.dbPath];
+		}
+	} catch {
+		// The configuration is what failed: there is no database to name.
+	}
+	recordMnemopiStartupFailure(session, describeMnemopiStartupFailure(error, { agentDir, dbPaths }));
 }
 
 export const mnemopiBackend: MemoryBackend = {
@@ -124,7 +159,13 @@ export const mnemopiBackend: MemoryBackend = {
 
 		if (options.taskDepth > 0) {
 			const parent = getMnemopiSessionStateFromParent(options);
-			if (!parent) return;
+			if (!parent) {
+				// The parent has no Mnemopi: keep its reason, so this child's memory tools name it.
+				if (options.parentMnemopiStartupFailure) {
+					inheritMnemopiStartupFailure(session, options.parentMnemopiStartupFailure);
+				}
+				return;
+			}
 			const previous = setMnemopiSessionState(
 				session,
 				new MnemopiSessionState({
@@ -135,12 +176,14 @@ export const mnemopiBackend: MemoryBackend = {
 					hasRecalledForFirstTurn: true,
 				}),
 			);
+			clearMnemopiStartupFailure(session);
 			await previous?.dispose();
 			return;
 		}
 
+		let config: MnemopiBackendConfig | undefined;
 		try {
-			const config = await loadMnemopiConfigWithProviders(
+			config = await loadMnemopiConfigWithProviders(
 				settings,
 				agentDir,
 				modelRegistry,
@@ -151,6 +194,7 @@ export const mnemopiBackend: MemoryBackend = {
 			await installMnemopiState(session, config, getMnemopiSessionStateFromParent(options));
 		} catch (error) {
 			logger.warn("Mnemopi: backend startup failed; memory backend inert.", { error: String(error) });
+			recordStartupFailure(session, error, agentDir, settings, config);
 		}
 	},
 
@@ -200,6 +244,7 @@ export const mnemopiBackend: MemoryBackend = {
 			await installMnemopiState(session, config);
 		} catch (error) {
 			logger.warn("Mnemopi: clear rehydrate failed; memory backend inert.", { error: String(error) });
+			recordStartupFailure(session, error, agentDir, session.settings, config);
 		}
 	},
 
@@ -220,6 +265,9 @@ export const mnemopiBackend: MemoryBackend = {
 			await state?.consolidate({ full: true, retain: true });
 		} catch (error) {
 			logger.warn("Mnemopi: enqueue failed.", { error: String(error) });
+			if (session && !getMnemopiSessionState(session)) {
+				recordStartupFailure(session, error, agentDir, session.settings);
+			}
 		}
 	},
 
@@ -259,7 +307,7 @@ export const mnemopiBackend: MemoryBackend = {
 				active: false,
 				writable: false,
 				searchable: false,
-				message: "Mnemopi backend is not initialised for this session.",
+				message: mnemopiNotInitialisedMessage(getMnemopiStartupFailure(session)),
 			};
 		}
 
@@ -289,7 +337,7 @@ export const mnemopiBackend: MemoryBackend = {
 				query,
 				count: 0,
 				items: [],
-				message: "Mnemopi backend is not initialised for this session.",
+				message: mnemopiNotInitialisedMessage(getMnemopiStartupFailure(session)),
 			};
 		}
 		if (options?.signal?.aborted) {
@@ -317,7 +365,7 @@ export const mnemopiBackend: MemoryBackend = {
 			return {
 				backend: "mnemopi",
 				stored: 0,
-				message: "Mnemopi backend is not initialised for this session.",
+				message: mnemopiNotInitialisedMessage(getMnemopiStartupFailure(session)),
 			};
 		}
 		const content = input.content.trim();

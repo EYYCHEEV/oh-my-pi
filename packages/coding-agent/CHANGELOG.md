@@ -46,6 +46,7 @@
 - Prevented custom messages from crossing session changes or disposal while image normalization is pending, for every delivery mode.
 - Fixed the runtime-requirements check running on every prompt, steer, follow-up, compaction, handoff, tool call and title request even when no requirement, declaration or session transition is pending; it is skipped then, as the other call sites already did, which removes extra async turns that reordered the title, branch and handoff races.
 - Fixed restricted subagents (task-tool children, restricted and plan-mode structured subagents, and restricted revival) not applying the owner's `tool_call` policy hooks, so a restricted child could read a path the owner had blocked; they now get the owner's hooks without any extension tools, MCP or discovered capabilities.
+- Fixed a Mnemopi start that fails (a database or folder that is not writable, a read-only `-wal` or `-shm` left by an earlier run, a locked file) leaving the session with memory silently off. The cause is now shown once at startup (stderr in print and RPC modes, a warning in the TUI), named by every memory tool and backend result instead of "Mnemopi backend is not initialised for this session.", and kept by child sessions. It names the files that are not writable, relative to the agent folder, and never changes a mode or retries.
 
 ## [18.12.6] - 2026-10-21
 

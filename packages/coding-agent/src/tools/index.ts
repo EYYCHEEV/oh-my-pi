@@ -33,6 +33,7 @@ import { LspTool } from "../lsp";
 import type { MCPManager } from "../mcp";
 import { MEMORY_BACKEND_TOOL_NAMES } from "../memory-backend/tool-names";
 import type { MnemopiSessionState } from "../mnemopi/state";
+import type { MnemopiStartupFailure } from "../mnemopi/startup-failure";
 import type { PlanModeState } from "../plan-mode/state";
 import type { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import type { AgentRegistry } from "../registry/agent-registry";
@@ -372,6 +373,8 @@ export interface ToolSession {
 	getHindsightSessionState?: () => HindsightSessionState | undefined;
 	/** Get Mnemopi runtime state for this agent session. */
 	getMnemopiSessionState?: () => MnemopiSessionState | undefined;
+	/** Why this session runs without Mnemopi, when its startup failed (or its parent's did). */
+	getMnemopiStartupFailure?: () => MnemopiStartupFailure | undefined;
 	/** Agent identity used for IRC routing. Returns the registry id (e.g. "Main", "AuthLoader"). */
 	getAgentId?: () => string | null;
 	/** Parent cache identity for sibling sharing, only when the parent model opts in. */

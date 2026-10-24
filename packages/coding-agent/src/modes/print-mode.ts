@@ -11,6 +11,7 @@ import { presentNarrationAsAnswer } from "@oh-my-pi/pi-ai/utils/narration";
 import { $flag, logger, postmortem, sanitizeText } from "@oh-my-pi/pi-utils";
 import type { MCPManager } from "../mcp/manager";
 import { resolveMCPTimeoutMs } from "../mcp/timeout";
+import { mnemopiStartupNotice, watchMnemopiStartupFailure } from "../mnemopi/startup-failure";
 import { type AgentSession, type AgentSessionEvent, SHUTDOWN_CONSOLIDATE_BUDGET_MS } from "../session/agent-session";
 import { CREDENTIAL_DISABLED_NOTICE_SOURCE } from "../session/credential-disabled-notice";
 import { isSilentAbort } from "../session/messages";
@@ -340,6 +341,10 @@ async function runPrintModeCore(
 	});
 	session.sessionManager.onPersistenceNotice(notice => {
 		writeStderrLine(`Warning: ${formatPersistenceNotice(notice)}`);
+	});
+	// Mnemopi that could not start leaves the run with memory off; say why, once, on stderr.
+	watchMnemopiStartupFailure(session, failure => {
+		writeStderrLine(`Warning: ${mnemopiStartupNotice(failure)}`);
 	});
 
 	// Always subscribe to enable session persistence via _handleAgentEvent

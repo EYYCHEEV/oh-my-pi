@@ -11,6 +11,7 @@ import type { ToolSession } from ".";
 import { cfgAutolearnEnabled } from "../autolearn/settings";
 import { cfgMemoryBackend } from "../memory-backend/settings";
 import { isGlobalMemoryScopeAvailable } from "../mnemopi/settings";
+import { mnemopiNotInitialisedMessage } from "../mnemopi/startup-failure";
 
 const learnSkillSchema = type({
 	action: "'create' | 'update'",
@@ -86,7 +87,7 @@ export class LearnTool implements AgentTool<LearnSchema> {
 		if (backend === "mnemopi") {
 			const state = this.session.getMnemopiSessionState?.();
 			if (!state) {
-				throw new Error("Mnemopi backend is not initialised for this session.");
+				throw new Error(mnemopiNotInitialisedMessage(this.session.getMnemopiStartupFailure?.()));
 			}
 			// Resolve the target before writing, so an unsupported scoping mode is not reported as a storage failure.
 			const target = params.scope === "global" ? state.getGlobalRetainTarget() : undefined;

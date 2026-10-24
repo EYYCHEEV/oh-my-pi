@@ -8,6 +8,7 @@ import type { ToolSession } from ".";
 
 import { cfgMemoryBackend } from "../memory-backend/settings";
 import { isGlobalMemoryScopeAvailable } from "../mnemopi/settings";
+import { mnemopiNotInitialisedMessage } from "../mnemopi/startup-failure";
 
 const memoryRetainSchemaBase = type({
 	items: type({
@@ -125,7 +126,7 @@ export class MemoryRetainTool implements AgentTool<MemoryRetainSchema, MemoryRet
 		if (backend === "mnemopi") {
 			const state = this.session.getMnemopiSessionState?.();
 			if (!state) {
-				throw new Error("Mnemopi backend is not initialised for this session.");
+				throw new Error(mnemopiNotInitialisedMessage(this.session.getMnemopiStartupFailure?.()));
 			}
 			return withLoopPhase("mnemopi.retain", () => {
 				// Resolve the global bank first, so an unsupported scoping mode rejects the batch before any item is stored.

@@ -263,6 +263,16 @@ Choose one for a bot:
 
 Warm the cache once, with network, by running a normal hand session with `allowModelDownload` unset and embeddings on, saving one memory and asking one question, then leave it open until the files above exist (print mode stops its embedding worker about 1.5 seconds after the turn, which can cut a download short; the next attempt resumes it). Then set `allowModelDownload: false` in the bot configs.
 
+## When Mnemopi cannot start
+
+If opening the database throws (a database or folder that is not writable, a read-only `-wal` or `-shm` left by an earlier run, a locked file), the session runs with memory off. It does not do so silently:
+
+- The cause is shown once at startup: a `Warning:` line on stderr in print and RPC modes (stdout stays clean for JSON and protocol frames) and a warning in the TUI. For example: `Mnemopi memory is off for this session. Startup failed: SQLiteError (SQLITE_IOERR_WRITE): disk I/O error; not writable: memories/mnemopi/mnemopi.db-wal; database: memories/mnemopi/mnemopi.db.`
+- `retain`, `recall`, `reflect`, `memory_edit` and `learn`, and the backend status, search and save results, add the same cause after "Mnemopi backend is not initialised for this session." Task, structured-subagent and vibe children keep their parent's reason.
+- Paths are relative to the agent folder, and only files that exist and are not writable are named: the database folder, the database, its `-wal` and its `-shm`. omp never changes a file mode and never retries; the next start tries again, and a successful one clears the reason.
+
+SQLite gives an empty `-wal` the database's mode each time it opens one, so a read-only `-wal` blocks a start only when it holds data. After a run on a read-only database or folder, restoring the modes of the database and the folder is not enough while that `-wal` stays read-only: make `mnemopi.db-wal` and `mnemopi.db-shm` writable by the user that runs omp, then start again. Do not delete a `-wal` that has data: it holds committed rows (see "Backing up a database that is in use").
+
 ## Operational notes
 
 - The default shared database lives under the agent memories directory in `mnemopi/mnemopi.db`; project-scoped banks use sibling database paths under that Mnemopi directory.

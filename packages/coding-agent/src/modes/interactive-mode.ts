@@ -308,6 +308,7 @@ import {
 import type { LoopConditionConfig, LoopLimitRuntime } from "@oh-my-pi/pi-tui/status-line/loop";
 import { OAuthManualInputManager } from "./oauth-manual-input";
 import { formatPersistenceNotice } from "./persistence-failure";
+import { mnemopiStartupNotice, watchMnemopiStartupFailure } from "../mnemopi/startup-failure";
 import { resolveComposerHint } from "@oh-my-pi/pi-tui/prompt/composer-hints";
 import { hintUsage } from "../utils/usage-counter";
 import {
@@ -2481,6 +2482,8 @@ export class InteractiveMode implements InteractiveModeContext {
 				);
 			}),
 			this.sessionManager.onPersistenceNotice(notice => this.showWarning(formatPersistenceNotice(notice))),
+			// Mnemopi that could not start leaves the session with memory off; show why, once.
+			watchMnemopiStartupFailure(this.session, failure => this.showWarning(mnemopiStartupNotice(failure))),
 			this.sessionManager.onSessionNameChanged(() => {
 				setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
 				this.#handleSessionAccentInputsChanged();
