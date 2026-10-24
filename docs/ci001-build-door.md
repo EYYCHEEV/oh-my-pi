@@ -182,7 +182,7 @@ It prints unit and process names and states only, never an address or a port.
 Run once, as root on ci-001, after Part A is clean and the entry file is at `/root/omp-ci-install/omp-build-entry`.
 The public key line to pass is the one in Part C.
 Every step adds only new things and is safe to run again; it never touches `swan-ci`, `cdm-ci`, any other account, unit, table or mount.
-A rerun restarts the fence unit and the door unit so that changed files take effect; the door's `KillMode=process` leaves a running build alone.
+A rerun reloads the fence atomically (there is never a moment without it) and restarts the door unit so that changed files take effect; the door's `KillMode=process` leaves a running build alone.
 
 ```bash install-host.sh
 #!/bin/bash
@@ -312,9 +312,8 @@ EOF
 /usr/sbin/nft -c -f /etc/omp-build/fence.nft
 systemctl daemon-reload
 systemctl enable omp-build-fence.service
-# Restart, not "enable --now": on a rerun, a changed fence.nft must take effect.
-# The door Requires the fence, so a restart also restarts the door; that is safe because the door unit has KillMode=process.
-systemctl restart omp-build-fence.service
+# reload-or-restart, not "enable --now": on a rerun a changed fence.nft must take effect, and the reload is one atomic nft transaction (table, delete, table), so the fence is never absent; an inactive unit is simply started.
+systemctl reload-or-restart omp-build-fence.service
 
 # 4. Rootless Docker, on the capped filesystem, now that the fence is already loaded.
 # The shim adds OwnerUID for runc when /proc is mounted with hidepid (same shim as the other CI accounts).
@@ -783,4 +782,4 @@ The private key `~/.ssh/omp-ci001-build` is the Captain's to keep or destroy.
 - `docker-ce-rootless-extras` is on hold at the same version as `docker-ce`: upgrade both together, or a `docker-ce` upgrade alone leaves rootlesskit and the rootless scripts behind.
   `MemoryMax=2G` and `TasksMax=512` on the door unit also cap the detached build supervisor and every host-side step, because they live in the door's cgroup (enough for a 256 MiB bundle; Part E step 3 proves it).
 - The door `Requires=` the fence, so stopping or restarting `omp-build-fence.service` also stops or restarts the door (a running build is not touched).
-  If something flushes the whole nftables ruleset (for example restarting `nftables.service`), the table is gone while the unit still reports active: check `nft list table inet omp_build_fence` and run `systemctl restart omp-build-fence.service`.
+  If something flushes the whole nftables ruleset (for example restarting `nftables.service`), the table is gone while the unit still reports active: check `nft list table inet omp_build_fence` and run `systemctl reload omp-build-fence.service` (an atomic reload; it does not touch the door).

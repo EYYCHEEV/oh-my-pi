@@ -452,8 +452,8 @@ class PacketTests(unittest.TestCase):
 
     def test_the_fence_loads_before_the_account_daemon_and_the_door_requires_it(self):  # N3
         self.assertLess(self.install.index("# 3. Egress fence"), self.install.index("# 4. Rootless Docker"))
-        self.assertLess(self.install.index("systemctl restart omp-build-fence.service"), self.install.index("dockerd-rootless-setuptool.sh install"))
-        self.assertLess(self.install.index("systemctl restart omp-build-fence.service"), self.install.index("enable --now docker.service"))
+        self.assertLess(self.install.index("systemctl reload-or-restart omp-build-fence.service"), self.install.index("dockerd-rootless-setuptool.sh install"))
+        self.assertLess(self.install.index("systemctl reload-or-restart omp-build-fence.service"), self.install.index("enable --now docker.service"))
         unit = heredoc(self.install, "put_file /etc/systemd/system/omp-build-sshd.service 0644 root:root <<'EOF'").splitlines()
         after = next(index for index, line in enumerate(unit) if line.startswith("After=") and "omp-build-fence.service" in line.split())
         self.assertEqual(unit[after + 1], "Requires=omp-build-fence.service")
@@ -481,16 +481,32 @@ class PacketTests(unittest.TestCase):
         for phrase in ("198.18.0.0/15", "127.0.0.0/8", "198.18.0.1", "priority mangle - 10"):
             self.assertIn(phrase, note)
 
-    def test_a_rerun_restarts_the_fence_and_the_door_so_changed_files_take_effect(self):  # N5
+    def test_a_rerun_reloads_the_fence_atomically_and_restarts_the_door_so_changed_files_take_effect(self):  # N5
         for unit in ("omp-build-fence.service", "omp-build-sshd.service"):
             with self.subTest(unit=unit):
                 self.assertIn(f"systemctl enable {unit}\n", self.install)
                 self.assertNotIn(f"enable --now {unit}", self.install)
-                self.assertLess(self.install.index(f"systemctl enable {unit}"), self.install.index(f"systemctl restart {unit}"))
-        self.assertLess(self.install.index("/usr/sbin/nft -c -f /etc/omp-build/fence.nft"), self.install.index("systemctl restart omp-build-fence.service"))
+        # The fence is never stopped and started again: reload-or-restart runs ExecReload while the unit is active (and starts it when not),
+        # and the whole rule file is one nft transaction (table, delete table, table), so there is never a moment without the fence.
+        self.assertNotIn("systemctl restart omp-build-fence.service", self.install)
+        self.assertEqual(self.install.count("systemctl reload-or-restart omp-build-fence.service\n"), 1)
+        self.assertLess(self.install.index("systemctl enable omp-build-fence.service"), self.install.index("systemctl reload-or-restart omp-build-fence.service"))
+        self.assertLess(self.install.index("/usr/sbin/nft -c -f /etc/omp-build/fence.nft"), self.install.index("systemctl reload-or-restart omp-build-fence.service"))
+        comment = self.install.split("systemctl reload-or-restart omp-build-fence.service", 1)[0].rstrip("\n").rsplit("\n", 1)[1]
+        self.assertTrue(comment.startswith("# reload-or-restart"))
+        self.assertIn("atomic", comment)
+        statements = [line for line in self.fence_heredoc().splitlines() if line and not line.lstrip().startswith("#")]
+        self.assertEqual(statements[:3], ["table inet omp_build_fence", "delete table inet omp_build_fence", "table inet omp_build_fence {"])
+        unit = heredoc(self.install, "put_file /etc/systemd/system/omp-build-fence.service 0644 root:root <<'EOF'")
+        self.assertIn("ExecReload=/usr/sbin/nft -f /etc/omp-build/fence.nft\n", unit + "\n")
+        self.assertIn("ExecStart=/usr/sbin/nft -f /etc/omp-build/fence.nft\n", unit + "\n")
+        self.assertIn("RemainAfterExit=yes", unit)
+        # The door is restarted (safe: KillMode=process) after its configuration was checked.
+        self.assertIn("systemctl restart omp-build-sshd.service\n", self.install)
+        self.assertLess(self.install.index("systemctl enable omp-build-sshd.service"), self.install.index("systemctl restart omp-build-sshd.service"))
         self.assertLess(self.install.index("/usr/sbin/sshd -t -f /etc/omp-build/sshd_config\n"), self.install.index("systemctl restart omp-build-sshd.service"))
         self.assertIn("KillMode=process leaves the detached supervisor alone", self.install)
-        self.assertIn("A rerun restarts the fence unit and the door unit", self.text.split("```bash install-host.sh", 1)[0])
+        self.assertIn("A rerun reloads the fence atomically", self.text.split("```bash install-host.sh", 1)[0])
 
     def test_the_undo_refuses_to_remove_the_account_while_its_data_or_logs_stay(self):  # N6
         block = re.search(r"(?m)^if \[\[ \$\{REMOVE_ACCOUNT:-0\} == 1 .*?^fi$", self.undo, re.DOTALL)[0]
@@ -608,7 +624,7 @@ class PacketTests(unittest.TestCase):
         notes = self.text.split("## Part G. Operating notes (Main)", 1)[1]
         for phrase in ("`docker-ce-rootless-extras` is on hold at the same version as `docker-ce`", "rootlesskit and the rootless scripts behind",
                        "`MemoryMax=2G` and `TasksMax=512`", "detached build supervisor", "The door `Requires=` the fence",
-                       "`systemctl restart omp-build-fence.service`"):
+                       "`systemctl reload omp-build-fence.service`"):
             self.assertIn(phrase, notes)
 
 
