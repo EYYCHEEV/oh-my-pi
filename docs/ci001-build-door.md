@@ -13,7 +13,7 @@ Nothing in this packet has been run on ci-001 yet.
 | --- | --- | --- |
 | Part A, read-only fact script, return its output | Main | ci-001, as root |
 | Part B, install in one root sitting, return the report | Main | ci-001, as root |
-| Optional, Docker daemon proxy block (after Part B) | Main, only if Part A shows the proxy service and the Captain wants it | ci-001, as root |
+| Optional, proxy block for the Docker daemon's image pulls only (after Part B) | Main, only if Part A shows the proxy service, Part E step 2b cannot pull directly and the Captain wants it | ci-001, as root |
 | Part D, ssh alias and known-hosts line | Mac owner or the Mac agent | Mac |
 | Part E, smoke steps | Main for the box checks, the Mac for the door and build checks | both |
 | Part F, undo | Main, with the Captain's approval | ci-001, as root |
@@ -171,8 +171,10 @@ Main reads the output before Part B, and stops and asks the Captain if any of th
 - `/srv` has under about 300 GiB available (the data image takes 256 GiB), or `/srv` is not on a local ext4 or xfs filesystem.
 - The account `ompbuild` already exists and is in the `sudo` or `docker` group.
 
+Part A did not record `dbus-user-session` or the `ip_tables` kernel module; Part B's preflight checks both, and the tailnet address, and stops before changing anything if one is missing.
+
 `KillUserProcesses=yes` in the logind lines is only a note, not a stop: the door's sessions are not logind sessions (`UsePAM no`), and Part E step 5 proves that a detached build survives a dropped connection.
-The "outbound proxy" section only decides whether the optional Docker daemon proxy block after Part B is relevant: `outbound proxy service present: yes` means the design notes' proxy (`devbox-mihomo`) runs on this box, `no` means skip the block.
+The "outbound proxy" section only decides whether the optional proxy block for image pulls after Part B is relevant: `outbound proxy service present: yes` means the design notes' proxy (`devbox-mihomo`) runs on this box, `no` means skip the block.
 It prints unit and process names and states only, never an address or a port.
 
 ## Part B. Install (Main, one root sitting)
@@ -180,6 +182,7 @@ It prints unit and process names and states only, never an address or a port.
 Run once, as root on ci-001, after Part A is clean and the entry file is at `/root/omp-ci-install/omp-build-entry`.
 The public key line to pass is the one in Part C.
 Every step adds only new things and is safe to run again; it never touches `swan-ci`, `cdm-ci`, any other account, unit, table or mount.
+A rerun restarts the fence unit and the door unit so that changed files take effect; the door's `KillMode=process` leaves a running build alone.
 
 ```bash install-host.sh
 #!/bin/bash
@@ -206,6 +209,12 @@ for tool in newuidmap newgidmap nft tailscale fallocate mkfs.ext4 runuser loginc
 done
 [[ -x /usr/bin/dockerd-rootless-setuptool.sh ]] || { echo "docker-ce-rootless-extras is missing; stop and ask"; exit 1; }
 command -v slirp4netns >/dev/null || command -v pasta >/dev/null || { echo "slirp4netns or passt is missing; stop and ask"; exit 1; }
+[[ $(dpkg-query -W -f='${db:Status-Abbrev}' dbus-user-session 2>/dev/null) == [ih]i* ]] || { echo "dbus-user-session is not installed; stop and ask"; exit 1; }
+grep -q '^ip_tables ' /proc/modules || grep -qE '(^|/)ip_tables\.ko$' "/lib/modules/$(uname -r)/modules.builtin" 2>/dev/null \
+  || { echo "the ip_tables kernel module is neither loaded nor built in; stop and ask"; exit 1; }
+# The address the door listens on, checked before anything is changed; kept in a variable, never printed.
+TAILNET_IP=${TAILNET_IP:-$(tailscale ip -4 2>/dev/null | head -n 1 || true)}
+[[ $TAILNET_IP =~ ^100\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "no tailnet address found; stop and ask"; exit 1; }
 if ! systemctl is-active --quiet omp-build-sshd.service && [[ -n $(ss -ltnH "sport = :$PORT") ]]; then
   echo "port $PORT is already in use"; exit 1
 fi
@@ -246,10 +255,14 @@ ensure_subids /etc/subuid --add-subuids
 ensure_subids /etc/subgid --add-subgids
 
 # 2. Data: a fully allocated 256 GiB ext4 image mounted at /srv/omp-ci. This is the size cap.
+# The image is built as a .new file and renamed only after mkfs succeeds, so an interrupted run never leaves an unformatted image that a rerun would skip.
+# nodiscard: by default mkfs discards the whole file, which punches holes and hands the reserved 256 GiB back to the root filesystem.
 if [[ ! -e $IMG ]]; then
-  fallocate -l "${IMG_GIB}G" "$IMG"
-  chmod 0600 "$IMG"
-  mkfs.ext4 -q -F -m 0 -L omp-ci "$IMG"
+  rm -f "$IMG.new"
+  fallocate -l "${IMG_GIB}G" "$IMG.new"
+  chmod 0600 "$IMG.new"
+  mkfs.ext4 -q -F -m 0 -E nodiscard -L omp-ci "$IMG.new"
+  mv "$IMG.new" "$IMG"
 fi
 install -d -m 0755 -o root -g root "$DATA"
 FSTAB_LINE="$IMG $DATA ext4 loop,nodev,nosuid,nofail 0 0"
@@ -267,7 +280,43 @@ install -d -m 0700 -o "$U" -g "$U" "$DATA/state" "$DATA/docker"
 install -d -m 0750 -o "$U" -g "$U" /var/log/omp-build
 install -d -m 0755 -o root -g root /etc/omp-build /etc/omp-build/authorized_keys /usr/local/lib/omp-build /usr/local/lib/omp-build/bin
 
-# 3. Rootless Docker, on the capped filesystem.
+# 3. Egress fence for this account only, in its own table (separate from cdm_fence and SWAN's fence). It goes in before the account's Docker daemon starts.
+put_file /etc/omp-build/fence.nft 0644 root:root <<EOF
+table inet omp_build_fence
+delete table inet omp_build_fence
+table inet omp_build_fence {
+  chain out {
+    # priority mangle - 10 (-160) runs before the mihomo nat output chain (-150) and any other NAT redirect, so the fence sees the original destination; equal priorities run in undefined order
+    type filter hook output priority mangle - 10; policy accept;
+    meta skuid $uid ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16 } counter drop
+    meta skuid $uid ip6 daddr { fc00::/7, fe80::/10 } counter drop
+    meta skuid $uid ip daddr 198.18.0.1 counter drop
+  }
+}
+EOF
+put_file /etc/systemd/system/omp-build-fence.service 0644 root:root <<'EOF'
+[Unit]
+Description=stronk-omp build account egress fence
+Before=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/omp-build/fence.nft
+ExecReload=/usr/sbin/nft -f /etc/omp-build/fence.nft
+ExecStop=/usr/sbin/nft delete table inet omp_build_fence
+
+[Install]
+WantedBy=multi-user.target
+EOF
+/usr/sbin/nft -c -f /etc/omp-build/fence.nft
+systemctl daemon-reload
+systemctl enable omp-build-fence.service
+# Restart, not "enable --now": on a rerun, a changed fence.nft must take effect.
+# The door Requires the fence, so a restart also restarts the door; that is safe because the door unit has KillMode=process.
+systemctl restart omp-build-fence.service
+
+# 4. Rootless Docker, on the capped filesystem, now that the fence is already loaded.
 # The shim adds OwnerUID for runc when /proc is mounted with hidepid (same shim as the other CI accounts).
 put_file /usr/local/lib/omp-build/bin/busctl 0755 root:root <<'EOF'
 #!/bin/sh
@@ -319,44 +368,10 @@ as_u=(runuser -u "$U" -- env "HOME=$HOME_DIR" "XDG_RUNTIME_DIR=/run/user/$uid"
 "${as_u[@]}" systemctl --user daemon-reload
 "${as_u[@]}" systemctl --user enable --now docker.service
 
-# 4. Egress fence for this account only, in its own table (separate from cdm_fence and SWAN's fence).
-put_file /etc/omp-build/fence.nft 0644 root:root <<EOF
-table inet omp_build_fence
-delete table inet omp_build_fence
-table inet omp_build_fence {
-  chain out {
-    type filter hook output priority filter; policy accept;
-    meta skuid $uid ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16 } counter drop
-    meta skuid $uid ip6 daddr { fc00::/7, fe80::/10 } counter drop
-    meta skuid $uid ip daddr 198.18.0.1 counter drop
-  }
-}
-EOF
-put_file /etc/systemd/system/omp-build-fence.service 0644 root:root <<'EOF'
-[Unit]
-Description=stronk-omp build account egress fence
-Before=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/sbin/nft -f /etc/omp-build/fence.nft
-ExecReload=/usr/sbin/nft -f /etc/omp-build/fence.nft
-ExecStop=/usr/sbin/nft delete table inet omp_build_fence
-
-[Install]
-WantedBy=multi-user.target
-EOF
-/usr/sbin/nft -c -f /etc/omp-build/fence.nft
-systemctl daemon-reload
-systemctl enable --now omp-build-fence.service
-
 # 5. The entry (root-owned, the only thing the key can run).
 install -m 0755 -o root -g root "$ENTRY_SRC" /usr/local/lib/omp-build/entry
 
 # 6. The door: a separate sshd on the tailnet address, port 2225, this account only, forced command only.
-TAILNET_IP=${TAILNET_IP:-$(tailscale ip -4 | head -n 1)}   # kept in a variable, never printed
-[[ $TAILNET_IP =~ ^100\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "no tailnet address found"; exit 1; }
 [[ -f /etc/omp-build/ssh_host_ed25519_key ]] || ssh-keygen -q -t ed25519 -N '' -C omp-build-sshd -f /etc/omp-build/ssh_host_ed25519_key
 chmod 0600 /etc/omp-build/ssh_host_ed25519_key
 printf 'restrict,command="/usr/local/lib/omp-build/entry",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-user-rc %s\n' "$PUB" \
@@ -408,6 +423,7 @@ put_file /etc/systemd/system/omp-build-sshd.service 0644 root:root <<'EOF'
 [Unit]
 Description=stronk-omp Linux build door (separate sshd instance, forced command only)
 After=network-online.target tailscaled.service omp-build-fence.service
+Requires=omp-build-fence.service
 Wants=network-online.target
 RequiresMountsFor=/srv/omp-ci
 
@@ -428,7 +444,10 @@ TasksMax=512
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable --now omp-build-sshd.service
+systemctl enable omp-build-sshd.service
+# Restart, not "enable --now": on a rerun, a changed sshd_config must take effect.
+# A restart is safe even while a build runs, because KillMode=process leaves the detached supervisor alone.
+systemctl restart omp-build-sshd.service
 sleep 1
 systemctl is-active omp-build-sshd.service
 
@@ -437,6 +456,9 @@ mask() { sed -E 's/([0-9]{1,3}\.){3}[0-9]{1,3}/<addr>/g'; }
 echo "entry $(sha256sum /usr/local/lib/omp-build/entry | cut -d' ' -f1)"
 id "$U"
 findmnt -no SOURCE,SIZE,OPTIONS "$DATA" | mask
+du -B1G "$IMG"
+du -B1G --apparent-size "$IMG"
+df -BG --output=avail / | tail -n 1 | sed 's/^/root filesystem free: /'
 ls -ld "$DATA" "$DATA/state" "$DATA/docker" /var/log/omp-build /etc/omp-build /usr/local/lib/omp-build/entry
 "${as_u[@]}" docker info --format 'rootless-daemon server={{.ServerVersion}} arch={{.Architecture}} cgroup={{.CgroupVersion}}/{{.CgroupDriver}} security={{.SecurityOptions}} root={{.DockerRootDir}} memlimit={{.MemoryLimit}} swaplimit={{.SwapLimit}} pids={{.PidsLimit}}'
 "${as_u[@]}" docker buildx version | head -n 1
@@ -446,13 +468,19 @@ echo "hostkey $(ssh-keygen -lf /etc/omp-build/ssh_host_ed25519_key.pub)"
 echo "hostkey-line $(cut -d' ' -f1,2 /etc/omp-build/ssh_host_ed25519_key.pub)"
 ```
 
+The fence's drop sets must never overlap `198.18.0.0/15` (the outbound proxy's fake-address range) or `127.0.0.0/8` (local DNS), or proxied traffic and name lookups would be dropped; only the single gateway address `198.18.0.1` is dropped.
+On ci-001 the proxy answers names with fake addresses, policy routing sends them to its tun device and a NAT output chain at priority -150 redirects them, so the fence runs at `priority mangle - 10` to see the original destination first (equal priorities run in undefined order).
+The packet test parses the fence and fails on any overlap or on a changed priority.
+
 Release builds also need `/etc/omp-build/source-allowed-signers` and `/etc/omp-build/source-revoked-signers` (root-owned, mode 0644, the allowed file non-empty, the revoked file empty when nothing is revoked).
 They hold public keys only and come from the Captain after he separately approves release signing; the candidate smoke below does not need them.
 
-### Optional: the rootless Docker daemon through the outbound proxy
+### Optional: image pulls of the rootless Docker daemon through the outbound proxy
 
-Skip this unless Part A printed `outbound proxy service present: yes`, Part E step 2's last `curl` cannot reach the public internet directly, and the Captain wants it.
-The design notes list an outbound proxy (`devbox-mihomo`) and say new CI accounts reach the public internet through it.
+Skip this unless Part A printed `outbound proxy service present: yes`, Part E step 2b's image pull cannot reach the registry directly, and the Captain wants it.
+It is not expected to be needed on ci-001: host egress there is transparent (read-only check, 2026-10-24: as the system account `nobody`, with proxy variables cleared, `github.com` and `snapshot.debian.org` answered HTTPS 200), and the four existing rootless CI accounts set no proxy variables.
+It stays here only as a fallback for image pulls, and it covers image pulls by the account's own Docker daemon only, not container egress: the build's `apt-get`, downloads and `bun install` run inside containers that get no proxy variables from it, so Part E step 2c must pass without this block, and if 2c fails this block is not the answer.
+The design notes list an outbound proxy (`devbox-mihomo`) on this box.
 This block only gives the account's own Docker daemon the standard proxy variables (a systemd user drop-in), so image pulls use the proxy.
 It does not change the egress fence, container networking or the recipe, and it needs the proxy's address from the box owner: put it in the command by hand, nothing here holds a real one.
 The script refuses an address with credentials, refuses to run while any build run folder exists (restarting the daemon would end it), writes only `~/.config/systemd/user/docker.service.d/omp-build-proxy.conf` and prints no address.
@@ -460,7 +488,7 @@ Undo: `bash optional-docker-proxy.sh undo` removes that one file and restarts th
 
 ```bash optional-docker-proxy.sh
 #!/bin/bash
-# OPTIONAL. Run as root on ci-001 after Part B, only if Part A printed "outbound proxy service present: yes".
+# OPTIONAL. Run as root on ci-001 after Part B, only if Part A printed "outbound proxy service present: yes" and image pulls fail. It covers pulls by the account's Docker daemon only, not container egress.
 #   bash optional-docker-proxy.sh set "http://<proxy-host>:<proxy-port>"   write the drop-in, restart the account's Docker daemon
 #   bash optional-docker-proxy.sh undo                                     remove that one drop-in, restart it
 set -euo pipefail
@@ -574,19 +602,77 @@ Stop at the first step that does not match, keep the output, and report it; do n
 
    Expected: `refused: invalid command`, then `refused: no such run`.
    A terminal request (`ssh -tt ...`) gets no terminal, `sftp cdm-ci-001-ompbuild` fails, and `ssh -L 9999:localhost:22 ...` is refused (forwarding is disabled).
-2. The rootless daemon and the fence (Main, as root on ci-001):
+2. The rootless daemon, a container under the build limits, the egress and the fence (Main, as root on ci-001).
+   Do parts a to d in order, in one root shell, and stop at the first one that does not match.
+   `curl` is not installed on ci-001 and nothing here installs it: the checks from the host use the system `python3` as the account, and the checks inside a container use that container image's own tools.
 
-   ```bash
-   U=ompbuild; uid=$(id -u "$U")
-   runuser -u "$U" -- env "XDG_RUNTIME_DIR=/run/user/$uid" "DOCKER_HOST=unix:///run/user/$uid/docker.sock" \
-     docker info --format '{{.SecurityOptions}} {{.CgroupVersion}} {{.CgroupDriver}} {{.DockerRootDir}}'
-   nft list table inet omp_build_fence
-   runuser -u "$U" -- curl --noproxy '*' --connect-timeout 5 --max-time 6 https://100.100.100.100/ || true
-   nft list table inet omp_build_fence
-   runuser -u "$U" -- curl -sSI --connect-timeout 10 --max-time 30 https://github.com | head -n 1
-   ```
+   a. Daemon facts (the entry refuses to start a build unless rootless mode, cgroup 2, the three limit flags and the data root all hold):
 
-   Expected: `name=rootless` in the security options, cgroup `2` and `systemd`, the data root under `/srv/omp-ci/docker`; the first `curl` times out and the drop counter in the second listing is higher; the last `curl` prints an HTTP status line from GitHub.
+      ```bash
+      cd /
+      U=ompbuild; uid=$(id -u "$U")
+      noproxy=(env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY)
+      as_u=(runuser -u "$U" -- "${noproxy[@]}" "XDG_RUNTIME_DIR=/run/user/$uid" "DOCKER_HOST=unix:///run/user/$uid/docker.sock")
+      "${as_u[@]}" docker info --format '{{json .}}' | python3 -I -c '
+      import json, sys
+      info = json.load(sys.stdin)
+      for key in ("ServerVersion", "SecurityOptions", "CgroupVersion", "CgroupDriver", "MemoryLimit", "PidsLimit", "CpuCfsQuota", "SwapLimit", "DockerRootDir"):
+          print(key, info.get(key))'
+      "${as_u[@]}" docker buildx version | head -n 1
+      ```
+
+      Expected: `SecurityOptions` lists `name=rootless`; `CgroupVersion 2` and `CgroupDriver systemd`; `MemoryLimit`, `PidsLimit` and `CpuCfsQuota` all `True`; `DockerRootDir` under `/srv/omp-ci/docker`; a buildx version line.
+      `SwapLimit` may read `False`: the entry does not need it, and the recipe's `--memory-swap` setting then only warns.
+   b. A container starts under the build limits.
+      This pulls the recipe's pinned base image by digest (`BASE_IMAGE` in `scripts/linux-amd64.Dockerfile`; the packet test fails if this copy drifts) and runs it with the same limits as the build's runtime container, which proves the account's user bus, cgroup delegation and limits before the 20-minute build:
+
+      ```bash
+      BASE='rustlang/rust:nightly-2026-08-12@sha256:51dc497bff0c24777d2ec6a1fc12ddf7ab0483de3ee537f4ec10816b9e1eff6c'
+      "${as_u[@]}" docker pull -q "$BASE"
+      "${as_u[@]}" docker run --rm --pull=never --cpus=4 --memory=24g --memory-swap=24g --pids-limit=1024 "$BASE" \
+        sh -c 'cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/pids.max /sys/fs/cgroup/cpu.max'
+      ```
+
+      Expected: `25769803776`, `1024` and `400000 100000` (24 GiB, 1024 processes, 4 CPUs).
+      A Docker warning about swap limit support is normal.
+      If only the pull fails, the optional proxy block below may fix pulls; part c must still pass afterwards.
+   c. Egress from a container on the default network, which is where the build's `apt-get` and downloads run: DNS and HTTPS to `github.com` and `snapshot.debian.org` must work, and the Tailscale service address must fail while the fence counter rises:
+
+      ```bash
+      fence_drops() { nft list table inet omp_build_fence | awk '/100\.64\.0\.0\/10/ { for (i = 1; i < NF; i++) if ($i == "packets") print $(i + 1) }'; }
+      before=$(fence_drops)
+      "${as_u[@]}" docker run --rm --pull=never --cpus=4 --memory=24g --memory-swap=24g --pids-limit=1024 "$BASE" sh -c '
+        for host in github.com snapshot.debian.org; do
+          getent hosts "$host" >/dev/null && echo "dns $host: ok" || echo "dns $host: FAILED"
+          curl -sSI --noproxy "*" --proto "=https" --tlsv1.2 --connect-timeout 10 --max-time 30 "https://$host/" | head -n 1
+        done
+        curl -sS --noproxy "*" --connect-timeout 5 --max-time 6 https://100.100.100.100/ >/dev/null \
+          && echo "TAILSCALE ADDRESS REACHED: the fence does not hold" || echo "tailscale address: blocked, as expected"'
+      after=$(fence_drops)
+      echo "fence counter before=$before after=$after"
+      ```
+
+      Expected: `dns github.com: ok` and `dns snapshot.debian.org: ok`, an `HTTP/` status line for each site (200 or a redirect), `tailscale address: blocked, as expected`, and `after` higher than `before` (the fence saw the packets before any redirect).
+      If part c fails, stop: the build's network-heavy step runs in exactly such a container, and the optional proxy block below cannot fix container egress.
+   d. The fence from the host, as the account, with proxy variables cleared and proxies also switched off in the request (`runuser` passes root's environment through, so a proxy variable would otherwise make this pass for the wrong reason):
+
+      ```bash
+      reach() { runuser -u "$U" -- "${noproxy[@]}" python3 -I -c '
+      import sys, urllib.request
+      opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+      for url in sys.argv[1:]:
+          try:
+              with opener.open(urllib.request.Request(url, method="HEAD"), timeout=8) as reply:
+                  print("reached", url, reply.status)
+          except Exception as error:
+              print("failed", url, type(error).__name__)' "$@"; }
+      nft list table inet omp_build_fence
+      reach https://100.100.100.100/
+      nft list table inet omp_build_fence
+      reach https://github.com/ https://snapshot.debian.org/
+      ```
+
+      Expected: `failed https://100.100.100.100/ URLError` (a timeout) and a higher drop counter in the second listing; then `reached ... 200` for GitHub and for snapshot.debian.org.
 3. A real candidate build (Mac, after the Captain's go-ahead; it takes roughly 20 minutes the first time and is the first native end-to-end run of this route).
    The application commit is the head of `stronk-omp`, and the fork manifest is the workstation's current `fork_boundary.json`; the driver sends exactly that file and its hash with the build:
 
@@ -622,6 +708,7 @@ Run as root, with the Captain's approval.
 It stops the door first, then removes what Part B added.
 It keeps the 256 GiB image, the account and its home, and the log folder unless asked:
 `REMOVE_DATA=1` deletes the image and every build artefact on it, `REMOVE_ACCOUNT=1` removes the account and its home, `REMOVE_LOGS=1` removes `/var/log/omp-build`.
+`REMOVE_ACCOUNT=1` is refused unless `REMOVE_DATA=1` and `REMOVE_LOGS=1` are set too: the next new account would reuse the freed user id and subordinate id block, and so would own the old build outputs.
 
 ```bash install-host-undo.sh
 #!/bin/bash
@@ -631,6 +718,10 @@ U=ompbuild
 DATA=/srv/omp-ci
 IMG=/srv/omp-ci.img
 [[ $(id -u) -eq 0 ]] || { echo "must run as root"; exit 1; }
+# Refuse first, before anything is stopped or removed.
+if [[ ${REMOVE_ACCOUNT:-0} == 1 && ( ${REMOVE_DATA:-0} != 1 || ${REMOVE_LOGS:-0} != 1 ) ]]; then
+  echo "REMOVE_ACCOUNT=1 also needs REMOVE_DATA=1 and REMOVE_LOGS=1: a reused uid would otherwise own the old build outputs"; exit 1
+fi
 uid=$(id -u "$U" 2>/dev/null || true)
 
 # 1. Door off first, so no new build can start.
@@ -664,7 +755,7 @@ if [[ ${REMOVE_DATA:-0} == 1 ]]; then
     mv /etc/fstab.new /etc/fstab
     systemctl daemon-reload
   fi
-  rm -f "$IMG"
+  rm -f "$IMG" "$IMG.new"
   rmdir "$DATA" 2>/dev/null || true
 fi
 if [[ ${REMOVE_ACCOUNT:-0} == 1 ]] && [[ -n $uid ]]; then
@@ -689,3 +780,7 @@ The private key `~/.ssh/omp-ci001-build` is the Captain's to keep or destroy.
 - A run is `cleanup: unproven` when Docker would not confirm removal.
   Fix the daemon (`runuser -u ompbuild -- env XDG_RUNTIME_DIR=/run/user/$(id -u ompbuild) systemctl --user status docker.service`), then `cleanup <run-id>` through the door.
 - Rotating the key: generate a new pair on the Mac, replace the line in Part C, run `install-host.sh` again, and delete the old public key line.
+- `docker-ce-rootless-extras` is on hold at the same version as `docker-ce`: upgrade both together, or a `docker-ce` upgrade alone leaves rootlesskit and the rootless scripts behind.
+  `MemoryMax=2G` and `TasksMax=512` on the door unit also cap the detached build supervisor and every host-side step, because they live in the door's cgroup (enough for a 256 MiB bundle; Part E step 3 proves it).
+- The door `Requires=` the fence, so stopping or restarting `omp-build-fence.service` also stops or restarts the door (a running build is not touched).
+  If something flushes the whole nftables ruleset (for example restarting `nftables.service`), the table is gone while the unit still reports active: check `nft list table inet omp_build_fence` and run `systemctl restart omp-build-fence.service`.

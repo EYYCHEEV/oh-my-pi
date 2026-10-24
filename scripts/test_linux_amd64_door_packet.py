@@ -5,7 +5,9 @@ Nothing is installed or contacted. The fenced scripts are syntax-checked, the re
 anything that writes, the address mask is exercised, and the packet is cross-checked against the entry and the Mac
 driver so the three cannot drift apart.
 """
+import functools
 import hashlib
+import http.server
 import ipaddress
 import json
 import os
@@ -15,6 +17,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
+import threading
 import unittest
 
 import test_linux_amd64_door as door_tests
@@ -23,7 +27,7 @@ ROOT = Path(__file__).resolve().parent.parent
 PACKET = ROOT / "docs" / "ci001-build-door.md"
 ENTRY = door_tests.ENTRY
 PUBLIC_KEY = Path.home() / ".ssh" / "omp-ci001-build.pub"
-FENCE_ADDRESSES = {"10.0.0.0", "172.16.0.0", "192.168.0.0", "100.64.0.0", "169.254.0.0", "198.18.0.1", "100.100.100.100"}
+FENCE_ADDRESSES = {"10.0.0.0", "172.16.0.0", "192.168.0.0", "100.64.0.0", "169.254.0.0", "198.18.0.0", "198.18.0.1", "127.0.0.0", "100.100.100.100"}
 
 
 def blocks():
@@ -37,6 +41,45 @@ def heredoc(script, header):
     found = re.search(re.escape(header) + r"\n(.*?)\nEOF\n", script, re.DOTALL)
     assert found, header
     return found[1]
+
+
+BASH = shutil.which("bash") or "bash"
+PROTECTED = [ipaddress.ip_network(value) for value in ("198.18.0.0/15", "127.0.0.0/8", "::1/128")]
+
+
+def base_image_pin():
+    return re.search(r"(?m)^ARG BASE_IMAGE=(\S+)$", (ROOT / "scripts" / "linux-amd64.Dockerfile").read_text())[1]
+
+
+def smoke_blocks():
+    """The bash blocks inside Part E's numbered steps (indented in the packet), dedented."""
+    section = PACKET.read_text().split("## Part E. Smoke steps", 1)[1].split("\n## ", 1)[0]
+    return [textwrap.dedent(body) for _, body in re.findall(r"^( +)```bash\n(.*?)^\1```$", section, re.MULTILINE | re.DOTALL)]
+
+
+def fence_overlaps(fence):
+    """Networks in the fence's drop sets that overlap the proxy's fake-address range or loopback (the lone gateway host rule is not a set)."""
+    found = []
+    for _, target in re.findall(r"(?m)^\s*meta skuid \$uid (ip6?) daddr (\{[^}]*\}|\S+) counter drop$", fence):
+        if target.startswith("{"):
+            for item in target.strip("{} ").split(","):
+                network = ipaddress.ip_network(item.strip())
+                found += [str(network) for protected in PROTECTED if network.version == protected.version and network.overlaps(protected)]
+    return found
+
+
+def stub_commands(work, stubs):
+    """Write recording stub commands into work/bin and return an environment that finds them first."""
+    (work / "bin").mkdir()
+    for name, body in stubs.items():
+        (work / "bin" / name).write_text("#!/bin/sh\n" + body)
+        (work / "bin" / name).chmod(0o755)
+    return {"PATH": f"{work / 'bin'}:/usr/bin:/bin", "HOME": str(work), "LANG": "C"}
+
+
+def run_bash(script, cwd, environment, **variables):
+    return subprocess.run([BASH, "-euo", "pipefail", "-c", script], cwd=cwd, env={**environment, **variables}, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, timeout=60, check=False)
 
 
 class PacketTests(unittest.TestCase):
@@ -65,7 +108,9 @@ class PacketTests(unittest.TestCase):
 
     def test_the_entry_hash_in_the_packet_is_the_hash_of_the_entry_file(self):
         digest = hashlib.sha256(ENTRY.read_bytes()).hexdigest()
-        self.assertEqual(re.findall(r"[0-9a-f]{64}", self.text), [digest, digest])
+        pin = base_image_pin()  # the recipe's base image digest is the only other 64-hex value, and it is the Dockerfile's own pin
+        self.assertEqual(self.text.count(pin), 1)
+        self.assertEqual(re.findall(r"[0-9a-f]{64}", self.text.replace(pin, "")), [digest, digest])
         self.assertIn(f"ENTRY_SHA={digest}", self.install)
 
     PROXY_CALL = "systemctl list-units --type=service --all --no-legend --plain *mihomo* *clash*"
@@ -198,7 +243,7 @@ class PacketTests(unittest.TestCase):
         # It refuses to restart the daemon under a build that is running, and refuses links where root writes.
         self.assertIn("/srv/omp-ci/state/runs", script)
         self.assertIn("is a symbolic link", script)
-        self.assertIn("### Optional: the rootless Docker daemon through the outbound proxy", self.text)
+        self.assertIn("### Optional: image pulls of the rootless Docker daemon through the outbound proxy", self.text)
         self.assertIn("Skip this unless Part A printed `outbound proxy service present: yes`", self.text)
 
     def test_the_address_mask_hides_addresses_and_keeps_names(self):
@@ -340,6 +385,231 @@ class PacketTests(unittest.TestCase):
             self.assertIn(step, self.text)
         for step in ("REMOVE_DATA=1", "REMOVE_ACCOUNT=1", "Host cdm-ci-001-ompbuild"):
             self.assertIn(step, self.text)
+
+    # ---- correction round after the independent review (B1, N2 to N7) and the later ci-001 egress facts ------------------
+
+    def fence_heredoc(self):
+        return heredoc(self.install, "put_file /etc/omp-build/fence.nft 0644 root:root <<EOF")
+
+    def test_the_data_image_stays_allocated_and_appears_only_after_mkfs_succeeded(self):  # B1 and the image part of N5
+        self.assertIn('mkfs.ext4 -q -F -m 0 -E nodiscard -L omp-ci "$IMG.new"', self.install)
+        self.assertNotIn('-L omp-ci "$IMG"', self.install)
+        block = re.search(r"(?m)^if \[\[ ! -e \$IMG \]\]; then\n.*?^fi$", self.install, re.DOTALL)[0]
+        with tempfile.TemporaryDirectory(prefix="omp-img-") as directory:
+            work = Path(directory)
+            environment = stub_commands(work, {
+                "fallocate": 'echo "fallocate $*" >> "$STUB_LOG"\nfor last; do :; done\n: > "$last"\n',
+                "mkfs.ext4": 'echo "mkfs $*" >> "$STUB_LOG"\nexit "${MKFS_EXIT:-0}"\n'})
+            image, log = work / "omp-ci.img", work / "calls.log"
+            script = f"IMG={image}; IMG_GIB=256\n{block}"
+            interrupted = run_bash(script, work, environment, MKFS_EXIT="1", STUB_LOG=str(log))
+            self.assertNotEqual(interrupted.returncode, 0)
+            self.assertFalse(image.exists(), "an interrupted mkfs must not leave an image a rerun would skip")
+            self.assertTrue(Path(f"{image}.new").exists())
+            rerun = run_bash(script, work, environment, MKFS_EXIT="0", STUB_LOG=str(log))
+            self.assertEqual(rerun.returncode, 0, rerun.stdout.decode())
+            self.assertTrue(image.exists())
+            self.assertFalse(Path(f"{image}.new").exists())
+            self.assertEqual(image.stat().st_mode & 0o777, 0o600)
+            calls = log.read_text().splitlines()
+            self.assertIn(f"fallocate -l 256G {image}.new", calls)
+            self.assertEqual(calls[-1], f"mkfs -q -F -m 0 -E nodiscard -L omp-ci {image}.new")
+            log.unlink()
+            self.assertEqual(run_bash(script, work, environment, STUB_LOG=str(log)).returncode, 0)
+            self.assertFalse(log.exists(), "an existing image must be left alone")
+        report = self.install.split("# 7. Report", 1)[1]
+        self.assertIn('du -B1G "$IMG"\n', report)
+        self.assertIn('du -B1G --apparent-size "$IMG"\n', report)
+
+    def test_the_preflight_stops_before_any_change_without_dbus_user_session_ip_tables_or_a_tailnet_address(self):  # N4, N5
+        start, end = self.install.index("[[ $(dpkg-query"), self.install.index("# The address the door listens on")
+        self.assertLess(end, self.install.index("useradd "))
+        checks = self.install[start:end].replace("/proc/modules", "$MODULES").replace('"/lib/modules/$(uname -r)/modules.builtin"', '"$BUILTIN"')
+        self.assertIn("$MODULES", checks)
+        self.assertIn("$BUILTIN", checks)
+        loaded = "ip_tables 32768 3 iptable_filter,iptable_nat, Live 0x0000000000000000\n"
+        other = "iptable_filter 12288 1 - Live 0x0000000000000000\nnf_tables 1 0 - Live 0x0000000000000000\n"
+        lookalike = "ip_tables_extra 4096 0 - Live 0x0000000000000000\n"
+        cases = (("ii ", loaded, "", 0, ""), ("hi ", loaded, "", 0, ""), ("", loaded, "", 1, "dbus-user-session"), ("rc ", loaded, "", 1, "dbus-user-session"),
+                 ("iU ", loaded, "", 1, "dbus-user-session"), ("ii ", other, "kernel/net/ipv4/netfilter/iptable_nat.ko\n", 1, "ip_tables"),
+                 ("ii ", "", "", 1, "ip_tables"), ("ii ", lookalike, "kernel/net/not_ip_tables.ko\n", 1, "ip_tables"),
+                 ("ii ", other, "kernel/net/ipv4/netfilter/ip_tables.ko\n", 0, ""))
+        for status, modules, builtin, code, message in cases:
+            with self.subTest(status=status, loaded=bool(modules), builtin=bool(builtin)), tempfile.TemporaryDirectory(prefix="omp-pre-") as directory:
+                work = Path(directory)
+                environment = stub_commands(work, {"dpkg-query": 'printf "%s" "$DPKG_OUT"\n[ -n "$DPKG_OUT" ] || exit 1\n'})
+                (work / "modules").write_text(modules)
+                (work / "builtin").write_text(builtin)
+                result = run_bash(checks, work, environment, DPKG_OUT=status, MODULES=str(work / "modules"), BUILTIN=str(work / "builtin"))
+                self.assertEqual(result.returncode, code, result.stdout.decode())
+                self.assertIn(message, result.stdout.decode())
+                if code:
+                    self.assertIn("stop and ask", result.stdout.decode())
+        self.assertEqual(self.install.count("TAILNET_IP=${TAILNET_IP:-"), 1)
+        self.assertLess(self.install.index("TAILNET_IP=${TAILNET_IP:-"), self.install.index("useradd "))
+        self.assertLess(self.install.index("no tailnet address found"), self.install.index("useradd "))
+        self.assertIn("`dbus-user-session`", self.text.split("## Part B. Install", 1)[0])
+
+    def test_the_fence_loads_before_the_account_daemon_and_the_door_requires_it(self):  # N3
+        self.assertLess(self.install.index("# 3. Egress fence"), self.install.index("# 4. Rootless Docker"))
+        self.assertLess(self.install.index("systemctl restart omp-build-fence.service"), self.install.index("dockerd-rootless-setuptool.sh install"))
+        self.assertLess(self.install.index("systemctl restart omp-build-fence.service"), self.install.index("enable --now docker.service"))
+        unit = heredoc(self.install, "put_file /etc/systemd/system/omp-build-sshd.service 0644 root:root <<'EOF'").splitlines()
+        after = next(index for index, line in enumerate(unit) if line.startswith("After=") and "omp-build-fence.service" in line.split())
+        self.assertEqual(unit[after + 1], "Requires=omp-build-fence.service")
+
+    def test_the_fence_runs_ahead_of_the_proxys_nat_redirect_and_never_overlaps_its_range(self):  # N1 and the A2 facts
+        fence = self.fence_heredoc()
+        self.assertIn("type filter hook output priority mangle - 10; policy accept;", fence)
+        self.assertNotRegex(fence, r"priority (filter|mangle)\s*;")
+        base, offset = re.search(r"hook output priority (\w+) - (\d+);", fence).groups()
+        priority = {"raw": -300, "mangle": -150, "dstnat": -100, "filter": 0}[base] - int(offset)
+        self.assertLess(priority, -150, "equal priorities run in undefined order, so stay strictly ahead of the proxy's nat output chain")
+        reasons = [line for line in fence.splitlines() if line.lstrip().startswith("#")]
+        self.assertEqual(len(reasons), 1)
+        for word in ("mangle - 10", "-160", "mihomo", "-150", "NAT"):
+            self.assertIn(word, reasons[0])
+        self.assertEqual(fence_overlaps(fence), [])
+        rules = re.findall(r"(?m)^\s*meta skuid \$uid (ip6?) daddr (\{[^}]*\}|\S+) counter drop$", fence)
+        self.assertEqual([target for _, target in rules if not target.startswith("{")], ["198.18.0.1"])  # the one gateway host, as before
+        self.assertEqual(len(rules), 3)
+        # The checker itself bites: a set that covers the fake-address range, or loopback, is reported.
+        self.assertEqual(fence_overlaps(fence.replace("169.254.0.0/16", "198.18.0.0/16")), ["198.18.0.0/16"])
+        self.assertEqual(fence_overlaps(fence.replace("fe80::/10", "::1/128")), ["::1/128"])
+        self.assertEqual(fence_overlaps(fence.replace("10.0.0.0/8", "127.0.0.0/8")), ["127.0.0.0/8"])
+        note = self.text.split("```bash install-host.sh", 1)[1].split("```", 1)[1].split("Release builds also need", 1)[0]
+        for phrase in ("198.18.0.0/15", "127.0.0.0/8", "198.18.0.1", "priority mangle - 10"):
+            self.assertIn(phrase, note)
+
+    def test_a_rerun_restarts_the_fence_and_the_door_so_changed_files_take_effect(self):  # N5
+        for unit in ("omp-build-fence.service", "omp-build-sshd.service"):
+            with self.subTest(unit=unit):
+                self.assertIn(f"systemctl enable {unit}\n", self.install)
+                self.assertNotIn(f"enable --now {unit}", self.install)
+                self.assertLess(self.install.index(f"systemctl enable {unit}"), self.install.index(f"systemctl restart {unit}"))
+        self.assertLess(self.install.index("/usr/sbin/nft -c -f /etc/omp-build/fence.nft"), self.install.index("systemctl restart omp-build-fence.service"))
+        self.assertLess(self.install.index("/usr/sbin/sshd -t -f /etc/omp-build/sshd_config\n"), self.install.index("systemctl restart omp-build-sshd.service"))
+        self.assertIn("KillMode=process leaves the detached supervisor alone", self.install)
+        self.assertIn("A rerun restarts the fence unit and the door unit", self.text.split("```bash install-host.sh", 1)[0])
+
+    def test_the_undo_refuses_to_remove_the_account_while_its_data_or_logs_stay(self):  # N6
+        block = re.search(r"(?m)^if \[\[ \$\{REMOVE_ACCOUNT:-0\} == 1 .*?^fi$", self.undo, re.DOTALL)[0]
+        self.assertLess(self.undo.index(block), self.undo.index("systemctl disable --now omp-build-sshd.service"))
+        self.assertIn("a reused uid would otherwise own the old build outputs", block)
+        with tempfile.TemporaryDirectory(prefix="omp-undo-") as directory:
+            work = Path(directory)
+            environment = stub_commands(work, {})
+            for account, data, logs, refused in ((None, None, None, False), ("0", "0", "0", False), ("0", None, "1", False),
+                                                 ("1", None, None, True), ("1", "1", None, True), ("1", None, "1", True),
+                                                 ("1", "0", "1", True), ("1", "1", "0", True), ("1", "1", "1", False)):
+                with self.subTest(account=account, data=data, logs=logs):
+                    variables = {key: value for key, value in (("REMOVE_ACCOUNT", account), ("REMOVE_DATA", data), ("REMOVE_LOGS", logs)) if value is not None}
+                    result = run_bash(block + "\necho passed", work, environment, **variables)
+                    shown = result.stdout.decode()
+                    self.assertEqual(result.returncode, 1 if refused else 0, shown)
+                    self.assertEqual("passed" in shown, not refused)
+                    if refused:
+                        self.assertIn("REMOVE_DATA=1 and REMOVE_LOGS=1", shown)
+        self.assertIn('rm -f "$IMG" "$IMG.new"', self.undo)
+        self.assertIn("`REMOVE_ACCOUNT=1` is refused unless `REMOVE_DATA=1` and `REMOVE_LOGS=1` are set too", self.text)
+
+    def test_part_e_proves_the_daemon_a_container_and_container_egress_before_the_real_build(self):  # N2, curl-free host checks
+        section = self.text.split("## Part E. Smoke steps", 1)[1].split("\n## ", 1)[0]
+        step2 = section[section.index("\n2. The rootless daemon"):section.index("\n3. A real candidate build")]
+        parts = [step2.index(label) for label in ("a. Daemon facts", "b. A container starts", "c. Egress from a container", "d. The fence from the host")]
+        self.assertEqual(parts, sorted(parts))
+        self.assertIn("`curl` is not installed on ci-001 and nothing here installs it", step2)
+        self.assertIn("If part c fails, stop", step2)
+        self.assertIn("cannot fix container egress", step2)
+        blocks_in_part_e = smoke_blocks()
+        for body in blocks_in_part_e:
+            checked = subprocess.run([BASH, "-n"], input=body.encode(), stderr=subprocess.PIPE, check=False)
+            self.assertEqual(checked.returncode, 0, checked.stderr.decode())
+        facts, limits, egress, host = (next(body for body in blocks_in_part_e if marker in body)
+                                       for marker in ("docker info --format", "docker pull", "fence_drops()", "reach()"))
+        # a. daemon facts, as the entry reads them
+        for key in ("SecurityOptions", "CgroupVersion", "CgroupDriver", "MemoryLimit", "PidsLimit", "CpuCfsQuota", "DockerRootDir"):
+            self.assertIn(f'"{key}"', facts)
+        self.assertIn("docker buildx version", facts)
+        for name in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            self.assertIn(f"-u {name}", facts)
+        code = re.search(r"python3 -I -c '(.*?)'\n", facts, re.DOTALL)[1]
+        sample = {"ServerVersion": "29.8.1", "SecurityOptions": ["name=rootless"], "CgroupVersion": "2", "CgroupDriver": "systemd",
+                  "MemoryLimit": True, "PidsLimit": True, "CpuCfsQuota": True, "SwapLimit": False, "DockerRootDir": "/srv/omp-ci/docker"}
+        printed = subprocess.run([sys.executable, "-I", "-c", code], input=json.dumps(sample).encode(), stdout=subprocess.PIPE, check=True).stdout.decode()
+        self.assertIn("SecurityOptions ['name=rootless']", printed)
+        self.assertIn("CpuCfsQuota True", printed)
+        # b. the recipe's own pin, by digest, run under the build container's limits
+        pin = base_image_pin()
+        self.assertIn(f"BASE='{pin}'", limits)
+        self.assertRegex(pin, r"@sha256:[0-9a-f]{64}$")
+        self.assertIn('docker pull -q "$BASE"', limits)
+        for flag in ("--cpus=4", "--memory=24g", "--memory-swap=24g", "--pids-limit=1024"):
+            self.assertIn(flag, limits)
+            self.assertIn(flag, egress)
+        # c. from a container on the default network: names, HTTPS, and the Tailscale address blocked while the counter rises
+        self.assertNotIn("--network", egress)
+        for needle in ("github.com", "snapshot.debian.org", "https://100.100.100.100/", "getent hosts", "curl ", "before=$(fence_drops)", "after=$(fence_drops)"):
+            self.assertIn(needle, egress)
+        self.assertLess(egress.index("before=$(fence_drops)"), egress.index("docker run"))
+        self.assertLess(egress.index("docker run"), egress.index("after=$(fence_drops)"))
+        with tempfile.TemporaryDirectory(prefix="omp-drops-") as directory:
+            work = Path(directory)
+            (work / "listing").write_text(
+                "table inet omp_build_fence {\n\tchain out {\n\t\ttype filter hook output priority mangle - 10; policy accept;\n"
+                "\t\tmeta skuid 1008 ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 } counter packets 7 bytes 420 drop\n"
+                "\t\tmeta skuid 1008 ip6 daddr { fc00::/7, fe80::/10 } counter packets 0 bytes 0 drop\n"
+                "\t\tmeta skuid 1008 ip daddr 198.18.0.1 counter packets 3 bytes 180 drop\n\t}\n}\n")
+            environment = stub_commands(work, {"nft": 'cat "$LISTING"\n'})
+            function = re.search(r"(?m)^fence_drops\(\) \{.*\}$", egress)[0]
+            counted = run_bash(f"{function}\nfence_drops", work, environment, LISTING=str(work / "listing"))
+            self.assertEqual(counted.stdout.decode().split(), ["7"])
+        # d. the host-side checks use python3 as the account, never curl, with proxies off in the environment and in the request
+        self.assertNotIn("curl", host)
+        self.assertIn('"${noproxy[@]}" python3 -I -c', host)
+        self.assertIn("ProxyHandler({})", host)
+        self.assertIn("https://100.100.100.100/", host)
+        self.assertEqual(host.count("nft list table inet omp_build_fence"), 2)
+        for body in blocks_in_part_e:
+            if "docker run" not in body:
+                self.assertNotIn("curl", body)
+        code = re.search(r"python3 -I -c '(.*?)' \"\$@\"", host, re.DOTALL)[1]
+
+        class Quiet(http.server.SimpleHTTPRequestHandler):
+            def log_message(self, *arguments):
+                pass
+
+        with tempfile.TemporaryDirectory(prefix="omp-reach-") as directory:
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Quiet, directory=directory))
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                url = f"http://127.0.0.1:{server.server_address[1]}/"
+                dead = {"HTTP_PROXY": "http://127.0.0.1:9", "http_proxy": "http://127.0.0.1:9", "HTTPS_PROXY": "http://127.0.0.1:9"}
+                outcome = subprocess.run([sys.executable, "-I", "-c", code, url, "http://127.0.0.1:1/"], env={**os.environ, **dead},
+                                         stdout=subprocess.PIPE, timeout=60, check=True).stdout.decode().splitlines()
+            finally:
+                server.shutdown()
+                server.server_close()
+        self.assertEqual(outcome, [f"reached {url} 200", "failed http://127.0.0.1:1/ URLError"])
+        self.assertLess(section.index("2. The rootless daemon"), section.index("3. A real candidate build"))
+
+    def test_the_optional_proxy_block_is_described_as_image_pulls_only(self):  # N2, N1, the A2 facts
+        block = self.text.split("### Optional: ", 1)[1].split("```bash optional-docker-proxy.sh", 1)[0]
+        self.assertTrue(block.startswith("image pulls of the rootless Docker daemon through the outbound proxy"))
+        for phrase in ("image pulls by the account's own Docker daemon only, not container egress", "Part E step 2b's image pull",
+                       "not expected to be needed on ci-001", "if 2c fails this block is not the answer"):
+            self.assertIn(phrase, block)
+        self.assertNotIn("curl", block)
+        self.assertNotIn("last `curl`", self.text)
+        self.assertIn("| Optional, proxy block for the Docker daemon's image pulls only (after Part B) |", self.text)
+        self.assertIn("covers pulls by the account's Docker daemon only, not container egress", self.blocks["optional-docker-proxy.sh"][1])
+
+    def test_the_operating_notes_cover_the_held_package_the_door_limits_and_the_fence(self):  # N7, N3
+        notes = self.text.split("## Part G. Operating notes (Main)", 1)[1]
+        for phrase in ("`docker-ce-rootless-extras` is on hold at the same version as `docker-ce`", "rootlesskit and the rootless scripts behind",
+                       "`MemoryMax=2G` and `TasksMax=512`", "detached build supervisor", "The door `Requires=` the fence",
+                       "`systemctl restart omp-build-fence.service`"):
+            self.assertIn(phrase, notes)
 
 
 if __name__ == "__main__":
