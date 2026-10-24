@@ -10,6 +10,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
 import type { HindsightSessionState } from "../hindsight/state";
+import type { MnemopiStartupFailure } from "../mnemopi/startup-failure";
 import type { MnemopiSessionState } from "../mnemopi/state";
 import type { AgentSession } from "../session/agent-session";
 
@@ -90,6 +91,8 @@ export interface MemoryBackendStartOptions {
 	taskDepth: number;
 	parentHindsightSessionState?: HindsightSessionState;
 	parentMnemopiSessionState?: MnemopiSessionState;
+	/** Why the parent session has no Mnemopi; a child keeps it so its memory tools can say why. */
+	parentMnemopiStartupFailure?: MnemopiStartupFailure;
 }
 
 /** A successful recall, including an empty result, staged until user-turn delivery. */

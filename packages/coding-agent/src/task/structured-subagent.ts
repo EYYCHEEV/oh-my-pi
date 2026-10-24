@@ -673,6 +673,7 @@ function buildExecutorOptions(
 		parentArtifactManager: preparedSession ? undefined : (session.getArtifactManager?.() ?? undefined),
 		parentHindsightSessionState: session.getHindsightSessionState?.(),
 		parentMnemopiSessionState: session.getMnemopiSessionState?.(),
+		parentMnemopiStartupFailure: session.getMnemopiStartupFailure?.(),
 		onRelease:
 			preparedSession !== undefined && lease.temporary
 				? async () => {

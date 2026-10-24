@@ -8,6 +8,7 @@ import { sessionMemoryToolRefs } from "../memory-backend/tool-names";
 import type { ToolSession } from ".";
 
 import { cfgMemoryBackend } from "../memory-backend/settings";
+import { mnemopiNotInitialisedMessage } from "../mnemopi/startup-failure";
 
 const memoryRecallSchema = type({
 	query: type("string").describe("natural language search query"),
@@ -44,7 +45,7 @@ export class MemoryRecallTool implements AgentTool<typeof memoryRecallSchema> {
 			if (backend === "mnemopi") {
 				const state = this.session.getMnemopiSessionState?.();
 				if (!state) {
-					throw new Error("Mnemopi backend is not initialised for this session.");
+					throw new Error(mnemopiNotInitialisedMessage(this.session.getMnemopiStartupFailure?.()));
 				}
 				try {
 					const results = await state.recallResultsScoped(params.query);

@@ -12,6 +12,7 @@ import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import { memoryToolRefs } from "../memory-backend/tool-names";
 import type { MemoryBackend, MemoryBackendStartOptions, MemoryPromptPreparation } from "../memory-backend/types";
+import { formatMnemopiStartupFailure } from "../mnemopi/startup-failure";
 import hindsightInstructions from "../prompts/system/hindsight-instructions.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
 import { type BankScope, computeBankScope } from "./bank";
@@ -245,7 +246,12 @@ export async function rebindMemoryBackendForCwd(session: AgentSession): Promise<
 
 	// Startup is best-effort, but a move must not commit an unusable memory backend.
 	if (cfgMemoryBackend.get(session.settings) === "mnemopi" && !session.getMnemopiSessionState()) {
-		throw new Error("Mnemopi backend failed to initialise for the destination cwd.");
+		const failure = session.getMnemopiStartupFailure?.();
+		throw new Error(
+			failure
+				? `Mnemopi backend failed to initialise for the destination cwd: ${formatMnemopiStartupFailure(failure)}.`
+				: "Mnemopi backend failed to initialise for the destination cwd.",
+		);
 	}
 }
 

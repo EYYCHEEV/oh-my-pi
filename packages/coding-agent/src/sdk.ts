@@ -184,6 +184,7 @@ import { resolveMCPToolAlias } from "./mcp/tool-bridge";
 import { createSessionMemoryRuntimeContext, resolveMemoryBackend } from "./memory-backend";
 import { MEMORY_BACKEND_TOOL_NAMES } from "./memory-backend/tool-names";
 import type { MnemopiSessionState } from "./mnemopi/state";
+import type { MnemopiStartupFailure } from "./mnemopi/startup-failure";
 import mcpXdevGuidanceTemplate from "./prompts/system/mcp-xdev-guidance.md" with { type: "text" };
 import lateDiagnosticTemplate from "./prompts/tools/lsp-late-diagnostic.md" with { type: "text" };
 import { AgentLifecycleManager } from "./registry/agent-lifecycle";
@@ -854,6 +855,8 @@ export interface CreateAgentSessionOptions {
 	parentHindsightSessionState?: HindsightSessionState;
 	/** Parent Mnemopi state: subagents alias it; a top-level fork (`/tan`) inherits its delivered recall. */
 	parentMnemopiSessionState?: MnemopiSessionState;
+	/** Why the parent session has no Mnemopi; a subagent keeps it so its memory tools can say why. */
+	parentMnemopiStartupFailure?: MnemopiStartupFailure;
 	/** Pre-allocated agent identity for IRC routing. Default: "Main" for top-level, parentTaskPrefix-derived for sub. */
 	agentId?: string;
 	/** Display name for the agent in IRC. Default: "main" or "sub". */
@@ -2870,6 +2873,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getProviderSessionId: () => session.sessionId,
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			getMnemopiSessionState: () => session?.getMnemopiSessionState(),
+			getMnemopiStartupFailure: () => session?.getMnemopiStartupFailure(),
 			getAgentId: () => resolvedAgentId,
 			getPromptCacheKey: () => {
 				if (!session) return undefined;
@@ -5775,6 +5779,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				taskDepth,
 				parentHindsightSessionState: options.parentHindsightSessionState,
 				parentMnemopiSessionState: options.parentMnemopiSessionState,
+				parentMnemopiStartupFailure: options.parentMnemopiStartupFailure,
 			});
 		};
 

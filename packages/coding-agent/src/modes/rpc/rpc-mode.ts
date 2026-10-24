@@ -48,6 +48,7 @@ import {
 	wordCompletionQuery,
 } from "@oh-my-pi/pi-tui/prompt/word-completion";
 import { requestTextPrediction, textPredictionBackend } from "../../predict/client";
+import { mnemopiStartupNotice, watchMnemopiStartupFailure } from "../../mnemopi/startup-failure";
 import { type AgentSession, SessionBusyError } from "../../session/agent-session";
 import type { MCPManager } from "../../mcp/manager";
 import { reconnectMcpManagerServer } from "../../mcp/oauth-reauth";
@@ -1690,6 +1691,11 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			persistenceFailure = error;
 		},
 	);
+	// Mnemopi that could not start leaves the run with memory off; say why, once, on stderr so the
+	// protocol stream on stdout stays clean.
+	watchMnemopiStartupFailure(session, failure => {
+		process.stderr.write(`Warning: ${mnemopiStartupNotice(failure)}\n`);
+	});
 
 	/**
 	 * Dispose the session, then end the process. A store failure still latched

@@ -6,6 +6,7 @@ import { sessionMemoryToolRefs } from "../memory-backend/tool-names";
 import type { ToolSession } from ".";
 
 import { cfgMemoryBackend } from "../memory-backend/settings";
+import { mnemopiNotInitialisedMessage } from "../mnemopi/startup-failure";
 
 const memoryEditSchema = type({
 	op: type("'update' | 'forget' | 'invalidate'").describe("memory edit operation"),
@@ -42,7 +43,7 @@ export class MemoryEditTool implements AgentTool<typeof memoryEditSchema> {
 	async execute(_id: string, params: MemoryEditParams): Promise<AgentToolResult> {
 		const state = this.session.getMnemopiSessionState?.();
 		if (!state) {
-			throw new Error("Mnemopi backend is not initialised for this session.");
+			throw new Error(mnemopiNotInitialisedMessage(this.session.getMnemopiStartupFailure?.()));
 		}
 		if (params.op === "update" && params.content === undefined && params.importance === undefined) {
 			throw new Error("memory_edit update requires content or importance.");
