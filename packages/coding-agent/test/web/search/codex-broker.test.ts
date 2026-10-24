@@ -76,6 +76,10 @@ describe("Codex web search broker auth", () => {
 			sessionId: "codex-broker-session",
 		};
 
+		// The fork picks its Codex search model itself (contracts codex-web-search-cli-fallback, codex-native-web-run):
+		// PI_CODEX_WEB_SEARCH_MODEL is its way to pin the model, so pin the one this test selects.
+		const originalSearchModel = process.env.PI_CODEX_WEB_SEARCH_MODEL;
+		process.env.PI_CODEX_WEB_SEARCH_MODEL = model.id;
 		try {
 			const result = await searchCodex({ ...params, fetch: fetchMock });
 
@@ -87,6 +91,8 @@ describe("Codex web search broker auth", () => {
 			expect(requestHeaders?.get("chatgpt-account-id")).toBe("broker-account-id");
 			expect(openSpy).not.toHaveBeenCalled();
 		} finally {
+			if (originalSearchModel === undefined) delete process.env.PI_CODEX_WEB_SEARCH_MODEL;
+			else process.env.PI_CODEX_WEB_SEARCH_MODEL = originalSearchModel;
 			vi.restoreAllMocks();
 			authStorage.close();
 		}

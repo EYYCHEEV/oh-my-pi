@@ -90,12 +90,14 @@ export default function(pi) {
 		expect(result.errors).toHaveLength(0);
 		expect(result.extensions[0].tools.has("dedup-tool")).toBe(true);
 
-		const checkReadCount = (filePath: string) => {
+		const checkReadCount = (filePath: string, expected = 1) => {
 			const real = fs.existsSync(filePath) ? fs.realpathSync(filePath) : filePath;
-			expect(reads.get(real) ?? 0).toBe(1);
+			expect(reads.get(real) ?? 0).toBe(expected);
 		};
 
-		checkReadCount(entryPath);
+		// Fork contract extension-runtime-requirements: the loader hashes the entry module before and after
+		// importing it to prove the loaded bytes (3 reads). The rest of the graph is still read exactly once.
+		checkReadCount(entryPath, 3);
 		for (let i = 0; i < numModules; i++) {
 			checkReadCount(path.join(extDir, `mod-${i}.ts`));
 		}

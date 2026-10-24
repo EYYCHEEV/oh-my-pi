@@ -24,6 +24,7 @@ import { RpcPromptResults, reportPromptResult } from "@oh-my-pi/pi-coding-agent/
 import type { RpcPromptResultFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import { AgentSession, PromptDroppedError } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { RuntimeRequirementError } from "@oh-my-pi/pi-coding-agent/session/runtime-requirements";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { assistantMsg } from "./utilities";
@@ -118,14 +119,21 @@ describe("AgentSession concurrent prompt dispatch", () => {
 				);
 				await reachedFlush.promise;
 			}
-			const pending = session.promptCustomMessage({
+			// Fork contract extension-runtime-requirements: a session transition that is restoring refuses new work,
+			// so during branchFromBtw the prompt is refused at admission instead of being dropped at commit.
+			const refusedWhileRestoring = (error: unknown): boolean => {
+				if (error instanceof RuntimeRequirementError) return false;
+				throw error;
+			};
+			const submitted = session.promptCustomMessage({
 				customType: "collab-prompt",
 				content: "Admitted on the abandoned branch",
 				display: true,
 				attribution: "user",
 			});
+			const pending = transition === "branchFromBtw" ? submitted.catch(refusedWhileRestoring) : submitted;
 			try {
-				await reached.promise;
+				if (transition !== "branchFromBtw") await reached.promise;
 				if (transition === "fork") {
 					expect(await session.fork()).toBe(true);
 				} else if (transition === "branchFromBtw") {

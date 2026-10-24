@@ -366,9 +366,9 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		await session.prompt("answer with exactly one line");
 		await hookStarted.promise;
 
-		// Persistence is committed in emission order and never waits on extension
-		// listeners, so the card is already durable while its hook is still held.
-		expect(persisted.at(-1)).toContain("Fixture verdict confirmed");
+		// Fork contract extension-runtime-requirements: a custom message reserves its persistence slot
+		// until its extension notification settles, so the card becomes durable once the hook is released.
+		expect(persisted).toHaveLength(0);
 		expect(await session.waitForAdvisorCatchup(0)).toBe(false);
 
 		let catchupSettled = false;
@@ -382,6 +382,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		releaseHook.resolve();
 		expect(await catchup).toBe(true);
 		expect(persisted).toHaveLength(1);
+		expect(persisted.at(-1)).toContain("Fixture verdict confirmed");
 		expect(mock.calls).toHaveLength(1);
 	});
 
