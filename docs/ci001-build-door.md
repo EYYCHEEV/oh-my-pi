@@ -688,6 +688,9 @@ Stop at the first step that does not match, keep the output, and report it; do n
    Expected: a `run <id>` line, `Phase: door ...` progress lines (the check line names `manifest <12 hex>`), `state: succeeded`, then `verified: omp 18.8.0 linux-amd64 ...`, `qualified: all nine checks passed on the builder; tag none (candidate, never publishable)`, `fork manifest: <64 hex> (the signed qualification record names exactly the file that was sent)` and a `receipt:` line.
    The output folder holds `assets/` (three public files), `evidence/` (three private files) and `build-receipt.json` (private, mode 0600, never published).
    Exit codes: 1 the remote build failed, 2 refused, 3 the Mac's own verification failed (the run is then kept on the box), 4 transport.
+   When qualification fails at an application test, the progress lines name it: after the `qualify-` stage of the failed command come at most eight `qualify-failed-<test name>` lines, one per failed test in Bun's order.
+   `qualify-failed-timeout` comes first when the command timed out, so the cap never hides it, and `qualify-failed-no-test-name` stands for a failure that named no test or a run with no passing test.
+   A name is lowercase letters, digits and hyphens only, cut at 96 characters, so it never carries a path, an address, an email or any other output text; the door passes these lines like every other `qualify-` stage, and the rest of the test output stays on the builder.
 4. Proof of removal (Main, as root, after step 3):
 
    ```bash

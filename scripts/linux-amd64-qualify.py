@@ -65,15 +65,28 @@ STAGES = (
     "qualify-markers", "qualify-native-addon", "qualify-native-grep",
     "qualify-typecheck", "qualify-integrity", "qualify-result",
 )
+# A failed boundary command names the tests that failed, as hyphenated lowercase words and nothing else (see failed_stages).
+FAILED_PREFIX = "qualify-failed-"
+FAILED_STAGE = re.compile(r"qualify-failed-[a-z0-9]+(?:-[a-z0-9]+)*")
+FAILED_STAGE_CHARS = 112
+FAILED_STAGE_LINES = 8
+FAILED_SLUG_CHARS = 96
+FAILED_TIMEOUT_STATUSES = (124, 137)  # the timeout command's own status, and its status after the kill
+BUN_TIMING = re.compile(rb" \[[0-9.]+(?:ms|s)\]$")
 
 
 def boundary_stage(contract, number):
     return f"qualify-boundary-{contract}-{number}"
 
 
+def failed_stage(value):
+    return len(value) <= FAILED_STAGE_CHARS and FAILED_STAGE.fullmatch(value) is not None
+
+
 def valid_stage(value, boundaries=frozenset()):
     # Boundary stages come from the supplied registry, so every caller names the exact set it computed.
-    return isinstance(value, str) and (value in STAGES or value in boundaries)
+    # A failed-test line holds letters, digits and hyphens only: no path, dot, colon, address or other output.
+    return isinstance(value, str) and (value in STAGES or value in boundaries or failed_stage(value))
 
 
 def announce_stage(value, *, inside=False, boundaries=frozenset()):
@@ -87,6 +100,7 @@ def forward_stages(stream, boundaries=frozenset()):
     require(len(data) <= STAGE_BYTES, "Invalid qualification stages")
     lines = data.decode("ascii").splitlines(keepends=True)
     require(all(line.endswith("\n") and valid_stage(line[:-1], boundaries) for line in lines), "Invalid qualification stage")
+    require(sum(failed_stage(line[:-1]) for line in lines) <= FAILED_STAGE_LINES, "Invalid qualification stages")
     for line in lines:
         announce_stage(line[:-1], boundaries=boundaries)
 
@@ -459,16 +473,61 @@ class Runtime:
         self.environment = environment
         self.sequence = 0
 
-    def run(self, args, cwd, seconds=240, stdin=b""):
+    def execute(self, args, cwd, seconds, stdin):
+        """Run one command under `timeout`, its output going to two private files. Returns (status, (stdout path, stderr path))."""
         self.sequence += 1
         prefix = Path("/runtime") / f"command-{self.sequence}"
-        with prefix.with_suffix(".out").open("wb") as out, prefix.with_suffix(".err").open("wb") as err:
+        paths = (prefix.with_suffix(".out"), prefix.with_suffix(".err"))
+        with paths[0].open("wb") as out, paths[1].open("wb") as err:
             completed = subprocess.run(["timeout", "--signal=TERM", "--kill-after=5s", f"{seconds}s", *map(str, args)],
                                        cwd=cwd, env=self.environment, input=stdin, stdout=out, stderr=err, timeout=seconds + 15)
-        require(completed.returncode == 0, "Runtime check failed")
-        paths = (prefix.with_suffix(".out"), prefix.with_suffix(".err"))
+        return completed.returncode, paths
+
+    @staticmethod
+    def read(paths):
         require(all(path.stat().st_size <= 8 * 1024 * 1024 for path in paths), "Runtime diagnostic limit exceeded")
         return tuple(path.read_bytes() for path in paths)
+
+    def run(self, args, cwd, seconds=240, stdin=b""):
+        status, paths = self.execute(args, cwd, seconds, stdin)
+        require(status == 0, "Runtime check failed")
+        return self.read(paths)
+
+    def run_unchecked(self, args, cwd, seconds=240, stdin=b""):
+        """Like run, but a non-zero exit status comes back with the output, so the caller can name what failed first."""
+        status, paths = self.execute(args, cwd, seconds, stdin)
+        return (status, *self.read(paths))
+
+
+def boundary_passed(status, combined):
+    """A boundary command passes only with exit status 0, at least one passing test and no failing one."""
+    return (status == 0 and re.search(rb"\b[1-9][0-9]* pass\b", combined) is not None and
+            re.search(rb"\b[1-9][0-9]* fail\b", combined) is None)
+
+
+def failed_name(line):
+    """The name in one Bun `(fail) <describe > test> [12.34ms]` line: lowercase letters and digits with single hyphens, at most 96 characters."""
+    name = BUN_TIMING.sub(b"", line[len(b"(fail) "):].rstrip(b"\r")).lower()
+    return re.sub(rb"[^a-z0-9]+", b"-", name).strip(b"-")[:FAILED_SLUG_CHARS].strip(b"-").decode("ascii")
+
+
+def failed_stages(status, combined):
+    """Up to eight `qualify-failed-<name>` stage lines for one failed boundary command: test names only, never output text.
+
+    One line per Bun `(fail) ` line, in order and without repeats; an empty name is skipped. A timeout (the timeout command's
+    own status, 124, or 137 after the kill) is announced first, so the cap can never hide it. A failure that named no test is
+    announced as `no-test-name`."""
+    names = []
+    for line in combined.split(b"\n"):
+        if line.startswith(b"(fail) "):
+            name = failed_name(line)
+            if name and name not in names:
+                names.append(name)
+    words = ["timeout"] if status in FAILED_TIMEOUT_STATUSES else []
+    words += [name for name in names if name not in words]
+    if not names:
+        words.append("no-test-name")
+    return [FAILED_PREFIX + word for word in words[:FAILED_STAGE_LINES]]
 
 
 def dependency_roots(source):
@@ -670,10 +729,14 @@ def runtime_main():
     })
     for stage, command in commands:
         announce_stage(stage, inside=True, boundaries=known)
-        output, error = runtime.run(command, source)
+        status, output, error = runtime.run_unchecked(command, source)
         combined = output + b"\n" + error
-        require(re.search(rb"\b[1-9][0-9]* pass\b", combined) is not None and
-                re.search(rb"\b[1-9][0-9]* fail\b", combined) is None, "Boundary command ran no passing tests")
+        passed = boundary_passed(status, combined)
+        if not passed:
+            # Test names only, on the stage channel, before failing closed; the output itself stays in the private files.
+            for line in failed_stages(status, combined):
+                announce_stage(line, inside=True, boundaries=known)
+        require(passed, "Boundary command failed or ran no passing tests")
     announce_stage("qualify-native-grep", inside=True)
     grep_source = (source / "crates/pi-natives/src/grep.rs").read_text()
     require(re.search(r"(?m)^\s*fn\s+" + NATIVE_GREP_TEST.rsplit("::", 1)[1] + r"\s*\(", grep_source), "Canonical native regression is missing")

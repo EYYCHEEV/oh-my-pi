@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline qualification fixtures: no Docker, Bun, OMP, build, or network execution."""
 import argparse
+import ast
 import contextlib
 import copy
 import hashlib
@@ -9,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import socket
@@ -927,6 +929,21 @@ class HostFlowTests(unittest.TestCase):
                 self.run_fixture(Path(temporary), stages=stage, invalid_stages=True)
             self.assertNotIn("qualify-boundary", output.getvalue())
 
+    def test_failed_test_lines_from_a_failed_runtime_are_forwarded_and_nothing_else_is(self):
+        stages = b"qualify-boundary-alpha-contract-2\nqualify-failed-suite-one-fails-twice\nqualify-failed-timeout\n"
+        with tempfile.TemporaryDirectory() as temporary, contextlib.redirect_stdout(io.StringIO()) as output:
+            self.run_fixture(Path(temporary), fail=True, stages=stages)
+        self.assertEqual(output.getvalue().splitlines()[-3:],
+                         ["qualify-boundary-alpha-contract-2", "qualify-failed-suite-one-fails-twice", "qualify-failed-timeout"])
+        ninth = b"".join(b"qualify-failed-case-%d\n" % number for number in range(1, 10))
+        for payload in (b"qualify-failed-a.b\n", b"qualify-failed-/etc/passwd\n", b"qualify-failed-" + b"a" * 98 + b"\n", ninth,
+                        b"qualify-smoke\nqualify-failed-suite one\n"):
+            with self.subTest(payload=payload[:40]), tempfile.TemporaryDirectory() as temporary, \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                self.run_fixture(Path(temporary), stages=payload, invalid_stages=True)
+            self.assertEqual(output.getvalue().splitlines(),
+                             ["qualify-host-inputs", "qualify-host-runtime", "qualify-host-source", "qualify-host-execute"])
+
     def test_a_missing_altered_or_unstated_registry_is_refused_before_any_daemon_contact(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -982,6 +999,136 @@ class HostFlowTests(unittest.TestCase):
         self.assertEqual(error.getvalue(), "qualify-smoke\n")
 
 
+# Real Bun 1.4.2 output for failing tests (captured on the Mac): one `(fail) <describe > test> [timing]` line per failure.
+BUN_FAILURES = "\n".join([
+    "bun test v1.4.2 (744846f84)",
+    "(pass) suite one > passes fine [0.02ms]",
+    "(fail) suite one > fails with a path /home/ompbuild/x.ts and 10.1.2.3 and a@b.example [0.64ms]",
+    "(fail) suite one > fails twice [0.26ms]",
+    "(fail) suite one > unicode \u00fcn\u00ef \u65e5\u672c name [0.01ms]",
+    "(fail) suite one > slow one [51.03ms]",
+    "(fail) top level fail [0.40ms]",
+    "",
+    " 1 pass",
+    " 5 fail",
+    "Ran 6 tests across 1 file. [55.00ms]",
+    "",
+]).encode()
+FAILED_LINES = [
+    "qualify-failed-suite-one-fails-with-a-path-home-ompbuild-x-ts-and-10-1-2-3-and-a-b-example",
+    "qualify-failed-suite-one-fails-twice",
+    "qualify-failed-suite-one-unicode-n-name",
+    "qualify-failed-suite-one-slow-one",
+    "qualify-failed-top-level-fail",
+]
+PASSING = (0, b"bun test v1.4.2 (744846f84)\n",
+           b"(pass) a > b [0.10ms]\n\n 1 pass\n 0 fail\nRan 1 test across 1 file. [5.00ms]\n")
+SETUP_STAGES = ["qualify-request", "qualify-cpu", "qualify-source", "qualify-binary", "qualify-libc", "qualify-version",
+                "qualify-help", "qualify-smoke", "qualify-offline-session", "qualify-markers", "qualify-native-addon"]
+BOUNDARY_STAGES = ["qualify-boundary-alpha-contract-1", "qualify-boundary-alpha-contract-2", "qualify-boundary-beta-contract-1"]
+
+
+def drive_runtime(runtime_class, entry=None, argv=("qualify",)):
+    """Run runtime_main (or `entry`) in a fixture tree, against a Runtime double, up to the native-grep stage.
+
+    The real announce_stage runs, so every announced line is validated and captured. Returns (raised, stdout, stderr)."""
+    real_announce = qualify.announce_stage
+
+    def stage(name, **kwargs):
+        real_announce(name, **kwargs)
+        if name == "qualify-native-grep":
+            raise RuntimeError("boundary fixture complete")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        assets = root / "assets"
+        assets.mkdir()
+        manifest = fixture(assets)
+        source = root / "source"
+        source_fixture(source)
+        (source / "packages/coding-agent").mkdir(parents=True, exist_ok=True)
+        (source / "packages/coding-agent/package.json").write_text('{"version":"18.8.0"}')
+        for name in receipt.LOCKS:
+            (source / name).write_text("fixture lock")
+            manifest["build_inputs"]["locks"][name] = receipt.digest(source / name)
+        request = root / "request.json"
+        request.write_text(json.dumps({"manifest": manifest, "runtime_image": IMAGE_DIGEST, "fork_manifest_sha256": FORK_SHA}))
+        cpu = root / "cpuinfo"
+        cpu.write_text("flags: ssse3 sse4_1 sse4_2 popcnt cx16 lahf_lm pni\n")
+        native = root / "native.node"
+        native.write_bytes(b"fixture native")
+        paths = {"/input/assets/request.json": request, "/input/assets/fork_boundary.json": fork_file(root),
+                 "/proc/cpuinfo": cpu,
+                 "/runtime": root / "runtime", "/workspace/source": source,
+                 "/workspace/omp": root / "omp", "/input/assets/omp-linux-amd64": assets / receipt.ASSETS[0]}
+        real_copyfile = shutil.copyfile
+
+        def copyfile(origin, destination):
+            return real_copyfile(paths.get(str(origin), origin), destination)
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(qualify, "Path", side_effect=lambda value: paths.get(str(value), Path(value))), \
+             patch.object(qualify.os, "uname", return_value=type("Uname", (), {"machine": "x86_64"})()), \
+             patch.object(qualify, "Runtime", runtime_class), \
+             patch.object(qualify, "prepare_dependencies", return_value=root / "grep"), \
+             patch.object(qualify.shutil, "copytree"), patch.object(qualify.shutil, "copyfile", side_effect=copyfile), \
+             patch.object(receipt, "elf", return_value=manifest["runtime"]["binary"]), \
+             patch.object(qualify, "native_help", return_value=native), \
+             patch.object(qualify, "offline_session"), patch.object(qualify, "require_markers"), \
+             patch.object(qualify, "announce_stage", side_effect=stage), \
+             patch.object(qualify.sys, "argv", list(argv)), \
+             contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                (entry or qualify.runtime_main)()
+                raised = None
+            except (Exception, SystemExit) as error:
+                raised = error
+    return raised, stdout.getvalue(), stderr.getvalue()
+
+
+def scripted_runtime(answers, bun_calls):
+    """A Runtime double. Each boundary `bun test` command answers with the next of `answers`, as (status, stdout, stderr).
+
+    Every other command succeeds as it does in a good run."""
+    queue = iter(answers)
+
+    class Scripted:
+        def __init__(self, environment):
+            self.environment = environment
+
+        def run(self, command, _cwd, seconds=240):
+            args = list(map(str, command))
+            if args == ["getconf", "GNU_LIBC_VERSION"]:
+                return b"glibc 2.41\n", b""
+            if args[-1] == "--version":
+                return b"omp/18.8.0\n", b""
+            if args[-1] == "--smoke-test":
+                return b"smoke-test: ok\n", b""
+            return b"1 pass\n", b""
+
+        def run_unchecked(self, command, cwd, seconds=240):
+            args = list(map(str, command))
+            if args[:2] == ["bun", "test"]:
+                bun_calls.append(args)
+                return next(queue)
+            return (0, *self.run(command, cwd, seconds))
+
+    return Scripted
+
+
+def door_filters():
+    """The door's own PROGRESS and ADDRESS patterns, read from the entry file; nothing else in that file runs."""
+    text = (Path(__file__).resolve().parent / "ci001" / "omp-build-entry").read_text()
+    tree = ast.parse(text.split("\n#PY\n", 1)[1])
+    wanted = {"SAFE_TEXT", "PROGRESS", "ADDRESS"}
+    body = [node for node in tree.body if isinstance(node, ast.Assign) and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name) and node.targets[0].id in wanted]
+    assert [node.targets[0].id for node in body] == ["SAFE_TEXT", "PROGRESS", "ADDRESS"], "the door's filters moved; update this reader"
+    scope = {"re": re}
+    exec(compile(ast.Module(body=body, type_ignores=[]), "omp-build-entry", "exec"), scope)
+    return scope["PROGRESS"], scope["ADDRESS"]
+
+
 class RuntimeStartupTests(unittest.TestCase):
     def test_initializes_native_xdg_namespace_on_executable_runtime_before_launch(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1025,57 +1172,21 @@ class RuntimeStartupTests(unittest.TestCase):
                     return b"smoke-test: ok\n", b""
                 return b"1 pass\n", b""
 
-        def stage(name, **_kwargs):
-            if name == "qualify-native-grep":
-                raise RuntimeError("boundary fixture complete")
+            def run_unchecked(self, command, cwd, seconds=240):
+                return (0, *self.run(command, cwd, seconds))
 
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            assets = root / "assets"
-            assets.mkdir()
-            manifest = fixture(assets)
-            source = root / "source"
-            source_fixture(source)
-            (source / "packages/coding-agent").mkdir(parents=True, exist_ok=True)
-            (source / "packages/coding-agent/package.json").write_text('{"version":"18.8.0"}')
-            for name in receipt.LOCKS:
-                (source / name).write_text("fixture lock")
-                manifest["build_inputs"]["locks"][name] = receipt.digest(source / name)
-            request = root / "request.json"
-            request.write_text(json.dumps({"manifest": manifest, "runtime_image": IMAGE_DIGEST, "fork_manifest_sha256": FORK_SHA}))
-            cpu = root / "cpuinfo"
-            cpu.write_text("flags: ssse3 sse4_1 sse4_2 popcnt cx16 lahf_lm pni\n")
-            native = root / "native.node"
-            native.write_bytes(b"fixture native")
-            paths = {"/input/assets/request.json": request, "/input/assets/fork_boundary.json": fork_file(root),
-                     "/proc/cpuinfo": cpu,
-                     "/runtime": root / "runtime", "/workspace/source": source,
-                     "/workspace/omp": root / "omp", "/input/assets/omp-linux-amd64": assets / receipt.ASSETS[0]}
-            real_copyfile = shutil.copyfile
-
-            def copyfile(source, destination):
-                return real_copyfile(paths.get(str(source), source), destination)
-
-            with patch.object(qualify, "Path", side_effect=lambda value: paths.get(str(value), Path(value))), \
-                 patch.object(qualify.os, "uname", return_value=type("Uname", (), {"machine": "x86_64"})()), \
-                 patch.object(qualify, "Runtime", FakeRuntime), \
-                 patch.object(qualify, "prepare_dependencies", return_value=root / "grep"), \
-                 patch.object(qualify.shutil, "copytree"), patch.object(qualify.shutil, "copyfile", side_effect=copyfile), \
-                 patch.object(receipt, "elf", return_value=manifest["runtime"]["binary"]), \
-                 patch.object(qualify, "native_help", return_value=native), \
-                 patch.object(qualify, "offline_session"), patch.object(qualify, "require_markers"), \
-                 patch.object(qualify, "announce_stage", side_effect=stage):
-                with self.assertRaisesRegex(RuntimeError, "boundary fixture complete"):
-                    qualify.runtime_main()
-            boundaries = [call for call in calls if call[0][:2] == ["bun", "test"]]
-            self.assertEqual([call[0] for call in boundaries], fork_commands())
-            self.assertEqual(len(boundaries), 3)
-            controls = {"PI_TEST_RUNTIME": "1", "BUN_JSC_useConcurrentGC": "0", "BUN_JSC_numberOfGCMarkers": "1"}
-            for _command, environment, seconds in boundaries:
-                self.assertEqual({key: environment.get(key) for key in controls}, controls)
-                self.assertEqual(seconds, 240)
-            smoke = next(call for call in calls if call[0][-1] == "--smoke-test")
-            self.assertTrue(all(key not in smoke[1] for key in controls))
+        raised, _, _ = drive_runtime(FakeRuntime)
+        self.assertIsInstance(raised, RuntimeError)
+        self.assertRegex(str(raised), "boundary fixture complete")
+        boundaries = [call for call in calls if call[0][:2] == ["bun", "test"]]
+        self.assertEqual([call[0] for call in boundaries], fork_commands())
+        self.assertEqual(len(boundaries), 3)
+        controls = {"PI_TEST_RUNTIME": "1", "BUN_JSC_useConcurrentGC": "0", "BUN_JSC_numberOfGCMarkers": "1"}
+        for _command, environment, seconds in boundaries:
+            self.assertEqual({key: environment.get(key) for key in controls}, controls)
+            self.assertEqual(seconds, 240)
+        smoke = next(call for call in calls if call[0][-1] == "--smoke-test")
+        self.assertTrue(all(key not in smoke[1] for key in controls))
 
 
 class StageTests(unittest.TestCase):
@@ -1111,6 +1222,259 @@ class StageTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 qualify.forward_stages(io.BytesIO(b"qualify-boundary-alpha-contract-2\n"), names)
         self.assertEqual(output.getvalue(), "qualify-boundary-alpha-contract-1\nqualify-smoke\n")
+
+    def test_failed_test_lines_are_valid_stages_only_in_their_exact_shape(self):
+        for line in ("qualify-failed-timeout", "qualify-failed-no-test-name", "qualify-failed-a", "qualify-failed-a1-b2-c3",
+                     "qualify-failed-" + "a" * 96, "qualify-failed-" + "a" * 97):
+            self.assertTrue(qualify.valid_stage(line), line)
+        for line in ("qualify-failed-", "qualify-failed", "qualify-failed--a", "qualify-failed-a-", "qualify-failed-A",
+                     "qualify-failed-a_b", "qualify-failed-a.b", "qualify-failed-a b", "qualify-failed-a/b", "qualify-failed-a:b",
+                     "qualify-failed-a@b", "qualify-failed-a\n", "qualify-failed-\u00fc", "Qualify-failed-a", " qualify-failed-a",
+                     "qualify-failed-a ", "qualify-failed-" + "a" * 98, "qualify-failedx", "qualify-failed-\x00"):
+            self.assertFalse(qualify.valid_stage(line), repr(line))
+        self.assertEqual(len("qualify-failed-" + "a" * 97), 112)
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            qualify.announce_stage("qualify-failed-top-level-fail")
+            qualify.announce_stage("qualify-failed-timeout", inside=True)
+            for invalid in ("qualify-failed-a.b", "qualify-failed-" + "a" * 98):
+                with self.assertRaises(ValueError):
+                    qualify.announce_stage(invalid, inside=True)
+        self.assertEqual((out.getvalue(), err.getvalue()), ("qualify-failed-top-level-fail\n", "qualify-failed-timeout\n"))
+
+    def test_runtime_stage_forwarding_accepts_failed_test_lines_and_refuses_bad_ones_before_emitting(self):
+        names = frozenset({"qualify-boundary-alpha-contract-1"})
+        good = b"qualify-boundary-alpha-contract-1\nqualify-failed-suite-one-fails-twice\nqualify-failed-timeout\n"
+        eight = b"".join(b"qualify-failed-case-%d\n" % number for number in range(1, 9))
+        for payload in (good, eight, b"qualify-smoke\n" + eight + b"qualify-help\n"):
+            with self.subTest(payload=payload[:40]), contextlib.redirect_stdout(io.StringIO()) as output:
+                qualify.forward_stages(io.BytesIO(payload), names)
+            self.assertEqual(output.getvalue(), payload.decode())
+        ninth = eight + b"qualify-failed-case-9\n"
+        malformed = (b"qualify-smoke\nqualify-failed-a.b\n", b"qualify-failed-\n", b"qualify-failed-A\n", b"qualify-failed-a b\n",
+                     b"qualify-failed-a\n\n", b"qualify-failed-a", b"qualify-failed-a\xc3\xbc\n", b"qualify-failed-a/../b\n")
+        too_long = (b"qualify-failed-" + b"a" * 98 + b"\n", b"qualify-smoke\nqualify-failed-" + b"a-" * 60 + b"a\n")
+        for payload in (*malformed, *too_long, ninth, b"qualify-smoke\n" + ninth):
+            with self.subTest(payload=payload[:40]), contextlib.redirect_stdout(io.StringIO()) as output:
+                with self.assertRaises(ValueError):
+                    qualify.forward_stages(io.BytesIO(payload), names)
+                self.assertEqual(output.getvalue(), "")
+        # Only failed-test lines are counted: eight of them plus any number of ordinary stages is fine, and the cap is per run.
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            qualify.forward_stages(io.BytesIO(eight + b"qualify-help\n" * 5), names)
+        self.assertEqual(output.getvalue(), (eight + b"qualify-help\n" * 5).decode())
+
+
+class FailedStageTests(unittest.TestCase):
+    """qualify-failed-<name> lines: which boundary tests failed, as hyphenated names and nothing else."""
+
+    def test_bun_failure_output_names_each_failed_test_in_order(self):
+        self.assertEqual(qualify.failed_stages(1, BUN_FAILURES), FAILED_LINES)
+
+    def test_a_command_passes_only_with_exit_zero_a_passing_test_and_no_failure(self):
+        self.assertTrue(qualify.boundary_passed(0, b"\n 12 pass\n 0 fail\nRan 12 tests\n"))
+        self.assertTrue(qualify.boundary_passed(0, b"1 pass\n\n"))
+        for status, output in ((1, b" 12 pass\n"), (124, b" 12 pass\n"), (0, b" 0 pass\n"), (0, b""),
+                               (0, b" 12 pass\n 1 fail\n"), (0, b" 12 pass\n 10 fail\n")):
+            self.assertFalse(qualify.boundary_passed(status, output), (status, output))
+
+    def test_a_name_with_a_path_an_address_an_email_and_non_ascii_text_is_only_letters_digits_and_hyphens(self):
+        hostile = ("(fail) \u00fc/etc/passwd 192.168.0.1 fe80::1 user@example.org C:\\temp \x1b[31m\u65e5\u672c ../.. [1.00ms]\n").encode()
+        self.assertEqual(qualify.failed_stages(1, hostile),
+                         ["qualify-failed-etc-passwd-192-168-0-1-fe80-1-user-example-org-c-temp-31m"])
+        for output in (BUN_FAILURES, hostile, b"(fail) " + bytes(range(1, 256)).replace(b"\n", b"") + b"\n"):
+            for line in qualify.failed_stages(1, output):
+                self.assertRegex(line, r"\Aqualify-failed-[a-z0-9]+(-[a-z0-9]+)*\Z")
+                self.assertLessEqual(len(line), 112)
+                self.assertTrue(qualify.valid_stage(line))
+                for forbidden in "/\\.:@ \x1b\x00\n":
+                    self.assertNotIn(forbidden, line)
+
+    def test_a_long_name_is_cut_to_96_characters_and_never_ends_in_a_hyphen(self):
+        self.assertEqual(qualify.failed_stages(1, b"(fail) " + b"x" * 200 + b" [1.00ms]\n"), ["qualify-failed-" + "x" * 96])
+        self.assertEqual(qualify.failed_stages(1, b"(fail) " + b"x" * 95 + b" tail [1.00ms]\n"), ["qualify-failed-" + "x" * 95])
+        self.assertEqual(qualify.failed_stages(1, b"(fail) " + b"x" * 96 + b" tail [1.00ms]\n"), ["qualify-failed-" + "x" * 96])
+        for line in qualify.failed_stages(1, b"(fail) " + b"word " * 60 + b"[1.00ms]\n"):
+            self.assertLessEqual(len(line), 111)
+            self.assertFalse(line.endswith("-"))
+
+    def test_a_trailing_timing_and_a_carriage_return_are_dropped_but_other_brackets_stay(self):
+        self.assertEqual(qualify.failed_stages(1, b"(fail) a > b [12.34ms]\r\n(fail) c [1.50s]\n(fail) d [x]\n(fail) e [5ms] f\n"),
+                         ["qualify-failed-a-b", "qualify-failed-c", "qualify-failed-d-x", "qualify-failed-e-5ms-f"])
+
+    def test_a_name_that_slugs_to_nothing_is_skipped(self):
+        output = b"(fail) >>> [1.00ms]\n(fail) \n(fail) \xe6\x97\xa5\xe6\x9c\xac\n(fail) real one [2.00ms]\n"
+        self.assertEqual(qualify.failed_stages(1, output), ["qualify-failed-real-one"])
+        self.assertEqual(qualify.failed_stages(1, b"(fail) >>> [1.00ms]\n(fail) \n"), ["qualify-failed-no-test-name"])
+
+    def test_repeated_names_are_announced_once(self):
+        output = b"(fail) a > b [1.00ms]\n(fail) c [2.00ms]\n(fail) a > b [3.50ms]\n(fail) a.b\n(fail) A/B\n"
+        self.assertEqual(qualify.failed_stages(1, output), ["qualify-failed-a-b", "qualify-failed-c"])
+
+    def test_at_most_eight_lines_are_announced_and_a_timeout_line_is_never_cut(self):
+        output = b"".join(b"(fail) case %d [1.00ms]\n" % number for number in range(1, 13))
+        first_eight = [f"qualify-failed-case-{number}" for number in range(1, 9)]
+        self.assertEqual(qualify.failed_stages(1, output), first_eight)
+        self.assertEqual(qualify.failed_stages(124, output), ["qualify-failed-timeout", *first_eight[:7]])
+        self.assertEqual(len(qualify.failed_stages(1, output * 3)), 8)
+
+    def test_a_timeout_and_a_failure_without_a_test_name_have_their_own_lines(self):
+        for status in (124, 137):
+            self.assertEqual(qualify.failed_stages(status, b""), ["qualify-failed-timeout", "qualify-failed-no-test-name"])
+            self.assertEqual(qualify.failed_stages(status, b"(fail) slow one [30000.10ms]\n"),
+                             ["qualify-failed-timeout", "qualify-failed-slow-one"])
+        for status in (1, 2, 126, 127, 139, -9):
+            self.assertEqual(qualify.failed_stages(status, b"error: something private happened\n"), ["qualify-failed-no-test-name"])
+        self.assertEqual(qualify.failed_stages(0, b" 0 pass\n"), ["qualify-failed-no-test-name"])
+        self.assertEqual(qualify.failed_stages(0, b" 3 pass\n 1 fail\n(fail) one [1.00ms]\n"), ["qualify-failed-one"])
+
+    def test_only_a_fail_marker_at_the_start_of_a_line_names_a_test(self):
+        output = b"error: (fail) not a marker\n  (fail) indented\nlog (fail) x\n(fail)\n(fail)x\n(FAIL) upper\n"
+        self.assertEqual(qualify.failed_stages(1, output), ["qualify-failed-no-test-name"])
+
+
+class RuntimeCommandTests(unittest.TestCase):
+    """Runtime keeps every command's output in private files; the unchecked form also hands back a failing command's output."""
+
+    @contextlib.contextmanager
+    def fake(self, status, out=b"standard output", err=b"standard error"):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory, calls = Path(temporary), []
+
+            def fake_run(command, **kwargs):
+                calls.append((command, kwargs))
+                kwargs["stdout"].write(out)
+                kwargs["stderr"].write(err)
+                return subprocess.CompletedProcess(command, status)
+
+            with patch.object(qualify, "Path", side_effect=lambda value: directory if str(value) == "/runtime" else Path(value)), \
+                 patch.object(subprocess, "run", side_effect=fake_run):
+                yield qualify.Runtime({"PATH": "/fixture"}), calls, directory
+
+    def test_a_failing_command_returns_its_status_and_output_instead_of_raising(self):
+        with self.fake(3) as (runtime, calls, directory):
+            self.assertEqual(runtime.run_unchecked(["bun", "test", "a.test.ts"], "src"), (3, b"standard output", b"standard error"))
+            command, options = calls[0]
+            self.assertEqual(command, ["timeout", "--signal=TERM", "--kill-after=5s", "240s", "bun", "test", "a.test.ts"])
+            self.assertEqual((options["cwd"], options["timeout"], options["input"], options["env"]), ("src", 255, b"", {"PATH": "/fixture"}))
+            self.assertEqual(sorted(path.name for path in directory.iterdir()), ["command-1.err", "command-1.out"])
+            with self.assertRaises(ValueError):
+                runtime.run(["bun", "test", "a.test.ts"], "src")
+
+    def test_a_passing_command_reads_the_same_through_both_forms(self):
+        with self.fake(0) as (runtime, calls, _directory):
+            self.assertEqual(runtime.run(["x"], "src", 30), (b"standard output", b"standard error"))
+            self.assertEqual(runtime.run_unchecked(["x"], "src", 30), (0, b"standard output", b"standard error"))
+            self.assertEqual([call[0][3] for call in calls], ["30s", "30s"])
+            self.assertEqual([call[1]["timeout"] for call in calls], [45, 45])
+
+    def test_oversized_diagnostics_are_refused_by_both_forms(self):
+        big = b"x" * (8 * 1024 * 1024 + 1)
+        for status in (0, 1):
+            with self.subTest(status=status), self.fake(status, out=big) as (runtime, _calls, _directory):
+                with self.assertRaises(ValueError):
+                    runtime.run_unchecked(["x"], "src")
+        with self.fake(0, err=big) as (runtime, _calls, _directory):
+            with self.assertRaises(ValueError):
+                runtime.run(["x"], "src")
+        with self.fake(0, out=b"x" * (8 * 1024 * 1024)) as (runtime, _calls, _directory):
+            self.assertEqual(runtime.run_unchecked(["x"], "src")[0], 0)
+
+
+class BoundaryFailureTests(unittest.TestCase):
+    """The boundary loop names the failing tests on stderr (the stage channel) and then fails closed, as it always did."""
+
+    def drive(self, answers, **options):
+        calls = []
+        raised, stdout, stderr = drive_runtime(scripted_runtime(answers, calls), **options)
+        return raised, stdout, stderr.splitlines(), calls
+
+    def test_a_passing_run_announces_exactly_the_stages_it_always_did(self):
+        raised, stdout, stages, calls = self.drive([PASSING] * 3)
+        self.assertRegex(str(raised), "boundary fixture complete")
+        self.assertEqual(stages, SETUP_STAGES + BOUNDARY_STAGES + ["qualify-native-grep"])
+        self.assertEqual(stdout, "")
+        self.assertEqual(len(calls), 3)
+
+    def test_a_failing_command_announces_its_failed_tests_then_fails_closed_and_runs_nothing_more(self):
+        raised, stdout, stages, calls = self.drive([PASSING, (1, b"bun test v1.4.2 (744846f84)\n", BUN_FAILURES), PASSING])
+        self.assertIsInstance(raised, ValueError)
+        self.assertEqual(stages, SETUP_STAGES + BOUNDARY_STAGES[:2] + FAILED_LINES)
+        self.assertEqual(stdout, "")
+        self.assertEqual(len(calls), 2)
+
+    def test_a_timed_out_command_and_an_unnamed_failure_are_announced(self):
+        for status in (124, 137):
+            with self.subTest(status=status):
+                raised, _stdout, stages, _calls = self.drive([(status, b"", b"")])
+                self.assertIsInstance(raised, ValueError)
+                self.assertEqual(stages, SETUP_STAGES + BOUNDARY_STAGES[:1] + ["qualify-failed-timeout", "qualify-failed-no-test-name"])
+        raised, _stdout, stages, _calls = self.drive([(1, b"error: private text\n", b"panic at /home/ompbuild/secret 10.1.2.3\n")])
+        self.assertIsInstance(raised, ValueError)
+        self.assertEqual(stages, SETUP_STAGES + BOUNDARY_STAGES[:1] + ["qualify-failed-no-test-name"])
+
+    def test_exit_zero_without_a_passing_test_or_with_a_failure_is_named_too(self):
+        raised, _stdout, stages, _calls = self.drive([(0, b"", b" 0 pass\n")])
+        self.assertIsInstance(raised, ValueError)
+        self.assertEqual(stages[-1:], ["qualify-failed-no-test-name"])
+        raised, _stdout, stages, _calls = self.drive([(0, b"", b"(fail) one [1.00ms]\n 3 pass\n 1 fail\n")])
+        self.assertIsInstance(raised, ValueError)
+        self.assertEqual(stages[-1:], ["qualify-failed-one"])
+
+    def test_the_inside_entry_point_prints_only_stage_lines_and_exits_one(self):
+        raised, stdout, stages, _calls = self.drive([PASSING, (1, b"", BUN_FAILURES)], entry=qualify.main, argv=("qualify", "--inside"))
+        self.assertIsInstance(raised, SystemExit)
+        self.assertEqual(raised.code, 1)
+        self.assertEqual(stdout, "")
+        self.assertEqual(stages, SETUP_STAGES + BOUNDARY_STAGES[:2] + FAILED_LINES)
+        shown = "\n".join(stages)
+        for private in ("/home/ompbuild", "10.1.2.3", "a@b.example", "bun test", "744846f84", "[0.64ms]", "Ran 6 tests", "\u00fc"):
+            self.assertNotIn(private, shown)
+
+    def test_the_hosts_forwarding_and_the_doors_own_filters_pass_the_failed_lines_on(self):
+        progress, address = door_filters()
+        raised, _stdout, stages, _calls = self.drive([PASSING, (124, b"", BUN_FAILURES)])
+        self.assertIsInstance(raised, ValueError)
+        with contextlib.redirect_stdout(io.StringIO()) as forwarded:
+            qualify.forward_stages(io.BytesIO(("\n".join(stages) + "\n").encode()), frozenset(BOUNDARY_STAGES))
+        lines = forwarded.getvalue().splitlines()
+        self.assertEqual(lines, stages)
+        self.assertEqual([line for line in lines if line.startswith("qualify-failed-")], ["qualify-failed-timeout", *FAILED_LINES])
+        for line in lines:
+            self.assertIsNotNone(progress.fullmatch(line), line)
+            self.assertIsNone(address.search(line), line)
+
+
+class DoorFilterTests(unittest.TestCase):
+    """The door (scripts/ci001/omp-build-entry, installed on ci-001, never edited here) forwards only allowlisted shapes."""
+
+    def test_the_doors_filters_were_read_from_the_entry_file(self):
+        progress, address = door_filters()
+        self.assertIsNotNone(progress.fullmatch("qualify-boundary-alpha-contract-1"))
+        self.assertIsNotNone(progress.fullmatch("Phase: door qualify."))
+        self.assertIsNotNone(address.search("10.1.2.3"))
+        self.assertIsNotNone(address.search("fe80::1:"))
+
+    def test_every_failed_line_the_recipe_can_make_is_forwarded_and_never_dropped_as_an_address(self):
+        progress, address = door_filters()
+        hostile = b"(fail) 192.168.0.1 fe80::1 10.0.0.1:8080 user@example.org /home/ompbuild/x.ts a:b:c dead:beef:: [1.00ms]\n"
+        numbers = b"".join(b"(fail) %d.%d.%d.%d\n" % (n, n, n, n) for n in (1, 10, 100, 255)) + b"(fail) 1:2:3:4\n(fail) ::1\n(fail) abcd:ef12:\n"
+        samples = [*qualify.failed_stages(1, BUN_FAILURES), *qualify.failed_stages(124, hostile), *qualify.failed_stages(1, numbers),
+                   *qualify.failed_stages(137, b""), *qualify.failed_stages(1, b""), "qualify-failed-" + "a" * 97, "qualify-failed-0"]
+        self.assertGreater(len(samples), 12)
+        for line in samples:
+            self.assertTrue(qualify.valid_stage(line), line)
+            self.assertIsNotNone(progress.fullmatch(line), line)
+            self.assertIsNone(address.search(line), line)
+
+    def test_the_door_still_drops_anything_that_is_not_a_plain_hyphenated_name(self):
+        progress, address = door_filters()
+
+        def forwarded(text):
+            return progress.fullmatch(text) is not None and address.search(text) is None
+
+        for dropped in ("qualify-failed-a.b", "qualify-failed-a:b:c", "qualify-failed-10.1.2.3", "qualify-failed-a/b", "qualify-failed-a@b",
+                        "qualify-failed-A", "qualify-failed-a b", "qualify-failed-", "(fail) suite one > x", "qualify-failed-a\n"):
+            self.assertFalse(forwarded(dropped), dropped)
 
 
 if __name__ == "__main__":
