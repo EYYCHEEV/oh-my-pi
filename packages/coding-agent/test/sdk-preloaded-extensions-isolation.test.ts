@@ -546,6 +546,11 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 			model: "claude-sonnet-4-5",
 		});
 		await persisted.close();
+		// Restoring that model needs a usable key; a test-local key keeps the test independent of the shell
+		// (scripts/ci-test-ts.ts and the Linux qualification strip every provider credential).
+		const coldAuthStorage = createInMemoryAuthStorage();
+		coldAuthStorage.keys.setRuntime("anthropic", "test-key");
+		const coldModelRegistry = new ModelRegistry(coldAuthStorage, path.join(sharedDir, "models.yml"));
 		const factory = createPersistedSubagentReviverFactory({
 			session: {
 				sessionManager: {
@@ -553,8 +558,8 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 					getArtifactManager: () => undefined,
 				},
 			} as unknown as AgentSession,
-			authStorage,
-			modelRegistry,
+			authStorage: coldAuthStorage,
+			modelRegistry: coldModelRegistry,
 			settings,
 			enableLsp: false,
 			requiredExtension: required,
@@ -590,6 +595,7 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 			await expect(mismatchedRevive(registeredRef)).rejects.toMatchObject({ code: "hash-mismatch" });
 		} finally {
 			AgentRegistry.global().unregister(ref.id, registeredRef);
+			coldAuthStorage.close();
 		}
 	});
 });
