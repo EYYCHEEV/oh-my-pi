@@ -1114,6 +1114,42 @@ describe("structured subagent primitive", () => {
 		await fs.rm(restrictedRun.artifactsDir, { recursive: true, force: true });
 	});
 
+	it("keeps the owner's prepared extensions for restricted and plan-mode children so policy hooks stay bound", async () => {
+		mockDiscovery();
+		const preparedExtensions = [
+			{ path: "<owner-policy>", resolvedPath: "<owner-policy>", factory: () => {}, error: null },
+		] as NonNullable<ToolSession["preparedExtensions"]>;
+		const requiredExtension = {
+			path: "/plugins/required.ts",
+			extensionId: "extension-module:required",
+			expectedSha256: "0".repeat(64),
+		} as NonNullable<ToolSession["requiredExtension"]>;
+		const planSession = session({ planMode: true });
+		Object.assign(planSession, { preparedExtensions, requiredExtension });
+		const restrictedSession = session();
+		Object.assign(restrictedSession, { restrictToolNames: true, preparedExtensions, requiredExtension });
+		const options = [] as executorModule.ExecutorOptions[];
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async executorOptions => {
+			options.push(executorOptions);
+			return result();
+		});
+
+		const planRun = await runStructuredSubagent(request({ session: planSession, retainArtifacts: true }));
+		const restrictedRun = await runStructuredSubagent(request({ session: restrictedSession, retainArtifacts: true }));
+
+		expect(options).toHaveLength(2);
+		for (const forwarded of options) {
+			// The owner's factories travel as the same list; the required extension, paths and tools do not.
+			expect(forwarded.restrictToolNames).toBe(true);
+			expect(forwarded.preloadedPreparedExtensions).toBe(preparedExtensions);
+			expect(forwarded.preloadedExtensionPaths).toEqual([]);
+			expect(forwarded.requiredExtension).toBeUndefined();
+			expect(forwarded.preloadedCustomToolPaths).toEqual([]);
+		}
+		await fs.rm(planRun.artifactsDir, { recursive: true, force: true });
+		await fs.rm(restrictedRun.artifactsDir, { recursive: true, force: true });
+	});
+
 	it("unregisters and removes a temporary lease when output ID allocation fails", async () => {
 		mockDiscovery();
 		const failingSession = session();

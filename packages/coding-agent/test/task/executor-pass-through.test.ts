@@ -351,12 +351,36 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(forwarded?.mcpTools).toBeUndefined();
 		expect(forwarded?.preloadedExtensionPaths).toEqual([]);
 		expect(forwarded?.requiredExtension).toBeUndefined();
-		expect(forwarded?.preloadedPreparedExtensions).toEqual([]);
 		expect(forwarded?.preloadedCustomToolPaths).toEqual([]);
 		expect(getTools).not.toHaveBeenCalled();
 		expect(forwarded?.outputSchemaMode).toBe("strict");
 		expect(persistedInits).toHaveLength(1);
 		expect(persistedInits[0]).toMatchObject({ restrictToolNames: true, tools: ["read", "yield"] });
+	});
+
+	it("keeps the owner's prepared extensions for a restricted child so inherited policy hooks stay bound", async () => {
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const preloadedPreparedExtensions: PreparedExtension[] = [
+			{ path: "<owner-policy>", resolvedPath: "<owner-policy>", factory: () => {}, error: null },
+		];
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "restricted-policy-child",
+			restrictToolNames: true,
+			preloadedExtensionPaths: ["/hostile/extensions/read.ts"],
+			preloadedPreparedExtensions,
+		});
+
+		expect(result.exitCode).toBe(0);
+		const forwarded = spy.mock.calls[0]?.[0];
+		// The owner's factories travel as the same list; discovered paths, the required extension and tools do not.
+		expect(forwarded?.restrictToolNames).toBe(true);
+		expect(forwarded?.preloadedPreparedExtensions).toBe(preloadedPreparedExtensions);
+		expect(forwarded?.preloadedExtensionPaths).toEqual([]);
+		expect(forwarded?.requiredExtension).toBeUndefined();
+		expect(forwarded?.preloadedCustomToolPaths).toEqual([]);
 	});
 
 	it("persists xd://-mounted tools from the enabled set", async () => {

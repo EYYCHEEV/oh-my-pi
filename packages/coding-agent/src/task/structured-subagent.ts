@@ -665,7 +665,9 @@ function buildExecutorOptions(
 		extensionRoots: session.effectiveExtensionRoots?.bind(session),
 		preloadedExtensionPaths: restrictToolNames ? [] : session.extensionPaths,
 		requiredExtension: restrictToolNames ? undefined : session.requiredExtension,
-		preloadedPreparedExtensions: restrictToolNames ? [] : session.preparedExtensions,
+		// Restricted children keep the owner's prepared extensions so its `tool_call`
+		// policy hooks stay bound; the SDK registers no extension tools for them.
+		preloadedPreparedExtensions: session.preparedExtensions,
 		preloadedCustomToolPaths: restrictToolNames ? [] : session.customToolPaths,
 		localProtocolOptions,
 		parentArtifactManager: preparedSession ? undefined : (session.getArtifactManager?.() ?? undefined),

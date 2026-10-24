@@ -4648,7 +4648,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					extensionRoots: options.extensionRoots,
 					preloadedExtensionPaths: restrictToolNames ? [] : options.preloadedExtensionPaths,
 					requiredExtension: restrictToolNames ? undefined : options.requiredExtension,
-					preloadedPreparedExtensions: restrictToolNames ? [] : options.preloadedPreparedExtensions,
+					// Restricted children keep the owner's prepared extensions so its `tool_call`
+					// policy hooks stay bound; the SDK registers no extension tools for them.
+					preloadedPreparedExtensions: options.preloadedPreparedExtensions,
 					preloadedCustomToolPaths: restrictToolNames ? [] : options.preloadedCustomToolPaths,
 					hasUI: false,
 					prewalk,

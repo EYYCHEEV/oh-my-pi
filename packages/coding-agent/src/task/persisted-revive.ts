@@ -275,6 +275,10 @@ export function createPersistedSubagentReviverFactory(
 					systemPrompt: () => [...init.systemPrompt],
 					// Inherit current owner policy, never extension authority from a transcript.
 					extensionRoots: () => ctx.session.effectiveExtensionRoots,
+					// The owner's prepared extensions rebind even for a restricted revival so its
+					// `tool_call` policy hooks stay in force. They bring hooks only: a restricted
+					// session registers no extension tools, MCP or discovered capabilities.
+					preloadedPreparedExtensions: ctx.session.preparedExtensions,
 					// Old files predate persisted spawns: deny re-spawning rather than let
 					// createAgentSession default to wildcard ("*").
 					spawns: init.spawns ?? "",
@@ -285,12 +289,10 @@ export function createPersistedSubagentReviverFactory(
 								enableIrc: false,
 								enableMCP: false,
 								preloadedExtensionPaths: [],
-								preloadedPreparedExtensions: [],
 								preloadedCustomToolPaths: [],
 							}
 						: {
 								requiredExtension: ctx.requiredExtension,
-								preloadedPreparedExtensions: ctx.session.preparedExtensions,
 								preloadedExtensionPaths: ctx.extensionPaths ? [...ctx.extensionPaths] : undefined,
 								enableMCP: !mcpManager,
 								mcpManager,
