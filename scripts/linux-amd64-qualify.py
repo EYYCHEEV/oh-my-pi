@@ -73,14 +73,33 @@ FAILED_STAGE_LINES = 8
 FAILED_SLUG_CHARS = 96
 FAILED_TIMEOUT_STATUSES = (124, 137)  # the timeout command's own status, and its status after the kill
 BUN_TIMING = re.compile(rb" \[[0-9.]+(?:ms|s)\]$")
+# After the names, up to four more lines say why a test failed (see failed_reasons): a kind chosen from fixed shapes, then the base
+# name and line of the first stack frame inside the source root. Message text, values and paths are never used.
+FAILED_REASON_PREFIX = FAILED_PREFIX + "why-"
+FAILED_REASON_CHARS = 140
+FAILED_REASON_LINES = 4
+FAILED_FILE_CHARS = 48
+BUN_RESULT_LINES = (b"(pass) ", b"(skip) ", b"(todo) ", b"(fail) ")
+BUN_TIMEOUT_NOTE = re.compile(rb"\s*\^ this test timed out after [0-9]+ms\.?\s*")
+BUN_EXPECT = re.compile(rb"expect\(received\)\.(?:(resolves|rejects)\.)?(?:(not)\.)?(to[A-Za-z]{0,38})\(")
+BUN_ERROR_CODE = re.compile(rb"(E[A-Z0-9]{2,15}):")
+BUN_ERROR_CLASS = re.compile(rb"([A-Za-z]{0,35}Error):")
+BUN_CLASS_LINE = re.compile(rb"[A-Za-z]{0,35}Error: ")
+BUN_FRAME = re.compile(rb"\s+at (?:[^()]* \()?(/[^()]*):([0-9]{1,6}):[0-9]+\)?\s*")
 
 
 def boundary_stage(contract, number):
     return f"qualify-boundary-{contract}-{number}"
 
 
+def reason_stage(value):
+    return value.startswith(FAILED_REASON_PREFIX)
+
+
 def failed_stage(value):
-    return len(value) <= FAILED_STAGE_CHARS and FAILED_STAGE.fullmatch(value) is not None
+    # A reason line may be longer than a name line, and only a line that starts with the reason prefix gets the longer limit.
+    limit = FAILED_REASON_CHARS if reason_stage(value) else FAILED_STAGE_CHARS
+    return len(value) <= limit and FAILED_STAGE.fullmatch(value) is not None
 
 
 def valid_stage(value, boundaries=frozenset()):
@@ -100,7 +119,9 @@ def forward_stages(stream, boundaries=frozenset()):
     require(len(data) <= STAGE_BYTES, "Invalid qualification stages")
     lines = data.decode("ascii").splitlines(keepends=True)
     require(all(line.endswith("\n") and valid_stage(line[:-1], boundaries) for line in lines), "Invalid qualification stage")
-    require(sum(failed_stage(line[:-1]) for line in lines) <= FAILED_STAGE_LINES, "Invalid qualification stages")
+    failed = [line[:-1] for line in lines if failed_stage(line[:-1])]
+    reasons = sum(reason_stage(line) for line in failed)
+    require(len(failed) - reasons <= FAILED_STAGE_LINES and reasons <= FAILED_REASON_LINES, "Invalid qualification stages")
     for line in lines:
         announce_stage(line[:-1], boundaries=boundaries)
 
@@ -508,7 +529,10 @@ def boundary_passed(status, combined):
 def failed_name(line):
     """The name in one Bun `(fail) <describe > test> [12.34ms]` line: lowercase letters and digits with single hyphens, at most 96 characters."""
     name = BUN_TIMING.sub(b"", line[len(b"(fail) "):].rstrip(b"\r")).lower()
-    return re.sub(rb"[^a-z0-9]+", b"-", name).strip(b"-")[:FAILED_SLUG_CHARS].strip(b"-").decode("ascii")
+    slug = re.sub(rb"[^a-z0-9]+", b"-", name).strip(b"-")
+    if slug == b"why" or slug.startswith(b"why-"):
+        slug = b"test-" + slug  # a test name never poses as a reason line
+    return slug[:FAILED_SLUG_CHARS].strip(b"-").decode("ascii")
 
 
 def failed_stages(status, combined):
@@ -528,6 +552,89 @@ def failed_stages(status, combined):
     if not names:
         words.append("no-test-name")
     return [FAILED_PREFIX + word for word in words[:FAILED_STAGE_LINES]]
+
+
+def failure_header(block):
+    """(index, message) of the first Bun error header in a failure block: `error: <message>`, or the bare `<Name>Error: <message>`
+    that Bun 1.4.2 prints for every error class except Error itself. Nothing else decides the kind."""
+    for index, line in enumerate(block):
+        line = line.rstrip(b"\r")
+        if line.startswith(b"error: "):
+            return index, line[len(b"error: "):]
+        if BUN_CLASS_LINE.match(line):
+            return index, line
+    return None
+
+
+def failure_kind(message):
+    """One of a fixed set of shapes, in this order: `expect-[resolves-|rejects-][not-]<matcher>`, an error code (`eacces`), an
+    error class (`typeerror`), `timeout`, `error`. Each is lowercase letters and digits; a name over its limit is not shortened,
+    it just falls through to the next shape."""
+    found = BUN_EXPECT.match(message)
+    if found:
+        modifiers = [part.decode() for part in found.group(1, 2) if part]
+        return "-".join(["expect", *modifiers, found[3].lower().decode()])
+    found = BUN_ERROR_CODE.match(message) or BUN_ERROR_CLASS.match(message)
+    if found:
+        return found[1].lower().decode()
+    lowered = message.lower()
+    return "timeout" if b"timed out" in lowered or b"timeout" in lowered else "error"
+
+
+def failure_location(lines, root):
+    """(file, line) of the first stack frame inside `root`: the base name as a slug of at most 48 characters, and the line number.
+
+    Frames outside the root, with a `..` step, with an empty slug or with a line over six digits are skipped."""
+    for line in lines:
+        found = BUN_FRAME.fullmatch(line.rstrip(b"\r"))
+        if found is None or not found[1].startswith(root) or b".." in found[1].split(b"/"):
+            continue
+        base = re.sub(rb"[^a-z0-9]+", b"-", found[1].rsplit(b"/", 1)[1].lower()).strip(b"-")[:FAILED_FILE_CHARS].strip(b"-")
+        if base:
+            return base.decode("ascii"), int(found[2])
+    return None
+
+
+def failure_reason(block, note, root):
+    """One `qualify-failed-why-` line for one failed test, or None when it cannot be made a valid stage line.
+
+    `block` is the output after the previous test result line, up to this test's `(fail) ` line; `note` is the line right after
+    that `(fail) ` line. Bun prints a per-test timeout as `  ^ this test timed out after 100ms.` there, and prints no error."""
+    header = failure_header(block)
+    if BUN_TIMEOUT_NOTE.fullmatch(note):
+        words = ["timeout"]
+    elif header is None:
+        words = ["no-error-line"]
+    else:
+        index, message = header
+        words = [failure_kind(message)]
+        where = failure_location(block[index + 1:], root)
+        if where is not None:
+            words += ["at", where[0], str(where[1])]
+    line = FAILED_REASON_PREFIX + "-".join(words)
+    return line if failed_stage(line) else None
+
+
+def failed_reasons(combined, source):
+    """Up to four `qualify-failed-why-<kind>[-at-<file>-<line>]` lines for one failed boundary command, one per distinct reason.
+
+    Bun prints a failure's error header and stack before its `(fail) ` line, so a failure's block starts after the previous
+    test result line (pass, skip, todo or fail). The location is the first frame inside `source`: only the base file name and the
+    line number are used. No `(fail) ` line, no reason."""
+    root = str(source).rstrip("/").encode() + b"/"
+    lines = combined.split(b"\n")
+    reasons, start = [], 0
+    for index, line in enumerate(lines):
+        if not line.startswith(BUN_RESULT_LINES):
+            continue
+        if line.startswith(b"(fail) "):
+            reason = failure_reason(lines[start:index], lines[index + 1] if index + 1 < len(lines) else b"", root)
+            if reason is not None and reason not in reasons:
+                reasons.append(reason)
+                if len(reasons) == FAILED_REASON_LINES:
+                    break
+        start = index + 1
+    return reasons
 
 
 def dependency_roots(source):
@@ -733,8 +840,9 @@ def runtime_main():
         combined = output + b"\n" + error
         passed = boundary_passed(status, combined)
         if not passed:
-            # Test names only, on the stage channel, before failing closed; the output itself stays in the private files.
-            for line in failed_stages(status, combined):
+            # Test names, then why each failed (kind, file, line), on the stage channel before failing closed; the output itself
+            # stays in the private files.
+            for line in (*failed_stages(status, combined), *failed_reasons(combined, source)):
                 announce_stage(line, inside=True, boundaries=known)
         require(passed, "Boundary command failed or ran no passing tests")
     announce_stage("qualify-native-grep", inside=True)

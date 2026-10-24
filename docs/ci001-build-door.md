@@ -691,6 +691,10 @@ Stop at the first step that does not match, keep the output, and report it; do n
    When qualification fails at an application test, the progress lines name it: after the `qualify-` stage of the failed command come at most eight `qualify-failed-<test name>` lines, one per failed test in Bun's order.
    `qualify-failed-timeout` comes first when the command timed out, so the cap never hides it, and `qualify-failed-no-test-name` stands for a failure that named no test or a run with no passing test.
    A name is lowercase letters, digits and hyphens only, cut at 96 characters, so it never carries a path, an address, an email or any other output text; the door passes these lines like every other `qualify-` stage, and the rest of the test output stays on the builder.
+   After the names come at most four `qualify-failed-why-<kind>-at-<file>-<line>` lines (`qualify-failed-why-<kind>` when no location is found), one per distinct reason, in the order they first appear, saying why a test failed.
+   The kind is a fixed word: `expect-<matcher>`, `expect-not-<matcher>`, or the same with `resolves-` or `rejects-` after `expect-` (for example `expect-tobe`), a Bun error code in lowercase (`eacces`, `enoent`), an error class in lowercase (`typeerror`), `timeout` (a test timeout), `error` for any other message, or `no-error-line` when Bun printed no error for that test.
+   The file and line are those of the first stack frame inside the application source, as the base name only (`agent-session-handoff-test-ts-123`), never a folder.
+   No message text, expected or received value, path or address is ever reported, and a test whose name starts with `why` is shown as `qualify-failed-test-why-...` so a name cannot pose as a reason.
 4. Proof of removal (Main, as root, after step 3):
 
    ```bash

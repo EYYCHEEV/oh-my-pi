@@ -1027,6 +1027,182 @@ SETUP_STAGES = ["qualify-request", "qualify-cpu", "qualify-source", "qualify-bin
                 "qualify-help", "qualify-smoke", "qualify-offline-session", "qualify-markers", "qualify-native-addon"]
 BOUNDARY_STAGES = ["qualify-boundary-alpha-contract-1", "qualify-boundary-alpha-contract-2", "qualify-boundary-beta-contract-1"]
 
+# Real Bun 1.4.2 output for failing tests, captured on the Mac from a throwaway test file that is not kept. Its folder is shown as
+# the container's source root, and the fake token in one thrown message is the only other edit. Three shapes matter here: the
+# error block (with its source context) comes before its `(fail)` line; an error class other than Error prints without the
+# `error: ` prefix; and a test timeout adds a note line after its `(fail)` line.
+REAL_HEAD = b"\n".join([
+    b'',
+    b'throwaway.test.ts:',
+    b'error: noise from a passing test',
+    b'(pass) suite one > passes fine [0.02ms]',
+]) + b"\n"
+REAL_FAILURES = {
+    'expect toBe fails': b"\n".join([
+        b' 5 | \ttest("passes fine", () => {',
+        b' 6 | \t\tconsole.error("error: noise from a passing test");',
+        b' 7 | \t\texpect(1).toBe(1);',
+        b' 8 | \t});',
+        b' 9 | \ttest("expect toBe fails", () => {',
+        b'10 | \t\texpect(1).toBe(2);',
+        b'                 ^',
+        b'error: expect(received).toBe(expected)',
+        b'',
+        b'Expected: 2',
+        b'Received: 1',
+        b'',
+        b'      at <anonymous> (/workspace/source/throwaway.test.ts:10:13)',
+        b'(fail) suite one > expect toBe fails [0.18ms]',
+    ]) + b"\n",
+    'expect not toBe fails': b"\n".join([
+        b' 8 | \t});',
+        b' 9 | \ttest("expect toBe fails", () => {',
+        b'10 | \t\texpect(1).toBe(2);',
+        b'11 | \t});',
+        b'12 | \ttest("expect not toBe fails", () => {',
+        b'13 | \t\texpect(1).not.toBe(1);',
+        b'                     ^',
+        b'error: expect(received).not.toBe(expected)',
+        b'',
+        b'Expected: not 1',
+        b'',
+        b'      at <anonymous> (/workspace/source/throwaway.test.ts:13:17)',
+        b'(fail) suite one > expect not toBe fails [0.03ms]',
+    ]) + b"\n",
+    'expect toEqual fails': b"\n".join([
+        b'11 | \t});',
+        b'12 | \ttest("expect not toBe fails", () => {',
+        b'13 | \t\texpect(1).not.toBe(1);',
+        b'14 | \t});',
+        b'15 | \ttest("expect toEqual fails", () => {',
+        b'16 | \t\texpect({ a: 1 }).toEqual({ a: 2 });',
+        b'                        ^',
+        b'error: expect(received).toEqual(expected)',
+        b'',
+        b'  {',
+        b'-   "a": 2,',
+        b'+   "a": 1,',
+        b'  }',
+        b'',
+        b'- Expected  - 1',
+        b'+ Received  + 1',
+        b'',
+        b'      at <anonymous> (/workspace/source/throwaway.test.ts:16:20)',
+        b'(fail) suite one > expect toEqual fails [0.14ms]',
+    ]) + b"\n",
+    'expect toHaveLength fails': b"\n".join([
+        b'14 | \t});',
+        b'15 | \ttest("expect toEqual fails", () => {',
+        b'16 | \t\texpect({ a: 1 }).toEqual({ a: 2 });',
+        b'17 | \t});',
+        b'18 | \ttest("expect toHaveLength fails", () => {',
+        b'19 | \t\texpect([1]).toHaveLength(3);',
+        b'                   ^',
+        b'error: expect(received).toHaveLength(expected)',
+        b'',
+        b'Expected length: 3',
+        b'Received length: 1',
+        b'',
+        b'      at <anonymous> (/workspace/source/throwaway.test.ts:19:15)',
+        b'(fail) suite one > expect toHaveLength fails [0.03ms]',
+    ]) + b"\n",
+    'thrown Error': b"\n".join([
+        b'17 | \t});',
+        b'18 | \ttest("expect toHaveLength fails", () => {',
+        b'19 | \t\texpect([1]).toHaveLength(3);',
+        b'20 | \t});',
+        b'21 | \ttest("thrown Error", () => {',
+        b'22 | \t\tthrow new Error("boom /home/ompbuild/secret 10.1.2.3 sk-test-0123456789abcdef");',
+        b'                                                                                    ^',
+        b'error: boom /home/ompbuild/secret 10.1.2.3 sk-test-0123456789abcdef',
+        b'      at <anonymous> (/workspace/source/throwaway.test.ts:22:80)',
+        b'(fail) suite one > thrown Error [0.03ms]',
+    ]) + b"\n",
+    'thrown TypeError': b"\n".join([
+        b'20 | \t});',
+        b'21 | \ttest("thrown Error", () => {',
+        b'22 | \t\tthrow new Error("boom /home/ompbuild/secret 10.1.2.3 sk-test-0123456789abcdef");',
+        b'23 | \t});',
+        b'24 | \ttest("thrown TypeError", () => {',
+        b'25 | \t\tthrow new TypeError("x is not a function");',
+        b'                                                ^',
+        b'TypeError: x is not a function',
+        b'      at <anonymous> (/workspace/source/throwaway.test.ts:25:44)',
+        b'(fail) suite one > thrown TypeError [0.02ms]',
+    ]) + b"\n",
+    'thrown EACCES': b"\n".join([
+        b'23 | \t});',
+        b'24 | \ttest("thrown TypeError", () => {',
+        b'25 | \t\tthrow new TypeError("x is not a function");',
+        b'26 | \t});',
+        b'27 | \ttest("thrown EACCES", () => {',
+        b'28 | \t\tthrow new Error("EACCES: permission denied, open \'/home/ompbuild/x\'");',
+        b'                                                                           ^',
+        b"error: EACCES: permission denied, open '/home/ompbuild/x'",
+        b'      at <anonymous> (/workspace/source/throwaway.test.ts:28:71)',
+        b'(fail) suite one > thrown EACCES [0.02ms]',
+    ]) + b"\n",
+    'real fs EROFS or ENOENT': b"\n".join([
+        b'26 | \t});',
+        b'27 | \ttest("thrown EACCES", () => {',
+        b'28 | \t\tthrow new Error("EACCES: permission denied, open \'/home/ompbuild/x\'");',
+        b'29 | \t});',
+        b'30 | \ttest("real fs EROFS or ENOENT", () => {',
+        b'31 | \t\tfs.writeFileSync("/nonexistent-dir-a6/x.txt", "x");',
+        b'          ^',
+        b"error: ENOENT: no such file or directory, open '/nonexistent-dir-a6/x.txt'",
+        b'      at <anonymous> (/workspace/source/throwaway.test.ts:31:6)',
+        b'(fail) suite one > real fs EROFS or ENOENT [0.05ms]',
+    ]) + b"\n",
+    'times out': b"\n".join([
+        b'(fail) suite one > times out [100.54ms]',
+        b'  ^ this test timed out after 100ms.',
+    ]) + b"\n",
+    'async rejection': b"\n".join([
+        b'32 | \t});',
+        b'33 | \ttest("times out", async () => {',
+        b'34 | \t\tawait new Promise(resolve => setTimeout(resolve, 600));',
+        b'35 | \t}, 100);',
+        b'36 | \ttest("async rejection", async () => {',
+        b'37 | \t\tawait Promise.reject(new RangeError("out of range"));',
+        b'                                ^',
+        b'RangeError: out of range',
+        b'      at <anonymous> (/workspace/source/throwaway.test.ts:37:28)',
+        b'(fail) suite one > async rejection [0.21ms]',
+    ]) + b"\n",
+}
+REAL_TAIL = b"\n".join([
+    b'',
+    b' 1 pass',
+    b' 10 fail',
+    b' 5 expect() calls',
+    b'Ran 11 tests across 1 file. [105.00ms]',
+]) + b"\n"
+REAL_ALL = REAL_HEAD + b"".join(REAL_FAILURES.values()) + REAL_TAIL
+SOURCE = Path("/workspace/source")
+# Why each real failure failed, as the recipe must say it: the kind, then the base file name and line of the first frame in the root.
+REAL_REASONS = {
+    "expect toBe fails": "qualify-failed-why-expect-tobe-at-throwaway-test-ts-10",
+    "expect not toBe fails": "qualify-failed-why-expect-not-tobe-at-throwaway-test-ts-13",
+    "expect toEqual fails": "qualify-failed-why-expect-toequal-at-throwaway-test-ts-16",
+    "expect toHaveLength fails": "qualify-failed-why-expect-tohavelength-at-throwaway-test-ts-19",
+    "thrown Error": "qualify-failed-why-error-at-throwaway-test-ts-22",
+    "thrown TypeError": "qualify-failed-why-typeerror-at-throwaway-test-ts-25",
+    "thrown EACCES": "qualify-failed-why-eacces-at-throwaway-test-ts-28",
+    "real fs EROFS or ENOENT": "qualify-failed-why-enoent-at-throwaway-test-ts-31",
+    "times out": "qualify-failed-why-timeout",
+    "async rejection": "qualify-failed-why-rangeerror-at-throwaway-test-ts-37",
+}
+# The first eight of the ten real failures, named as before (the cap is eight).
+REAL_NAME_LINES = [
+    "qualify-failed-suite-one-expect-tobe-fails", "qualify-failed-suite-one-expect-not-tobe-fails",
+    "qualify-failed-suite-one-expect-toequal-fails", "qualify-failed-suite-one-expect-tohavelength-fails",
+    "qualify-failed-suite-one-thrown-error", "qualify-failed-suite-one-thrown-typeerror",
+    "qualify-failed-suite-one-thrown-eacces", "qualify-failed-suite-one-real-fs-erofs-or-enoent",
+]
+# A `(fail)` line with no error block before it has no error line: that is the reason the older fixtures now also carry.
+NO_REASON = ["qualify-failed-why-no-error-line"]
+
 
 def drive_runtime(runtime_class, entry=None, argv=("qualify",)):
     """Run runtime_main (or `entry`) in a fixture tree, against a Runtime double, up to the native-grep stage.
@@ -1110,7 +1286,10 @@ def scripted_runtime(answers, bun_calls):
             args = list(map(str, command))
             if args[:2] == ["bun", "test"]:
                 bun_calls.append(args)
-                return next(queue)
+                status, out, err = next(queue)
+                # The fixtures name the container's source root; the double answers with the root this run really uses.
+                root = str(cwd).encode()
+                return status, out.replace(b"/workspace/source", root), err.replace(b"/workspace/source", root)
             return (0, *self.run(command, cwd, seconds))
 
     return Scripted
@@ -1263,6 +1442,43 @@ class StageTests(unittest.TestCase):
             qualify.forward_stages(io.BytesIO(eight + b"qualify-help\n" * 5), names)
         self.assertEqual(output.getvalue(), (eight + b"qualify-help\n" * 5).decode())
 
+    def test_reason_lines_are_valid_stages_only_in_their_exact_shape_and_up_to_140_characters(self):
+        for line in ("qualify-failed-why-error", "qualify-failed-why-no-error-line", "qualify-failed-why-expect-not-tobe-at-a-test-ts-12",
+                     "qualify-failed-why-" + "a" * 121):
+            self.assertTrue(qualify.valid_stage(line), line)
+        self.assertEqual(len("qualify-failed-why-" + "a" * 121), 140)
+        for line in ("qualify-failed-why-", "qualify-failed-why--a", "qualify-failed-why-a-", "qualify-failed-why-A", "qualify-failed-why-a_b",
+                     "qualify-failed-why-a.b", "qualify-failed-why-a b", "qualify-failed-why-a/b", "qualify-failed-why-a:b",
+                     "qualify-failed-why-a@b", "qualify-failed-why-\u00fc", "qualify-failed-why-a\n", "qualify-failed-why-" + "a" * 122):
+            self.assertFalse(qualify.valid_stage(line), repr(line))
+        # A name line keeps its own, shorter cap: only a line that starts with the reason prefix gets the longer one.
+        self.assertTrue(qualify.valid_stage("qualify-failed-whyx-" + "a" * 92))
+        self.assertFalse(qualify.valid_stage("qualify-failed-whyx-" + "a" * 93))
+        self.assertFalse(qualify.valid_stage("qualify-failed-" + "a" * 98))
+
+    def test_forwarding_accepts_eight_names_and_four_reasons_and_refuses_one_more_of_either(self):
+        names = frozenset({"qualify-boundary-alpha-contract-1"})
+        eight = b"".join(b"qualify-failed-case-%d\n" % number for number in range(1, 9))
+        four = b"".join(b"qualify-failed-why-error-at-a-test-ts-%d\n" % number for number in range(1, 5))
+        fifth, ninth = b"qualify-failed-why-error-at-a-test-ts-5\n", b"qualify-failed-case-9\n"
+        # Names that merely start with `why` are names, not reasons, so they never use up the four.
+        why_names = b"".join(b"qualify-failed-whyx-%d\n" % number for number in range(1, 9))
+        for payload in (eight + four, four + eight, four, eight, b"qualify-smoke\n" + eight + four + b"qualify-help\n",
+                        b"qualify-failed-why-no-error-line\n", why_names + four, b"qualify-failed-why\n" * 8 + four,
+                        b"qualify-failed-why-" + b"a" * 121 + b"\n"):
+            with self.subTest(payload=payload[:40]), contextlib.redirect_stdout(io.StringIO()) as output:
+                qualify.forward_stages(io.BytesIO(payload), names)
+            self.assertEqual(output.getvalue(), payload.decode())
+        refused = (eight + four + fifth, four + fifth, fifth * 5, eight + ninth + four, eight + four + ninth, four + ninth * 9,
+                   b"qualify-failed-why-" + b"a" * 122 + b"\n", b"qualify-failed-why-\n", b"qualify-failed-why-a.b\n",
+                   b"qualify-failed-why-A\n", b"qualify-failed-why-a b\n", b"qualify-failed-why-a/b\n", b"qualify-failed-why-a:b\n",
+                   b"qualify-failed-why-a\xc3\xbc\n", b"qualify-failed-why-a-\n", b"qualify-smoke\n" + four + fifth)
+        for payload in refused:
+            with self.subTest(payload=payload[:40]), contextlib.redirect_stdout(io.StringIO()) as output:
+                with self.assertRaises(ValueError):
+                    qualify.forward_stages(io.BytesIO(payload), names)
+                self.assertEqual(output.getvalue(), "")
+
 
 class FailedStageTests(unittest.TestCase):
     """qualify-failed-<name> lines: which boundary tests failed, as hyphenated names and nothing else."""
@@ -1301,6 +1517,16 @@ class FailedStageTests(unittest.TestCase):
         self.assertEqual(qualify.failed_stages(1, b"(fail) a > b [12.34ms]\r\n(fail) c [1.50s]\n(fail) d [x]\n(fail) e [5ms] f\n"),
                          ["qualify-failed-a-b", "qualify-failed-c", "qualify-failed-d-x", "qualify-failed-e-5ms-f"])
 
+    def test_a_test_name_that_starts_with_why_cannot_pose_as_a_reason_line(self):
+        output = b"(fail) Why not [1.00ms]\n(fail) why [1.00ms]\n(fail) whyx [1.00ms]\n(fail) a why [1.00ms]\n(fail) why-it-fails\n"
+        self.assertEqual(qualify.failed_stages(1, output),
+                         ["qualify-failed-test-why-not", "qualify-failed-test-why", "qualify-failed-whyx", "qualify-failed-a-why",
+                          "qualify-failed-test-why-it-fails"])
+        for line in qualify.failed_stages(1, b"(fail) why " + b"x" * 200 + b"\n"):
+            self.assertLessEqual(len(line), 112)
+            self.assertFalse(line.startswith("qualify-failed-why-"))
+            self.assertTrue(qualify.valid_stage(line))
+
     def test_a_name_that_slugs_to_nothing_is_skipped(self):
         output = b"(fail) >>> [1.00ms]\n(fail) \n(fail) \xe6\x97\xa5\xe6\x9c\xac\n(fail) real one [2.00ms]\n"
         self.assertEqual(qualify.failed_stages(1, output), ["qualify-failed-real-one"])
@@ -1330,6 +1556,232 @@ class FailedStageTests(unittest.TestCase):
     def test_only_a_fail_marker_at_the_start_of_a_line_names_a_test(self):
         output = b"error: (fail) not a marker\n  (fail) indented\nlog (fail) x\n(fail)\n(fail)x\n(FAIL) upper\n"
         self.assertEqual(qualify.failed_stages(1, output), ["qualify-failed-no-test-name"])
+
+
+def stack_frame(path, line=3, column=5, shape="paren"):
+    """One Bun stack frame line: `at <anonymous> (path:line:column)`, or the bare `at path:line:column`."""
+    if shape == "paren":
+        return b"      at <anonymous> (%s:%d:%d)" % (path, line, column)
+    return b"      at %s:%d:%d" % (path, line, column)
+
+
+def reasons_of(*lines, source=SOURCE):
+    """The reason lines for one failure made of `lines`, followed by its `(fail)` line."""
+    return qualify.failed_reasons(b"\n".join([*lines, b"(fail) x [1.00ms]", b""]), source)
+
+
+class FailedReasonTests(unittest.TestCase):
+    """qualify-failed-why-<kind>[-at-<file>-<line>] lines: why a failed test failed, as hyphenated words and nothing else."""
+
+    def test_each_real_bun_failure_gives_its_kind_and_the_base_file_and_line(self):
+        for name, expected in REAL_REASONS.items():
+            with self.subTest(test=name):
+                self.assertEqual(qualify.failed_reasons(REAL_HEAD + REAL_FAILURES[name] + REAL_TAIL, SOURCE), [expected])
+
+    def test_the_whole_real_stream_is_split_at_each_failure_and_capped_at_four(self):
+        every = list(REAL_REASONS.values())
+        self.assertEqual(qualify.failed_reasons(REAL_ALL, SOURCE), every[:4])
+        with patch.object(qualify, "FAILED_REASON_LINES", 20):
+            self.assertEqual(qualify.failed_reasons(REAL_ALL, SOURCE), every)
+
+    def test_the_kind_follows_the_documented_rules_in_order(self):
+        cases = {
+            b"error: expect(received).toBe(expected)": "expect-tobe",
+            b"error: expect(received).not.toBe(expected)": "expect-not-tobe",
+            b"error: expect(received).resolves.toBe(expected)": "expect-resolves-tobe",
+            b"error: expect(received).rejects.not.toThrow(expected)": "expect-rejects-not-tothrow",
+            b"error: expect(received).resolves.rejects.toBe(x)": "error",
+            b"error: expect(received).other.toBe(x)": "error",
+            b"error: expect(received).toHaveBeenCalledWith(...expected)": "expect-tohavebeencalledwith",
+            b"error: expect(received).to" + b"a" * 38 + b"(x)": "expect-to" + "a" * 38,
+            b"error: expect(received).to" + b"a" * 39 + b"(x)": "error",
+            b"error: expect(received).toBe(expected) timed out": "expect-tobe",
+            b"error: EACCES: permission denied": "eacces",
+            b"error: EROFS: read-only file system, open 'x'": "erofs",
+            b"error: E12: x": "e12",
+            b"error: E" + b"A" * 15 + b": x": "e" + "a" * 15,
+            b"error: E" + b"A" * 16 + b": x": "error",
+            b"error: E1: x": "error",
+            b"error: ERR_INVALID_ARG_TYPE: x": "error",
+            b"error: EACCES permission denied": "error",
+            b"error: TypeError: nested class": "typeerror",
+            b"error: TypeError: request timed out": "typeerror",
+            b"TypeError: bare class line": "typeerror",
+            b"RangeError: bare class line": "rangeerror",
+            b"AggregateError: bare class line": "aggregateerror",
+            b"Error: bare class line": "error",
+            b"A" * 35 + b"Error: forty letters": "a" * 35 + "error",
+            b"error: " + b"A" * 36 + b"Error: forty-one letters": "error",
+            b"error: Test \"x\" timed out after 5000ms": "timeout",
+            b"error: request TIMEOUT reached": "timeout",
+            b"error: Timed Out waiting": "timeout",
+            b"error: something else entirely": "error",
+            b"error: ": "error",
+            b"error: EACCES: x\r": "eacces",
+        }
+        for header, kind in cases.items():
+            with self.subTest(header=header[:60]):
+                self.assertEqual(reasons_of(header), [f"qualify-failed-why-{kind}"])
+        self.assertEqual(reasons_of(b"A" * 36 + b"Error: forty-one letters, bare"), ["qualify-failed-why-no-error-line"])
+
+    def test_only_a_line_that_starts_with_the_error_header_decides_the_kind(self):
+        noise = [b"console noise", b"  error: EACCES: indented", b'Expected: "error: EROFS: quoted"', b"Received: TypeError: a value",
+                 b"10 | error: EROFS: in the source context", b"at error: EROFS: mid-line", b"ERROR: EROFS upper case", b"errors: EROFS: x"]
+        self.assertEqual(reasons_of(*noise), ["qualify-failed-why-no-error-line"])
+        self.assertEqual(reasons_of(*noise, b"error: expect(received).toBe(expected)", b"error: EACCES: a second header",
+                                    b"TypeError: a bare class line after it"), ["qualify-failed-why-expect-tobe"])
+        self.assertEqual(reasons_of(b"TypeError: first", b"error: EACCES: second"), ["qualify-failed-why-typeerror"])
+
+    def test_a_failure_with_no_error_line_says_so_and_names_no_location(self):
+        self.assertEqual(reasons_of(stack_frame(b"/workspace/source/a.test.ts")), ["qualify-failed-why-no-error-line"])
+        self.assertEqual(qualify.failed_reasons(b"(fail) x [1.00ms]\n", SOURCE), ["qualify-failed-why-no-error-line"])
+
+    def test_the_location_is_the_first_frame_inside_the_source_root_after_the_header(self):
+        cases = {
+            "a parenthesised frame": ([stack_frame(b"/workspace/source/a/b/c.test.ts", 7, 9)], "c-test-ts-7"),
+            "a bare frame": ([stack_frame(b"/workspace/source/pkg/index.ts", 12, 1, "bare")], "index-ts-12"),
+            "an async frame": ([b"      at async run (/workspace/source/x.ts:4:2)"], "x-ts-4"),
+            "a frame in a module inside the root": ([stack_frame(b"/workspace/source/node_modules/pkg/lib/index.js", 70000, 3)], "index-js-70000"),
+            "a six digit line": ([stack_frame(b"/workspace/source/x.ts", 999999, 1)], "x-ts-999999"),
+            "a leading zero": ([b"      at f (/workspace/source/x.ts:007:1)"], "x-ts-7"),
+            "the first of two": ([stack_frame(b"/workspace/source/first.ts", 1, 1), stack_frame(b"/workspace/source/second.ts", 2, 2)], "first-ts-1"),
+            "a carriage return": ([stack_frame(b"/workspace/source/x.ts", 4, 2) + b"\r"], "x-ts-4"),
+        }
+        for label, (frames, location) in cases.items():
+            with self.subTest(label):
+                self.assertEqual(reasons_of(b"error: boom", *frames), [f"qualify-failed-why-error-at-{location}"])
+        self.assertEqual(reasons_of(b"error: EACCES: x", b"      at f (/workspace/source/x.ts:4:2)"), ["qualify-failed-why-eacces-at-x-ts-4"])
+
+    def test_frames_outside_the_root_or_without_a_usable_location_are_skipped(self):
+        skipped = [stack_frame(b"/usr/lib/bun/internal.js"), stack_frame(b"/home/ompbuild/x.ts", 5, 5), b"      at c (native:1:2)",
+                   stack_frame(b"/workspace/source-other/y.ts"), stack_frame(b"/workspace/sourcex.ts"),
+                   stack_frame(b"/workspace/source/../../etc/passwd", 1, 1), stack_frame(b"/workspace/source/a/../b.ts"),
+                   stack_frame(b"/workspace/source/___", 3, 3), stack_frame(b"/workspace/source/x.ts", 1234567, 1),
+                   b"      at <anonymous>", b"      at /workspace/source/x.ts", b"      at (/workspace/source/x.ts:3:4",
+                   b"at f (/workspace/source/not-indented.ts:3:4)", b"   /workspace/source/no-at.ts:3:4",
+                   b"      at f (/workspace/source/x.ts:3)", b"      at f (/workspace/source/x.ts:a:4)"]
+        self.assertEqual(reasons_of(b"error: boom", *skipped), ["qualify-failed-why-error"])
+        good = stack_frame(b"/workspace/source/pkg/inside.ts", 8, 9)
+        self.assertEqual(reasons_of(b"error: boom", *skipped, good), ["qualify-failed-why-error-at-inside-ts-8"])
+        self.assertEqual(reasons_of(stack_frame(b"/workspace/source/before.ts"), b"error: boom", good), ["qualify-failed-why-error-at-inside-ts-8"])
+        self.assertEqual(reasons_of(stack_frame(b"/workspace/source/before.ts"), b"error: boom"), ["qualify-failed-why-error"])
+
+    def test_the_root_comes_from_the_source_argument_and_not_from_a_constant(self):
+        lines = (b"error: boom", stack_frame(b"/workspace/source/w.ts", 1, 1), stack_frame(b"/tmp/other-root/pkg/z.ts", 5, 5))
+        self.assertEqual(reasons_of(*lines), ["qualify-failed-why-error-at-w-ts-1"])
+        self.assertEqual(reasons_of(*lines, source=Path("/tmp/other-root")), ["qualify-failed-why-error-at-z-ts-5"])
+        self.assertEqual(reasons_of(*lines, source=Path("/tmp/other-root/")), ["qualify-failed-why-error-at-z-ts-5"])
+        self.assertEqual(reasons_of(*lines, source=Path("/tmp/other")), ["qualify-failed-why-error"])
+
+    def test_the_file_is_the_base_name_as_lowercase_letters_digits_and_single_hyphens_up_to_48_characters(self):
+        cases = {
+            b"agent-session-handoff.test.ts": "agent-session-handoff-test-ts",
+            b"My_File  Name.TS": "my-file-name-ts",
+            b"a\xc3\xbcb\xe6\x97\xa5.ts": "a-b-ts",
+            b"--lead--and--trail--.ts--": "lead-and-trail-ts",
+            b"1.2.3.ts": "1-2-3-ts",
+            b"x" * 60 + b".ts": "x" * 48,
+            b"y" * 47 + b".ts": "y" * 47,
+            b"z" * 46 + b".ts": "z" * 46 + "-t",
+        }
+        for base, slug in cases.items():
+            with self.subTest(base=base[:30]):
+                (line,) = reasons_of(b"error: boom", stack_frame(b"/workspace/source/secret dir/sub folder/" + base))
+                self.assertEqual(line, f"qualify-failed-why-error-at-{slug}-3")
+                self.assertNotIn("secret", line)
+                self.assertNotIn("folder", line)
+
+    def test_a_failure_block_starts_after_the_previous_result_line(self):
+        output = b"\n".join([
+            b"error: EACCES: noise printed by a passing test", b"(pass) a [1.00ms]",
+            b"error: expect(received).toBe(expected)", stack_frame(b"/workspace/source/one.test.ts", 3, 3), b"(fail) b [1.00ms]",
+            b"console noise", b"(skip) c", b"error: EROFS: noise before a todo test", b"(todo) d", b"(fail) e [1.00ms]",
+            b"TypeError: x", stack_frame(b"/workspace/source/two.test.ts", 4, 4), b"(fail) f [1.00ms]", b""])
+        self.assertEqual(qualify.failed_reasons(output, SOURCE),
+                         ["qualify-failed-why-expect-tobe-at-one-test-ts-3", "qualify-failed-why-no-error-line",
+                          "qualify-failed-why-typeerror-at-two-test-ts-4"])
+
+    def test_a_test_timeout_note_after_the_fail_line_is_a_timeout_and_nothing_else_is(self):
+        note = b"  ^ this test timed out after 30000ms.\n"
+        self.assertEqual(qualify.failed_reasons(b"(fail) a [30000.10ms]\n" + note, SOURCE), ["qualify-failed-why-timeout"])
+        self.assertEqual(qualify.failed_reasons(b"(fail) a [30000.10ms]\n" + note.rstrip(b"\n"), SOURCE), ["qualify-failed-why-timeout"])
+        noisy = b"error: noise\n" + stack_frame(b"/workspace/source/x.ts") + b"\n(fail) a [30000.10ms]\n" + note
+        self.assertEqual(qualify.failed_reasons(noisy, SOURCE), ["qualify-failed-why-timeout"])
+        self.assertEqual(qualify.failed_reasons(b"(fail) a [1.00ms]\nconsole noise\n" + note + b"(fail) b [1.00ms]\n", SOURCE),
+                         ["qualify-failed-why-no-error-line"])
+        for text in (b"  ^ this test timed out after 30s.\n", b"  ^ this test timed out after ms.\n", b"  ^ this test timed out after 5ms. more\n",
+                     b"this test timed out after 5ms.\n", b"  ^ this test failed after 5ms.\n"):
+            self.assertEqual(qualify.failed_reasons(b"(fail) a [1.00ms]\n" + text, SOURCE), ["qualify-failed-why-no-error-line"], text)
+
+    def test_duplicates_collapse_and_at_most_four_reasons_are_kept_in_order_of_first_appearance(self):
+        def failure(line):
+            return b"error: boom\n      at f (/workspace/source/a.test.ts:%d:3)\n(fail) t [1.00ms]\n" % line
+
+        def expected(*lines):
+            return [f"qualify-failed-why-error-at-a-test-ts-{line}" for line in lines]
+
+        def run(*lines):
+            return qualify.failed_reasons(b"".join(failure(line) for line in lines), SOURCE)
+
+        self.assertEqual(run(1, 1, 1), expected(1))
+        self.assertEqual(run(1, 2, 3, 4, 5, 6), expected(1, 2, 3, 4))
+        self.assertEqual(run(1, 2, 1, 3, 2, 4, 5, 4), expected(1, 2, 3, 4))
+        self.assertEqual(run(3, 1, 2), expected(3, 1, 2))
+        other_file = b"error: boom\n      at f (/workspace/source/b.test.ts:1:3)\n(fail) t [1.00ms]\n"
+        self.assertEqual(qualify.failed_reasons(failure(1) + other_file + failure(1), SOURCE),
+                         ["qualify-failed-why-error-at-a-test-ts-1", "qualify-failed-why-error-at-b-test-ts-1"])
+
+    def test_no_fail_line_means_no_reason(self):
+        for output in (b"", b"error: EACCES: x\n      at f (/workspace/source/x.ts:3:3)\n 1 pass\n 0 fail\n",
+                       b"error: (fail) not a marker\n  (fail) indented\nlog (fail) x\n(fail)\n(fail)x\n(FAIL) upper\n"):
+            self.assertEqual(qualify.failed_reasons(output, SOURCE), [], output)
+
+    def test_the_longest_possible_line_is_137_characters_and_valid(self):
+        header = b"error: expect(received).rejects.not.to" + b"a" * 38 + b"(x)"
+        (line,) = reasons_of(header, stack_frame(b"/workspace/source/" + b"f" * 60 + b".ts", 999999, 1))
+        self.assertEqual(line, "qualify-failed-why-expect-rejects-not-to" + "a" * 38 + "-at-" + "f" * 48 + "-999999")
+        self.assertEqual(len(line), 137)
+        self.assertTrue(qualify.valid_stage(line))
+
+    def test_two_more_real_bun_shapes_a_node_assert_failure_and_a_refused_connection(self):
+        # Captured with Bun 1.4.2 like the stream above. The assert frames are in `node:assert`, outside the root, so the location
+        # is the test file; the refused connection puts an address, a path and a code in the message, and none of them is reported.
+        assertion = b"\n".join([
+            b'             ^', b'AssertionError: Expected values to be strictly equal:', b'', b'1 !== 2', b'',
+            b'      at innerFail (node:assert:50:32)', b'      at strictEqual (node:assert:181:14)',
+            b'      at <anonymous> (/workspace/source/second.test.ts:6:10)', b'(fail) shapes > node assert strictEqual [6.11ms]', b''])
+        refused = b"\n".join([
+            b'             ^', b'TypeError: Unable to connect. Is the computer able to access the url?', b'  path: "http://127.0.0.1:9/",',
+            b' errno: 0,', b'  code: "ConnectionRefused"', b'', b'      at async <anonymous> (/workspace/source/second.test.ts:21:9)',
+            b'(fail) shapes > fetch refused [0.44ms]', b''])
+        self.assertEqual(qualify.failed_reasons(assertion, SOURCE), ["qualify-failed-why-assertionerror-at-second-test-ts-6"])
+        self.assertEqual(qualify.failed_reasons(refused, SOURCE), ["qualify-failed-why-typeerror-at-second-test-ts-21"])
+        self.assertEqual(qualify.failed_reasons(assertion + refused, SOURCE),
+                         ["qualify-failed-why-assertionerror-at-second-test-ts-6", "qualify-failed-why-typeerror-at-second-test-ts-21"])
+
+    def test_nothing_from_a_message_a_path_an_address_or_a_token_is_ever_emitted(self):
+        hostile = b"\n".join([
+            b"error: EACCES: open '/home/ompbuild/.ssh/id_rsa' 10.1.2.3 fe80::1 sk-test-0123456789abcdef user@example.org",
+            b"      at secret-fn-sk-test-0123456789abcdef (/home/ompbuild/private/key.pem:9:9)",
+            stack_frame(b"/workspace/source/pkg/ok.ts", 5, 6), b"(fail) hostile [1.00ms]",
+            b"error: boom /home/ompbuild/secret 10.1.2.3 sk-test-0123456789abcdef a@b.example", b"(fail) other [1.00ms]",
+            b"error: expect(received).toBe(expected)", b"", b'Expected: "sk-test-0123456789abcdef"', b'Received: "10.1.2.3"',
+            b"(fail) third [1.00ms]", b""])
+        self.assertEqual(qualify.failed_reasons(hostile, SOURCE),
+                         ["qualify-failed-why-eacces-at-ok-ts-5", "qualify-failed-why-error", "qualify-failed-why-expect-tobe"])
+        noise = bytes(range(1, 256)).replace(b"\n", b"")
+        fuzz = b"\n".join([b"error: " + noise, stack_frame(b"/workspace/source/" + noise.replace(b"/", b"")), b"(fail) a",
+                           b"TypeError: " + noise, b"(fail) b", b""])
+        self.assertEqual(qualify.failed_reasons(fuzz, SOURCE), ["qualify-failed-why-error", "qualify-failed-why-typeerror"])
+        forbidden = ("ompbuild", "home", "10.1.2.3", "10-1-2-3", "sk-", "secret", "key-pem", "id-rsa", "ssh", "example", "boom", "expected",
+                     "received", "permission", "noise", "workspace", "source", "/", "\\", ".", ":", "@", " ")
+        for output in (hostile, REAL_ALL, fuzz):
+            for line in qualify.failed_reasons(output, SOURCE):
+                self.assertRegex(line, r"\Aqualify-failed-why-[a-z0-9]+(-[a-z0-9]+)*\Z")
+                self.assertLessEqual(len(line), 140)
+                self.assertTrue(qualify.valid_stage(line))
+                for word in forbidden:
+                    self.assertNotIn(word, line)
 
 
 class RuntimeCommandTests(unittest.TestCase):
@@ -1398,7 +1850,7 @@ class BoundaryFailureTests(unittest.TestCase):
     def test_a_failing_command_announces_its_failed_tests_then_fails_closed_and_runs_nothing_more(self):
         raised, stdout, stages, calls = self.drive([PASSING, (1, b"bun test v1.4.2 (744846f84)\n", BUN_FAILURES), PASSING])
         self.assertIsInstance(raised, ValueError)
-        self.assertEqual(stages, SETUP_STAGES + BOUNDARY_STAGES[:2] + FAILED_LINES)
+        self.assertEqual(stages, SETUP_STAGES + BOUNDARY_STAGES[:2] + FAILED_LINES + NO_REASON)
         self.assertEqual(stdout, "")
         self.assertEqual(len(calls), 2)
 
@@ -1418,14 +1870,14 @@ class BoundaryFailureTests(unittest.TestCase):
         self.assertEqual(stages[-1:], ["qualify-failed-no-test-name"])
         raised, _stdout, stages, _calls = self.drive([(0, b"", b"(fail) one [1.00ms]\n 3 pass\n 1 fail\n")])
         self.assertIsInstance(raised, ValueError)
-        self.assertEqual(stages[-1:], ["qualify-failed-one"])
+        self.assertEqual(stages[-2:], ["qualify-failed-one", *NO_REASON])
 
     def test_the_inside_entry_point_prints_only_stage_lines_and_exits_one(self):
         raised, stdout, stages, _calls = self.drive([PASSING, (1, b"", BUN_FAILURES)], entry=qualify.main, argv=("qualify", "--inside"))
         self.assertIsInstance(raised, SystemExit)
         self.assertEqual(raised.code, 1)
         self.assertEqual(stdout, "")
-        self.assertEqual(stages, SETUP_STAGES + BOUNDARY_STAGES[:2] + FAILED_LINES)
+        self.assertEqual(stages, SETUP_STAGES + BOUNDARY_STAGES[:2] + FAILED_LINES + NO_REASON)
         shown = "\n".join(stages)
         for private in ("/home/ompbuild", "10.1.2.3", "a@b.example", "bun test", "744846f84", "[0.64ms]", "Ran 6 tests", "\u00fc"):
             self.assertNotIn(private, shown)
@@ -1438,8 +1890,37 @@ class BoundaryFailureTests(unittest.TestCase):
             qualify.forward_stages(io.BytesIO(("\n".join(stages) + "\n").encode()), frozenset(BOUNDARY_STAGES))
         lines = forwarded.getvalue().splitlines()
         self.assertEqual(lines, stages)
-        self.assertEqual([line for line in lines if line.startswith("qualify-failed-")], ["qualify-failed-timeout", *FAILED_LINES])
+        self.assertEqual([line for line in lines if line.startswith("qualify-failed-")], ["qualify-failed-timeout", *FAILED_LINES, *NO_REASON])
         for line in lines:
+            self.assertIsNotNone(progress.fullmatch(line), line)
+            self.assertIsNone(address.search(line), line)
+
+    def test_a_real_bun_failure_announces_names_then_reasons_and_nothing_else(self):
+        raised, stdout, stages, calls = self.drive([PASSING, (1, b"", REAL_ALL), PASSING])
+        self.assertIsInstance(raised, ValueError)
+        self.assertEqual(stages, SETUP_STAGES + BOUNDARY_STAGES[:2] + REAL_NAME_LINES + list(REAL_REASONS.values())[:4])
+        self.assertEqual(stdout, "")
+        self.assertEqual(len(calls), 2)
+        shown = "\n".join(stages)
+        for private in ("/home/ompbuild", "10.1.2.3", "sk-test", "boom", "Expected", "Received", "/workspace", "no such file", "permission"):
+            self.assertNotIn(private, shown)
+
+    def test_a_test_timeout_note_is_reported_as_the_reason(self):
+        output = REAL_HEAD + REAL_FAILURES["times out"] + REAL_TAIL
+        raised, _stdout, stages, _calls = self.drive([(1, b"", output)])
+        self.assertIsInstance(raised, ValueError)
+        self.assertEqual(stages[-2:], ["qualify-failed-suite-one-times-out", "qualify-failed-why-timeout"])
+
+    def test_the_hosts_forwarding_and_the_doors_own_filters_pass_eight_names_and_four_reasons_on(self):
+        progress, address = door_filters()
+        raised, _stdout, stages, _calls = self.drive([(124, b"", REAL_ALL)])
+        self.assertIsInstance(raised, ValueError)
+        failed = [line for line in stages if line.startswith("qualify-failed-")]
+        self.assertEqual(failed, ["qualify-failed-timeout", *REAL_NAME_LINES[:7], *list(REAL_REASONS.values())[:4]])
+        with contextlib.redirect_stdout(io.StringIO()) as forwarded:
+            qualify.forward_stages(io.BytesIO(("\n".join(stages) + "\n").encode()), frozenset(BOUNDARY_STAGES))
+        self.assertEqual(forwarded.getvalue().splitlines(), stages)
+        for line in stages:
             self.assertIsNotNone(progress.fullmatch(line), line)
             self.assertIsNone(address.search(line), line)
 
@@ -1461,6 +1942,17 @@ class DoorFilterTests(unittest.TestCase):
         samples = [*qualify.failed_stages(1, BUN_FAILURES), *qualify.failed_stages(124, hostile), *qualify.failed_stages(1, numbers),
                    *qualify.failed_stages(137, b""), *qualify.failed_stages(1, b""), "qualify-failed-" + "a" * 97, "qualify-failed-0"]
         self.assertGreater(len(samples), 12)
+        for line in samples:
+            self.assertTrue(qualify.valid_stage(line), line)
+            self.assertIsNotNone(progress.fullmatch(line), line)
+            self.assertIsNone(address.search(line), line)
+
+    def test_every_reason_line_the_recipe_can_make_is_forwarded_and_never_dropped_as_an_address(self):
+        progress, address = door_filters()
+        longest = "qualify-failed-why-expect-not-to" + "a" * 38 + "-at-" + "f" * 48 + "-999999"
+        digits = qualify.failed_reasons(b"error: E12: 10.1.2.3\n" + b"      at f (/workspace/source/1.2.3.4.ts:10:20)\n(fail) a\n", SOURCE)
+        samples = [*REAL_REASONS.values(), longest, *digits, *NO_REASON, "qualify-failed-why-" + "a" * 121, "qualify-failed-why-timeout"]
+        self.assertEqual(digits, ["qualify-failed-why-e12-at-1-2-3-4-ts-10"])
         for line in samples:
             self.assertTrue(qualify.valid_stage(line), line)
             self.assertIsNotNone(progress.fullmatch(line), line)
