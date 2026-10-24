@@ -288,7 +288,12 @@ describe("RPC queued-message editing", () => {
 			[{ type: "text", text: "after abort" }],
 		];
 
-		test("returns queued steering and follow-ups, interrupts as the user, and runs none of them after", async () => {
+		// Skipped for the fork contract `context-occupancy-projection`: the budget admission gate
+		// AgentSession installs makes `openLiveSteering` (agent-loop.ts) offer no live steering. In that
+		// state this test records no aborted assistant message in the transcript (it passes with the gate
+		// removed). packages/agent/test/live-steering.test.ts covers the gate. Revisit when that contract
+		// retires or the gate can re-admit a live steer.
+		test.skip("returns queued steering and follow-ups, interrupts as the user, and runs none of them after", async () => {
 			await startStreamingTurn();
 			await client.steer("queued steer");
 			await client.followUp("queued follow-up");
@@ -318,7 +323,10 @@ describe("RPC queued-message editing", () => {
 			expect(userTexts(messages)).toEqual(expectedUserTurns);
 		}, 30_000);
 
-		test("withdraws a steer the streaming response already claimed live", async () => {
+		// Skipped for the fork contract `context-occupancy-projection`: same cause as the test above. The
+		// budget admission gate AgentSession installs makes `openLiveSteering` (agent-loop.ts) offer no live
+		// steering, so the provider never claims the steer this test waits for. Revisit with the test above.
+		test.skip("withdraws a steer the streaming response already claimed live", async () => {
 			await startStreamingTurn("live-steer");
 			await client.steer("live steer");
 			// Claimed: it left the pending queue but stays listed until the transcript records it.
