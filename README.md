@@ -147,6 +147,7 @@ An upgrade fails before build or installation if the block is stale, any require
 - `mnemopi-retain-ids`: The retain tool returns the ids of the memories it stored (Mnemopi backend)
 - `mnemopi-prune-consolidated`: Mnemopi bounds database growth by deleting consolidated working rows N days after their summary (mnemopi.pruneConsolidatedDays, off by default)
 - `mnemopi-startup-visibility`: A Mnemopi start that fails says why, once at startup and in every memory tool, instead of leaving memory silently off
+- `read-racy-stamp`: The read tool's archive cache stores no file stamp younger than 2 seconds, so a same-tick rewrite on a coarse Linux file clock is seen
 <!-- stronk-omp:fork-contracts:end -->
 
 ## Upstream alignment
