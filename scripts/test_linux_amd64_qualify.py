@@ -1204,10 +1204,11 @@ REAL_NAME_LINES = [
 NO_REASON = ["qualify-failed-why-no-error-line"]
 
 
-def drive_runtime(runtime_class, entry=None, argv=("qualify",)):
+def drive_runtime(runtime_class, entry=None, argv=("qualify",), offline=None):
     """Run runtime_main (or `entry`) in a fixture tree, against a Runtime double, up to the native-grep stage.
 
-    The real announce_stage runs, so every announced line is validated and captured. Returns (raised, stdout, stderr)."""
+    The real announce_stage runs, so every announced line is validated and captured. `offline` stands in for the offline
+    session (default: does nothing). Returns (raised, stdout, stderr)."""
     real_announce = qualify.announce_stage
 
     def stage(name, **kwargs):
@@ -1250,7 +1251,7 @@ def drive_runtime(runtime_class, entry=None, argv=("qualify",)):
              patch.object(qualify.shutil, "copytree"), patch.object(qualify.shutil, "copyfile", side_effect=copyfile), \
              patch.object(receipt, "elf", return_value=manifest["runtime"]["binary"]), \
              patch.object(qualify, "native_help", return_value=native), \
-             patch.object(qualify, "offline_session"), patch.object(qualify, "require_markers"), \
+             patch.object(qualify, "offline_session", side_effect=offline), patch.object(qualify, "require_markers"), \
              patch.object(qualify, "announce_stage", side_effect=stage), \
              patch.object(qualify.sys, "argv", list(argv)), \
              contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
@@ -1366,6 +1367,46 @@ class RuntimeStartupTests(unittest.TestCase):
             self.assertEqual(seconds, 240)
         smoke = next(call for call in calls if call[0][-1] == "--smoke-test")
         self.assertTrue(all(key not in smoke[1] for key in controls))
+
+    def test_boundaries_run_in_an_empty_agent_dir_the_offline_fence_never_reaches(self):
+        fenced, seen = [], []
+
+        def offline(_runtime, _binary, _cwd, agent):
+            # What the real offline session leaves in its agent dir: only its fake provider on, every real one off.
+            (agent / "config.yml").write_text("enabledProviders: [offline-smoke]\ndisabledProviders:\n  - anthropic\n")
+            (agent / "models.yml").write_text("providers: {}\n")
+            fenced.append(agent.resolve())
+
+        class FakeRuntime:
+            def __init__(self, environment):
+                self.environment = environment
+
+            def run(self, command, _cwd, seconds=240):
+                args = list(map(str, command))
+                if args == ["getconf", "GNU_LIBC_VERSION"]:
+                    return b"glibc 2.41\n", b""
+                if args[-1] == "--version":
+                    return b"omp/18.8.0\n", b""
+                if args[-1] == "--smoke-test":
+                    return b"smoke-test: ok\n", b""
+                return b"1 pass\n", b""
+
+            def run_unchecked(self, command, cwd, seconds=240):
+                if list(map(str, command))[:2] == ["bun", "test"]:
+                    agent = Path(self.environment["PI_CODING_AGENT_DIR"]).resolve()
+                    seen.append((agent, sorted(path.name for path in agent.iterdir()) if agent.is_dir() else None))
+                return (0, *self.run(command, cwd, seconds))
+
+        raised, _, _ = drive_runtime(FakeRuntime, offline=offline)
+        self.assertRegex(str(raised), "boundary fixture complete")
+        self.assertEqual(len(fenced), 1)
+        self.assertEqual(len(seen), 3)
+        for agent, contents in seen:
+            self.assertFalse(agent == fenced[0] or agent.is_relative_to(fenced[0]) or fenced[0].is_relative_to(agent))
+            self.assertIsNotNone(contents, "the boundary agent dir must exist")
+            self.assertNotIn("config.yml", contents)
+            self.assertNotIn("models.yml", contents)
+        self.assertEqual(seen[0][1], [])
 
 
 class StageTests(unittest.TestCase):

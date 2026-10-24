@@ -695,6 +695,7 @@ Stop at the first step that does not match, keep the output, and report it; do n
    The kind is a fixed word: `expect-<matcher>`, `expect-not-<matcher>`, or the same with `resolves-` or `rejects-` after `expect-` (for example `expect-tobe`), a Bun error code in lowercase (`eacces`, `enoent`), an error class in lowercase (`typeerror`), `timeout` (a test timeout), `error` for any other message, or `no-error-line` when Bun printed no error for that test.
    The file and line are those of the first stack frame inside the application source, as the base name only (`agent-session-handoff-test-ts-123`), never a folder.
    No message text, expected or received value, path or address is ever reported, and a test whose name starts with `why` is shown as `qualify-failed-test-why-...` so a name cannot pose as a reason.
+   The application tests run with an empty agent folder of their own (`PI_CODING_AGENT_DIR`), never the offline session's, whose config enables only the fake offline provider and disables every real one; sharing it made every test that looks up a provider key fail.
 4. Proof of removal (Main, as root, after step 3):
 
    ```bash

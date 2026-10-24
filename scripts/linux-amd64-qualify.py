@@ -830,9 +830,14 @@ def runtime_main():
     native_destination.parent.mkdir(parents=True, exist_ok=True)
     require(not native_destination.exists() and not native_destination.is_symlink(), "Source contains unexpected native addon")
     shutil.copyfile(native, native_destination)
-    # Match the pinned application's scripts/ci-test-ts.ts child-test environment.
+    # Match the pinned application's scripts/ci-test-ts.ts child-test environment. The tests start from an empty agent
+    # dir of their own: the offline session's config (only its fake provider enabled, every real one disabled) stays in
+    # its dir, or every test that resolves a provider key through the default settings finds none.
+    boundary_agent = base / "boundary-agent"
+    boundary_agent.mkdir()
     runtime.environment.update({
         "PI_TEST_RUNTIME": "1", "BUN_JSC_useConcurrentGC": "0", "BUN_JSC_numberOfGCMarkers": "1",
+        "PI_CODING_AGENT_DIR": str(boundary_agent),
     })
     for stage, command in commands:
         announce_stage(stage, inside=True, boundaries=known)
