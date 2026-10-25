@@ -36,6 +36,9 @@ const canRestrictModes = process.platform !== "win32" && process.getuid?.() !== 
 const describeModes = canRestrictModes ? describe : describe.skip;
 
 const GENERIC = "Mnemopi backend is not initialised for this session.";
+// A write refused because the database or its folder is read-only: macOS reports SQLITE_READONLY,
+// Linux the extended SQLITE_READONLY_DIRECTORY (the folder cannot take the journal). Both name the cause.
+const READONLY_CODE = /^SQLITE_READONLY(?:_DIRECTORY)?$/;
 const modelRegistry = { getApiKeyForProvider: async () => undefined, resolver: () => async () => undefined };
 
 let temp: TempDir;
@@ -182,7 +185,7 @@ describeModes("Mnemopi startup failure is visible", () => {
 		const failure = getMnemopiStartupFailure(session);
 		expect(failure).toBeDefined();
 		expect(failure?.errorClass).toBe("SQLiteError");
-		expect(failure?.code).toBe("SQLITE_READONLY");
+		expect(failure?.code).toMatch(READONLY_CODE);
 		expect(failure?.message).toMatch(/readonly/i);
 		expect(failure?.file).toBe("memories/mnemopi/mnemopi.db");
 		expect(failure?.notWritable).toContain("memories/mnemopi");
@@ -227,7 +230,7 @@ describeModes("Mnemopi startup failure is visible", () => {
 		fs.chmodSync(dbDir, 0o555);
 		const first = fakeSession("wal-first");
 		await start(first);
-		expect(getMnemopiStartupFailure(first)?.code).toBe("SQLITE_READONLY");
+		expect(getMnemopiStartupFailure(first)?.code).toMatch(READONLY_CODE);
 
 		// The operator restores the database and the folder; the -wal stays 444.
 		fs.chmodSync(dbDir, 0o700);
