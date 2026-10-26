@@ -337,6 +337,7 @@ async function executeTool(
 	const sanitizedFinalResult: AgentToolResult<unknown> = {
 		content: result.content.map(c => (c.type === "text" ? { ...c, text: sanitizeText(c.text) } : c)),
 		details: result.details,
+		...(result.answeredBy !== undefined ? { answeredBy: result.answeredBy } : {}),
 	};
 	options.emitEvent?.({ type: "tool_execution_end", toolCallId, toolName, result: sanitizedFinalResult, isError });
 
@@ -707,6 +708,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		const sanitizedFinalResult: AgentToolResult<unknown> = {
 			content: result.content.map(c => (c.type === "text" ? { ...c, text: sanitizeText(c.text) } : c)),
 			details: result.details,
+			...(result.answeredBy !== undefined ? { answeredBy: result.answeredBy } : {}),
 		};
 		this.options.emitEvent?.({
 			type: "tool_execution_end",
