@@ -1331,6 +1331,15 @@ export class Agent {
 		return this.#interruptMode;
 	}
 
+	/**
+	 * Applies the `transformToolCallArguments` pass the loop runs on a call's validated arguments before
+	 * it executes the tool (the arguments unchanged when no transform is set), so a host can predict
+	 * what the loop will dispatch for a given set of arguments.
+	 */
+	transformToolArguments(args: Record<string, unknown>, toolName: string): Record<string, unknown> {
+		return this.#transformToolCallArguments ? this.#transformToolCallArguments(args, toolName) : args;
+	}
+
 	setTools(t: AgentTool<any>[]) {
 		this.#state.tools = t;
 	}

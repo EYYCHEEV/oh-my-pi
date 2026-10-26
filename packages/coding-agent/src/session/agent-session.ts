@@ -187,6 +187,7 @@ import {
 	type AgentActivityOutcome,
 	type AgentActivityStateEvent,
 	decideToolCallAnswer,
+	snapshotCallInput,
 } from "../extensibility/shared-events";
 import type { CustomCommandContext } from "../extensibility/custom-commands/types";
 import { SkillDescriptionCatalog } from "../extensibility/skill-descriptions";
@@ -5847,6 +5848,9 @@ export class AgentSession implements SettingsScope {
 		const eventArgs = computer
 			? { actions: computer.actions, pendingSafetyChecks: computer.pendingSafetyChecks }
 			: ctx.args;
+		// A private copy of the call's input, taken before any handler sees it: once an answer is possible
+		// the host relies on this copy, never on the live object an add-on may still hold.
+		const inputCopy = computer ? undefined : snapshotCallInput(ctx.args);
 		runner.markToolCallEmitted(ctx.toolCall.id, ctx.tool.name);
 		let callResult: Awaited<ReturnType<ExtensionRunner["emitToolCall"]>>;
 		try {
@@ -5868,13 +5872,22 @@ export class AgentSession implements SettingsScope {
 			runner.clearLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
 			return { block: true, reason: callResult.reason || "Tool execution was blocked by an extension" };
 		}
-		const decision = decideToolCallAnswer(callResult, computer !== undefined, ctx.tool.name, ctx.args);
+		const decision = decideToolCallAnswer(callResult, computer !== undefined, ctx.tool.name, ctx.args, inputCopy);
 		if (decision.kind === "refused") {
 			runner.clearLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
 			return { block: true, reason: decision.reason };
 		}
 		if (decision.kind === "answered") {
-			runner.holdToolCallAnswer(ctx.toolCall.id, ctx.tool.name, decision.held);
+			// The wrapper judges the call on the host's copy, run through the same argument transform the
+			// loop applies to the live input before it dispatches the call.
+			let pinned: Record<string, unknown>;
+			try {
+				pinned = this.agent.transformToolArguments(decision.held.input, ctx.toolCall.name);
+			} catch (error) {
+				runner.clearLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
+				throw error;
+			}
+			runner.holdToolCallAnswer(ctx.toolCall.id, ctx.tool.name, { ...decision.held, input: pinned });
 			const answeredContext = callResult?.additionalContext;
 			return answeredContext === undefined ? undefined : { additionalContext: answeredContext };
 		}

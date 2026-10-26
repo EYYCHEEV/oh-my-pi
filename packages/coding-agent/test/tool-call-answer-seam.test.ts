@@ -357,7 +357,7 @@ describe("tool-call answer seam", () => {
 	});
 
 	describe("runner: one answer per call (rule 10)", () => {
-		const held = { answer: CACHED, answeredBy: CACHE_NAME };
+		const held = { answer: CACHED, answeredBy: CACHE_NAME, input: { path: ORIGINAL_URL } };
 
 		it("holds an answer for that exact call id and tool name and hands it out once", async () => {
 			const runner = await makeRunner([]);
@@ -701,7 +701,11 @@ describe("tool-call answer seam", () => {
 				initUi(runner, async () => "Deny");
 				runner.markLoopToolCall("c1", "read");
 				runner.markToolCallEmitted("c1", "read");
-				runner.holdToolCallAnswer("c1", "read", { answer: CACHED, answeredBy: CACHE_NAME });
+				runner.holdToolCallAnswer("c1", "read", {
+					answer: CACHED,
+					answeredBy: CACHE_NAME,
+					input: { path: ORIGINAL_URL },
+				});
 				const wrapped = new ExtensionToolWrapper(promptingTool(executed), runner);
 
 				await expect(
@@ -734,7 +738,7 @@ describe("tool-call answer seam", () => {
 
 	describe("wrapper: loop dispatches", () => {
 		const yolo = { settings: Settings.isolated({ "tools.approvalMode": "yolo" }) } as unknown as AgentToolContext;
-		const held = { answer: CACHED, answeredBy: CACHE_NAME };
+		const held = { answer: CACHED, answeredBy: CACHE_NAME, input: { path: ORIGINAL_URL } };
 		const tool = (executed: unknown[]) =>
 			({
 				name: "read",

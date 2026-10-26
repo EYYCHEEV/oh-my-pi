@@ -29,7 +29,12 @@ import { withFileMutationSession } from "../../tools/file-write-fallback";
 import { throwIfAborted } from "../../tools/tool-errors";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
-import { decideToolCallAnswer } from "../shared-events";
+import {
+	answeredInputChangedReason,
+	decideToolCallAnswer,
+	isCallInputUnchanged,
+	snapshotCallInput,
+} from "../shared-events";
 import type { ExtensionRunner } from "./runner";
 import type { ExtensionAgentIdentity, HeldToolCallAnswer, RegisteredTool, ToolCallEmitResult } from "./types";
 
@@ -181,6 +186,11 @@ function toolEventArgs(params: unknown, context: AgentToolContext | undefined): 
 	return params as Record<string, unknown>;
 }
 
+/** Blocks an answered call whose live input no longer equals the host's copy of what the model sent. */
+function assertAnsweredInputUnchanged(answered: HeldToolCallAnswer, live: unknown): void {
+	if (!isCallInputUnchanged(live, answered.input)) throw new Error(answeredInputChangedReason(answered.answeredBy));
+}
+
 function approvalData(value: string): string {
 	const sanitized = sanitizeText(value)
 		.replace(/[\r\n\t]+/g, " ")
@@ -251,11 +261,11 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// (non-loop) execution such as Cursor exec handlers.
 		const inheritedLoopDispatch = (context as LoopAwareToolContext | undefined)?.[LOOP_DISPATCH_CONTEXT] === true;
 		const loopDispatchedToolCall =
-			(this.runner.consumeLoopToolCall?.(toolCallId, this.tool.name) ?? false) || inheritedLoopDispatch;
+			(this.runner.consumeLoopToolCall?.(toolCallId, this.tool.name, this.#agent) ?? false) || inheritedLoopDispatch;
 		if (loopDispatchedToolCall && context && !inheritedLoopDispatch) {
 			(context as LoopAwareToolContext)[LOOP_DISPATCH_CONTEXT] = true;
 		}
-		const loopEmittedToolCall = this.runner.consumeToolCallEmitted(toolCallId, this.tool.name);
+		const loopEmittedToolCall = this.runner.consumeToolCallEmitted(toolCallId, this.tool.name, this.#agent);
 		// The answer the loop's arg-prep emission held for exactly this call, if any. It is taken
 		// before anything below can throw, so it is used at most once and is gone even when this call
 		// is denied or blocked; it is applied only after the full approval gate.
@@ -264,6 +274,9 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			this.tool.name,
 			this.#agent,
 		);
+		// The held copy of the input is what this call is judged on: a live input that no longer
+		// equals it blocks the call before anything is approved.
+		if (answered !== undefined) assertAnsweredInputUnchanged(answered, params);
 		// Resolve approval settings up front. A `deny` on the original input short-circuits before the
 		// runner is touched — an already-denied tool never emits `tool_call` — while the full gate below
 		// re-resolves against the (possibly revised) input so a handler cannot rewrite into a denied or
@@ -306,6 +319,10 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		};
 		if (!loopEmittedToolCall && this.runner.hasHandlers("tool_call")) {
 			try {
+				const computerCall = context?.toolCall?.providerMetadata?.type === "computer";
+				// A private copy of the input, taken before any handler sees it: once an answer is
+				// possible the host relies on this copy, never on the live object an add-on may hold.
+				const inputCopy = computerCall ? undefined : snapshotCallInput(params);
 				const callResult = (await this.runner.emitToolCall(
 					{
 						type: "tool_call",
@@ -325,8 +342,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					const reason = callResult.reason || "Tool execution was blocked by an extension";
 					throw new Error(reason);
 				}
-				const computerCall = context?.toolCall?.providerMetadata?.type === "computer";
-				const decision = decideToolCallAnswer(callResult, computerCall, this.tool.name, params);
+				const decision = decideToolCallAnswer(callResult, computerCall, this.tool.name, params, inputCopy);
 				if (decision.kind === "refused") throw new Error(decision.reason);
 				if (decision.kind === "answered") answered = decision.held;
 				if (isNonBlankContext(callResult?.additionalContext)) {
@@ -347,6 +363,9 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				throw new Error(`Extension failed, blocking execution: ${String(err)}`);
 			}
 		}
+		// An answered call is preflighted, approved, prompted and reported from the host's copy of its
+		// input (the model's call), never from the live object an add-on may still hold.
+		if (answered !== undefined) effectiveParams = answered.input as typeof params;
 		if (!loopDispatchedToolCall) {
 			const preflight = await this.runner.runToolCallPreflightBefore?.(
 				toolCallId,
@@ -377,7 +396,9 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// handlers can mutate the original argument object in place. Denies were
 		// enforced above, and provider safety checks remain independently required.
 		const explicitPrompt = resolved.override || Object.hasOwn(userPolicies, resolved.policyKey ?? this.tool.name);
-		const xdevBypass = context?.xdevApproved === true && effectiveParams === params;
+		const xdevBypass =
+			context?.xdevApproved === true &&
+			(answered === undefined ? effectiveParams === params : isCallInputUnchanged(params, answered.input));
 		const acpBypass =
 			context !== undefined &&
 			Object.hasOwn(context, "acpApprovedArgs") &&
@@ -492,32 +513,39 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			}
 		}
 
+		// The prompt and the gate above ran on the host's copy; the answer is applied only if the live
+		// input is still what that copy says the model sent.
+		if (answered !== undefined) assertAnsweredInputUnchanged(answered, params);
+
 		// Execute the actual tool, or take the add-on's answer in its place (the tool's `execute` never
 		// runs for an answered call; the approval gate above already approved the original call).
 		let result: AgentToolResult<TDetails, TParameters>;
 		let executionError: Error | undefined;
+		let answeredBy: string | undefined;
 
 		try {
 			assertEvaluationTool(this.tool.name);
 			// An answer must not outlive an abort: a real tool would see the aborted signal and fail, so
 			// an answered call whose run was aborted (a late "approve" included) fails the same way.
-			if (answered !== undefined) throwIfAborted(signal);
 			// Name the owning session for process-wide file-mutation fallbacks and
 			// expose its settings to registered tools and any fallback handlers they
 			// trigger. `sdk.ts` wraps the whole tool registry with this class whenever
 			// a runner exists.
-			result =
-				answered !== undefined
-					? {
-							content: answered.answer.content,
-							details: answered.answer.details as TDetails,
-							answeredBy: answered.answeredBy,
-						}
-					: await this.runner.runScoped(() =>
-							withFileMutationSession(this.runner.sessionId, () =>
-								this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context),
-							),
-						);
+			if (answered !== undefined) {
+				throwIfAborted(signal);
+				result = {
+					content: answered.answer.content,
+					details: answered.answer.details as TDetails,
+					answeredBy: answered.answeredBy,
+				};
+				answeredBy = answered.answeredBy;
+			} else {
+				result = await this.runner.runScoped(() =>
+					withFileMutationSession(this.runner.sessionId, () =>
+						this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context),
+					),
+				);
+			}
 		} catch (err) {
 			executionError = err instanceof Error ? err : new Error(String(err));
 			result = {
@@ -525,9 +553,10 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				details: undefined as TDetails,
 			};
 		}
-		// Only an add-on's answer is marked `answeredBy`: a tool that really ran cannot claim it, so
-		// the stored record cannot be forged by a tool, an MCP server, or an RPC host tool result.
-		if (answered === undefined && result?.answeredBy !== undefined) {
+		// Only a used add-on answer is marked `answeredBy`: a tool that really ran cannot claim it, so
+		// the stored record cannot be forged by a tool, an MCP server, or an RPC host tool result, and
+		// an answer that was never used (the call was aborted first) carries no mark.
+		if (answeredBy === undefined && result?.answeredBy !== undefined) {
 			const { answeredBy: _claimed, ...genuine } = result;
 			result = genuine;
 		}
@@ -550,7 +579,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					content: result.content,
 					details: result.details,
 					isError: !!executionError || result.isError === true,
-					...(answered !== undefined ? { answeredBy: answered.answeredBy } : {}),
+					...(answeredBy !== undefined ? { answeredBy } : {}),
 				},
 				this.#agent,
 			);
@@ -586,7 +615,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					content: modifiedContent,
 					details: modifiedDetails,
 					providerMetadata: result.providerMetadata,
-					...(answered !== undefined ? { answeredBy: answered.answeredBy } : {}),
+					...(answeredBy !== undefined ? { answeredBy } : {}),
 					...(effectiveError ? { isError: true } : {}),
 				};
 			}

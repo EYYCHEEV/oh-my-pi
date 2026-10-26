@@ -15,6 +15,7 @@
 import { type AgentMessage, isNonBlankContext, joinAdditionalContext } from "@oh-my-pi/pi-agent-core";
 import type { CompactionPreparation, CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantRetryRecovery, ImageContent, TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import { cloneJsonTree, isRecord } from "@oh-my-pi/pi-utils";
 import type { Rule } from "../capability/rule";
 import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
 import type { GoalModeState } from "../goals/state";
@@ -364,9 +365,18 @@ export interface ToolCallAnswer {
 }
 
 /** An answer together with the name of the add-on that gave it (never its path). */
-export interface HeldToolCallAnswer {
+export interface ToolCallAnswerSource {
 	answer: ToolCallAnswer;
 	answeredBy: string;
+}
+
+/**
+ * An answer held for one call, with the host's private copy of that call's input as the model sent
+ * it. Approval, the prompt, grants and the `tool_result` event use the copy, never the live object an
+ * add-on may still hold.
+ */
+export interface HeldToolCallAnswer extends ToolCallAnswerSource {
+	input: Record<string, unknown>;
 }
 
 /**
@@ -411,10 +421,13 @@ export interface ToolCallEventResult {
 	 * one wins; the model's original call is what approval and the session record use, so any
 	 * `input` revision is dropped; `additionalContext` from non-blocking handlers is still
 	 * delivered. Approval is unchanged: the answer is used only after the normal approval gate
-	 * approves the original call. `tool_result` handlers still see the answered result (with
-	 * `answeredBy`) and may change it. A malformed answer, an answer for a `computer` tool call,
-	 * and an answer from a legacy hook each block the call, naming the add-on. The stored result
-	 * message carries `answeredBy`, set by the host to the add-on's name; a handler cannot set it.
+	 * approves the original call, which the host checks against its own copy of the input taken
+	 * before any handler ran. An answer is refused (the call is blocked) when a handler edited
+	 * `event.input` in place, even a handler that did not answer. `tool_result` handlers still see
+	 * the answered result (with `answeredBy`) and may change it. A malformed answer, an answer for a
+	 * `computer` tool call, and an answer from a legacy hook each block the call, naming the add-on.
+	 * The stored result message carries `answeredBy`, set by the host to the add-on's name; a
+	 * handler cannot set it.
 	 */
 	result?: ToolCallAnswer;
 }
@@ -432,54 +445,125 @@ export interface ToolCallAggregate {
 	input?: Record<string, unknown>;
 	additionalContext: string[];
 	/** Tracked on its own, so a later handler that only adds context cannot erase an earlier answer. */
-	answered?: HeldToolCallAnswer;
+	answered?: ToolCallAnswerSource;
 }
 
-function isAnswerBlock(block: unknown): boolean {
-	if (typeof block !== "object" || block === null || !("type" in block)) return false;
-	if (block.type === "text") return "text" in block && typeof block.text === "string";
-	if (block.type === "image") {
-		return (
-			"data" in block && typeof block.data === "string" && "mimeType" in block && typeof block.mimeType === "string"
-		);
+const IMAGE_DETAILS: ReadonlySet<string> = new Set(["auto", "low", "high", "original"]);
+const PROVIDER_FILE_PROVIDERS: ReadonlySet<string> = new Set(["openai", "anthropic", "google"]);
+type ProviderFile = NonNullable<ImageContent["providerFile"]>;
+
+function canonicalProviderFile(value: unknown): ProviderFile | undefined {
+	if (!isRecord(value) || typeof value.provider !== "string" || !PROVIDER_FILE_PROVIDERS.has(value.provider)) {
+		return undefined;
 	}
-	return false;
+	const file: ProviderFile = { provider: value.provider as ProviderFile["provider"] };
+	for (const key of ["id", "uri"] as const) {
+		const part = value[key];
+		if (part === undefined) continue;
+		if (typeof part !== "string") return undefined;
+		file[key] = part;
+	}
+	if (value.expiresAt !== undefined) {
+		if (typeof value.expiresAt !== "number") return undefined;
+		file.expiresAt = value.expiresAt;
+	}
+	return file;
+}
+
+/**
+ * The stored form of one answer block, built field by field from parsed JSON: the required fields
+ * and only the optional fields the shared content types define, each checked. Anything else is
+ * dropped, and a supported field of the wrong shape refuses the block.
+ */
+function canonicalAnswerBlock(block: unknown): TextContent | ImageContent | undefined {
+	if (!isRecord(block)) return undefined;
+	if (block.type === "text") {
+		if (typeof block.text !== "string") return undefined;
+		if (block.textSignature === undefined) return { type: "text", text: block.text };
+		if (typeof block.textSignature !== "string") return undefined;
+		return { type: "text", text: block.text, textSignature: block.textSignature };
+	}
+	if (block.type !== "image" || typeof block.data !== "string" || typeof block.mimeType !== "string") return undefined;
+	const image: ImageContent = { type: "image", data: block.data, mimeType: block.mimeType };
+	if (block.detail !== undefined) {
+		if (typeof block.detail !== "string" || !IMAGE_DETAILS.has(block.detail)) return undefined;
+		image.detail = block.detail as ImageContent["detail"];
+	}
+	if (block.url !== undefined) {
+		if (typeof block.url !== "string") return undefined;
+		image.url = block.url;
+	}
+	if (block.providerFile !== undefined) {
+		const providerFile = canonicalProviderFile(block.providerFile);
+		if (providerFile === undefined) return undefined;
+		image.providerFile = providerFile;
+	}
+	return image;
 }
 
 /** The outcome of {@link snapshotToolCallAnswer}: a stored copy of the answer, or why it was refused. */
 export type ToolCallAnswerSnapshot = { answer: ToolCallAnswer } | { problem: string };
 
 /**
- * Validate a handler's answer and copy it, reading each part of the add-on's object exactly once,
- * so nothing the add-on does to its own objects afterwards (a cache entry updated in place, a getter
- * that answers differently the second time) can change what was validated. The content must be a
- * non-empty list of text or image blocks, `isError` must not be set (use `block` to refuse a call),
- * and `details` must survive `JSON.stringify` because the session stores it: the stored copy is
- * exactly that JSON form.
+ * Validate a handler's answer and copy it into one canonical, JSON-safe form, reading each part of
+ * the add-on's object exactly once. The content and the details are serialized in a single pass, so
+ * a cycle, a throwing getter or a throwing `toJSON` anywhere in them refuses the answer, and the
+ * parsed result shares nothing with the add-on's objects: what it does to them afterwards (a cache
+ * entry updated in place, a getter that answers differently the second time) cannot change what was
+ * validated. The content must be a non-empty list of text or image blocks, copied field by field
+ * (see {@link canonicalAnswerBlock}); `isError` must not be set (use `block` to refuse a call); and
+ * `details` must survive `JSON.stringify` because the session stores it.
  */
 export function snapshotToolCallAnswer(raw: unknown): ToolCallAnswerSnapshot {
-	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return { problem: "the answer is not an object" };
-	const source = raw as { content?: unknown; details?: unknown; isError?: unknown };
-	const content = source.content;
-	const details = source.details;
-	const isError = source.isError;
-	if (!Array.isArray(content) || content.length === 0) {
+	if (!isRecord(raw)) return { problem: "the answer is not an object" };
+	const { content, details, isError } = raw as { content?: unknown; details?: unknown; isError?: unknown };
+	if (isError !== undefined) {
+		return { problem: "an answer is never an error result (return block to refuse the call)" };
+	}
+	let contentJson: string | undefined;
+	let detailsJson: string | undefined;
+	try {
+		contentJson = JSON.stringify(content);
+		detailsJson = details === undefined ? undefined : JSON.stringify(details);
+	} catch {
+		return { problem: "the answer cannot be stored as JSON" };
+	}
+	const parsedContent: unknown = contentJson === undefined ? undefined : JSON.parse(contentJson);
+	if (!Array.isArray(parsedContent) || parsedContent.length === 0) {
 		return { problem: "content must be a non-empty list of text or image blocks" };
 	}
-	const blocks = content.map(block => (typeof block === "object" && block !== null ? { ...block } : block));
-	if (!blocks.every(isAnswerBlock)) return { problem: "content has a block that is not a valid text or image block" };
-	if (isError !== undefined)
-		return { problem: "an answer is never an error result (return block to refuse the call)" };
-	const stored = blocks as ToolCallAnswer["content"];
-	if (details === undefined) return { answer: { content: stored } };
-	let json: string | undefined;
-	try {
-		json = JSON.stringify(details);
-	} catch {
-		return { problem: "details cannot be stored as JSON" };
+	const blocks: ToolCallAnswer["content"] = [];
+	for (const block of parsedContent) {
+		const canonical = canonicalAnswerBlock(block);
+		if (canonical === undefined) return { problem: "content has a block that is not a valid text or image block" };
+		blocks.push(canonical);
 	}
-	if (json === undefined) return { problem: "details cannot be stored as JSON" };
-	return { answer: { content: stored, details: JSON.parse(json) as unknown } };
+	if (details === undefined) return { answer: { content: blocks } };
+	if (detailsJson === undefined) return { problem: "details cannot be stored as JSON" };
+	return { answer: { content: blocks, details: JSON.parse(detailsJson) as unknown } };
+}
+
+/**
+ * A private deep copy of a call's input, taken before any handler sees it, or undefined when the
+ * input cannot be copied (a cycle, say). The host relies only on this copy once handlers have run.
+ */
+export function snapshotCallInput(input: unknown): Record<string, unknown> | undefined {
+	if (!isRecord(input)) return undefined;
+	try {
+		return cloneJsonTree(input);
+	} catch {
+		return undefined;
+	}
+}
+
+/** Why an answered call is blocked when its live input no longer equals the host's copy. */
+export function answeredInputChangedReason(answeredBy: string): string {
+	return `Extension ${answeredBy} answered this call, but the call's input was changed in place while the call was pending. The call was blocked.`;
+}
+
+/** Whether the call's live input still equals the host's copy of what the model sent. */
+export function isCallInputUnchanged(live: unknown, copy: Record<string, unknown>): boolean {
+	return Bun.deepEquals(live, copy, true);
 }
 
 /** Why a legacy hook cannot answer a tool call; shared by the hook runner and the extension runner. */
@@ -522,13 +606,16 @@ const NO_TOOL_CALL_ANSWER: ToolCallAnswerDecision = { kind: "none" };
  * Decide what to do with the answer, if any, in a `tool_call` emission's result. An answer needs the
  * add-on's name for the record, `computer` calls cannot be answered (there is no safe way to fake a
  * screenshot), and calls the session interprets by tool name cannot be answered (an answer could end
- * a run or fake a checkpoint): each refuses. The caller blocks a refused call with the returned reason.
+ * a run or fake a checkpoint): each refuses. So does an answered call whose live `input` no longer
+ * equals `inputCopy`, the copy taken before any handler ran, or whose copy could not be taken. The
+ * caller blocks a refused call with the returned reason; an accepted answer is held with that copy.
  */
 export function decideToolCallAnswer(
 	callResult: ToolCallEmitResult | undefined,
 	isComputerCall: boolean,
 	toolName: string,
 	input?: unknown,
+	inputCopy?: Record<string, unknown>,
 ): ToolCallAnswerDecision {
 	if (callResult?.result === undefined) return NO_TOOL_CALL_ANSWER;
 	const answeredBy = callResult.answeredBy;
@@ -544,13 +631,22 @@ export function decideToolCallAnswer(
 			reason: `Extension ${answeredBy} tried to answer a computer tool call, which cannot be answered. The call was blocked.`,
 		};
 	}
-	if (isSessionControlCall(toolName, input)) {
+	if (isSessionControlCall(toolName, inputCopy ?? input)) {
 		return {
 			kind: "refused",
 			reason: `Extension ${answeredBy} tried to answer a call to ${toolName}, which the session interprets and so cannot be answered. The call was blocked.`,
 		};
 	}
-	return { kind: "answered", held: { answer: callResult.result, answeredBy } };
+	if (inputCopy === undefined) {
+		return {
+			kind: "refused",
+			reason: `Extension ${answeredBy} answered a call whose input could not be copied for approval. The call was blocked.`,
+		};
+	}
+	if (!isCallInputUnchanged(input, inputCopy)) {
+		return { kind: "refused", reason: answeredInputChangedReason(answeredBy) };
+	}
+	return { kind: "answered", held: { answer: callResult.result, answeredBy, input: inputCopy } };
 }
 
 /**
@@ -564,7 +660,7 @@ export function decideToolCallAnswer(
 export function accumulateToolCallResult(
 	aggregated: ToolCallAggregate,
 	handlerResult: ToolCallEventResult,
-	answered?: HeldToolCallAnswer,
+	answered?: ToolCallAnswerSource,
 ): void {
 	if (isNonBlankContext(handlerResult.additionalContext)) {
 		aggregated.additionalContext.push(handlerResult.additionalContext);
