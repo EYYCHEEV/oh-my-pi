@@ -877,14 +877,22 @@ refuse the call returns `block`.
 
 Order rules:
 
-1. Handlers run in load order, then registration order, as for every `tool_call` handler.
+1. Handlers run in load order, then registration order, as for every `tool_call` handler. Every handler
+   receives the original `event.input`: a returned `input` rewrite or `result` is collected, not passed to
+   later handlers, so a handler cannot answer from, or be tricked by, an earlier handler's revision.
 2. A block always wins. The first block stops the loop and discards everything collected before it, an
    earlier answer included.
 3. An answer does not stop the loop. Every later handler still runs and can still block.
 4. With several answers the last one wins (registration order), as for rewritten `input`. The answer is
    tracked on its own, so a later handler that only adds context cannot erase an earlier answer.
 5. An answer cancels `input` rewrites: when the final result has an answer, any `input` rewrite is dropped,
-   and approval and the session record use the model's original call.
+   and approval and the session record use the model's original call. The host takes a private copy of that
+   call's input before any handler runs and uses only the copy afterwards (approval, the prompt, grants,
+   `tool_execution_start`, the `tool_result` event, the stored call). If the live `event.input` no longer
+   equals the copy, because a handler (yours or another add-on's) edited it in place, whether before the
+   answer returned, right after, or while an approval prompt was open, the call is blocked with a reason
+   naming the answering add-on and the tool does not run. Calls with no answer behave as before: an in-place
+   edit still reaches the tool.
 6. `additionalContext` from non-blocking handlers is kept and delivered after the answered result, as for
    any successful call.
 7. Approval is unchanged and runs against the original call. A deny policy stops the call before any
@@ -894,8 +902,9 @@ Order rules:
 8. `tool_result` handlers still run on the answered result and may change it, so after-the-fact add-ons
    (redaction, logging) keep working. The event carries `answeredBy`.
 9. Fail closed: each of these blocks the call with a reason that names the add-on. A malformed answer
-   (`content` not a non-empty list of text or image blocks, `isError` set, `details` that cannot be
-   stored as JSON). An answer for a `computer` tool call (there is no safe way to fake screenshots). An
+   (`content` not a non-empty list of text or image blocks, `isError` set, `details` or any block that
+   cannot be stored as JSON, such as a cycle or a throwing getter). An answer for a call whose input could
+   not be copied. An answer for a `computer` tool call (there is no safe way to fake screenshots). An
    answer for a call the session interprets by tool name (`yield`, `checkpoint`, `rewind`, `todo`,
    `goal`, `ask`, `new_context`, and a `write` to an `xd://` device), because an answer could end a run
    or fake a checkpoint. An answer from a legacy hook (the hooks API does not get this field; a hook
@@ -904,8 +913,11 @@ Order rules:
 10. One answer per call. It is held only for that exact tool call id, tool name and agent (an advisor
     that reuses a call id never takes the primary agent's answer), used once, and dropped if the call
     is blocked, denied, skipped, or aborted. An answer is never returned for a call whose run was
-    aborted, even when the approval prompt is answered late. The host copies the answer when it
-    validates it, so changing your own objects afterwards has no effect.
+    aborted, even when the approval prompt is answered late (and then it carries no `answeredBy`). The
+    host stores one canonical copy of the answer when it validates it: a text block keeps `type`, `text`
+    and `textSignature`; an image block keeps `type`, `data`, `mimeType` and the optional `detail`, `url`
+    and `providerFile`; any other field is dropped, and `details` is kept as JSON. Changing your own
+    objects afterwards has no effect.
 
 The host sets `answeredBy` to the add-on's name (the folder name for `<folder>/index.ts`, otherwise the
 file name without `.ts`/`.js`, never its path). A handler cannot set it, and neither can a tool that really
