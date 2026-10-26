@@ -26,6 +26,7 @@ import {
 import { getApprovalGrants } from "../../tools/approval-cache";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { withFileMutationSession } from "../../tools/file-write-fallback";
+import { throwIfAborted } from "../../tools/tool-errors";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
 import { decideToolCallAnswer } from "../shared-events";
@@ -258,7 +259,11 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// The answer the loop's arg-prep emission held for exactly this call, if any. It is taken
 		// before anything below can throw, so it is used at most once and is gone even when this call
 		// is denied or blocked; it is applied only after the full approval gate.
-		let answered: HeldToolCallAnswer | undefined = this.runner.consumeToolCallAnswer?.(toolCallId, this.tool.name);
+		let answered: HeldToolCallAnswer | undefined = this.runner.consumeToolCallAnswer?.(
+			toolCallId,
+			this.tool.name,
+			this.#agent,
+		);
 		// Resolve approval settings up front. A `deny` on the original input short-circuits before the
 		// runner is touched — an already-denied tool never emits `tool_call` — while the full gate below
 		// re-resolves against the (possibly revised) input so a handler cannot rewrite into a denied or
@@ -321,7 +326,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					throw new Error(reason);
 				}
 				const computerCall = context?.toolCall?.providerMetadata?.type === "computer";
-				const decision = decideToolCallAnswer(callResult, computerCall);
+				const decision = decideToolCallAnswer(callResult, computerCall, this.tool.name, params);
 				if (decision.kind === "refused") throw new Error(decision.reason);
 				if (decision.kind === "answered") answered = decision.held;
 				if (isNonBlankContext(callResult?.additionalContext)) {
@@ -494,6 +499,9 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 
 		try {
 			assertEvaluationTool(this.tool.name);
+			// An answer must not outlive an abort: a real tool would see the aborted signal and fail, so
+			// an answered call whose run was aborted (a late "approve" included) fails the same way.
+			if (answered !== undefined) throwIfAborted(signal);
 			// Name the owning session for process-wide file-mutation fallbacks and
 			// expose its settings to registered tools and any fallback handlers they
 			// trigger. `sdk.ts` wraps the whole tool registry with this class whenever

@@ -42,12 +42,13 @@ import type { SessionManager, SessionPersistenceReceipt } from "../../session/se
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
 import { resolveToolOutputBudgetBytes } from "../../tools/output-meta";
 import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
-import { getLoadedRuntimeOrigin, type RequiredExtensionHandlerSnapshot } from "./loader";
+import { getLoadedRuntimeOrigin, isHookOriginExtension, type RequiredExtensionHandlerSnapshot } from "./loader";
 import {
 	accumulateToolCallResult,
 	buildAggregatedToolCallResult,
 	type ToolCallAggregate,
-	toolCallAnswerProblem,
+	hookAnswerRefusal,
+	snapshotToolCallAnswer,
 } from "../shared-events";
 import { ManagedTimers } from "./managed-timers";
 import { createExtensionModelQuery } from "./model-api";
@@ -630,12 +631,18 @@ export class ExtensionRunner {
 	#emittedToolCalls = new Set<string>();
 	#loopToolCalls = new Set<string>();
 	/**
-	 * The answer a `tool_call` handler gave for a loop dispatch, keyed `${toolCallId}:${toolName}`
-	 * like the markers above. The loop's arg-prep emission holds it here and the wrapper applies it
-	 * only after its approval gate, so one answer belongs to exactly one call: it is used once and
-	 * dropped if the call is blocked, denied, skipped, or aborted. Bounded like the markers.
+	 * The answer a `tool_call` handler gave for a loop dispatch, keyed by agent, call id and tool
+	 * name. The loop's arg-prep emission holds it here and the wrapper applies it only after its
+	 * approval gate, so one answer belongs to exactly one call of exactly one agent (an advisor that
+	 * reuses a call id never takes the primary agent's answer): it is used once and dropped if the
+	 * call is blocked, denied, skipped, or aborted. Bounded like the markers above; evicting an
+	 * answer also drops its emitted marker so the call emits `tool_call` again instead of running
+	 * unanswered.
 	 */
-	#heldToolCallAnswers = new Map<string, HeldToolCallAnswer>();
+	#heldToolCallAnswers = new Map<
+		string,
+		{ held: HeldToolCallAnswer; toolCallId: string; agentKey: string; markerKey: string }
+	>();
 
 	/** Records that the loop already emitted `tool_call` for this dispatch. */
 	markToolCallEmitted(toolCallId: string, toolName: string): void {
@@ -662,13 +669,13 @@ export class ExtensionRunner {
 			if (oldest !== undefined) this.#loopToolCalls.delete(oldest);
 		}
 		this.#loopToolCalls.add(`${toolCallId}:${toolName}`);
-		this.#heldToolCallAnswers.delete(`${toolCallId}:${toolName}`);
+		this.#heldToolCallAnswers.delete(this.#heldKey(toolCallId, toolName));
 	}
 
 	/** Clears a loop marker (and any held answer) when pre-dispatch blocked execution before the wrapper ran. */
 	clearLoopToolCall(toolCallId: string, toolName: string): void {
 		this.#loopToolCalls.delete(`${toolCallId}:${toolName}`);
-		this.#heldToolCallAnswers.delete(`${toolCallId}:${toolName}`);
+		this.#heldToolCallAnswers.delete(this.#heldKey(toolCallId, toolName));
 	}
 
 	/** Consumes the marker for a loop dispatch; false means non-loop execution. */
@@ -676,28 +683,66 @@ export class ExtensionRunner {
 		return this.#loopToolCalls.delete(`${toolCallId}:${toolName}`);
 	}
 
-	/** Holds `held` for exactly this call id and tool name until the wrapper consumes or the loop drops it. */
-	holdToolCallAnswer(toolCallId: string, toolName: string, held: HeldToolCallAnswer): void {
-		const key = `${toolCallId}:${toolName}`;
+	#heldKey(toolCallId: string, toolName: string, agent?: ExtensionAgentIdentity): string {
+		return `${agent?.id ?? ""}\u0000${toolCallId}:${toolName}`;
+	}
+
+	/**
+	 * Holds `held` for exactly this agent, call id and tool name until the wrapper consumes it or the
+	 * loop drops it. The primary agent passes no `agent`.
+	 */
+	holdToolCallAnswer(
+		toolCallId: string,
+		toolName: string,
+		held: HeldToolCallAnswer,
+		agent?: ExtensionAgentIdentity,
+	): void {
+		const key = this.#heldKey(toolCallId, toolName, agent);
 		this.#heldToolCallAnswers.delete(key);
 		if (this.#heldToolCallAnswers.size >= 512) {
-			const oldest = this.#heldToolCallAnswers.keys().next().value;
-			if (oldest !== undefined) this.#heldToolCallAnswers.delete(oldest);
+			const oldest = this.#heldToolCallAnswers.entries().next().value;
+			if (oldest !== undefined) {
+				this.#heldToolCallAnswers.delete(oldest[0]);
+				// Fail closed: with its answer gone the call must emit `tool_call` again, not run
+				// the real tool because a stale marker says the loop already emitted.
+				this.#emittedToolCalls.delete(oldest[1].markerKey);
+			}
 		}
-		this.#heldToolCallAnswers.set(key, held);
+		this.#heldToolCallAnswers.set(key, {
+			held,
+			toolCallId,
+			agentKey: agent?.id ?? "",
+			markerKey: `${toolCallId}:${toolName}`,
+		});
 	}
 
-	/** Takes the held answer for exactly this call id and tool name; it is handed out once. */
-	consumeToolCallAnswer(toolCallId: string, toolName: string): HeldToolCallAnswer | undefined {
-		const key = `${toolCallId}:${toolName}`;
-		const held = this.#heldToolCallAnswers.get(key);
+	/** Takes the held answer for exactly this agent, call id and tool name; it is handed out once. */
+	consumeToolCallAnswer(
+		toolCallId: string,
+		toolName: string,
+		agent?: ExtensionAgentIdentity,
+	): HeldToolCallAnswer | undefined {
+		const key = this.#heldKey(toolCallId, toolName, agent);
+		const entry = this.#heldToolCallAnswers.get(key);
 		this.#heldToolCallAnswers.delete(key);
-		return held;
+		return entry?.held;
 	}
 
-	/** Drops the held answer for this call id and tool name, if any. */
-	clearToolCallAnswer(toolCallId: string, toolName: string): void {
-		this.#heldToolCallAnswers.delete(`${toolCallId}:${toolName}`);
+	/** Drops the held answer for this agent, call id and tool name, if any. */
+	clearToolCallAnswer(toolCallId: string, toolName: string, agent?: ExtensionAgentIdentity): void {
+		this.#heldToolCallAnswers.delete(this.#heldKey(toolCallId, toolName, agent));
+	}
+
+	/**
+	 * Drops every answer held for this call id (whatever tool name the hold used) for one agent: the
+	 * primary agent when `agent` is omitted. The session ends a call by its wire name, which can differ
+	 * from the tool's own name.
+	 */
+	clearToolCallAnswersForCall(toolCallId: string, agent?: ExtensionAgentIdentity): void {
+		const agentKey = agent?.id ?? "";
+		for (const [key, entry] of this.#heldToolCallAnswers) {
+			if (entry.toolCallId === toolCallId && entry.agentKey === agentKey) this.#heldToolCallAnswers.delete(key);
+		}
 	}
 
 	/** Drops every held answer; a run that ended leaves nothing held. */
@@ -2103,8 +2148,8 @@ export class ExtensionRunner {
 						block: true,
 						reason:
 							kind === "timeout"
-								? `Extension ${ext.path} timed out after ${timeoutMs}ms`
-								: `Extension ${ext.path} failed: ${message}`,
+								? `Extension ${getExtensionNameFromPath(ext.path)} timed out after ${timeoutMs}ms`
+								: `Extension ${getExtensionNameFromPath(ext.path)} failed: ${message}`,
 					}),
 					signal,
 				)) as ToolCallEmitResult | undefined;
@@ -2116,15 +2161,21 @@ export class ExtensionRunner {
 					const { result: _answer, answeredBy: _forged, ...blocked } = handlerResult;
 					return blocked;
 				}
-				const answeredBy = handlerResult.result !== undefined ? getExtensionNameFromPath(ext.path) : undefined;
-				if (handlerResult.result !== undefined) {
-					const problem = toolCallAnswerProblem(handlerResult.result);
-					if (problem !== undefined) {
+				const extensionName = getExtensionNameFromPath(ext.path);
+				// Read the add-on's answer once: what is validated is exactly what is copied and kept.
+				const rawAnswer = handlerResult.result;
+				let answered: HeldToolCallAnswer | undefined;
+				if (rawAnswer !== undefined) {
+					// Hook files are bound through this runner, but the legacy hooks API has no `result`.
+					if (isHookOriginExtension(ext)) return { block: true, reason: hookAnswerRefusal(extensionName) };
+					const snapshot = snapshotToolCallAnswer(rawAnswer);
+					if ("problem" in snapshot) {
 						return {
 							block: true,
-							reason: `Extension ${answeredBy} returned an invalid tool_call answer: ${problem}. The call was blocked.`,
+							reason: `Extension ${extensionName} returned an invalid tool_call answer: ${snapshot.problem}. The call was blocked.`,
 						};
 					}
+					answered = { answer: snapshot.answer, answeredBy: extensionName };
 				}
 				// `answeredBy` is the runner's to set: a handler-supplied value is dropped here.
 				const {
@@ -2134,7 +2185,7 @@ export class ExtensionRunner {
 					answeredBy: _forged,
 					...controlResult
 				} = handlerResult;
-				accumulateToolCallResult(aggregated, handlerResult, answeredBy);
+				accumulateToolCallResult(aggregated, handlerResult, answered);
 				result = controlResult;
 			}
 		}

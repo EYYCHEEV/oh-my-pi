@@ -34,6 +34,7 @@ const ADDON_NAME = /^<inline-\d+>$/;
 
 interface ScriptedCall {
 	id: string;
+	name?: string;
 	arguments: Record<string, unknown>;
 	providerMetadata?: ToolCall["providerMetadata"];
 }
@@ -62,7 +63,7 @@ function registerScript(api: string, calls: ScriptedCall[], contexts: Context[])
 			const toolCalls: ToolCall[] = calls.map(call => ({
 				type: "toolCall",
 				id: call.id,
-				name: "read",
+				name: call.name ?? "read",
 				arguments: call.arguments,
 				...(call.providerMetadata ? { providerMetadata: call.providerMetadata } : {}),
 			}));
@@ -94,10 +95,10 @@ function stubModel(api: string): Model<Api> {
 }
 
 /** Re-registers `read` as a stub that records every real execution. */
-function stubRead(executed: unknown[], approval: "read" | "exec" = "read"): ExtensionFactory {
+function stubRead(executed: unknown[], approval: "read" | "exec" = "read", name = "read"): ExtensionFactory {
 	return pi => {
 		pi.registerTool({
-			name: "read",
+			name,
 			label: "Read",
 			description: "stub read",
 			approval,
@@ -146,8 +147,15 @@ describe("tool-call answer seam, end to end", () => {
 		extensions: ExtensionFactory[];
 		calls: ScriptedCall[];
 		settings?: Record<string, unknown>;
+		hookFiles?: Record<string, string>;
+		toolNames?: string[];
 	}) {
 		const dir = TempDir.createSync("@pi-answer-seam-session-");
+		for (const [file, source] of Object.entries(options.hookFiles ?? {})) {
+			const hookDir = dir.join(".omp", "hooks", "pre");
+			fs.mkdirSync(hookDir, { recursive: true });
+			fs.writeFileSync(`${hookDir}/${file}`, source);
+		}
 		const api = `test-answer-seam-${sessions.length}-${Math.random().toString(36).slice(2)}`;
 		const contexts: Context[] = [];
 		registerScript(api, options.calls, contexts);
@@ -165,7 +173,7 @@ describe("tool-call answer seam, end to end", () => {
 				...options.settings,
 			}),
 			model: stubModel(api),
-			disableExtensionDiscovery: true,
+			disableExtensionDiscovery: options.hookFiles === undefined,
 			extensions: options.extensions,
 			skills: [],
 			contextFiles: [],
@@ -174,7 +182,7 @@ describe("tool-call answer seam, end to end", () => {
 			enableMCP: false,
 			enableLsp: false,
 			skipPythonPreflight: true,
-			toolNames: ["read"],
+			toolNames: options.toolNames ?? ["read"],
 		});
 		sessions.push({ session, authStorage, dir });
 		const events: AgentSessionEvent[] = [];
@@ -429,5 +437,51 @@ describe("tool-call answer seam, end to end", () => {
 		expect(executed).toEqual([]);
 		expect(session.extensionRunner?.consumeToolCallAnswer("call-a", "read")).toBeUndefined();
 		expect(session.extensionRunner?.consumeToolCallAnswer("call-b", "read")).toBeUndefined();
+	});
+
+	it("blocks an answer from a legacy hook file bound through the extension runner, naming the hook (rule 9)", async () => {
+		const executed: unknown[] = [];
+		const { session } = await start({
+			extensions: [stubRead(executed)],
+			hookFiles: {
+				"answerer.ts": `export default function (pi) {
+	pi.on("tool_call", async () => ({ result: { content: [{ type: "text", text: "x" }] } }));
+}
+`,
+			},
+			calls: [{ id: "c1", arguments: { path: URL_A } }],
+		});
+
+		await session.sendUserMessage("read the page");
+
+		expect(executed).toEqual([]);
+		const [result] = toolResults(session);
+		expect(result?.isError).toBe(true);
+		expect(result?.content[0]?.text).toContain("answerer");
+		expect(result?.content[0]?.text).toContain("hooks cannot answer tool calls");
+		expect(result?.answeredBy).toBeUndefined();
+		expect(session.extensionRunner?.consumeToolCallAnswer("c1", "read")).toBeUndefined();
+	});
+
+	it("blocks an answer for a call the session interprets by tool name, naming the add-on (finding 10)", async () => {
+		const executed: unknown[] = [];
+		const answerEverything: ExtensionFactory = pi => {
+			pi.on("tool_call", async () => ({ result: { content: [{ type: "text" as const, text: CACHED_TEXT }] } }));
+		};
+		const { session } = await start({
+			extensions: [stubRead(executed, "read", "checkpoint"), answerEverything],
+			toolNames: ["checkpoint"],
+			calls: [{ id: "c1", name: "checkpoint", arguments: { path: URL_A } }],
+		});
+
+		await session.sendUserMessage("save a checkpoint");
+
+		expect(executed).toEqual([]);
+		const [result] = toolResults(session);
+		expect(result?.toolName).toBe("checkpoint");
+		expect(result?.isError).toBe(true);
+		expect(result?.content[0]?.text).toMatch(/<inline-\d+>/);
+		expect(result?.content[0]?.text).toContain("cannot be answered");
+		expect(result?.answeredBy).toBeUndefined();
 	});
 });

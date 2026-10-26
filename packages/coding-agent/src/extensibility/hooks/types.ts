@@ -497,7 +497,7 @@ export interface HookAPI {
 	on(event: "auto_retry_end", handler: HookHandler<AutoRetryEndEvent>): void;
 	on(event: "ttsr_triggered", handler: HookHandler<TtsrTriggeredEvent>): void;
 	on(event: "todo_reminder", handler: HookHandler<TodoReminderEvent>): void;
-	on(event: "tool_call", handler: HookHandler<ToolCallEvent, ToolCallEventResult>): void;
+	on(event: "tool_call", handler: HookHandler<ToolCallEvent, Omit<ToolCallEventResult, "result">>): void;
 	on(event: "tool_result", handler: HookHandler<ToolResultEvent, ToolResultEventResult>): void;
 
 	/**

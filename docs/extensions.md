@@ -896,10 +896,16 @@ Order rules:
 9. Fail closed: each of these blocks the call with a reason that names the add-on. A malformed answer
    (`content` not a non-empty list of text or image blocks, `isError` set, `details` that cannot be
    stored as JSON). An answer for a `computer` tool call (there is no safe way to fake screenshots). An
-   answer from a legacy hook (the hooks API does not get this field). Handler errors and timeouts
-   already block.
-10. One answer per call. It is held only for that exact tool call id and tool name, used once, and dropped
-    if the call is blocked, denied, skipped, or aborted.
+   answer for a call the session interprets by tool name (`yield`, `checkpoint`, `rewind`, `todo`,
+   `goal`, `ask`, `new_context`, and a `write` to an `xd://` device), because an answer could end a run
+   or fake a checkpoint. An answer from a legacy hook (the hooks API does not get this field; a hook
+   file found under `.omp/hooks`, which loads through the extension runner, counts as a hook). Handler
+   errors and timeouts already block. Every one of these reasons names the extension, never its path.
+10. One answer per call. It is held only for that exact tool call id, tool name and agent (an advisor
+    that reuses a call id never takes the primary agent's answer), used once, and dropped if the call
+    is blocked, denied, skipped, or aborted. An answer is never returned for a call whose run was
+    aborted, even when the approval prompt is answered late. The host copies the answer when it
+    validates it, so changing your own objects afterwards has no effect.
 
 The host sets `answeredBy` to the add-on's name (the folder name for `<folder>/index.ts`, otherwise the
 file name without `.ts`/`.js`, never its path). A handler cannot set it, and neither can a tool that really
@@ -914,7 +920,10 @@ original call, so the session file tells the truth:
 Providers ignore `answeredBy`; it never reaches the model. The RPC wire types carry the same optional field
 on tool result messages. Answers work for loop calls and for direct calls the loop never sees (nested
 `xd://` device calls, Cursor exec, an advisor's tools); subagents get them through their own runner.
-Answer size is the add-on's business, as with a tool's own output.
+An answer to a nested `xd://` device call, or to a call bridged through `eval`, is used, but the stored
+message of the outer tool (`write` or `eval`) is not marked `answeredBy`: the outer tool did run, and
+the mark is only for a call the add-on answered in place of the tool. Answer size is the add-on's
+business, as with a tool's own output.
 
 ### Delegating to a native built-in (`ctx.invokeTool`)
 
@@ -1533,7 +1542,7 @@ Provide `renderCall` / `renderResult` on `registerTool` definitions for custom t
 ## Constraints and pitfalls
 
 - Session actions are unavailable during extension load; registration methods, `getFlag`, and `exec` are available.
-- `tool_call` errors and timeouts block execution (fail-closed), as do malformed answers, answers for `computer` calls, and answers from legacy hooks (see "Answering a tool call"). Its budget is `extensionHandlers.toolCallTimeoutMs` (default 30,000 ms), paused during extension UI waits.
+- `tool_call` errors and timeouts block execution (fail-closed), as do malformed answers, answers for `computer` calls, answers for session-interpreted tools (`yield`, `checkpoint`, `rewind`, `todo`, `goal`, `ask`, `new_context`, `write xd://...`), and answers from legacy hooks (see "Answering a tool call"). Its budget is `extensionHandlers.toolCallTimeoutMs` (default 30,000 ms), paused during extension UI waits.
 - Most dispatched handlers have a 30-second budget; `session_shutdown` handlers run concurrently with a 2-second budget. Timing out stops waiting and cancels handler UI, but cannot undo arbitrary extension side effects.
 - Command name conflicts with built-ins are skipped with diagnostics.
 - Reserved shortcuts are ignored (`ctrl+c`, `ctrl+d`, `ctrl+z`, `ctrl+k`, `ctrl+p`, `ctrl+l`, `ctrl+o`, `ctrl+t`, `ctrl+g`, `ctrl+q`, `alt+m`, `shift+tab`, `shift+ctrl+p`, `alt+enter`, `escape`, `enter`).

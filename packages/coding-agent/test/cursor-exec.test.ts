@@ -2475,4 +2475,74 @@ describe("CursorExecHandlers passive tool context", () => {
 		expect(result.content).toEqual([{ type: "text", text: "<cached page>" }]);
 		expect(result.answeredBy).toBe("stronk-web-cache");
 	});
+
+	it("carries answeredBy on the tool_execution_end event of an answered exec call (finding 7)", async () => {
+		const answeringRunner = {
+			...passthroughRunner(),
+			emitToolCall: async () => ({
+				result: { content: [{ type: "text", text: "<cached page>" }], details: { cachedAt: "now" } },
+				answeredBy: "stronk-web-cache",
+			}),
+		} as unknown as ExtensionRunner;
+		const events: AgentEvent[] = [];
+		const handlers = new CursorExecHandlers({
+			cwd: os.tmpdir(),
+			tools: new Map<string, Tool>([
+				["probe", new ExtensionToolWrapper(probeTool(false), answeringRunner) as unknown as Tool],
+			]),
+			getToolContext: () => yoloToolContext(),
+			emitEvent: event => events.push(event),
+		});
+
+		await handlers.mcp({
+			name: "probe",
+			providerIdentifier: "pi-agent",
+			toolName: "probe",
+			toolCallId: "probe-answered-event",
+			args: {},
+			rawArgs: {},
+		});
+
+		const end = events.find(event => event.type === "tool_execution_end");
+		expect(end?.type === "tool_execution_end" ? (end.result as { answeredBy?: string }).answeredBy : undefined).toBe(
+			"stronk-web-cache",
+		);
+	});
+
+	it("carries answeredBy on the tool_execution_end event of an answered shell stream (finding 7)", async () => {
+		const answeringRunner = {
+			...passthroughRunner(),
+			emitToolCall: async () => ({
+				result: { content: [{ type: "text", text: "<cached output>" }] },
+				answeredBy: "stronk-web-cache",
+			}),
+		} as unknown as ExtensionRunner;
+		const bashTool = {
+			name: "bash",
+			label: "bash",
+			description: "never runs",
+			parameters: type({ command: "string" }),
+			approval: "read",
+			execute: async () => ({ content: [{ type: "text", text: "ran" }], details: undefined }),
+		} as unknown as AgentTool;
+		const events: AgentEvent[] = [];
+		const handlers = new CursorExecHandlers({
+			cwd: os.tmpdir(),
+			tools: new Map<string, Tool>([
+				["bash", new ExtensionToolWrapper(bashTool, answeringRunner) as unknown as Tool],
+			]),
+			getToolContext: () => yoloToolContext(),
+			emitEvent: event => events.push(event),
+		});
+
+		await handlers.shellStream(create(ShellArgsSchema, { toolCallId: "shell-answered-event", command: "ls" }), {
+			onStdout: () => {},
+			onStderr: () => {},
+		});
+
+		const end = events.find(event => event.type === "tool_execution_end");
+		expect(end?.type === "tool_execution_end" ? (end.result as { answeredBy?: string }).answeredBy : undefined).toBe(
+			"stronk-web-cache",
+		);
+	});
 });

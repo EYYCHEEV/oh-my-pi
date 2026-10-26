@@ -15,6 +15,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { convertToLlm, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { getExtensionNameFromPath } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import {
 	ExtensionRuntime,
 	loadExtensionFromFactory,
@@ -1823,7 +1824,7 @@ describe("ExtensionRunner", () => {
 
 			const startedAt = performance.now();
 			await expect(wrapped.execute("tool-call-id", {})).rejects.toThrow(
-				`Extension ${hangExtensionPath} timed out after 10ms`,
+				`Extension ${getExtensionNameFromPath(hangExtensionPath)} timed out after 10ms`,
 			);
 			const elapsedMs = performance.now() - startedAt;
 
@@ -1905,7 +1906,7 @@ describe("ExtensionRunner", () => {
 					vi.advanceTimersByTime(0);
 					expect(await decision).toEqual({
 						block: true,
-						reason: `Extension ${extensionPath} timed out after ${EXTENSION_HANDLER_TIMEOUT_MS}ms`,
+						reason: `Extension ${getExtensionNameFromPath(extensionPath)} timed out after ${EXTENSION_HANDLER_TIMEOUT_MS}ms`,
 					});
 				}
 			} finally {
@@ -1965,7 +1966,7 @@ describe("ExtensionRunner", () => {
 			);
 
 			await expect(wrapped.execute("tool-call-id", {})).rejects.toThrow(
-				`Extension ${extensionPath} failed: expected tool-call registration failure`,
+				`Extension ${getExtensionNameFromPath(extensionPath)} failed: expected tool-call registration failure`,
 			);
 			expect(executeCalls).toEqual([]);
 			expect(errors).toContainEqual({
@@ -2131,7 +2132,9 @@ describe("ExtensionRunner", () => {
 				await Promise.resolve();
 				await Promise.resolve();
 				vi.advanceTimersByTime(0);
-				await expect(execution).rejects.toThrow(`Extension ${extensionPath} timed out after 25ms`);
+				await expect(execution).rejects.toThrow(
+					`Extension ${getExtensionNameFromPath(extensionPath)} timed out after 25ms`,
+				);
 			} finally {
 				performanceNow.mockRestore();
 				vi.useRealTimers();
@@ -2201,7 +2204,7 @@ describe("ExtensionRunner", () => {
 				expect(settled).toBe(true);
 				expect(await decision).toEqual({
 					block: true,
-					reason: `Extension ${extensionPath} timed out after 10ms`,
+					reason: `Extension ${getExtensionNameFromPath(extensionPath)} timed out after 10ms`,
 				});
 			} finally {
 				vi.useRealTimers();
