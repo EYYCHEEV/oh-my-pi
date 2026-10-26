@@ -446,28 +446,68 @@ function isAnswerBlock(block: unknown): boolean {
 	return false;
 }
 
+/** The outcome of {@link snapshotToolCallAnswer}: a stored copy of the answer, or why it was refused. */
+export type ToolCallAnswerSnapshot = { answer: ToolCallAnswer } | { problem: string };
+
 /**
- * Why `answer` cannot be a tool call's result, or undefined when it can: the content must be a
- * non-empty list of text or image blocks, `isError` must not be set (use `block` to refuse a
- * call), and `details` must survive `JSON.stringify` because the session stores it.
+ * Validate a handler's answer and copy it, reading each part of the add-on's object exactly once,
+ * so nothing the add-on does to its own objects afterwards (a cache entry updated in place, a getter
+ * that answers differently the second time) can change what was validated. The content must be a
+ * non-empty list of text or image blocks, `isError` must not be set (use `block` to refuse a call),
+ * and `details` must survive `JSON.stringify` because the session stores it: the stored copy is
+ * exactly that JSON form.
  */
-export function toolCallAnswerProblem(answer: unknown): string | undefined {
-	if (typeof answer !== "object" || answer === null || Array.isArray(answer)) return "the answer is not an object";
-	if (!("content" in answer) || !Array.isArray(answer.content) || answer.content.length === 0) {
-		return "content must be a non-empty list of text or image blocks";
+export function snapshotToolCallAnswer(raw: unknown): ToolCallAnswerSnapshot {
+	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return { problem: "the answer is not an object" };
+	const source = raw as { content?: unknown; details?: unknown; isError?: unknown };
+	const content = source.content;
+	const details = source.details;
+	const isError = source.isError;
+	if (!Array.isArray(content) || content.length === 0) {
+		return { problem: "content must be a non-empty list of text or image blocks" };
 	}
-	if (!answer.content.every(isAnswerBlock)) return "content has a block that is not a valid text or image block";
-	if ("isError" in answer && answer.isError !== undefined) {
-		return "an answer is never an error result (return block to refuse the call)";
+	const blocks = content.map(block => (typeof block === "object" && block !== null ? { ...block } : block));
+	if (!blocks.every(isAnswerBlock)) return { problem: "content has a block that is not a valid text or image block" };
+	if (isError !== undefined)
+		return { problem: "an answer is never an error result (return block to refuse the call)" };
+	const stored = blocks as ToolCallAnswer["content"];
+	if (details === undefined) return { answer: { content: stored } };
+	let json: string | undefined;
+	try {
+		json = JSON.stringify(details);
+	} catch {
+		return { problem: "details cannot be stored as JSON" };
 	}
-	if ("details" in answer && answer.details !== undefined) {
-		try {
-			if (JSON.stringify(answer.details) === undefined) return "details cannot be stored as JSON";
-		} catch {
-			return "details cannot be stored as JSON";
-		}
-	}
-	return undefined;
+	if (json === undefined) return { problem: "details cannot be stored as JSON" };
+	return { answer: { content: stored, details: JSON.parse(json) as unknown } };
+}
+
+/** Why a legacy hook cannot answer a tool call; shared by the hook runner and the extension runner. */
+export function hookAnswerRefusal(hookName: string): string {
+	return `Hook ${hookName} returned an answer for a tool call, but hooks cannot answer tool calls (use an extension instead). The call was blocked.`;
+}
+
+/** Tools whose results the session itself interprets by name (run end, checkpoints, goals, plans, todos). */
+const SESSION_CONTROL_TOOLS: ReadonlySet<string> = new Set([
+	"yield",
+	"checkpoint",
+	"rewind",
+	"todo",
+	"goal",
+	"ask",
+	"new_context",
+]);
+
+/**
+ * Whether the session reads this call's result by tool name: the tools in {@link SESSION_CONTROL_TOOLS},
+ * and any `write` to an `xd://` device (the session reads the device's result from the `write` result).
+ */
+export function isSessionControlCall(toolName: string, input: unknown): boolean {
+	const name = toolName.trim().replace(/^xd:\/\//i, "");
+	if (SESSION_CONTROL_TOOLS.has(name)) return true;
+	if (name !== "write" || typeof input !== "object" || input === null) return false;
+	const target = (input as { path?: unknown }).path;
+	return typeof target === "string" && /^\s*xd:\/\//i.test(target);
 }
 
 /** What a caller does with a `tool_call` emission's answer; see {@link decideToolCallAnswer}. */
@@ -480,12 +520,15 @@ const NO_TOOL_CALL_ANSWER: ToolCallAnswerDecision = { kind: "none" };
 
 /**
  * Decide what to do with the answer, if any, in a `tool_call` emission's result. An answer needs the
- * add-on's name for the record, and `computer` calls cannot be answered (there is no safe way to
- * fake a screenshot): both refuse. The caller blocks a refused call with the returned reason.
+ * add-on's name for the record, `computer` calls cannot be answered (there is no safe way to fake a
+ * screenshot), and calls the session interprets by tool name cannot be answered (an answer could end
+ * a run or fake a checkpoint): each refuses. The caller blocks a refused call with the returned reason.
  */
 export function decideToolCallAnswer(
 	callResult: ToolCallEmitResult | undefined,
 	isComputerCall: boolean,
+	toolName: string,
+	input?: unknown,
 ): ToolCallAnswerDecision {
 	if (callResult?.result === undefined) return NO_TOOL_CALL_ANSWER;
 	const answeredBy = callResult.answeredBy;
@@ -501,6 +544,12 @@ export function decideToolCallAnswer(
 			reason: `Extension ${answeredBy} tried to answer a computer tool call, which cannot be answered. The call was blocked.`,
 		};
 	}
+	if (isSessionControlCall(toolName, input)) {
+		return {
+			kind: "refused",
+			reason: `Extension ${answeredBy} tried to answer a call to ${toolName}, which the session interprets and so cannot be answered. The call was blocked.`,
+		};
+	}
 	return { kind: "answered", held: { answer: callResult.result, answeredBy } };
 }
 
@@ -508,14 +557,14 @@ export function decideToolCallAnswer(
  * Merge one handler's `tool_call` result into the running aggregation.
  * Non-blank `additionalContext` values accumulate in registration order and
  * join (repeats dropped) at the end; `input` stays last-wins. An answer
- * (`result`, already validated by the caller, which passes the add-on's
+ * (already validated and copied by the caller, which passes it with the add-on's
  * name) is last-wins too but tracked separately from the control result. A
  * `block` result short-circuits the caller, discarding everything collected so far.
  */
 export function accumulateToolCallResult(
 	aggregated: ToolCallAggregate,
 	handlerResult: ToolCallEventResult,
-	answeredBy?: string,
+	answered?: HeldToolCallAnswer,
 ): void {
 	if (isNonBlankContext(handlerResult.additionalContext)) {
 		aggregated.additionalContext.push(handlerResult.additionalContext);
@@ -523,10 +572,7 @@ export function accumulateToolCallResult(
 	if (handlerResult.input !== undefined) {
 		aggregated.input = handlerResult.input;
 	}
-	if (handlerResult.result !== undefined && answeredBy !== undefined) {
-		const { content, details } = handlerResult.result;
-		aggregated.answered = { answer: { content, ...(details !== undefined ? { details } : {}) }, answeredBy };
-	}
+	if (answered !== undefined) aggregated.answered = answered;
 }
 
 /**

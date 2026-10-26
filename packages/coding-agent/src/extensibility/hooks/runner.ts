@@ -10,6 +10,7 @@ import { createNoOpUIContext } from "../utils";
 import {
 	accumulateToolCallResult,
 	buildAggregatedToolCallResult,
+	hookAnswerRefusal,
 	type ToolCallAggregate,
 	type ToolCallEmitResult,
 } from "../shared-events";
@@ -366,7 +367,7 @@ export class HookRunner {
 				if (handlerResult.result !== undefined) {
 					return {
 						block: true,
-						reason: `Hook ${getExtensionNameFromPath(hook.path)} returned an answer for a tool call, but hooks cannot answer tool calls (use an extension instead). The call was blocked.`,
+						reason: hookAnswerRefusal(getExtensionNameFromPath(hook.path)),
 					};
 				}
 				const { additionalContext: _context, input: _input, answeredBy: _forged, ...controlResult } = handlerResult;

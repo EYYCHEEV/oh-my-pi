@@ -78,6 +78,24 @@ const loadedRuntimeOrigins = new WeakMap<
 	Extension,
 	Readonly<{ path: string; sha256: string; runtime: IExtensionRuntime }>
 >();
+/**
+ * Files discovery found as legacy hooks (`.omp/hooks/pre|post`, hook plugin roots). They load as
+ * extensions, but only the loader decides which extensions came from a hook: the runner refuses a
+ * `tool_call` answer from them, since the legacy hooks API has no `result`. Paths are resolved, so
+ * the mark survives the loader's own path handling; a file that is both a hook and an explicit
+ * extension path is treated as a hook (the stricter reading).
+ */
+const hookOriginPaths = new Set<string>();
+const hookOriginExtensions = new WeakSet<Extension>();
+
+function markHookOrigin(hookPath: string): void {
+	hookOriginPaths.add(path.resolve(hookPath));
+}
+
+/** Whether discovery found this extension's file as a legacy hook. Only the loader marks it. */
+export function isHookOriginExtension(extension: Extension): boolean {
+	return hookOriginExtensions.has(extension);
+}
 // Some supported platforms reuse a cached factory despite a new import tag.
 // Never relabel that same executable object with newer entry bytes.
 const runtimeFactoryOrigins = new WeakMap<ExtensionFactory, Readonly<{ path: string; sha256: string }>>();
@@ -617,7 +635,7 @@ class ConcreteExtensionAPI implements ExtensionAPI {
  * Create an Extension object with empty collections.
  */
 function createExtension(extensionPath: string, resolvedPath: string): Extension {
-	return {
+	const extension: Extension = {
 		path: extensionPath,
 		resolvedPath,
 		handlers: new Map(),
@@ -633,6 +651,10 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 		shortcuts: new Map(),
 		statusSegments: new Map(),
 	};
+	if (hookOriginPaths.has(path.resolve(extensionPath)) || hookOriginPaths.has(path.resolve(resolvedPath))) {
+		hookOriginExtensions.add(extension);
+	}
+	return extension;
 }
 
 /**
@@ -1129,12 +1151,15 @@ export async function discoverExtensionPaths(
 			for (const hookPath of hooks.items
 				.map(hook => hook.path)
 				.filter(hookPath => isExtensionFile(path.basename(hookPath)))) {
+				markHookOrigin(hookPath);
 				addPath(hookPath);
 			}
 		}
 	} else {
 		for (const configuredPath of configuredPaths) {
-			addPaths(await discoverHooksInPackageRoot(resolvePath(configuredPath, cwd)));
+			const hookPaths = await discoverHooksInPackageRoot(resolvePath(configuredPath, cwd));
+			for (const hookPath of hookPaths) markHookOrigin(hookPath);
+			addPaths(hookPaths);
 		}
 	}
 

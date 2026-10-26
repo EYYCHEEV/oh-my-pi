@@ -3800,9 +3800,7 @@ export class AgentSession implements SettingsScope {
 		} else if (event.type === "tool_execution_end") {
 			this.#activeToolExecutionUpdates.delete(event.toolCallId);
 			// One answer per call: whatever ended this call (result, skip, abort), nothing stays held for it.
-			this.#extensionRunner?.clearToolCallAnswer?.(event.toolCallId, event.toolName);
-		} else if (event.type === "agent_end") {
-			this.#extensionRunner?.clearToolCallAnswers?.();
+			this.#extensionRunner?.clearToolCallAnswersForCall?.(event.toolCallId);
 		}
 		if (event.type === "message_update") {
 			this.#emit(event);
@@ -5870,7 +5868,7 @@ export class AgentSession implements SettingsScope {
 			runner.clearLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
 			return { block: true, reason: callResult.reason || "Tool execution was blocked by an extension" };
 		}
-		const decision = decideToolCallAnswer(callResult, computer !== undefined);
+		const decision = decideToolCallAnswer(callResult, computer !== undefined, ctx.tool.name, ctx.args);
 		if (decision.kind === "refused") {
 			runner.clearLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
 			return { block: true, reason: decision.reason };
@@ -5953,6 +5951,9 @@ export class AgentSession implements SettingsScope {
 		if (budgetRefusal && agentRunSequence !== this.#agentRunSequence) return;
 		this.#settledAgentEnd = event;
 		if (agentRunSequence === this.#agentRunSequence) this.#emitRunState("idle");
+		// The run that ended leaves nothing held. A settle from an older run must not clear answers a
+		// newer run already holds.
+		if (agentRunSequence === this.#agentRunSequence) this.#extensionRunner?.clearToolCallAnswers?.();
 		// Tagged isTerminal so subscribers can tell final settles from scheduled
 		// continuations, and `yielded` so they can tell the agent's own follow-up
 		// work (retries, reminders, compaction) from a finished turn that only
