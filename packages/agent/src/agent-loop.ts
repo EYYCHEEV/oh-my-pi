@@ -580,6 +580,8 @@ function coerceToolResult(raw: unknown): { result: AgentToolResult<unknown>; mal
 	// Tools may flag the result contextually useless (zero matches, elapsed
 	// wait) so compaction can elide it once consumed. Errors are never useless.
 	const useless = Boolean(rawObj && "useless" in rawObj && rawObj.useless);
+	// The add-on that answered the call through the `tool_call` answer seam. Only a string is kept.
+	const answeredBy = rawObj && typeof rawObj.answeredBy === "string" ? rawObj.answeredBy : undefined;
 
 	if (!Array.isArray(rawContent)) {
 		return {
@@ -636,6 +638,7 @@ function coerceToolResult(raw: unknown): { result: AgentToolResult<unknown>; mal
 			providerMetadata,
 			...(isError ? { isError: true } : {}),
 			...(useless && !isError ? { useless: true } : {}),
+			...(answeredBy !== undefined ? { answeredBy } : {}),
 		},
 		malformed: invalidBlocks > 0 || providerMetadataResult.malformed,
 	};
@@ -3538,6 +3541,7 @@ async function executeToolCalls(
 			providerMetadata: result.providerMetadata,
 			isError,
 			...(result.useless && !isError ? { useless: true } : {}),
+			...(result.answeredBy !== undefined ? { answeredBy: result.answeredBy } : {}),
 			timestamp: Date.now(),
 		};
 		record.result = result;
@@ -3746,6 +3750,7 @@ async function executeToolCalls(
 							isError: after.isError ?? result.isError,
 							providerMetadata: after.providerMetadata ?? result.providerMetadata,
 							useless: after.useless ?? result.useless,
+							answeredBy: result.answeredBy,
 						});
 						result = coerced.result;
 						isError = coerced.malformed || (after.isError ?? isError);

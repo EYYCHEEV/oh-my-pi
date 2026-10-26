@@ -341,6 +341,7 @@ class ToolResultMessage(TypedDict):
     attribution: NotRequired[Attribution]
     prunedAt: NotRequired[float]
     useless: NotRequired[bool]
+    answeredBy: NotRequired[str]
 
 
 class BashExecutionMessage(TypedDict):

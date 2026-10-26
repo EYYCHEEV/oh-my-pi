@@ -797,18 +797,24 @@ export interface RpcHostToolCancelRequest {
 	targetId: string;
 }
 
+/**
+ * Tool output a host sends back: an `AgentToolResult` without `answeredBy`. Only the extension tool
+ * wrapper marks a result as answered by an add-on, so the wire never offers hosts that field.
+ */
+export type RpcHostToolPayload = Omit<AgentToolResult<unknown>, "answeredBy">;
+
 /** Sent by the host to stream partial tool updates back to the RPC server. */
 export interface RpcHostToolUpdate {
 	type: "host_tool_update";
 	id: string;
-	partialResult: AgentToolResult<unknown>;
+	partialResult: RpcHostToolPayload;
 }
 
 /** Sent by the host to complete a pending tool call. */
 export interface RpcHostToolResult {
 	type: "host_tool_result";
 	id: string;
-	result: AgentToolResult<unknown>;
+	result: RpcHostToolPayload;
 	isError?: boolean;
 }
 

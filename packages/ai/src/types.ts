@@ -1477,6 +1477,11 @@ export interface ToolResultMessage<TDetails = unknown> {
 	 * Never set together with isError.
 	 */
 	useless?: boolean;
+	/**
+	 * Name of the add-on that answered this call itself (the tool did not run); the assistant message
+	 * before it keeps the model's original call. Providers ignore the field: it never reaches the model.
+	 */
+	answeredBy?: string;
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
