@@ -148,6 +148,7 @@ An upgrade fails before build or installation if the block is stale, any require
 - `mnemopi-prune-consolidated`: Mnemopi bounds database growth by deleting consolidated working rows N days after their summary (mnemopi.pruneConsolidatedDays, off by default)
 - `mnemopi-startup-visibility`: A Mnemopi start that fails says why, once at startup and in every memory tool, instead of leaving memory silently off
 - `read-racy-stamp`: The read tool's archive cache stores no file stamp younger than 2 seconds, so a same-tick rewrite on a coarse Linux file clock is seen
+- `tool-call-answer-seam`: A tool_call handler can answer the call itself (result); the tool does not run, approval still gates the call, a block still wins, and the stored result carries answeredBy
 <!-- stronk-omp:fork-contracts:end -->
 
 ## Upstream alignment
