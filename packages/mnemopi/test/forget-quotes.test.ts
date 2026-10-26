@@ -27,12 +27,16 @@ type Db = Mnemopi["beam"]["db"];
 type Turn = readonly [role: "user" | "assistant", text: string];
 
 const TRANSCRIPT = "coding-agent-transcript";
-const MARKER = "OLIVE-MNEMO-6150";
+// Its number word carries a letter on purpose: a bare four-digit number sits in about one bank in 200 by chance, in a
+// random id, digest or rolling hash, and a scan for it reported a leak that was not one.
+const MARKER = "OLIVE-MNEMO-X6150";
 // Holds " for ": a sleep summary writes it as "code→the east door", so only the compacted form is in a summary.
 const MEMORY = `The delta bot's locker code for the east door is ${MARKER}.`;
 // The wording the extractor gave the memory: not a substring of it.
 const FACT = `delta bot east door locker code ${MARKER}`;
 const UNRELATED = "Quokka migration is scheduled for 2027-05-09 with 41 gadgets";
+// What no table may hold once a memory is forgotten: the words of the marker and of the memory.
+const FORGOTTEN = ["olive", "mnemo", "x6150", "east door"];
 const hoursAgo = (hours: number): string => new Date(Date.now() - hours * 3_600_000).toISOString();
 const daysAgo = (days: number): string => hoursAgo(days * 24);
 
@@ -148,7 +152,7 @@ describe("word windows", () => {
 		new WindowSet(salt, windowEntries([forgotten], salt)).cut(text);
 
 	it("cuts a quote in another case, other punctuation or other whitespace", () => {
-		expect(cutWith(MEMORY, `Note: THE DELTA BOT'S  LOCKER CODE for the east door is olive-mnemo-6150, ok`)).toBe(
+		expect(cutWith(MEMORY, `Note: THE DELTA BOT'S  LOCKER CODE for the east door is olive-mnemo-x6150, ok`)).toBe(
 			"Note: [forgotten], ok",
 		);
 	});
@@ -180,7 +184,7 @@ describe("word windows", () => {
 		const entries = windowEntries([MEMORY], salt);
 
 		expect(entries.length).toBeGreaterThan(5);
-		expect(JSON.stringify(entries).toLowerCase()).not.toMatch(/olive|mnemo|6150|delta|locker/);
+		expect(JSON.stringify(entries).toLowerCase()).not.toMatch(/olive|mnemo|x6150|delta|locker/);
 		for (const entry of entries) expect(entry.digest).toMatch(/^[0-9a-f]{16}$/);
 	});
 });
@@ -284,11 +288,26 @@ describe("a tombstone cuts the forgotten text out of transcripts retained after 
 
 		expect(count(db, "SELECT COUNT(*) FROM forget_tombstones")).toBeGreaterThan(5);
 		const dump = dumpTables(db);
-		for (const piece of ["olive", "mnemo", "6150", "east door"]) expect(dump).not.toContain(piece);
+		for (const piece of FORGOTTEN) expect(dump).not.toContain(piece);
 		// What is stored: a window size, two hashes and a time, and one random salt.
 		const [tombstone] = db.query("SELECT * FROM forget_tombstones LIMIT 1").all() as Record<string, unknown>[];
 		expect(Object.keys(tombstone ?? {}).sort()).toEqual(["created_at", "digest", "id", "ntokens", "roll"]);
 		expect(count(db, "SELECT COUNT(*) FROM forget_tombstone_salt")).toBe(1);
+	});
+
+	it("does not take the digits of a hash or a number for the forgotten text", () => {
+		const db = makeMemory("tombstone-lookalike").beam.db;
+		// Digests, rolling hashes and times are random hex and decimal, so any four digits sit in about one bank in 200 by chance.
+		db.run("INSERT INTO forget_tombstones (ntokens, roll, digest, created_at) VALUES (?, ?, ?, ?)", [
+			3,
+			3_461_502_817,
+			"0a6150c3d5e7f912",
+			"1761501234567",
+		]);
+		const dump = dumpTables(db);
+		expect(dump).toContain("6150");
+
+		for (const piece of FORGOTTEN) expect(dump).not.toContain(piece);
 	});
 
 	it("keeps each window once, however often it is forgotten", async () => {
