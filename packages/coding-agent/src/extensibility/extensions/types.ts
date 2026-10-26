@@ -1402,6 +1402,12 @@ interface ToolResultEventBase {
 	input: Record<string, unknown>;
 	content: (TextContent | ImageContent)[];
 	isError: boolean;
+	/**
+	 * Set (to the add-on's name, never its path) when a `tool_call` handler answered this call
+	 * itself, so the tool did not run and `content`/`details` are that answer. Handlers may still
+	 * change the result; the stored message keeps the marker.
+	 */
+	answeredBy?: string;
 }
 
 export interface BashToolResultEvent extends ToolResultEventBase {
@@ -1552,7 +1558,7 @@ export interface AssistantMessageRewriteResult {
 
 export type BeforeProviderRequestEventResult = unknown;
 
-export type { ToolCallEventResult } from "../shared-events";
+export type { HeldToolCallAnswer, ToolCallAnswer, ToolCallEmitResult, ToolCallEventResult } from "../shared-events";
 
 /** Result from input event handler */
 export interface InputEventResult {

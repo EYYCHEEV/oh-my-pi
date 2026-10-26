@@ -4,9 +4,15 @@
 import { type AgentMessage, isNonBlankContext, joinAdditionalContext } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { ModelRegistry } from "../../config/model-registry";
+import { getExtensionNameFromPath } from "../../discovery/helpers";
 import type { SessionManager } from "../../session/session-manager";
 import { createNoOpUIContext } from "../utils";
-import { accumulateToolCallResult, buildAggregatedToolCallResult } from "../shared-events";
+import {
+	accumulateToolCallResult,
+	buildAggregatedToolCallResult,
+	type ToolCallAggregate,
+	type ToolCallEmitResult,
+} from "../shared-events";
 import type {
 	AppendEntryHandler,
 	BranchHandler,
@@ -336,11 +342,13 @@ export class HookRunner {
 	 * Emit a tool_call event to all hooks.
 	 * No timeout - user prompts can take as long as needed.
 	 * Errors are thrown (not swallowed) so caller can block on failure.
+	 * A hook cannot answer a tool call (`result`): the legacy hooks API does not get that field, so
+	 * an answer from a hook blocks the call, naming the hook. Use an extension to answer calls.
 	 */
 	async emitToolCall(event: ToolCallEvent): Promise<ToolCallEventResult | undefined> {
 		const ctx = this.#createContext();
 		let result: ToolCallEventResult | undefined;
-		const aggregated = { input: undefined as ToolCallEventResult["input"], additionalContext: [] as string[] };
+		const aggregated: ToolCallAggregate = { additionalContext: [] };
 
 		for (const hook of this.hooks) {
 			const handlers = hook.handlers.get("tool_call");
@@ -348,13 +356,20 @@ export class HookRunner {
 
 			for (const handler of handlers) {
 				// No timeout - let user take their time
-				const handlerResult = (await handler(event, ctx)) as ToolCallEventResult | undefined;
+				const handlerResult = (await handler(event, ctx)) as ToolCallEmitResult | undefined;
 
 				if (!handlerResult) continue;
 				if (handlerResult.block) {
-					return handlerResult;
+					const { result: _answer, answeredBy: _forged, ...blocked } = handlerResult;
+					return blocked;
 				}
-				const { additionalContext: _context, input: _input, ...controlResult } = handlerResult;
+				if (handlerResult.result !== undefined) {
+					return {
+						block: true,
+						reason: `Hook ${getExtensionNameFromPath(hook.path)} returned an answer for a tool call, but hooks cannot answer tool calls (use an extension instead). The call was blocked.`,
+					};
+				}
+				const { additionalContext: _context, input: _input, answeredBy: _forged, ...controlResult } = handlerResult;
 				accumulateToolCallResult(aggregated, handlerResult);
 				result = controlResult;
 			}

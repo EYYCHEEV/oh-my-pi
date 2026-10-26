@@ -352,8 +352,27 @@ export interface TodoReminderEvent {
 // ============================================================================
 
 /**
+ * An answer a `tool_call` handler gives for the call itself. The tool does not run: the model sees
+ * `content` as the call's result. An answer is always a normal, non-error result; a handler that
+ * wants to refuse the call returns `block` instead.
+ */
+export interface ToolCallAnswer {
+	/** What the model sees: at least one text or image block. */
+	content: (TextContent | ImageContent)[];
+	/** Optional details stored with the result; must survive `JSON.stringify` because the session stores them. */
+	details?: unknown;
+}
+
+/** An answer together with the name of the add-on that gave it (never its path). */
+export interface HeldToolCallAnswer {
+	answer: ToolCallAnswer;
+	answeredBy: string;
+}
+
+/**
  * Return type for `tool_call` handlers.
- * Allows handlers to block tool execution or revise the input the tool runs with.
+ * Allows handlers to block tool execution, revise the input the tool runs with, or answer the call
+ * themselves.
  */
 export interface ToolCallEventResult {
 	/** If true, block the tool from executing */
@@ -362,11 +381,12 @@ export interface ToolCallEventResult {
 	reason?: string;
 	/**
 	 * Replacement input the tool executes with, instead of the original arguments. Ignored when
-	 * `block` is true. This is the raw execution input passed to the tool's `execute` (the handler
-	 * owns its correctness) — not the normalized `event.input` view, which may carry derived
-	 * gate-only fields (e.g. hashline `edit` `path`/`paths`) that are not real parameters. When
-	 * multiple handlers set `input`, the last one wins; handlers do not observe each other's
-	 * revisions (each sees the original `event.input`). Not applied to `computer` tool calls.
+	 * `block` is true, and dropped whenever the final result carries an answer (`result`). This is
+	 * the raw execution input passed to the tool's `execute` (the handler owns its correctness) —
+	 * not the normalized `event.input` view, which may carry derived gate-only fields (e.g. hashline
+	 * `edit` `path`/`paths`) that are not real parameters. When multiple handlers set `input`, the
+	 * last one wins; handlers do not observe each other's revisions (each sees the original
+	 * `event.input`). Not applied to `computer` tool calls.
 	 *
 	 * For model-issued tool calls the event fires at arg-prep time in the agent loop, before
 	 * concurrency scheduling, `tool_execution_start`, and the approval gate: the revision is
@@ -385,17 +405,117 @@ export interface ToolCallEventResult {
 	 * registration order; ignored when this or a later handler blocks the call.
 	 */
 	additionalContext?: string;
+	/**
+	 * Answer the call: the tool does not run and the model sees this result. Every later handler
+	 * still runs and can still block (a block discards the answer); with several answers the last
+	 * one wins; the model's original call is what approval and the session record use, so any
+	 * `input` revision is dropped; `additionalContext` from non-blocking handlers is still
+	 * delivered. Approval is unchanged: the answer is used only after the normal approval gate
+	 * approves the original call. `tool_result` handlers still see the answered result (with
+	 * `answeredBy`) and may change it. A malformed answer, an answer for a `computer` tool call,
+	 * and an answer from a legacy hook each block the call, naming the add-on. The stored result
+	 * message carries `answeredBy`, set by the host to the add-on's name; a handler cannot set it.
+	 */
+	result?: ToolCallAnswer;
+}
+
+/**
+ * What the extension runner returns for a `tool_call` emission: the merged handler results plus
+ * `answeredBy`, which the runner (never a handler) sets to the answering add-on's name.
+ */
+export interface ToolCallEmitResult extends ToolCallEventResult {
+	answeredBy?: string;
+}
+
+/** Running aggregation of the `tool_call` handlers' results; see {@link accumulateToolCallResult}. */
+export interface ToolCallAggregate {
+	input?: Record<string, unknown>;
+	additionalContext: string[];
+	/** Tracked on its own, so a later handler that only adds context cannot erase an earlier answer. */
+	answered?: HeldToolCallAnswer;
+}
+
+function isAnswerBlock(block: unknown): boolean {
+	if (typeof block !== "object" || block === null || !("type" in block)) return false;
+	if (block.type === "text") return "text" in block && typeof block.text === "string";
+	if (block.type === "image") {
+		return (
+			"data" in block && typeof block.data === "string" && "mimeType" in block && typeof block.mimeType === "string"
+		);
+	}
+	return false;
+}
+
+/**
+ * Why `answer` cannot be a tool call's result, or undefined when it can: the content must be a
+ * non-empty list of text or image blocks, `isError` must not be set (use `block` to refuse a
+ * call), and `details` must survive `JSON.stringify` because the session stores it.
+ */
+export function toolCallAnswerProblem(answer: unknown): string | undefined {
+	if (typeof answer !== "object" || answer === null || Array.isArray(answer)) return "the answer is not an object";
+	if (!("content" in answer) || !Array.isArray(answer.content) || answer.content.length === 0) {
+		return "content must be a non-empty list of text or image blocks";
+	}
+	if (!answer.content.every(isAnswerBlock)) return "content has a block that is not a valid text or image block";
+	if ("isError" in answer && answer.isError !== undefined) {
+		return "an answer is never an error result (return block to refuse the call)";
+	}
+	if ("details" in answer && answer.details !== undefined) {
+		try {
+			if (JSON.stringify(answer.details) === undefined) return "details cannot be stored as JSON";
+		} catch {
+			return "details cannot be stored as JSON";
+		}
+	}
+	return undefined;
+}
+
+/** What a caller does with a `tool_call` emission's answer; see {@link decideToolCallAnswer}. */
+export type ToolCallAnswerDecision =
+	| { kind: "none" }
+	| { kind: "refused"; reason: string }
+	| { kind: "answered"; held: HeldToolCallAnswer };
+
+const NO_TOOL_CALL_ANSWER: ToolCallAnswerDecision = { kind: "none" };
+
+/**
+ * Decide what to do with the answer, if any, in a `tool_call` emission's result. An answer needs the
+ * add-on's name for the record, and `computer` calls cannot be answered (there is no safe way to
+ * fake a screenshot): both refuse. The caller blocks a refused call with the returned reason.
+ */
+export function decideToolCallAnswer(
+	callResult: ToolCallEmitResult | undefined,
+	isComputerCall: boolean,
+): ToolCallAnswerDecision {
+	if (callResult?.result === undefined) return NO_TOOL_CALL_ANSWER;
+	const answeredBy = callResult.answeredBy;
+	if (typeof answeredBy !== "string" || answeredBy.length === 0) {
+		return {
+			kind: "refused",
+			reason: "A tool_call answer arrived without the name of the add-on that gave it. The call was blocked.",
+		};
+	}
+	if (isComputerCall) {
+		return {
+			kind: "refused",
+			reason: `Extension ${answeredBy} tried to answer a computer tool call, which cannot be answered. The call was blocked.`,
+		};
+	}
+	return { kind: "answered", held: { answer: callResult.result, answeredBy } };
 }
 
 /**
  * Merge one handler's `tool_call` result into the running aggregation.
  * Non-blank `additionalContext` values accumulate in registration order and
- * join (repeats dropped) at the end; `input` stays last-wins. A `block`
- * result short-circuits the caller, discarding everything collected so far.
+ * join (repeats dropped) at the end; `input` stays last-wins. An answer
+ * (`result`, already validated by the caller, which passes the add-on's
+ * name) is last-wins too but tracked separately from the control result. A
+ * `block` result short-circuits the caller, discarding everything collected so far.
  */
 export function accumulateToolCallResult(
-	aggregated: { input?: Record<string, unknown>; additionalContext: string[] },
+	aggregated: ToolCallAggregate,
 	handlerResult: ToolCallEventResult,
+	answeredBy?: string,
 ): void {
 	if (isNonBlankContext(handlerResult.additionalContext)) {
 		aggregated.additionalContext.push(handlerResult.additionalContext);
@@ -403,23 +523,30 @@ export function accumulateToolCallResult(
 	if (handlerResult.input !== undefined) {
 		aggregated.input = handlerResult.input;
 	}
+	if (handlerResult.result !== undefined && answeredBy !== undefined) {
+		const { content, details } = handlerResult.result;
+		aggregated.answered = { answer: { content, ...(details !== undefined ? { details } : {}) }, answeredBy };
+	}
 }
 
 /**
- * Build the aggregated `tool_call` result from collected context and input.
+ * Build the aggregated `tool_call` result from collected context, input and answer.
  * Returns undefined when there is nothing to carry beyond the control result.
+ * An answer cancels any input rewrite: the model's original call is what approval
+ * and the session record use.
  */
 export function buildAggregatedToolCallResult(
 	result: ToolCallEventResult | undefined,
-	aggregated: { input?: Record<string, unknown>; additionalContext: string[] },
-): ToolCallEventResult | undefined {
-	const { input } = aggregated;
+	aggregated: ToolCallAggregate,
+): ToolCallEmitResult | undefined {
+	const { input, answered } = aggregated;
 	const additionalContext = joinAdditionalContext(aggregated.additionalContext);
-	if (additionalContext === undefined && input === undefined) return result;
+	if (additionalContext === undefined && input === undefined && answered === undefined) return result;
 	const { additionalContext: _dropped, input: _droppedInput, ...controlResult } = result ?? {};
 	return {
 		...controlResult,
-		...(input !== undefined ? { input } : {}),
+		...(input !== undefined && answered === undefined ? { input } : {}),
+		...(answered !== undefined ? { result: answered.answer, answeredBy: answered.answeredBy } : {}),
 		...(additionalContext !== undefined ? { additionalContext } : {}),
 	};
 }

@@ -233,6 +233,7 @@ function createToolResultMessage(
 		content: result.content,
 		details: result.details,
 		isError,
+		...(result.answeredBy !== undefined ? { answeredBy: result.answeredBy } : {}),
 		timestamp: Date.now(),
 	};
 }

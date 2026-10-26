@@ -28,8 +28,9 @@ import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { withFileMutationSession } from "../../tools/file-write-fallback";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
+import { decideToolCallAnswer } from "../shared-events";
 import type { ExtensionRunner } from "./runner";
-import type { ExtensionAgentIdentity, RegisteredTool, ToolCallEventResult } from "./types";
+import type { ExtensionAgentIdentity, HeldToolCallAnswer, RegisteredTool, ToolCallEmitResult } from "./types";
 
 /**
  * Second `renderCall` argument that satisfies both the omp and the upstream-pi
@@ -254,6 +255,10 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			(context as LoopAwareToolContext)[LOOP_DISPATCH_CONTEXT] = true;
 		}
 		const loopEmittedToolCall = this.runner.consumeToolCallEmitted(toolCallId, this.tool.name);
+		// The answer the loop's arg-prep emission held for exactly this call, if any. It is taken
+		// before anything below can throw, so it is used at most once and is gone even when this call
+		// is denied or blocked; it is applied only after the full approval gate.
+		let answered: HeldToolCallAnswer | undefined = this.runner.consumeToolCallAnswer?.(toolCallId, this.tool.name);
 		// Resolve approval settings up front. A `deny` on the original input short-circuits before the
 		// runner is touched — an already-denied tool never emits `tool_call` — while the full gate below
 		// re-resolves against the (possibly revised) input so a handler cannot rewrite into a denied or
@@ -309,20 +314,25 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					},
 					signal?.aborted ? undefined : signal,
 					this.#agent,
-				)) as ToolCallEventResult | undefined;
+				)) as ToolCallEmitResult | undefined;
 
 				if (callResult?.block) {
 					const reason = callResult.reason || "Tool execution was blocked by an extension";
 					throw new Error(reason);
 				}
+				const computerCall = context?.toolCall?.providerMetadata?.type === "computer";
+				const decision = decideToolCallAnswer(callResult, computerCall);
+				if (decision.kind === "refused") throw new Error(decision.reason);
+				if (decision.kind === "answered") answered = decision.held;
 				if (isNonBlankContext(callResult?.additionalContext)) {
 					pendingAdditionalContext = callResult.additionalContext;
 				}
 				// A non-blocking handler may replace the execution input. The returned object is the raw
 				// input passed to `execute` (handler-owned; not re-normalized). Skipped for `computer`
 				// tool calls, whose event input is a synthetic {actions,pendingSafetyChecks} view
-				// (see toolEventArgs) rather than the real execution params.
-				if (callResult?.input !== undefined && context?.toolCall?.providerMetadata?.type !== "computer") {
+				// (see toolEventArgs) rather than the real execution params. An answer cancels the
+				// rewrite: approval and the record use the model's original call.
+				if (answered === undefined && callResult?.input !== undefined && !computerCall) {
 					effectiveParams = callResult.input as typeof params;
 				}
 			} catch (err) {
@@ -477,7 +487,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			}
 		}
 
-		// Execute the actual tool
+		// Execute the actual tool, or take the add-on's answer in its place (the tool's `execute` never
+		// runs for an answered call; the approval gate above already approved the original call).
 		let result: AgentToolResult<TDetails, TParameters>;
 		let executionError: Error | undefined;
 
@@ -487,17 +498,30 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			// expose its settings to registered tools and any fallback handlers they
 			// trigger. `sdk.ts` wraps the whole tool registry with this class whenever
 			// a runner exists.
-			result = await this.runner.runScoped(() =>
-				withFileMutationSession(this.runner.sessionId, () =>
-					this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context),
-				),
-			);
+			result =
+				answered !== undefined
+					? {
+							content: answered.answer.content,
+							details: answered.answer.details as TDetails,
+							answeredBy: answered.answeredBy,
+						}
+					: await this.runner.runScoped(() =>
+							withFileMutationSession(this.runner.sessionId, () =>
+								this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context),
+							),
+						);
 		} catch (err) {
 			executionError = err instanceof Error ? err : new Error(String(err));
 			result = {
 				content: [{ type: "text", text: executionError.message }],
 				details: undefined as TDetails,
 			};
+		}
+		// Only an add-on's answer is marked `answeredBy`: a tool that really ran cannot claim it, so
+		// the stored record cannot be forged by a tool, an MCP server, or an RPC host tool result.
+		if (answered === undefined && result?.answeredBy !== undefined) {
+			const { answeredBy: _claimed, ...genuine } = result;
+			result = genuine;
 		}
 		if (!loopDispatchedToolCall) {
 			const postflight = await this.runner.runToolCallPreflightAfter?.(toolCallId, result, context);
@@ -518,6 +542,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					content: result.content,
 					details: result.details,
 					isError: !!executionError || result.isError === true,
+					...(answered !== undefined ? { answeredBy: answered.answeredBy } : {}),
 				},
 				this.#agent,
 			);
@@ -553,6 +578,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					content: modifiedContent,
 					details: modifiedDetails,
 					providerMetadata: result.providerMetadata,
+					...(answered !== undefined ? { answeredBy: answered.answeredBy } : {}),
 					...(effectiveError ? { isError: true } : {}),
 				};
 			}
