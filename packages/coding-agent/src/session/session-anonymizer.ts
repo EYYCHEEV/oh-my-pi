@@ -328,7 +328,7 @@ const FIELD_RULES: Record<string, Rule> = {
 		"messages",
 		"body",
 	]),
-	...fields("label", ["title", "previousTitle", "label", "injectedRules", "intent", "emoji", "nf"]),
+	...fields("label", ["title", "previousTitle", "label", "injectedRules", "intent", "emoji", "nf", "answeredBy"]),
 	...fields("error", ["errorMessage", "explanation", "errorClassificationMessage", "upstreamError"]),
 	...fields("tool", ["toolName", "tools", "declared", "deferred", "active"]),
 	name: "name",

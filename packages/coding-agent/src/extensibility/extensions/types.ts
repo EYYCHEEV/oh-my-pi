@@ -1558,7 +1558,13 @@ export interface AssistantMessageRewriteResult {
 
 export type BeforeProviderRequestEventResult = unknown;
 
-export type { HeldToolCallAnswer, ToolCallAnswer, ToolCallEmitResult, ToolCallEventResult } from "../shared-events";
+export type {
+	HeldToolCallAnswer,
+	ToolCallAnswer,
+	ToolCallAnswerSource,
+	ToolCallEmitResult,
+	ToolCallEventResult,
+} from "../shared-events";
 
 /** Result from input event handler */
 export interface InputEventResult {

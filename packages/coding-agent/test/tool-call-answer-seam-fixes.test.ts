@@ -305,7 +305,7 @@ describe("tool-call answer seam, fix round 1", () => {
 		it("re-emits tool_call for a call whose held answer was evicted, so it fails closed", async () => {
 			const executed: unknown[] = [];
 			const runner = await makeRunner([answeringAddon()]);
-			const held = { answer: CACHED, answeredBy: CACHE_NAME };
+			const held = { answer: CACHED, answeredBy: CACHE_NAME, input: { path: ORIGINAL_URL } };
 			runner.markToolCallEmitted("c0", "read");
 			for (let index = 0; index <= 512; index++) runner.holdToolCallAnswer(`c${index}`, "read", held);
 			const wrapped = new ExtensionToolWrapper(namedTool("read", executed), runner);
@@ -320,7 +320,7 @@ describe("tool-call answer seam, fix round 1", () => {
 	describe("finding 6: a held answer is cleared by call id whatever the wire name", () => {
 		it("clears every answer held for the primary agent's call id, and no other agent's", async () => {
 			const runner = await makeRunner([]);
-			const held = { answer: CACHED, answeredBy: CACHE_NAME };
+			const held = { answer: CACHED, answeredBy: CACHE_NAME, input: { path: ORIGINAL_URL } };
 			const advisor = { kind: "sub", id: "advisor", name: "advisor", depth: 0 } as never;
 			runner.holdToolCallAnswer("c1", "read", held);
 			runner.holdToolCallAnswer("c1", "alias", held);
@@ -338,7 +338,7 @@ describe("tool-call answer seam, fix round 1", () => {
 		it("never gives the primary agent's answer to an advisor call that reuses the call id", async () => {
 			const executed: unknown[] = [];
 			const runner = await makeRunner([]);
-			const held = { answer: CACHED, answeredBy: CACHE_NAME };
+			const held = { answer: CACHED, answeredBy: CACHE_NAME, input: { path: ORIGINAL_URL } };
 			runner.markToolCallEmitted("c1", "read");
 			runner.holdToolCallAnswer("c1", "read", held);
 			const advisor = { kind: "sub", id: "advisor", name: "advisor", depth: 0 } as never;
@@ -370,7 +370,7 @@ describe("tool-call answer seam, fix round 1", () => {
 			["write", { path: "xd://checkpoint" }],
 			["write", { path: " XD://propose" }],
 		])("refuses an answer for %s %j, naming the add-on", (toolName, input) => {
-			const decision = decideToolCallAnswer(answered, false, toolName, input);
+			const decision = decideToolCallAnswer(answered, false, toolName, input, { ...input });
 			expect(decision.kind).toBe("refused");
 			if (decision.kind !== "refused") return;
 			expect(decision.reason).toContain(CACHE_NAME);
@@ -378,9 +378,11 @@ describe("tool-call answer seam, fix round 1", () => {
 		});
 
 		it("still allows an answer for read, bash and a write to an ordinary path", () => {
-			expect(decideToolCallAnswer(answered, false, "read", { path: ORIGINAL_URL }).kind).toBe("answered");
-			expect(decideToolCallAnswer(answered, false, "bash", { command: "ls" }).kind).toBe("answered");
-			expect(decideToolCallAnswer(answered, false, "write", { path: "/tmp/a.txt" }).kind).toBe("answered");
+			const decide = (toolName: string, input: Record<string, unknown>) =>
+				decideToolCallAnswer(answered, false, toolName, input, { ...input }).kind;
+			expect(decide("read", { path: ORIGINAL_URL })).toBe("answered");
+			expect(decide("bash", { command: "ls" })).toBe("answered");
+			expect(decide("write", { path: "/tmp/a.txt" })).toBe("answered");
 		});
 
 		it("blocks a direct dispatch of yield that an add-on tries to answer, and never runs the tool", async () => {

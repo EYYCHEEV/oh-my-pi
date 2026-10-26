@@ -479,4 +479,27 @@ describe("SessionAnonymizer", () => {
 		// Equal stamps stay comparable after anonymization, so build changes remain visible.
 		expect(at(second, "runtime")).toEqual(at(first, "runtime"));
 	});
+
+	test("keeps the answeredBy key of an answered tool result and tokenizes the add-on name consistently", () => {
+		const anonymizer = new SessionAnonymizer();
+		const answered = (toolCallId: string) =>
+			anonymizer.entry({
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolCallId,
+					toolName: "read",
+					content: [{ type: "text", text: "cached page for customer-acme" }],
+					isError: false,
+					answeredBy: "customer-acme-cache",
+					timestamp: 1,
+				},
+			});
+		const [first, second] = [answered("call-1"), answered("call-2")];
+
+		expect(JSON.stringify([first, second])).not.toContain("acme");
+		expect(at(first, "message", "answeredBy")).toMatch(/^PLACEHOLDER_\d+$/);
+		// The same add-on keeps one token across results, so answers stay attributable to one source.
+		expect(at(second, "message", "answeredBy")).toBe(at(first, "message", "answeredBy"));
+	});
 });
