@@ -2438,4 +2438,41 @@ describe("CursorExecHandlers passive tool context", () => {
 			expect(JSON.stringify(result)).not.toContain("tool context");
 		}
 	});
+
+	it("marks the stored result with the add-on that answered the call, without running the tool", async () => {
+		let executed = false;
+		const answeringRunner = {
+			...passthroughRunner(),
+			emitToolCall: async () => ({
+				result: { content: [{ type: "text", text: "<cached page>" }], details: { cachedAt: "now" } },
+				answeredBy: "stronk-web-cache",
+			}),
+		} as unknown as ExtensionRunner;
+		const tool = {
+			...probeTool(false),
+			async execute() {
+				executed = true;
+				return { content: [{ type: "text", text: "ran" }], details: undefined };
+			},
+		} as AgentTool;
+		const handlers = new CursorExecHandlers({
+			cwd: os.tmpdir(),
+			tools: new Map<string, Tool>([["probe", new ExtensionToolWrapper(tool, answeringRunner) as unknown as Tool]]),
+			getToolContext: () => yoloToolContext(),
+		});
+
+		const result = (await handlers.mcp({
+			name: "probe",
+			providerIdentifier: "pi-agent",
+			toolName: "probe",
+			toolCallId: "probe-answered",
+			args: {},
+			rawArgs: {},
+		})) as ToolResultMessage;
+
+		expect(executed).toBe(false);
+		expect(result.isError).toBe(false);
+		expect(result.content).toEqual([{ type: "text", text: "<cached page>" }]);
+		expect(result.answeredBy).toBe("stronk-web-cache");
+	});
 });

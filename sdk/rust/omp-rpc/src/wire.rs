@@ -1073,6 +1073,7 @@ pub struct ToolResultMessage {
 	pub attribution: Option<Attribution>,
 	pub pruned_at: Option<f64>,
 	pub useless: Option<bool>,
+	pub answered_by: Option<String>,
 	/// Every key not decoded into a declared field.
 	pub extra: Map<String, Value>,
 }
@@ -1110,6 +1111,9 @@ impl Serialize for ToolResultMessage {
 		if let Some(value) = &self.useless {
 			map.serialize_entry("useless", value)?;
 		}
+		if let Some(value) = &self.answered_by {
+			map.serialize_entry("answeredBy", value)?;
+		}
 		for (key, value) in &self.extra {
 			match key.as_str() {
 				"role" if self.role.is_some() => continue,
@@ -1122,6 +1126,7 @@ impl Serialize for ToolResultMessage {
 				"attribution" if self.attribution.is_some() => continue,
 				"prunedAt" if self.pruned_at.is_some() => continue,
 				"useless" if self.useless.is_some() => continue,
+				"answeredBy" if self.answered_by.is_some() => continue,
 				_ => {}
 			}
 			map.serialize_entry(key, value)?;
@@ -1144,6 +1149,7 @@ impl<'de> Deserialize<'de> for ToolResultMessage {
 			attribution: take(&mut extra, "attribution"),
 			pruned_at: take(&mut extra, "prunedAt"),
 			useless: take(&mut extra, "useless"),
+			answered_by: take(&mut extra, "answeredBy"),
 			extra,
 		})
 	}

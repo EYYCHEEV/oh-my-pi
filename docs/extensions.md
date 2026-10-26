@@ -739,8 +739,8 @@ and `/new`. Commands retain their explicit prefill and session-transition action
 
 ### Tool lifecycle
 
-- `tool_call` (pre-exec, may block, revise the tool's execution `input`, or return passive `additionalContext`; for model-issued calls it fires at arg-prep time in the agent loop, so a revision is revalidated and seen by concurrency scheduling, execution events, the persisted assistant message, and the approval gate alike; passive context from non-blocking handlers is delivered after the batch's tool results in assistant call order, before the next provider request)
-- `tool_result` (post-exec, may patch content/details/isError or return passive `additionalContext`; result context is delivered outside the tool output even when `event.isError` is true, so a failure-specific handler can guide the next model step)
+- `tool_call` (pre-exec, may block, revise the tool's execution `input`, answer the call itself with `result`, or return passive `additionalContext`; for model-issued calls it fires at arg-prep time in the agent loop, so a revision is revalidated and seen by concurrency scheduling, execution events, the persisted assistant message, and the approval gate alike; passive context from non-blocking handlers is delivered after the batch's tool results in assistant call order, before the next provider request)
+- `tool_result` (post-exec, may patch content/details/isError or return passive `additionalContext`; result context is delivered outside the tool output even when `event.isError` is true, so a failure-specific handler can guide the next model step; an answered call's event carries `answeredBy`)
 - `tool_execution_start` / `tool_execution_update` / `tool_execution_end` (observability)
 - `tool_approval_requested` / `tool_approval_resolved` (observability; emitted by `wrapper.ts` only when a tool requires approval and an approval handler is registered)
 
@@ -852,6 +852,69 @@ returns an error. Within one call, the tool's own context (including tools reach
 `xd://` dispatch) comes before `tool_call` handler context.
 Calls Cursor executes on its exec channel deliver context after their buffered results, on the next
 provider request.
+
+### Answering a tool call (`result`)
+
+A `tool_call` handler can answer the call itself. The tool does not run: the model sees the answer as the
+call's result. This suits a cache, a mirror, or a policy that already knows the answer.
+
+```ts
+pi.on("tool_call", async event => {
+  if (event.toolName !== "read" || typeof event.input.path !== "string") return;
+  const page = await cache.get(event.input.path);
+  if (!page) return; // not cached: the tool runs as usual
+  return {
+    result: {
+      content: [{ type: "text", text: page.text }], // at least one text or image block
+      details: { cachedAt: page.cachedAt }, // optional; must survive JSON, it is stored
+    },
+  };
+});
+```
+
+An answer is always a normal, non-error result. `isError` inside it is refused: a handler that wants to
+refuse the call returns `block`.
+
+Order rules:
+
+1. Handlers run in load order, then registration order, as for every `tool_call` handler.
+2. A block always wins. The first block stops the loop and discards everything collected before it, an
+   earlier answer included.
+3. An answer does not stop the loop. Every later handler still runs and can still block.
+4. With several answers the last one wins (registration order), as for rewritten `input`. The answer is
+   tracked on its own, so a later handler that only adds context cannot erase an earlier answer.
+5. An answer cancels `input` rewrites: when the final result has an answer, any `input` rewrite is dropped,
+   and approval and the session record use the model's original call.
+6. `additionalContext` from non-blocking handlers is kept and delivered after the answered result, as for
+   any successful call.
+7. Approval is unchanged and runs against the original call. A deny policy stops the call before any
+   handler runs. A prompt shows the normal prompt: "deny" discards the answer, "approve" returns the
+   answer. The tool's `execute` is never called for an answered call, and the tool-call preflight and
+   postflight hooks (such as TTSR) still run.
+8. `tool_result` handlers still run on the answered result and may change it, so after-the-fact add-ons
+   (redaction, logging) keep working. The event carries `answeredBy`.
+9. Fail closed: each of these blocks the call with a reason that names the add-on. A malformed answer
+   (`content` not a non-empty list of text or image blocks, `isError` set, `details` that cannot be
+   stored as JSON). An answer for a `computer` tool call (there is no safe way to fake screenshots). An
+   answer from a legacy hook (the hooks API does not get this field). Handler errors and timeouts
+   already block.
+10. One answer per call. It is held only for that exact tool call id and tool name, used once, and dropped
+    if the call is blocked, denied, skipped, or aborted.
+
+The host sets `answeredBy` to the add-on's name (the folder name for `<folder>/index.ts`, otherwise the
+file name without `.ts`/`.js`, never its path). A handler cannot set it, and neither can a tool that really
+ran. The stored tool result message carries it, while the assistant message before it keeps the model's
+original call, so the session file tells the truth:
+
+```json
+{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"read","arguments":{"path":"https://example.com/page"}}]}
+{"role":"toolResult","toolCallId":"c1","toolName":"read","content":[{"type":"text","text":"<cached page>"}],"details":{"cachedAt":"..."},"isError":false,"answeredBy":"my-cache"}
+```
+
+Providers ignore `answeredBy`; it never reaches the model. The RPC wire types carry the same optional field
+on tool result messages. Answers work for loop calls and for direct calls the loop never sees (nested
+`xd://` device calls, Cursor exec, an advisor's tools); subagents get them through their own runner.
+Answer size is the add-on's business, as with a tool's own output.
 
 ### Delegating to a native built-in (`ctx.invokeTool`)
 
@@ -1470,7 +1533,7 @@ Provide `renderCall` / `renderResult` on `registerTool` definitions for custom t
 ## Constraints and pitfalls
 
 - Session actions are unavailable during extension load; registration methods, `getFlag`, and `exec` are available.
-- `tool_call` errors and timeouts block execution (fail-closed). Its budget is `extensionHandlers.toolCallTimeoutMs` (default 30,000 ms), paused during extension UI waits.
+- `tool_call` errors and timeouts block execution (fail-closed), as do malformed answers, answers for `computer` calls, and answers from legacy hooks (see "Answering a tool call"). Its budget is `extensionHandlers.toolCallTimeoutMs` (default 30,000 ms), paused during extension UI waits.
 - Most dispatched handlers have a 30-second budget; `session_shutdown` handlers run concurrently with a 2-second budget. Timing out stops waiting and cancels handler UI, but cannot undo arbitrary extension side effects.
 - Command name conflicts with built-ins are skipped with diagnostics.
 - Reserved shortcuts are ignored (`ctrl+c`, `ctrl+d`, `ctrl+z`, `ctrl+k`, `ctrl+p`, `ctrl+l`, `ctrl+o`, `ctrl+t`, `ctrl+g`, `ctrl+q`, `alt+m`, `shift+tab`, `shift+ctrl+p`, `alt+enter`, `escape`, `enter`).

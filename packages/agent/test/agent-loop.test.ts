@@ -5815,6 +5815,71 @@ describe("agentLoop useless-flag propagation", () => {
 	});
 });
 
+describe("agentLoop answeredBy propagation", () => {
+	async function runProbe(toolReturn: unknown, extra: Partial<AgentLoopConfig> = {}): Promise<ToolResultMessage> {
+		const toolSchema = type({});
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "probe",
+			label: "Probe",
+			description: "Probe tool",
+			parameters: toolSchema,
+			async execute() {
+				return toolReturn as never;
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "probe", arguments: {} }] },
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter, ...extra };
+		const events: AgentEvent[] = [];
+		for await (const event of agentLoop([createUserMessage("go")], context, config, undefined, mock.stream)) {
+			events.push(event);
+		}
+		const message = events
+			.filter(e => e.type === "message_end")
+			.map(e => (e as { message: AgentMessage }).message)
+			.find(m => m.role === "toolResult");
+		expect(message).toBeDefined();
+		return message as ToolResultMessage;
+	}
+
+	it("keeps a string answeredBy through the result check and copies it onto the stored message", async () => {
+		const message = await runProbe({
+			content: [{ type: "text", text: "<cached page>" }],
+			details: { cachedAt: "2026-10-26T12:00:00Z" },
+			answeredBy: "stronk-web-cache",
+		});
+		expect(message.answeredBy).toBe("stronk-web-cache");
+		expect(message.isError).toBe(false);
+		expect(message.content).toEqual([{ type: "text", text: "<cached page>" }]);
+	});
+
+	it("leaves answeredBy off a message whose tool did not set it", async () => {
+		const message = await runProbe({ content: [{ type: "text", text: "ran" }], details: {} });
+		expect(message).not.toHaveProperty("answeredBy");
+	});
+
+	it("drops an answeredBy that is not a string", async () => {
+		for (const answeredBy of [42, true, null, {}, ["stronk-web-cache"]]) {
+			const message = await runProbe({ content: [{ type: "text", text: "ran" }], details: {}, answeredBy });
+			expect(message).not.toHaveProperty("answeredBy");
+		}
+	});
+
+	it("keeps answeredBy when afterToolCall rewrites the result", async () => {
+		const message = await runProbe(
+			{ content: [{ type: "text", text: "<cached page>" }], details: {}, answeredBy: "stronk-web-cache" },
+			{ afterToolCall: () => ({ content: [{ type: "text", text: "<rewritten>" }] }) },
+		);
+		expect(message.content).toEqual([{ type: "text", text: "<rewritten>" }]);
+		expect(message.answeredBy).toBe("stronk-web-cache");
+	});
+});
+
 describe("agentLoopContinue with AgentMessage", () => {
 	it("should throw when context has no messages", () => {
 		const context: AgentContext = {

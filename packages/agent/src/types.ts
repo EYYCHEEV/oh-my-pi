@@ -1048,6 +1048,12 @@ export interface AgentToolResult<T = any, _TInput = unknown> {
 	providerMetadata?: ToolResultProviderMetadata;
 	/** Marks the result as contextually useless: safe for compaction to elide once consumed (e.g. zero matches, wait timeout). Ignored when isError is set. */
 	useless?: boolean;
+	/**
+	 * Name of the add-on (never its path) that answered this call through the `tool_call` answer seam,
+	 * so the tool did not run and `content`/`details` are the add-on's answer. The agent loop keeps a
+	 * string value and copies it onto the tool result message; any other value is dropped.
+	 */
+	answeredBy?: string;
 }
 
 // Callback for streaming tool execution updates

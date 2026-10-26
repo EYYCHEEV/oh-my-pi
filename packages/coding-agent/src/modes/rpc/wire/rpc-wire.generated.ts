@@ -145,6 +145,7 @@ export interface ToolResultMessage {
 	attribution?: Attribution;
 	prunedAt?: number;
 	useless?: boolean;
+	answeredBy?: string;
 }
 
 export interface BashExecutionMessage {

@@ -32,6 +32,7 @@ import { refreshShellConfigCache } from "@oh-my-pi/pi-utils/procmgr";
 import { MAIN_AGENT_RULE_NAME } from "../../capability/rule";
 import type { ModelRegistry } from "../../config/model-registry";
 import { type Settings, withActiveSettings } from "../../config/settings";
+import { getExtensionNameFromPath } from "../../discovery/helpers";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
@@ -42,7 +43,12 @@ import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-wr
 import { resolveToolOutputBudgetBytes } from "../../tools/output-meta";
 import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
 import { getLoadedRuntimeOrigin, type RequiredExtensionHandlerSnapshot } from "./loader";
-import { accumulateToolCallResult, buildAggregatedToolCallResult } from "../shared-events";
+import {
+	accumulateToolCallResult,
+	buildAggregatedToolCallResult,
+	type ToolCallAggregate,
+	toolCallAnswerProblem,
+} from "../shared-events";
 import { ManagedTimers } from "./managed-timers";
 import { createExtensionModelQuery } from "./model-api";
 import { trackUserWaits, type UserWaitTracker } from "./user-wait";
@@ -79,6 +85,7 @@ import type {
 	ExtensionShortcut,
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
+	HeldToolCallAnswer,
 	InputEvent,
 	InputEventResult,
 	CacheWarmingAction,
@@ -97,6 +104,7 @@ import type {
 	SessionCompactingResult,
 	SessionStopEvent,
 	SessionStopEventResult,
+	ToolCallEmitResult,
 	ToolCallEvent,
 	ToolCallEventResult,
 	ToolRegistrationListener,
@@ -621,6 +629,13 @@ export class ExtensionRunner {
 	 */
 	#emittedToolCalls = new Set<string>();
 	#loopToolCalls = new Set<string>();
+	/**
+	 * The answer a `tool_call` handler gave for a loop dispatch, keyed `${toolCallId}:${toolName}`
+	 * like the markers above. The loop's arg-prep emission holds it here and the wrapper applies it
+	 * only after its approval gate, so one answer belongs to exactly one call: it is used once and
+	 * dropped if the call is blocked, denied, skipped, or aborted. Bounded like the markers.
+	 */
+	#heldToolCallAnswers = new Map<string, HeldToolCallAnswer>();
 
 	/** Records that the loop already emitted `tool_call` for this dispatch. */
 	markToolCallEmitted(toolCallId: string, toolName: string): void {
@@ -636,23 +651,58 @@ export class ExtensionRunner {
 		return this.#emittedToolCalls.delete(`${toolCallId}:${toolName}`);
 	}
 
-	/** Marks every dispatch prepared by the agent loop, independent of extension handlers. */
+	/**
+	 * Marks every dispatch prepared by the agent loop, independent of extension handlers. A fresh
+	 * dispatch starts with no held answer, so a stale answer can never reach a later call that
+	 * reuses the same id and tool name.
+	 */
 	markLoopToolCall(toolCallId: string, toolName: string): void {
 		if (this.#loopToolCalls.size >= 512) {
 			const oldest = this.#loopToolCalls.values().next().value;
 			if (oldest !== undefined) this.#loopToolCalls.delete(oldest);
 		}
 		this.#loopToolCalls.add(`${toolCallId}:${toolName}`);
+		this.#heldToolCallAnswers.delete(`${toolCallId}:${toolName}`);
 	}
 
-	/** Clears a loop marker when pre-dispatch blocked execution before the wrapper ran. */
+	/** Clears a loop marker (and any held answer) when pre-dispatch blocked execution before the wrapper ran. */
 	clearLoopToolCall(toolCallId: string, toolName: string): void {
 		this.#loopToolCalls.delete(`${toolCallId}:${toolName}`);
+		this.#heldToolCallAnswers.delete(`${toolCallId}:${toolName}`);
 	}
 
 	/** Consumes the marker for a loop dispatch; false means non-loop execution. */
 	consumeLoopToolCall(toolCallId: string, toolName: string): boolean {
 		return this.#loopToolCalls.delete(`${toolCallId}:${toolName}`);
+	}
+
+	/** Holds `held` for exactly this call id and tool name until the wrapper consumes or the loop drops it. */
+	holdToolCallAnswer(toolCallId: string, toolName: string, held: HeldToolCallAnswer): void {
+		const key = `${toolCallId}:${toolName}`;
+		this.#heldToolCallAnswers.delete(key);
+		if (this.#heldToolCallAnswers.size >= 512) {
+			const oldest = this.#heldToolCallAnswers.keys().next().value;
+			if (oldest !== undefined) this.#heldToolCallAnswers.delete(oldest);
+		}
+		this.#heldToolCallAnswers.set(key, held);
+	}
+
+	/** Takes the held answer for exactly this call id and tool name; it is handed out once. */
+	consumeToolCallAnswer(toolCallId: string, toolName: string): HeldToolCallAnswer | undefined {
+		const key = `${toolCallId}:${toolName}`;
+		const held = this.#heldToolCallAnswers.get(key);
+		this.#heldToolCallAnswers.delete(key);
+		return held;
+	}
+
+	/** Drops the held answer for this call id and tool name, if any. */
+	clearToolCallAnswer(toolCallId: string, toolName: string): void {
+		this.#heldToolCallAnswers.delete(`${toolCallId}:${toolName}`);
+	}
+
+	/** Drops every held answer; a run that ended leaves nothing held. */
+	clearToolCallAnswers(): void {
+		this.#heldToolCallAnswers.clear();
 	}
 
 	/**
@@ -2013,20 +2063,27 @@ export class ExtensionRunner {
 	 * pre-execution gate — an unresponsive extension MUST NOT be treated as
 	 * silent consent to run the tool.
 	 *
+	 * A handler may answer the call (`result`). An answer does not stop the loop: every later handler
+	 * still runs and a block (first one wins, as ever) discards everything collected, an answer
+	 * included. With several answers the last wins, tracked apart from the control result so a later
+	 * context-only handler cannot erase it, and any `input` rewrite is dropped. The answer is
+	 * validated here; a malformed one blocks the call. The returned `answeredBy` is the answering
+	 * extension's name (see `getExtensionNameFromPath`), never its path, and only this method sets it.
+	 *
 	 * `agent` overrides `ctx.agent` when the tool runs for another agent sharing this runner.
 	 */
 	async emitToolCall(
 		event: ToolCallEvent,
 		signal?: AbortSignal,
 		agent?: ExtensionAgentIdentity,
-	): Promise<ToolCallEventResult | undefined> {
+	): Promise<ToolCallEmitResult | undefined> {
 		const ctx = this.createContext(undefined, undefined, agent);
 		const timeoutMs = normalizeHandlerTimeout(
 			(this.settings ? cfgExtensionHandlersToolCallTimeoutMs.get(this.settings) : undefined) ??
 				extensionHandlerTimeoutMs,
 		);
 		let result: ToolCallEventResult | undefined;
-		const aggregated = { input: undefined as ToolCallEventResult["input"], additionalContext: [] as string[] };
+		const aggregated: ToolCallAggregate = { additionalContext: [] };
 
 		for (const ext of this.extensions) {
 			const handlers =
@@ -2050,14 +2107,34 @@ export class ExtensionRunner {
 								: `Extension ${ext.path} failed: ${message}`,
 					}),
 					signal,
-				)) as ToolCallEventResult | undefined;
+				)) as ToolCallEmitResult | undefined;
 
 				if (!handlerResult) continue;
 				if (handlerResult.block) {
-					return handlerResult;
+					// A block always wins: it discards everything collected so far, an earlier answer
+					// included, and never carries an answer or an answeredBy of its own.
+					const { result: _answer, answeredBy: _forged, ...blocked } = handlerResult;
+					return blocked;
 				}
-				const { additionalContext: _context, input: _input, ...controlResult } = handlerResult;
-				accumulateToolCallResult(aggregated, handlerResult);
+				const answeredBy = handlerResult.result !== undefined ? getExtensionNameFromPath(ext.path) : undefined;
+				if (handlerResult.result !== undefined) {
+					const problem = toolCallAnswerProblem(handlerResult.result);
+					if (problem !== undefined) {
+						return {
+							block: true,
+							reason: `Extension ${answeredBy} returned an invalid tool_call answer: ${problem}. The call was blocked.`,
+						};
+					}
+				}
+				// `answeredBy` is the runner's to set: a handler-supplied value is dropped here.
+				const {
+					additionalContext: _context,
+					input: _input,
+					result: _answer,
+					answeredBy: _forged,
+					...controlResult
+				} = handlerResult;
+				accumulateToolCallResult(aggregated, handlerResult, answeredBy);
 				result = controlResult;
 			}
 		}

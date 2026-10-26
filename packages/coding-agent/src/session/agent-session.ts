@@ -183,7 +183,11 @@ import {
 import type { RequiredRuntimeExtension } from "./runtime-requirements";
 import { createExtensionModelQuery } from "../extensibility/extensions/model-api";
 import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
-import type { AgentActivityOutcome, AgentActivityStateEvent } from "../extensibility/shared-events";
+import {
+	type AgentActivityOutcome,
+	type AgentActivityStateEvent,
+	decideToolCallAnswer,
+} from "../extensibility/shared-events";
 import type { CustomCommandContext } from "../extensibility/custom-commands/types";
 import { SkillDescriptionCatalog } from "../extensibility/skill-descriptions";
 import type { Skill, SkillWarning } from "../extensibility/skills";
@@ -3795,6 +3799,10 @@ export class AgentSession implements SettingsScope {
 			this.#activeToolExecutionUpdates.set(event.toolCallId, event);
 		} else if (event.type === "tool_execution_end") {
 			this.#activeToolExecutionUpdates.delete(event.toolCallId);
+			// One answer per call: whatever ended this call (result, skip, abort), nothing stays held for it.
+			this.#extensionRunner?.clearToolCallAnswer?.(event.toolCallId, event.toolName);
+		} else if (event.type === "agent_end") {
+			this.#extensionRunner?.clearToolCallAnswers?.();
 		}
 		if (event.type === "message_update") {
 			this.#emit(event);
@@ -5810,9 +5818,12 @@ export class AgentSession implements SettingsScope {
 	 * and the wrapper's approval gate. A handler block becomes a blocked tool
 	 * result; a handler `input` revision becomes the arguments the loop
 	 * schedules, displays, persists, and executes, so approval resolves against
-	 * what actually runs. Marks the dispatch so `ExtensionToolWrapper` does not
-	 * emit a second event (nested xd:// device dispatches and direct non-loop
-	 * execution still emit there).
+	 * what actually runs. A handler answer (`result`) is held in the runner for
+	 * this exact call id and tool name and applied by the wrapper only after its
+	 * approval gate; it cancels any `input` revision (the model's original call
+	 * stays the record) and the loop learns only the passive context. Marks the
+	 * dispatch so `ExtensionToolWrapper` does not emit a second event (nested
+	 * xd:// device dispatches and direct non-loop execution still emit there).
 	 */
 	async #beforeToolCall(ctx: BeforeToolCallContext, signal?: AbortSignal): Promise<BeforeToolCallResult | undefined> {
 		if (this.#runtimeRequirementValidationNeeded()) await this.#assertRuntimeRequirements(signal);
@@ -5858,6 +5869,16 @@ export class AgentSession implements SettingsScope {
 		if (callResult?.block) {
 			runner.clearLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
 			return { block: true, reason: callResult.reason || "Tool execution was blocked by an extension" };
+		}
+		const decision = decideToolCallAnswer(callResult, computer !== undefined);
+		if (decision.kind === "refused") {
+			runner.clearLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
+			return { block: true, reason: decision.reason };
+		}
+		if (decision.kind === "answered") {
+			runner.holdToolCallAnswer(ctx.toolCall.id, ctx.tool.name, decision.held);
+			const answeredContext = callResult?.additionalContext;
+			return answeredContext === undefined ? undefined : { additionalContext: answeredContext };
 		}
 		// A computer call's event input is a synthetic {actions, pendingSafetyChecks}
 		// view, not the execution params — a revision cannot map back onto them.
