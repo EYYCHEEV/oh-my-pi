@@ -17,7 +17,7 @@ import tempfile
 
 REPOSITORY = "EYYCHEEV/oh-my-pi"
 # The application commit is an input, never a constant. Toolchain pins below are the recipe's own.
-BUN_VERSION = "1.4.2"
+BUN_VERSION = "1.4.4"
 BAZEL_VERSION = "9.2.0"
 ASSETS = ("omp-linux-amd64", "RELEASE_MANIFEST.json", "SHA256SUMS.txt")
 RECIPES = ("build-linux-amd64.sh", "linux-amd64.Dockerfile", "linux-amd64-receipt.py",
@@ -34,7 +34,7 @@ TAG = r"stronk-omp-s1-[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]{4}"
 DIGEST = r"sha256:" + HEX
 IMAGE = r"[a-z0-9][a-z0-9._/-]*(?::[A-Za-z0-9_.-]+)?@sha256:" + HEX
 BASE_IMAGE = "rustlang/rust:nightly-2026-08-12@sha256:51dc497bff0c24777d2ec6a1fc12ddf7ab0483de3ee537f4ec10816b9e1eff6c"
-BUN_SHA256 = "c678040f14fe0440eb839d37cbd0ce4c051a32da72806ac97de6a6aab6bf728f"
+BUN_SHA256 = "e0446eb55995772eb9894bebae9a6be368d985a8b9271ee124486f9946eedd76"
 BAZEL_SHA256 = "7668a95db1250f12c40407251e4e203b4ec8bf39bc495d2f485b2d8c99048694"
 ATTESTATION_NAMESPACE = "stronk-omp-qualification"
 ATTESTATION_IDENTITY = "stronk-omp-qualification"

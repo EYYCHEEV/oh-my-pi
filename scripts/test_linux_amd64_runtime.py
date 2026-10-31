@@ -413,7 +413,7 @@ class ContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             prepared = Path(temporary)
             outputs = [b"timeout (GNU coreutils) 9.7\n", b"glibc 2.41\n",
-                       b"GNU readelf (GNU Binutils) 2.44\n", b"1.4.2\n",
+                       b"GNU readelf (GNU Binutils) 2.44\n", b"1.4.4\n",
                        b"running 0 tests\ntest result: ok. 0 passed; 0 failed;\n"]
             with patch.object(runtime, "PREPARED", prepared), patch.object(runtime.sys, "version_info", (3, 12)), \
                     patch.object(Path, "read_bytes", return_value=b"{}"), \
@@ -514,7 +514,7 @@ class ContractTests(unittest.TestCase):
             if command[0] == "readelf":
                 return b"GNU readelf (GNU Binutils) 2.44\n"
             if command[0] == "bun":
-                return b"1.4.2\n"
+                return b"1.4.4\n"
             self.assertEqual(command[1:], [runtime.qualify.NATIVE_GREP_TEST, "--exact"])
             return b"running 1 test\ntest result: ok. 1 passed; 0 failed;\n"
 

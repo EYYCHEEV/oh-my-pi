@@ -673,7 +673,7 @@ def prepare_dependencies(source, manifest, runtime):
     metadata = receipt.strict_json((PREPARED / "dependencies.json").read_text())
     receipt.keys(metadata, ("schema", "source_commit", "bun_version", "locks", "dependency_tree_sha256", "native_grep_sha256"))
     require(type(metadata["schema"]) is int and metadata["schema"] == 1 and metadata["source_commit"] == manifest["source"]["commit"] and
-            metadata["bun_version"] == "1.4.2" and metadata["locks"] == manifest["build_inputs"]["locks"], "Prepared dependency identity differs")
+            metadata["bun_version"] == receipt.BUN_VERSION and metadata["locks"] == manifest["build_inputs"]["locks"], "Prepared dependency identity differs")
     require(all(receipt.digest(prepared_source / lock) == value for lock, value in metadata["locks"].items()), "Prepared locks differ")
     require(metadata["dependency_tree_sha256"] == dependency_digest(prepared_source), "Prepared dependency bytes differ")
     grep = PREPARED / "native-grep-regression"
@@ -684,7 +684,7 @@ def prepare_dependencies(source, manifest, runtime):
             "Prepared Bun bytes differ from the pinned build runtime")
     announce_stage("qualify-bun", inside=True)
     version, _ = runtime.run(["bun", "--version"], source, 30)
-    require(version == b"1.4.2\n", "Pinned Bun runtime is required")
+    require(version == f"{receipt.BUN_VERSION}\n".encode(), "Pinned Bun runtime is required")
     for root in dependency_roots(prepared_source):
         destination = source / root.relative_to(prepared_source)
         require(not destination.exists() and not destination.is_symlink(), "Source contains unexpected dependencies")

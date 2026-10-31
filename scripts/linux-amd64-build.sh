@@ -17,8 +17,8 @@ trap on_exit EXIT
 test "$TARGETPLATFORM" = linux/amd64
 test "$(uname -m)" = x86_64
 test "$BASE_IMAGE" = 'rustlang/rust:nightly-2026-08-12@sha256:51dc497bff0c24777d2ec6a1fc12ddf7ab0483de3ee537f4ec10816b9e1eff6c'
-test "$BUN_VERSION" = 1.4.2
-test "$BUN_SHA256" = c678040f14fe0440eb839d37cbd0ce4c051a32da72806ac97de6a6aab6bf728f
+test "$BUN_VERSION" = 1.4.4
+test "$BUN_SHA256" = e0446eb55995772eb9894bebae9a6be368d985a8b9271ee124486f9946eedd76
 test "$BAZEL_VERSION" = 9.2.0
 test "$BAZEL_SHA256" = 7668a95db1250f12c40407251e4e203b4ec8bf39bc495d2f485b2d8c99048694
 test "$DEBIAN_SNAPSHOT" = 20260813T000000Z

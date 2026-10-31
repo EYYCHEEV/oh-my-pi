@@ -76,7 +76,7 @@ def tree_bytes(_root, rev, name):
 
 
 # What the recipe's tools print, in the shapes the fleet puller accepts.
-TOOL_VERSIONS = {"bun": "1.4.2", "bazel": "bazel 9.2.0", "rustc": "rustc 1.97.0-nightly (a1b2c3d 2026-10-06)",
+TOOL_VERSIONS = {"bun": "1.4.4", "bazel": "bazel 9.2.0", "rustc": "rustc 1.97.0-nightly (a1b2c3d 2026-10-06)",
                  "cargo": "cargo 1.97.0-nightly (a1b2c3d 2026-10-06)", "cmake": "cmake version 3.31.0", "ninja": "1.12.1"}
 
 
@@ -141,7 +141,7 @@ PULLER_FIELDS = {  # `_object(value, fields)` at :134-135 requires value.keys() 
 PULLER_PINS = {  # OMP_BUILD_PINS :1118-1123, compared literally at :1278-1279
     "base_image": "rustlang/rust:nightly-2026-08-12@sha256:51dc497bff0c24777d2ec6a1fc12ddf7ab0483de3ee537f4ec10816b9e1eff6c",
     "debian_snapshot": "20260813T000000Z",
-    "bun_archive_sha256": "c678040f14fe0440eb839d37cbd0ce4c051a32da72806ac97de6a6aab6bf728f",
+    "bun_archive_sha256": "e0446eb55995772eb9894bebae9a6be368d985a8b9271ee124486f9946eedd76",
     "bazel_download_sha256": "7668a95db1250f12c40407251e4e203b4ec8bf39bc495d2f485b2d8c99048694",
 }
 PULLER_LOADER = "ld-linux-x86-64.so.2"  # OMP_LOADER :1124
@@ -602,15 +602,15 @@ class ApplicationCommitTests(unittest.TestCase):
 
     def test_matching_pins_and_floors_pass_and_report_the_version(self):
         self.assertEqual(self.check(), "18.12.6")
-        self.assertEqual(self.check(manager="bun@1.4.2", engine="1.4.2"), "18.12.6")
+        self.assertEqual(self.check(manager="bun@1.4.4", engine="1.4.4"), "18.12.6")
         self.assertEqual(self.check(manager=None, engine=None), "18.12.6")
 
     def test_toolchain_mismatches_fail_closed_with_a_clear_reason(self):
         cases = (
             ({"bazel": "9.3.0\n"}, "Bazel 9.3.0 but this recipe pins Bazel 9.2.0"),
-            ({"manager": "bun@>=1.5"}, "Bun >=1.5 but this recipe pins Bun 1.4.2"),
-            ({"manager": "bun@1.4.3"}, "Bun 1.4.3 but this recipe pins Bun 1.4.2"),
-            ({"engine": ">=2.0.0"}, "Bun >=2.0.0 but this recipe pins Bun 1.4.2"),
+            ({"manager": "bun@>=1.5"}, "Bun >=1.5 but this recipe pins Bun 1.4.4"),
+            ({"manager": "bun@1.4.3"}, "Bun 1.4.3 but this recipe pins Bun 1.4.4"),
+            ({"engine": ">=2.0.0"}, "Bun >=2.0.0 but this recipe pins Bun 1.4.4"),
             ({"manager": "bun@^1.4"}, "neither an exact pin nor a floor"),
             ({"manager": "pnpm@9.0.0"}, "package manager other than Bun"),
             ({"missing": ("Cargo.lock",)}, "lacks Cargo.lock"),
@@ -651,7 +651,7 @@ class ApplicationCommitTests(unittest.TestCase):
                                 capture_output=True, text=True, timeout=60, env=environment)
             passed = check("--fork-manifest", str(manifest), "--fork-manifest-sha256", FORK_SHA)
             self.assertEqual(passed.returncode, 0, passed.stderr)
-            self.assertEqual(passed.stdout.strip(), "Application check passed: omp 18.12.6, Bazel 9.2.0, Bun 1.4.2, 1 fork contracts, manifest "
+            self.assertEqual(passed.stdout.strip(), "Application check passed: omp 18.12.6, Bazel 9.2.0, Bun 1.4.4, 1 fork contracts, manifest "
                              + FORK_SHA[:12] + ".")
             self.assertEqual(check("--fork-manifest", str(manifest)).returncode, 0)  # the hash is optional for the early check
             stale = Path(temporary) / "stale.json"
@@ -815,7 +815,7 @@ class PullerMirrorTests(unittest.TestCase):
         header = bytearray(64)
         header[:6] = b"\x7fELF\x02\x01"
         struct.pack_into("<H", header, 18, 62)
-        outputs = {"bun": "1.4.2\n", "bazel": "bazel 9.2.0\n", "rustc": TOOL_VERSIONS["rustc"] + "\n",
+        outputs = {"bun": "1.4.4\n", "bazel": "bazel 9.2.0\n", "rustc": TOOL_VERSIONS["rustc"] + "\n",
                    "cargo": TOOL_VERSIONS["cargo"] + "\n", "cmake": "cmake version 3.31.0\n\nCMake suite maintained and supported.\n",
                    "ninja": "1.12.1\n"}
         readelf = {"--program-headers": "  [Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]\n",

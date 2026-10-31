@@ -30,7 +30,7 @@ The application is an input: the full 40-hex commit passed as `--commit` (and to
 The first application built this way is `5e43891a87140fb0972c982f3027f0228c4f6378`, version `18.8.0`, which does not contain the new release tools.
 `--recipe-commit` therefore binds a separate reviewed full Git commit containing the release route.
 The builder exports application bytes only from `--commit` and recipe bytes only from `--recipe-commit`.
-Version-specific values come from the application commit and fail closed when this recipe's pinned toolchain cannot serve it: `linux-amd64-receipt.py check --commit <app> --fork-manifest <file>` compares the application's Bazel version, Bun requirement and locks with this recipe's pins (Bazel `9.2.0`, Bun `1.4.2`) and its README contract block and boundary tests with the supplied fork manifest before any daemon contact.
+Version-specific values come from the application commit and fail closed when this recipe's pinned toolchain cannot serve it: `linux-amd64-receipt.py check --commit <app> --fork-manifest <file>` compares the application's Bazel version, Bun requirement and locks with this recipe's pins (Bazel `9.2.0`, Bun `1.4.4`) and its README contract block and boundary tests with the supplied fork manifest before any daemon contact.
 All route files named by `linux-amd64-receipt.py:RECIPES`, including preparation, qualification and publishing code, must match the invoked local copies byte for byte.
 The manifest records both full commits and every recipe digest.
 The SHA-256 of the fork manifest the application was judged against is bound by the signed private qualification record, never by the public manifest (the fleet puller reads that file with exact key sets).
@@ -52,7 +52,7 @@ Source signing and remote source/tag publication are separate approved operation
 | Input | Exact selection and integrity |
 | --- | --- |
 | Base | Official Rust amd64 manifest `rustlang/rust:nightly-2026-08-12@sha256:51dc497bff0c24777d2ec6a1fc12ddf7ab0483de3ee537f4ec10816b9e1eff6c` |
-| Bun compiler/runtime/template | `1.4.2`, baseline archive SHA-256 `c678040f14fe0440eb839d37cbd0ce4c051a32da72806ac97de6a6aab6bf728f` |
+| Bun compiler/runtime/template | `1.4.4`, baseline archive SHA-256 `e0446eb55995772eb9894bebae9a6be368d985a8b9271ee124486f9946eedd76` |
 | Bazel | `9.2.0`, Linux executable SHA-256 `7668a95db1250f12c40407251e4e203b4ec8bf39bc495d2f485b2d8c99048694` |
 | System packages | Signed Debian trixie snapshot `20260813T000000Z`; TLS/package signature checks retained |
 | JavaScript | Immutable application `bun.lock`, frozen install with lifecycle scripts disabled |
@@ -127,10 +127,10 @@ The host umask and private Docker client directories remain unchanged.
 
 The prepared image contract is:
 
-- Tools on `/usr/local/bin:/usr/bin:/bin`: Python 3.12+, GNU `timeout`/`getconf`, `readelf`, `/bin/sh`, and Bun `1.4.2` with executable SHA-256 equal to `build_inputs.host_tools.bun.sha256`.
+- Tools on `/usr/local/bin:/usr/bin:/bin`: Python 3.12+, GNU `timeout`/`getconf`, `readelf`, `/bin/sh`, and Bun `1.4.4` with executable SHA-256 equal to `build_inputs.host_tools.bun.sha256`.
 - `/opt/omp-qualification/source`: exact application lock files and frozen `node_modules` directories in their original workspace layout, with real module-root directories and only relative links that remain inside that source tree.
 - `/opt/omp-qualification/native-grep-regression`: the separately compiled GNU amd64 `pi-natives` libtest executable for this exact application/toolchain/lock tuple, with a qualification-only GNU libc 2.27 floor and explicit `x86-64-v2` CPU.
-- `/opt/omp-qualification/dependencies.json`: exact keys `schema` (`1`), `source_commit`, `bun_version` (`1.4.2`), `locks` (the manifest's exact lock map), `dependency_tree_sha256`, `native_grep_sha256`.
+- `/opt/omp-qualification/dependencies.json`: exact keys `schema` (`1`), `source_commit`, `bun_version` (`1.4.4`), `locks` (the manifest's exact lock map), `dependency_tree_sha256`, `native_grep_sha256`.
 - Compute `dependency_tree_sha256` using the committed qualifier's `dependency_digest(prepared_source)`; `native_grep_sha256` hashes the exact prebuilt executable.
 - All fixed inputs must be readable/executable by container user `65532:65532`.
 
@@ -369,5 +369,5 @@ Fixture success is not a native execution witness; actual tmpfs execution and pr
 - [Git signed-tag verification](https://git-scm.com/docs/git-verify-tag).
 - [GitHub immutable releases](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases#immutable-releases).
 - [GitHub Releases API](https://docs.github.com/en/rest/releases/releases).
-- [Bun 1.4.2 official release](https://github.com/oven-sh/bun/releases/tag/bun-v1.4.2).
+- [Bun 1.4.4 official release](https://github.com/oven-sh/bun/releases/tag/bun-v1.4.4).
 - [Bazel 9.2.0 official release](https://github.com/bazelbuild/bazel/releases/tag/9.2.0).

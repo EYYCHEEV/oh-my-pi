@@ -267,7 +267,7 @@ def inside_prepare():
     require(receipt.match(r"glibc [0-9]+(?:\.[0-9]+)+", output(["getconf", "GNU_LIBC_VERSION"]).decode().strip()),
             "GNU libc tools are required")
     require(b"GNU readelf" in output(["readelf", "--version"]).splitlines()[0], "GNU readelf is required")
-    require(output(["bun", "--version"]) == b"1.4.2\n", "Pinned Bun is required")
+    require(output(["bun", "--version"]) == f"{receipt.BUN_VERSION}\n".encode(), "Pinned Bun is required")
     manifest = receipt.strict_json(Path("/out/RELEASE_MANIFEST.json").read_bytes())
     metadata = prepared_metadata(PREPARED, manifest, Path("/usr/local/bin/bun"))
     result = output([str(PREPARED / "native-grep-regression"), qualify.NATIVE_GREP_TEST, "--exact"], 300)

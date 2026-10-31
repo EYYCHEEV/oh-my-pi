@@ -630,7 +630,7 @@ class PreparedRuntimeTests(unittest.TestCase):
         manifest["build_inputs"]["host_tools"]["bun"]["sha256"] = receipt.digest(bun)
         grep = prepared / "native-grep-regression"
         grep.write_bytes(b"prebuilt test fixture")
-        metadata = {"schema": 1, "source_commit": COMMIT, "bun_version": "1.4.2",
+        metadata = {"schema": 1, "source_commit": COMMIT, "bun_version": "1.4.4",
                     "locks": manifest["build_inputs"]["locks"], "dependency_tree_sha256": qualify.dependency_digest(frozen),
                     "native_grep_sha256": receipt.digest(grep)}
         (prepared / "dependencies.json").write_text(json.dumps(metadata))
@@ -643,7 +643,7 @@ class PreparedRuntimeTests(unittest.TestCase):
 
             def run(self, command, cwd, seconds):
                 self.calls.append(command)
-                return b"1.4.2\n", b""
+                return b"1.4.4\n", b""
 
         with tempfile.TemporaryDirectory() as temporary:
             source, prepared, manifest, bun = self.prepare_fixture(Path(temporary))
