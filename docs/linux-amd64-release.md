@@ -129,12 +129,12 @@ The prepared image contract is:
 
 - Tools on `/usr/local/bin:/usr/bin:/bin`: Python 3.12+, GNU `timeout`/`getconf`, `readelf`, `/bin/sh`, and Bun `1.4.4` with executable SHA-256 equal to `build_inputs.host_tools.bun.sha256`.
 - `/opt/omp-qualification/source`: exact application lock files and frozen `node_modules` directories in their original workspace layout, with real module-root directories and only relative links that remain inside that source tree.
-- `/opt/omp-qualification/native-grep-regression`: the separately compiled GNU amd64 `pi-natives` libtest executable for this exact application/toolchain/lock tuple, with a qualification-only GNU libc 2.27 floor and explicit `x86-64-v2` CPU.
+- `/opt/omp-qualification/native-grep-regression`: the separately compiled GNU amd64 `pi-walker` libtest executable for this exact application/toolchain/lock tuple, with a qualification-only GNU libc 2.27 floor and explicit `x86-64-v2` CPU.
 - `/opt/omp-qualification/dependencies.json`: exact keys `schema` (`1`), `source_commit`, `bun_version` (`1.4.4`), `locks` (the manifest's exact lock map), `dependency_tree_sha256`, `native_grep_sha256`.
 - Compute `dependency_tree_sha256` using the committed qualifier's `dependency_digest(prepared_source)`; `native_grep_sha256` hashes the exact prebuilt executable.
 - All fixed inputs must be readable/executable by container user `65532:65532`.
 
-The canonical native grep test is `grep::tests::oversized_prefix_read_returns_stable_snapshot_after_rewrite`.
+The canonical native grep test is `fs::tests::read_into_honours_limit_and_open_time_size` in `pi-walker`, which owns native grep file reads since upstream `fcf34aaeb0` (2026-10-29) deleted the earlier `grep::tests::oversized_prefix_read_returns_stable_snapshot_after_rewrite`.
 The qualifier runs its prepared libtest executable with that exact selector and `--exact`, requiring exactly one passed test instead of invoking Cargo and silently compiling.
 The runtime limits are four CPUs, 12 GiB memory with no additional swap, 1024 processes, and private tmpfs capacities of 8 GiB workspace, 1 GiB runtime, 1 GiB home and 2 GiB temporary state.
 Only `/workspace` and `/runtime` explicitly enable `exec`, allowing application execution and native mappings; all four tmpfs mounts retain `nosuid`, `nodev`, size limits and mode `1777`.
@@ -197,8 +197,8 @@ All dependency installation, downloads and compilation run in a dedicated contai
 This avoids pretending that BuildKit honors legacy `docker build --memory` flags.
 No host directory, signing key, Docker socket, credential, or home is mounted into that container.
 The shared build script keeps the shipped addon and `omp-linux-amd64` on the application's GNU libc 2.17 baseline recipe.
-Only the canonical Bazel `//crates/pi-natives:pi_natives_test` build and matching output query use `--platforms=@zig_sdk//platform:linux_amd64`, `--extra_toolchains=@zig_sdk//toolchain:linux_amd64_gnu.2.27`, host-first `--extra_execution_platforms=@bazel_tools//tools:host_platform,@zig_sdk//platform:linux_amd64`, and explicit `-Ctarget-cpu=x86-64-v2`, preserving the pinned Zig/Rust toolchain, locked graph, optimization and thin LTO.
-The complete libtest harness needs GNU libc 2.27 because an unrelated Wayland test imports `memfd_create`; selecting the grep test at runtime cannot remove that link dependency.
+Only the canonical Bazel `//crates/pi-walker:pi-walker_test` build and matching output query use `--platforms=@zig_sdk//platform:linux_amd64`, `--extra_toolchains=@zig_sdk//toolchain:linux_amd64_gnu.2.27`, host-first `--extra_execution_platforms=@bazel_tools//tools:host_platform,@zig_sdk//platform:linux_amd64`, and explicit `-Ctarget-cpu=x86-64-v2`, preserving the pinned Zig/Rust toolchain, locked graph, optimization and thin LTO.
+The qualification executable keeps the GNU libc 2.27 floor chosen for the earlier `pi-natives` libtest harness; selecting the grep test at runtime cannot remove link dependencies of other tests in the same harness.
 This qualification-only executable proves the grep logic, not GNU libc 2.17 compatibility, and must never be described as supporting that older runtime.
 The shipped executable and extracted addon are actually loaded and exercised separately during qualification; the recorded runtime facts describe that environment, not a test on every older libc.
 The preparation image retains the pinned base's GNU library closure and validates the exact standalone libtest selector.

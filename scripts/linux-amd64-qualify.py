@@ -37,7 +37,7 @@ README_MARKERS = ("<!-- stronk-omp:fork-contracts:start -->", "<!-- stronk-omp:f
 CONTRACT_STATUSES = frozenset({"active", "retire_candidate", "retired", "deferred", "maintenance"})
 SHELL_SYNTAX = ("\n", "\r", ";", "&&", "||", "|", "`", "$(", ">", "<")
 STAGE_BYTES = 32768
-NATIVE_GREP_TEST = "grep::tests::oversized_prefix_read_returns_stable_snapshot_after_rewrite"
+NATIVE_GREP_TEST = "fs::tests::read_into_honours_limit_and_open_time_size"
 TYPECHECK = ["bun", "run", "--cwd", "packages/coding-agent", "check:types"]
 MARKERS = (
     b"requiredExtension.path", b"--oauth-account", b"--require-runtime-contract",
@@ -851,8 +851,8 @@ def runtime_main():
                 announce_stage(line, inside=True, boundaries=known)
         require(passed, "Boundary command failed or ran no passing tests")
     announce_stage("qualify-native-grep", inside=True)
-    grep_source = (source / "crates/pi-natives/src/grep.rs").read_text()
-    require(re.search(r"(?m)^\s*fn\s+" + NATIVE_GREP_TEST.rsplit("::", 1)[1] + r"\s*\(", grep_source), "Canonical native regression is missing")
+    grep_source = (source / "crates/pi-walker/src/fs/tests.rs").read_text()
+    require(re.search(r"(?m)^\s*(?:async\s+)?fn\s+" + NATIVE_GREP_TEST.rsplit("::", 1)[1] + r"\s*\(", grep_source), "Canonical native regression is missing")
     output, _ = runtime.run([grep, NATIVE_GREP_TEST, "--exact"], source)
     require(re.search(rb"(?m)^running 1 test$", output) and
             re.search(rb"test result: ok\. 1 passed; 0 failed;", output), "Canonical native regression failed or was filtered out")

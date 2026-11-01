@@ -485,7 +485,7 @@ class ContractTests(unittest.TestCase):
 
     def test_native_recipe_and_no_run_workspace_are_explicit(self):
         script = Path(__file__).with_name("linux-amd64-build.sh").read_text()
-        for value in ("//crates/pi-natives:pi_natives_test", "--lockfile_mode=error",
+        for value in ("//crates/pi-walker:pi-walker_test", "--lockfile_mode=error",
                       "--platforms=@zig_sdk//platform:linux_amd64",
                       "--extra_toolchains=@zig_sdk//toolchain:linux_amd64_gnu.2.27",
                       "--extra_execution_platforms=@bazel_tools//tools:host_platform,@zig_sdk//platform:linux_amd64",

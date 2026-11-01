@@ -73,7 +73,7 @@ if [[ "$mode" == prepare-runtime ]]; then
     '--extra_execution_platforms=@bazel_tools//tools:host_platform,@zig_sdk//platform:linux_amd64'
     --@rules_rust//rust/settings:lto=thin
     '--@rules_rust//rust/settings:extra_rustc_flags=-Ccodegen-units=16,-Cstrip=symbols,-Ctarget-cpu=x86-64-v2')
-  native_target=//crates/pi-natives:pi_natives_test
+  native_target=//crates/pi-walker:pi-walker_test
   quiet bazel build "${native_args[@]}" "$native_target"
   bazel cquery "${native_args[@]}" --output=files "$native_target" > /tmp/native-output 2>/dev/null
   mapfile -t native_outputs < /tmp/native-output
