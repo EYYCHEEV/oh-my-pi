@@ -7,24 +7,18 @@ import * as path from "node:path";
 import { formatDuration, formatNumber } from "@oh-my-pi/pi-utils";
 import { renderProgressBar } from "../components/progress-bar";
 import { Text } from "../components/text";
-import {
-	Ellipsis,
-	fileHyperlink,
-	getTreeBranch,
-	renderStatusLine,
-	renderTreeList,
-	truncateToWidth,
-	uriHyperlink,
-} from "../render";
+import { fileHyperlink, getTreeBranch, renderStatusLine, renderTreeList, uriHyperlink } from "../render";
 import {
 	createCachedComponent,
+	fitHeaderedRows,
 	formatCount,
 	formatEmptyMessage,
 	formatErrorMessage,
 	PREVIEW_LIMITS,
 	replaceTabs,
 } from "../render/render-utils";
-import type { Theme, ThemeColor } from "../theme/theme";
+import { getLanguageFromPath } from "../lang-from-path";
+import { highlightCode, isHighlightLanguage, type Theme, type ThemeColor } from "../theme/theme";
 import type { Component } from "../tui";
 import type { OutputMeta } from "./output-meta";
 import type {
@@ -178,10 +172,14 @@ function renderHit(hit: FindHit, rangeLimit: number, cwd: string | undefined, ra
 		`${gauge(hit.contentScore, theme)} ${theme.fg(scoreColor(hit.contentScore), hit.contentScore.toFixed(2))} ${link(theme.fg("accent", hit.rel))} ${theme.fg("dim", coverage)}`,
 	];
 	const ranges = [...hit.ranges].sort((a, b) => b.p - a.p || a.start - b.start).slice(0, rangeLimit);
+	const lang = getLanguageFromPath(hit.rel);
 	ranges.forEach((range, index) => {
 		const span = range.start === range.end ? String(range.start) : `${range.start}-${range.end}`;
 		const ref = link(theme.fg("muted", `:${span}`), range.start);
-		const snippet = theme.fg("toolOutput", replaceTabs(range.snippet.trim()));
+		const source = replaceTabs(range.snippet.trim());
+		const snippet = isHighlightLanguage(lang)
+			? highlightCode(source, lang, theme).join("\n")
+			: theme.fg("toolOutput", source);
 		const branch = theme.fg("dim", getTreeBranch(index === ranges.length - 1, theme));
 		lines.push(`  ${branch} ${ref} ${theme.fg("dim", range.p.toFixed(2))} ${snippet}`);
 	});
@@ -357,7 +355,7 @@ export const findToolRenderer = {
 					extra.push(uiTheme.fg("dim", `keywords: ${details.keywords.join(", ")}`));
 					for (const failure of stats.failures) extra.push(uiTheme.fg("warning", failure));
 				}
-				return [header, ...hitLines, ...extra].map(line => truncateToWidth(line, width, Ellipsis.Omit));
+				return fitHeaderedRows(header, [...hitLines, ...extra], width);
 			},
 		);
 	},

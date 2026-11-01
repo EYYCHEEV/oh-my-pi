@@ -113,12 +113,10 @@ export class SessionStatsTracker {
 	/** Tool-schema tokens the active model carries in its prompt. */
 	#currentToolSchemaTokens(): number {
 		const session = this.#host.session;
-		return estimateContextToolSchemaTokens(
-			session.agent?.state?.tools ?? [],
-			this.#tokenizer,
-			session.model,
-			session.settings?.revision,
-		);
+		return estimateContextToolSchemaTokens(session.agent?.state?.tools ?? [], this.#tokenizer, session.model, {
+			sourceRevision: session.settings?.revision,
+			pruneDescriptions: session.agent?.prunesToolDescriptions?.(session.model),
+		});
 	}
 
 	/**
@@ -203,6 +201,7 @@ export class SessionStatsTracker {
 		let committedAcuCost = 0;
 		let hasCredits = false;
 		const routedModels: Record<string, number> = {};
+		const editRejections: Record<string, number> = {};
 		const addUsage = (usage: Usage): void => {
 			totalInput += usage.input;
 			totalOutput += usage.output;
@@ -228,6 +227,12 @@ export class SessionStatsTracker {
 				if (message.toolName === "task") {
 					const usage = taskToolUsage(message.details);
 					if (usage) addUsage(usage);
+				} else if (message.toolName === "edit" && message.isError) {
+					const { details } = message;
+					if (details && typeof details === "object" && "errorKind" in details) {
+						const kind = details.errorKind;
+						if (typeof kind === "string") editRejections[kind] = (editRejections[kind] ?? 0) + 1;
+					}
 				}
 			} else if (message.role === "assistant") {
 				assistantMessages++;
@@ -272,6 +277,7 @@ export class SessionStatsTracker {
 					}
 				: undefined),
 			...(Object.keys(routedModels).length > 0 ? { routedModels } : undefined),
+			...(Object.keys(editRejections).length > 0 ? { editRejections } : undefined),
 			contextUsage: this.getContextUsage(),
 		};
 	}

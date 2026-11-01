@@ -68,6 +68,7 @@ export * from "./auth/types";
 /** Store-bound credential modules; rebuilt as a unit by {@link AuthStorage.replaceStore}. */
 interface AuthStorageModules {
 	pool: CredentialPool;
+	refresher: OAuthRefresher;
 	keys: KeyCascade;
 	oauth: OAuthAccounts;
 	sessions: SessionAffinity;
@@ -155,9 +156,10 @@ export class AuthStorage {
 	/**
 	 * Swap the backing credential store in place (live `auth.broker.url` change).
 	 * Loads `store` into fresh store-bound state — pins, blocks, and usage caches are
-	 * keyed by the old store's row ids — then closes the previous store. Runtime key
-	 * overrides, account policies, session account restrictions, usage-provider
-	 * overrides, and credential event subscribers carry over. On a load failure
+	 * keyed by the old store's row ids — then retires the previous store like
+	 * {@link AuthStorage.close}. Runtime key overrides, account policies, session
+	 * account restrictions, usage-provider overrides, and credential event
+	 * subscribers carry over. On a load failure
 	 * `store` is closed and the current store stays active. Launch-restricted
 	 * sessions must relaunch to change stores.
 	 */
@@ -179,7 +181,7 @@ export class AuthStorage {
 		next.sessions.adoptSubscribers(previous.sessions);
 		next.usage.adoptRuntimeProviders(previous.usage);
 		this.#modules = next;
-		previous.pool.close();
+		retire(previous);
 		next.pool.bump("store-replaced");
 	}
 
@@ -251,6 +253,7 @@ export class AuthStorage {
 
 		return {
 			pool,
+			refresher,
 			keys,
 			oauth,
 			sessions: affinity,
@@ -279,9 +282,13 @@ export class AuthStorage {
 		return new AuthStorage(store, options);
 	}
 
-	/** Close the underlying credential store; the instance must not be reused. */
+	/**
+	 * Close the underlying credential store; the instance must not be reused.
+	 * New OAuth refreshes are refused at once; a token exchange already under way
+	 * keeps the store open until it has saved the rotated token.
+	 */
 	close(): void {
-		this.#modules.pool.close();
+		retire(this.#modules);
 	}
 
 	/**
@@ -299,4 +306,9 @@ export class AuthStorage {
 	reload(): Promise<void> {
 		return this.credentials.reload();
 	}
+}
+
+/** Stop store-bound modules: refuse new refreshes, close the store once in-flight ones have saved. */
+function retire(modules: AuthStorageModules): void {
+	modules.refresher.close(() => modules.pool.close());
 }

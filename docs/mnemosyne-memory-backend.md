@@ -6,16 +6,16 @@ Set:
 
 ```yaml
 memory:
-  backend: mnemopi
+   backend: mnemopi
 ```
 
 Example:
 
 ```yaml
 memory:
-  backend: mnemopi
+   backend: mnemopi
 mnemopi:
-  scoping: per-project-tagged
+   scoping: per-project-tagged
 ```
 
 With this backend enabled, the coding agent:
@@ -51,14 +51,14 @@ Memory text is scanned on the way in and on the way out. Writes redact provider 
 
 ## Settings
 
-| Setting                       | Default            | Description                                                                                                                                                                                                                                                                            |
-| ----------------------------- | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `memory.backend`              | `off`              | Set to `mnemopi` to enable this backend.                                                                                                                                                                                                                                               |
-| `mnemopi.dbPath`              | agent memories dir | Optional SQLite database path.                                                                                                                                                                                                                                                         |
-| `mnemopi.bank`                | unset              | Optional shared bank base name passed to `Mnemopi`; the coding-agent wrapper scopes from this base according to `mnemopi.scoping`. Unset → shared bank `default`; per-project modes derive a project bank from the working-directory basename plus a stable hash of its absolute path. |
-| `mnemopi.scoping`             | `per-project`      | Memory visibility mode: `global` = one shared bank, `per-project` = isolated project memory, `per-project-tagged` = project-local writes plus global recall visibility.                                                                                                                |
-| `mnemopi.autoRecall`          | `true`             | Recall memory on the first turn of a session.                                                                                                                                                                                                                                          |
-| `mnemopi.autoRetain`          | `true`             | Retain completed turns automatically.                                                                                                                                                                                                                                                  |
+| Setting                       | Default            | Description                                                                                                                                                                                                                                                                                                   |
+| ----------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `memory.backend`              | `off`              | Set to `mnemopi` to enable this backend.                                                                                                                                                                                                                                                                      |
+| `mnemopi.dbPath`              | agent memories dir | Optional SQLite database path.                                                                                                                                                                                                                                                                                |
+| `mnemopi.bank`                | unset              | Optional shared bank base name passed to `Mnemopi`; the coding-agent wrapper scopes from this base according to `mnemopi.scoping`. Unset → shared bank `default`; per-project modes derive a project bank from the working-directory basename plus a stable hash of its absolute path.                        |
+| `mnemopi.scoping`             | `per-project`      | Memory visibility mode: `global` = one shared bank, `per-project` = isolated project memory, `per-project-tagged` = project-local writes plus global recall visibility.                                                                                                                                       |
+| `mnemopi.autoRecall`          | `true`             | Recall memory on the first turn of a session.                                                                                                                                                                                                                                                                 |
+| `mnemopi.autoRetain`          | `true`             | Retain completed turns automatically.                                                                                                                                                                                                                                                                         |
 | `mnemopi.polyphonicRecall`    | `false`            | Fuse the standard ranking by reciprocal rank with vector, graph, fact and temporal voices, so memories linked in the episodic graph (by `mnemopi.proactiveLinking` or consolidation) or through consolidated extracted facts surface without a keyword match. `MNEMOPI_POLYPHONIC_RECALL` overrides when set. |
 | `mnemopi.enhancedRecall`      | `false`            | Cache recall results per query for up to 5 minutes. Entries are keyed on every recall option (limit, facts, channel, time, bank), similar queries only reuse entries with identical options, and any write to the bank drops the cache. `MNEMOPI_ENHANCED_RECALL` overrides when set.  |
 | `mnemopi.proactiveLinking`    | `false`            | Ingest new memories into the episodic graph and link them to related entities/memories as they are stored; `MNEMOPI_PROACTIVE_LINKING` overrides when set.                                                                                                                             |
@@ -109,16 +109,16 @@ Retention writes a marker-free transcript projection: when the host supplies an 
 
 Recall multiplies each memory's score by a weight for its stored `veracity` label and, for episodic memories, by a weight for its degradation tier. Each weight is read from its environment variable on every recall:
 
-| Variable                  | Default | Applies to                                                                           |
-| ------------------------- | ------- | ------------------------------------------------------------------------------------ |
-| `MNEMOPI_STATED_WEIGHT`   | `1.0`   | `veracity: stated`, which the coding agent's explicit memory save (the extension `memory.save` API) writes |
+| Variable                  | Default | Applies to                                                                                                             |
+| ------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `MNEMOPI_STATED_WEIGHT`   | `1.0`   | `veracity: stated`, which the coding agent's explicit memory save (the extension `memory.save` API) writes             |
 | `MNEMOPI_UNKNOWN_WEIGHT`  | `0.8`   | `veracity: unknown`, which the coding agent's automatic transcript retention writes, and any write that names no label |
-| `MNEMOPI_INFERRED_WEIGHT` | `0.7`   | `veracity: inferred`                                                                 |
-| `MNEMOPI_IMPORTED_WEIGHT` | `0.6`   | `veracity: imported`                                                                 |
-| `MNEMOPI_TOOL_WEIGHT`     | `0.5`   | `veracity: tool`, which the coding agent's `retain` and `learn` tools write          |
-| `MNEMOPI_TIER1_WEIGHT`    | `1.0`   | episodic memories at degradation tier 1                                              |
-| `MNEMOPI_TIER2_WEIGHT`    | `0.85`  | episodic memories at degradation tier 2                                              |
-| `MNEMOPI_TIER3_WEIGHT`    | `0.7`   | episodic memories at degradation tier 3 or beyond                                    |
+| `MNEMOPI_INFERRED_WEIGHT` | `0.7`   | `veracity: inferred`                                                                                                   |
+| `MNEMOPI_IMPORTED_WEIGHT` | `0.6`   | `veracity: imported`                                                                                                   |
+| `MNEMOPI_TOOL_WEIGHT`     | `0.5`   | `veracity: tool`, which the coding agent's `retain` and `learn` tools write                                            |
+| `MNEMOPI_TIER1_WEIGHT`    | `1.0`   | episodic memories at degradation tier 1                                                                                |
+| `MNEMOPI_TIER2_WEIGHT`    | `0.85`  | episodic memories at degradation tier 2                                                                                |
+| `MNEMOPI_TIER3_WEIGHT`    | `0.7`   | episodic memories at degradation tier 3 or beyond                                                                      |
 
 Sleep consolidation carries a working memory's label onto the episodic memory it produces.
 
@@ -165,9 +165,9 @@ FTS-only:
 
 ```yaml
 memory:
-  backend: mnemopi
+   backend: mnemopi
 mnemopi:
-  noEmbeddings: true
+   noEmbeddings: true
 ```
 
 Equivalent constructor shape:
@@ -180,18 +180,18 @@ Remote embeddings:
 
 ```yaml
 mnemopi:
-  embeddingModel: text-embedding-3-small
-  embeddingApiUrl: https://api.openai.com/v1
-  embeddingApiKey: ${OPENAI_API_KEY}
+   embeddingModel: text-embedding-3-small
+   embeddingApiUrl: https://api.openai.com/v1
+   embeddingApiKey: ${OPENAI_API_KEY}
 ```
 
 Equivalent constructor shape:
 
 ```ts
 new Mnemopi({
-  embeddingModel: "text-embedding-3-small",
-  embeddingApiUrl: "https://api.openai.com/v1",
-  embeddingApiKey,
+	embeddingModel: "text-embedding-3-small",
+	embeddingApiUrl: "https://api.openai.com/v1",
+	embeddingApiKey,
 });
 ```
 
@@ -199,10 +199,10 @@ Remote LLM:
 
 ```yaml
 mnemopi:
-  llmMode: remote
-  llmBaseUrl: https://api.openai.com/v1
-  llmApiKey: ${OPENAI_API_KEY}
-  llmModel: gpt-4.1-mini
+   llmMode: remote
+   llmBaseUrl: https://api.openai.com/v1
+   llmApiKey: ${OPENAI_API_KEY}
+   llmModel: gpt-4.1-mini
 ```
 
 Equivalent constructor shapes:
@@ -216,14 +216,14 @@ Dynamic function LLM for rotating OAuth tokens:
 
 ```ts
 new Mnemopi({
-  llm: async (prompt, opts) => {
-    const token = await getFreshOauthToken();
-    return await completeWithPiAi(prompt, {
-      token,
-      maxTokens: opts?.maxTokens,
-      temperature: opts?.temperature,
-    });
-  },
+	llm: async (prompt, opts) => {
+		const token = await getFreshOauthToken();
+		return await completeWithPiAi(prompt, {
+			token,
+			maxTokens: opts?.maxTokens,
+			temperature: opts?.temperature,
+		});
+	},
 });
 ```
 
@@ -231,14 +231,14 @@ Managed memory-role LLM:
 
 ```yaml
 mnemopi:
-  llmMode: smol
+   llmMode: smol
 ```
 
 The coding agent resolves the `memory` role and passes a dynamic completion function so every Mnemopi LLM call can fetch current provider credentials at call time and try the role's fallback candidates:
 
 ```ts
 new Mnemopi({
-  llm: async (prompt, opts) => completeMemoryRoleWithCurrentAuth(prompt, opts),
+	llm: async (prompt, opts) => completeMemoryRoleWithCurrentAuth(prompt, opts),
 });
 ```
 

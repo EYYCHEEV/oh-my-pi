@@ -1,22 +1,27 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { logger } from "@oh-my-pi/pi-utils";
 
+/**
+ * Methods are bound arrow fields: upstream Pi's `createEventBus()` returns
+ * closures, so extensions (e.g. `pi-gemini-acp`) detach `pi.events.on` and
+ * `pi.events.emit` and call them without a receiver.
+ */
 export class EventBus {
 	readonly #listeners = new Map<string, Set<(data: unknown) => void>>();
 	readonly #subscriptionOwner = new AsyncLocalStorage<object>();
 	readonly #ownedSubscriptions = new WeakMap<object, Set<() => void>>();
 	readonly #disposedSubscriptionOwners = new WeakSet<object>();
 
-	emit(channel: string, data: unknown): void {
+	emit = (channel: string, data: unknown): void => {
 		const handlers = this.#listeners.get(channel);
 		if (handlers) {
 			for (const handler of handlers) {
 				handler(data);
 			}
 		}
-	}
+	};
 
-	on(channel: string, handler: (data: unknown) => void): () => void {
+	on = (channel: string, handler: (data: unknown) => void): (() => void) => {
 		if (!this.#listeners.has(channel)) {
 			this.#listeners.set(channel, new Set());
 		}
@@ -47,21 +52,21 @@ export class EventBus {
 			subscriptions.add(dispose);
 		}
 		return dispose;
-	}
+	};
 
-	async runWithSubscriptionOwner<T>(owner: object, callback: () => T | Promise<T>): Promise<T> {
+	runWithSubscriptionOwner = async <T>(owner: object, callback: () => T | Promise<T>): Promise<T> => {
 		return await this.#subscriptionOwner.run(owner, callback);
-	}
+	};
 
-	disposeSubscriptions(owner: object): void {
+	disposeSubscriptions = (owner: object): void => {
 		this.#disposedSubscriptionOwners.add(owner);
 		for (const dispose of this.#ownedSubscriptions.get(owner) ?? []) dispose();
 		this.#ownedSubscriptions.delete(owner);
-	}
+	};
 
-	clear(): void {
+	clear = (): void => {
 		this.#listeners.clear();
-	}
+	};
 }
 
 /**

@@ -120,6 +120,7 @@ function createControllerContext() {
 		hookEditor: undefined,
 		session: { extensionRunner: undefined },
 		syncComposerShape: vi.fn(),
+		syncExtensionLinks: vi.fn(),
 		setToolUIContext(context: ExtensionUIContext): void {
 			toolUiContext = context;
 		},

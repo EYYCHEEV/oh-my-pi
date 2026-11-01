@@ -21,6 +21,29 @@
 - Fixed `forget` leaving the forgotten text recallable through retained session transcripts. The coding-agent retains the transcript of the session that stored a memory and of any later session whose recall showed it, so after `forget` a fresh recall still returned the text from those rows. `forget` now replaces the exact text with `[forgotten]` in the `content` and `embed_text` of every transcript row (`source = 'coding-agent-transcript'`) and keeps the rest of each row. Only whole occurrences are cut (a non-word character or the edge of the text on both sides), so `password` is cut out of a row but `passwords` is left alone, and a text shorter than 8 characters is not scrubbed from transcripts at all: `forgetDetailed` reports it and one warning names the memory id, never its text. It drops the facts, memoria rows, graph links and vector extracted from a scrubbed row's old text (annotations stay) and re-embeds the row after the commit, and it rewrites the summaries `sleep` built from scrubbed rows from their scrubbed text, deleting the old summary and its facts. A retired or caller-written summary of a scrubbed row is deleted whole. The full-text indexes follow through their triggers. `invalidate` keeps history and does not touch transcripts. Added `Mnemopi.forgetDetailed(id)` and `Mnemopi.scrubForgottenText(text)` to scrub another bank without deleting a memory.
 - Fixed `forget` still leaving the forgotten text recallable when a retained transcript quoted it another way, or was retained after the forget. A recall shows what the fact extractor made of a memory, in the extractor's wording, and the transcript of a recall session quotes that, so `forget` now also cuts the facts' wording out of transcripts, and finds a quote by word windows instead of exact text: another case or punctuation, the AAAK compaction of a summary (`and` became `+`), or a partial quote of five consecutive words or more (a text under 8 characters, one word, or only numbers has no windows). It keeps the windows as salted hashes, never as text, in `forget_tombstones` (newest 50 000 per bank, `MNEMOPI_FORGET_TOMBSTONE_LIMIT`), and a transcript retained afterwards (`remember` with source `coding-agent-transcript`) is cut by them before it is stored, embedded or mined for facts, so the transcript of the session that forgot a memory cannot keep it. A `sleep` summary of transcripts whose rows `pruneConsolidatedDays` deleted is cut in place (`rewriteSleepSummary`), and the facts of pruned rows that quote the text are deleted, so pruning no longer keeps a quote out of reach. `ForgetOutcome` gains `forgottenTexts`, and `Mnemopi.scrubForgottenText(text)` is now `scrubForgottenTexts(texts)`, which also records the tombstones in the other banks of a session
 - Fixed `forget` leaving the forgotten text in the database files. SQLite keeps what a delete frees in the free space of the main file, in the write-ahead log until a checkpoint, and in the segments of a full-text index, so anything that opened `mnemopi.db` and `mnemopi.db-wal` (or a copy of them) could still read a forgotten memory, its facts and the transcripts that quoted it, although no query returned them. Every pragma'd connection now sets `PRAGMA secure_delete=ON` (the build default is FAST or OFF). While a forget (or a `scrubForgottenTexts` that rewrites rows) deletes, the three full-text indexes get the FTS5 `secure-delete` option, put back with the same commit, because a secure full-text delete rewrites segment pages and left on it made a 5000-row prune about 30 times slower; an SQLite whose FTS5 refuses the option gets an `optimize` merge of each index after the forget instead. The forget then ends with `PRAGMA wal_checkpoint(TRUNCATE)`, which waits at most 200 ms for readers. A checkpoint a reader blocks is recorded in the new `forget_checkpoint_pending` table and finished by the next open, `sleep` or close of the bank, in any process. Bytes that earlier non-secure deletes left in the free space of an existing file stay until a `VACUUM`.
+## [18.14.2] - 2026-10-31
+
+### Fixed
+
+- Fixed heuristic episodic facts storing word fragments (`Drafting is active.` → `ctive`), truncated multiword objects, or nothing for `has an …` sentences ([#17511](https://github.com/can1357/oh-my-pi/issues/17511))
+
+## [18.13.3] - 2026-10-28
+
+### Changed
+
+- Updated Bun engine requirement to ≥1.4.4
+
+## [18.13.2] - 2026-10-27
+
+### Fixed
+
+- Fixed local embeddings using one spinning CPU thread per core, so a single recall query cost several CPU-seconds on a many-core machine ([#17109](https://github.com/can1357/oh-my-pi/pull/17109) by [@sjawhar](https://github.com/sjawhar))
+
+## [18.13.0] - 2026-10-26
+
+### Fixed
+
+- Fixed polyphonic recall's graph voice finding no memories for non-English names (e.g. `Hà Nội`) or names of three or more words, and Vietnamese words like `tôi` being stored as the participant `i` ([#16723](https://github.com/can1357/oh-my-pi/issues/16723))
 
 ## [18.12.4] - 2026-10-20
 

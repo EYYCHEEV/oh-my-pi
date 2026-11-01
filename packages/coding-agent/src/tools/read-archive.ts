@@ -1,5 +1,6 @@
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { TextContent } from "@oh-my-pi/pi-ai";
+import { TempDir } from "@oh-my-pi/pi-utils";
 import {
 	type ArchiveFormat,
 	type ArchiveReader,
@@ -9,6 +10,7 @@ import {
 } from "@oh-my-pi/pi-utils/ar";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import type { ToolSession } from "../sdk";
+import { convertBufferWithMarkit } from "../utils/markit";
 import { truncateHead } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { applyListLimit } from "@oh-my-pi/pi-tui/tools/list-limit";
 import { resolveReadPath } from "./path-utils";
@@ -28,6 +30,8 @@ import {
 	type SuffixMatchCache,
 } from "./read-path-resolution";
 import { isMultiRange, type ParsedSelector, parseSel, resolveTailSelector, selToOffsetLimit } from "./read-selector";
+import { type PdfImageReadTarget, type PdfPageReadOptions, splitPdfImageReadPath } from "./read-pdf";
+import { cfgReadRenderMarkdown } from "./settings";
 import { formatBytes } from "@oh-my-pi/pi-tui/render/render-utils";
 import { throwIfAborted } from "./tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -44,7 +48,7 @@ interface ResolvedArchiveReadPath {
  * reads from disk. Stream containers buffer the whole archive and RAR/7z keep
  * decoded solid blocks, so caching those would pin up to their in-memory limit.
  */
-const CACHEABLE_ARCHIVE_FORMATS: Partial<Record<ArchiveFormat, true>> = { zip: true, asar: true, iso: true };
+const CACHEABLE_ARCHIVE_FORMATS: Partial<Record<ArchiveFormat, true>> = { tar: true, zip: true, asar: true, iso: true };
 
 interface CachedArchiveReader {
 	reader: ArchiveReader;
@@ -72,13 +76,16 @@ const archiveReaderCache = new LRUCache<string, CachedArchiveReader>({
 });
 
 async function openArchiveCached(absolutePath: string): Promise<ArchiveReader> {
+	// The clock is read before the stat, so a change landing between the two counts as recent.
+	const checkedAtMs = Date.now();
 	// A vanished or unreadable archive is reported by the opener, as it always has been.
 	const stat = await Bun.file(absolutePath)
 		.stat()
 		.catch(() => null);
 	if (!stat) return openArchive(absolutePath);
-	// Judged at stat time, before the open, so a slow open cannot age the stamp past the racy window.
-	const racy = isRacyStat(stat);
+	// Judged against the clock read before the stat and before the open, so neither a change landing in between nor a
+	// slow open can age the stamp past the racy window.
+	const racy = isRacyStat(stat, checkedAtMs);
 	const cached = archiveReaderCache.get(absolutePath);
 	if (
 		cached &&
@@ -195,6 +202,7 @@ export async function readArchive(
 	readPath: string,
 	parsedSel: ParsedSelector,
 	resolvedArchivePath: ResolvedArchiveReadPath,
+	readPdfPage: (options: PdfPageReadOptions) => Promise<AgentToolResult<ReadToolDetails>>,
 	signal?: AbortSignal,
 ): Promise<AgentToolResult<ReadToolDetails>> {
 	throwIfAborted(signal);
@@ -212,6 +220,7 @@ export async function readArchive(
 
 	let archiveSubPath = resolvedArchivePath.archiveSubPath;
 	let sel = parsedSel;
+	let pdfImageRead: PdfImageReadTarget | null = null;
 	let node = archive.getNode(archiveSubPath);
 	if (!node && archiveSubPath) {
 		// `archive.zip:500` / `archive.zip:raw`: the whole subPath is a
@@ -222,6 +231,15 @@ export async function readArchive(
 			node = archive.getNode("");
 			archiveSubPath = "";
 			sel = wholeSel;
+		}
+	}
+	if (!node && sel.kind === "none") {
+		const candidate = splitPdfImageReadPath(archiveSubPath);
+		const pdfNode = candidate ? archive.getNode(candidate.pdfPath) : undefined;
+		if (candidate && pdfNode && !pdfNode.isDirectory) {
+			pdfImageRead = candidate;
+			archiveSubPath = candidate.pdfPath;
+			node = pdfNode;
 		}
 	}
 	if (!node) {
@@ -236,6 +254,55 @@ export async function readArchive(
 	}
 
 	const entry = await archive.readFile(archiveSubPath);
+	throwIfAborted(signal);
+	if (entry.path.toLowerCase().endsWith(".pdf")) {
+		const memberPath = `${resolvedArchivePath.absolutePath}:${entry.path}`;
+		const pdfDetails: ReadToolDetails = { ...details, resolvedPath: memberPath, fileSize: entry.size };
+		if (pdfImageRead) {
+			// Only the selected, extraction-bounded member is materialized, under
+			// an owned name rather than any untrusted archive path.
+			await using scratch = await TempDir.create("@omp-read-archive-pdf-");
+			const pdfPath = scratch.join("member.pdf");
+			await Bun.write(pdfPath, entry.bytes);
+			throwIfAborted(signal);
+			const result = await readPdfPage({
+				readPath,
+				absolutePdfPath: pdfPath,
+				page: pdfImageRead.page,
+				pdfFileSize: entry.size,
+				suffixResolution: resolvedArchivePath.suffixResolution,
+				signal,
+			});
+			return toolResult<ReadToolDetails>({ ...result.details, ...pdfDetails })
+				.content(result.content)
+				.sourcePath(memberPath)
+				.done();
+		}
+		const converted = await convertBufferWithMarkit(entry.bytes, ".pdf", signal);
+		if (!converted.ok) {
+			return toolResult<ReadToolDetails>(pdfDetails)
+				.text(
+					prependSuffixResolutionNotice(
+						`[Cannot read .pdf file: ${converted.error || "conversion failed"}]`,
+						resolvedArchivePath.suffixResolution,
+					),
+				)
+				.sourcePath(memberPath)
+				.done();
+		}
+		pdfDetails.contentType = cfgReadRenderMarkdown.get(session.settings) ? "text/markdown" : undefined;
+		const result = await buildInMemorySelectorResult(session, converted.content, sel, {
+			details: pdfDetails,
+			sourcePath: memberPath,
+			entityLabel: "document",
+			immutable: true,
+		});
+		const firstText = result.content.find((content): content is TextContent => content.type === "text");
+		if (firstText) {
+			firstText.text = prependSuffixResolutionNotice(firstText.text, resolvedArchivePath.suffixResolution);
+		}
+		return result;
+	}
 	const text = decodeUtf8Text(entry.bytes);
 	if (text === null) {
 		return toolResult<ReadToolDetails>(details)

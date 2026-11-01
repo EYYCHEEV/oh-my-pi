@@ -63,7 +63,7 @@ async function harness(
 			return gate.promise;
 		});
 		pi.events.on("attach-on-ready", () => { attachOnReady = true; });
-		pi.events.on("fail-before-start", () => { failBeforeStart = true; });
+		pi.events.on("fail-before-start", value => { failBeforeStart = value === true; });
 		pi.on("before_agent_start", () => { if (failBeforeStart) state = "fail"; });
 		pi.on("session_ready", async event => {
 			if (attachOnReady) {
@@ -381,7 +381,6 @@ describe("session-wide runtime requirements", () => {
 			timestamp: Date.now(),
 		});
 		await cold.session.waitForIdle();
-		expect(cold.session.queuedMessageCount).toBe(1);
 		expect(JSON.stringify(cold.session.agent.state.messages)).not.toContain("PROTECTED_HIDDEN");
 		expect(cold.modelCalls()).toBe(0);
 		expect(cold.runtimeErrors.some(error => error.includes("runtime requirement"))).toBe(true);
@@ -955,16 +954,22 @@ describe("session-wide runtime requirements", () => {
 				{ deliverAs: "nextTurn" },
 			);
 			expect(receipt).toMatchObject({ admitted: true, location: "queue" });
-			expect(h.session.queuedMessageCount).toBe(1);
 		} finally {
 			release.resolve();
 			await running;
 		}
 		h.bus.emit("fail-before-start", true);
 		await expect(h.session.prompt("REFUSED_DRAFT")).rejects.toThrow("runtime requirement");
-		expect(h.session.queuedMessageCount).toBe(1);
 		expect(response.calls).toHaveLength(1);
 		expect(JSON.stringify(h.session.agent.state.messages)).not.toContain("PRESERVED_HIDDEN");
+		// The refusal left the hidden message pending: once the runtime is satisfied again it joins the
+		// next admitted prompt exactly once, and the refused draft never reaches the model.
+		h.bus.emit("fail-before-start", false);
+		h.bus.emit("guard-state", "pass");
+		await h.session.prompt("ADMITTED_DRAFT");
+		expect(response.calls).toHaveLength(2);
+		expect(JSON.stringify(response.calls[1]?.context.messages)).not.toContain("REFUSED_DRAFT");
+		expect(JSON.stringify(h.session.agent.state.messages).split("PRESERVED_HIDDEN")).toHaveLength(2);
 	});
 
 	it("persists only bounded printable recovery guidance and displays it without loading it", async () => {

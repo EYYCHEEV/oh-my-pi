@@ -350,7 +350,13 @@ describe("tool-call answer seam, fix round 2", () => {
 				const wrapped = new ExtensionToolWrapper(promptingTool(executed), runner);
 
 				const message = await failure(
-					wrapped.execute("c1", { path: ORIGINAL_URL }, undefined, undefined, askContext({ xdevApproved: true })),
+					wrapped.execute(
+						"c1",
+						{ path: ORIGINAL_URL },
+						undefined,
+						undefined,
+						askContext({ xdevPolicyKey: "read" }),
+					),
 				);
 
 				expect(select).toHaveBeenCalledTimes(1);
@@ -424,7 +430,7 @@ describe("tool-call answer seam, fix round 2", () => {
 				expect(seen[0]).not.toBe(live);
 			});
 
-			it("keeps the xdevApproved bypass for an unchanged input (deep equality with the copy)", async () => {
+			it("keeps the xd:// device approval bypass for an unchanged input (deep equality with the copy)", async () => {
 				const executed: unknown[] = [];
 				const runner = await makeRunner([]);
 				dispatch(runner, "c1");
@@ -436,14 +442,14 @@ describe("tool-call answer seam, fix round 2", () => {
 					{ path: ORIGINAL_URL },
 					undefined,
 					undefined,
-					askContext({ xdevApproved: true }),
+					askContext({ xdevPolicyKey: "read" }),
 				);
 
 				expect(result.answeredBy).toBe(CACHE_NAME);
 				expect(executed).toEqual([]);
 			});
 
-			it("never lets xdevApproved bless a changed input", async () => {
+			it("never lets xd:// device approval bless a changed input", async () => {
 				const executed: unknown[] = [];
 				const runner = await makeRunner([]);
 				dispatch(runner, "c1");
@@ -451,7 +457,7 @@ describe("tool-call answer seam, fix round 2", () => {
 				const wrapped = new ExtensionToolWrapper(promptingTool(executed), runner);
 
 				const message = await failure(
-					wrapped.execute("c1", { path: EVIL_URL }, undefined, undefined, askContext({ xdevApproved: true })),
+					wrapped.execute("c1", { path: EVIL_URL }, undefined, undefined, askContext({ xdevPolicyKey: "read" })),
 				);
 
 				expect(message).toContain("input was changed");

@@ -176,6 +176,22 @@ describe("SessionAnonymizer", () => {
 		expect(at(result, "message", "details")).toEqual({ wallTimeNoticeEmitted: false });
 	});
 
+	test.each([null, "high"])("preserves per-call revival metadata with %s thinking", perCallThinkingLevel => {
+		const anonymizer = new SessionAnonymizer();
+		const metadata = {
+			type: "session_init",
+			perCallModel: true,
+			perCallModelIdentity: "openrouter/anthropic/claude-sonnet-4-5@anthropic",
+			perCallThinkingLevel,
+		};
+
+		expect(anonymizer.entry(metadata)).toEqual(metadata);
+		expect(anonymizer.entry({ type: "session_init", perCallModel: false })).toEqual({
+			type: "session_init",
+			perCallModel: false,
+		});
+	});
+
 	test("rewrites shell commands keeping programs, flags, and operators", () => {
 		const anonymizer = new SessionAnonymizer();
 		const out = anonymizer.command(
@@ -403,13 +419,18 @@ describe("SessionAnonymizer", () => {
 					toolCallId: "toolu_01abcdef",
 					toolName: "mcp__crm_lookup",
 					details: 987654321,
-					content: [{ type: "image", data: "AAAA", mimeType: "image/png", status: "customer-acme" }],
+					content: [
+						{ type: "image", data: "AAAA", mimeType: "image/png", status: "customer-acme" },
+						{ type: "acmeBlock", text: "s" },
+					],
 				},
 			}),
 			// Usage counters stay even though `input` is also the tool-call arguments key.
 			anonymizer.entry({ type: "message", message: { role: "assistant", usage: { input: 120, output: 30 } } }),
 		]);
 		for (const secret of ["123456789", "987654321", "acme", "status"]) expect(json).not.toContain(secret);
+		// Replay tells text from image blocks by `type`; an unknown block type stays opaque.
+		expect(json).toContain('{"type":"image",');
 		expect(json).toContain('"mimeType":"image/png"');
 		expect(json).toContain('"usage":{"input":120,"output":30}');
 	});
@@ -501,5 +522,16 @@ describe("SessionAnonymizer", () => {
 		expect(at(first, "message", "answeredBy")).toMatch(/^PLACEHOLDER_\d+$/);
 		// The same add-on keeps one token across results, so answers stay attributable to one source.
 		expect(at(second, "message", "answeredBy")).toBe(at(first, "message", "answeredBy"));
+	});
+
+	test("keeps an edit's error kind and replaces a value outside the engine's kinds", () => {
+		const anonymizer = new SessionAnonymizer();
+		const result = (errorKind: string) =>
+			anonymizer.entry({
+				type: "message",
+				message: { role: "toolResult", toolName: "edit", isError: true, details: { diff: "", errorKind } },
+			});
+		expect(at(result("unseen_lines"), "message", "details", "errorKind")).toBe("unseen_lines");
+		expect(JSON.stringify(result("customer-acme"))).not.toContain("acme");
 	});
 });
