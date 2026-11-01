@@ -1217,6 +1217,8 @@ describe("AgentSession mid-run threshold compaction", () => {
 				],
 			},
 		);
+		// With history, pre-prompt maintenance compacts first; stub it so the refusal never depends on a live provider call.
+		const compactSpy = mockCompaction("COMPACTED-BEFORE-REFUSAL");
 		const stderr: string[] = [];
 		const stdout: string[] = [];
 		vi.spyOn(process.stderr, "write").mockImplementation(chunk => {
@@ -1233,6 +1235,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 		expect(stderr.join("")).toContain("3,096-token usable budget");
 		expect(stdout.join("")).toBe("");
 		expect(observedContexts).toHaveLength(0);
+		expect(compactSpy).toHaveBeenCalledTimes(withHistory ? 1 : 0);
 	});
 
 	it("compacts in place between tool-call turns during an active goal run", async () => {
