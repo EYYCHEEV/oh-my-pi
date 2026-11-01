@@ -692,9 +692,11 @@ def prepare_dependencies(source, manifest, runtime):
     # Relative workspace links now resolve into the immutable exported source,
     # not into a possibly different source tree prepared inside the image.
     require(dependency_digest(source) == metadata["dependency_tree_sha256"], "Copied dependency bytes differ")
-    # The pristine export excludes this generated input required by CLI compile tests.
+    # The pristine export excludes the generated export viewer asset required by CLI compile tests. Upstream
+    # 92788ccf8a replaced gen:tool-views with gen:export-viewer; --check writes the gitignored asset and fails on
+    # stale committed metadata instead of rewriting source. The stage keeps its announced name.
     announce_stage("qualify-tool-views", inside=True)
-    runtime.run(["bun", "run", "--cwd", "packages/collab-web", "gen:tool-views"], source, 120)
+    runtime.run(["bun", "run", "--cwd", "packages/collab-web", "gen:export-viewer", "--check"], source, 120)
     return grep
 
 
