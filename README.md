@@ -149,6 +149,7 @@ An upgrade fails before build or installation if the block is stale, any require
 - `mnemopi-startup-visibility`: A Mnemopi start that fails says why, once at startup and in every memory tool, instead of leaving memory silently off
 - `read-racy-stamp`: The read tool's archive cache stores no file stamp younger than 2 seconds, so a same-tick rewrite on a coarse Linux file clock is seen
 - `tool-call-answer-seam`: A tool_call handler can answer the call itself (result); the tool does not run, approval still gates the call, a block still wins, and the stored result carries answeredBy
+- `no-native-shell-subcommands`: omp ships no zsh, bash or sh subcommand that runs a line through its shell engine
 <!-- stronk-omp:fork-contracts:end -->
 
 ## Upstream alignment

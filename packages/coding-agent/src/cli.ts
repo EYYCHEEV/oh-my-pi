@@ -30,7 +30,6 @@ import {
 
 import { declareWorkerHostEntry, installWorkerInbox, isWorkerHostSelector } from "@oh-my-pi/pi-utils/worker-host";
 import { installSqliteLockShim } from "@oh-my-pi/pi-natives/sqlite-locks";
-import { isNativeShell, runNativeShell } from "./cli/native-shell";
 import { extractProfileFlags } from "./cli/profile-bootstrap";
 import {
 	AUTO_UPDATE_WORKER_ARG,
@@ -466,12 +465,6 @@ let runningCommand: string | undefined;
 export async function runCli(argv: string[]): Promise<void> {
 	if (getEvaluationPolicy() && (!argv[0]?.startsWith("-") || (!argv.includes("--print") && !argv.includes("-p")))) {
 		denyEvaluationIngress("CLI command or worker");
-	}
-	// `omp zsh|bash|sh [args...]`: the whole argv belongs to the shell (`--help`,
-	// `--profile`, `-c` included), so it dispatches before profile bootstrap,
-	// prepaint, network setup and the command table.
-	if (isNativeShell(argv[0])) {
-		await runNativeShell(argv);
 	}
 	let resolvedArgv = argv;
 	try {
