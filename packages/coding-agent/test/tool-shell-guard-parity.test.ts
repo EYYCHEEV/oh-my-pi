@@ -98,4 +98,15 @@ describe("bash tool guard parity after native rebuild", () => {
 		expect(second.exitCode !== 0).toBe(true);
 		expect(second.output.includes("forbidden")).toBe(false);
 	});
+
+	it("refuses emulate command text and keeps later calls in bash", async () => {
+		const command = await run("emulate sh -c 'printf forbidden'");
+		expect(command.exitCode === 1).toBe(true);
+		expect(command.output.includes("forbidden")).toBe(false);
+		expect(command.output.includes("emulate: disabled in tool shells")).toBe(true);
+		const switchMode = await run("emulate zsh");
+		expect(switchMode.exitCode === 1).toBe(true);
+		const later = await run("shopt -s extglob; emulate");
+		expect(later.exitCode === 0 && later.output === "bash\n").toBe(true);
+	});
 });

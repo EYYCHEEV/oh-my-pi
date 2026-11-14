@@ -140,3 +140,87 @@ async fn tool_shell_keeps_ordinary_and_literal_heredoc_data() {
 		execute("cat <<'EOF'\n${ printf forbidden; }\nEOF", None).await;
 	assert!(status == Some(0) && output == "${ printf forbidden; }\n", "quoted heredoc data must stay literal");
 }
+
+#[tokio::test]
+async fn tool_shell_emulate_refuses_command_text() {
+	let (status, output, errors) = execute("emulate sh -c 'printf forbidden'", None).await;
+	assert!(status == Some(1), "emulate command text must be refused");
+	assert!(output.is_empty(), "emulate command text must not run");
+	assert!(errors == "emulate: disabled in tool shells\n", "emulate must report the tool restriction");
+}
+
+#[tokio::test]
+async fn tool_shell_emulate_refuses_builtin_and_dynamic_names() {
+	let mut failures = Vec::new();
+	for (name, command) in [
+		("builtin", "builtin emulate sh -c 'printf forbidden'"),
+		("dynamic", "name=emulate; \"$name\" sh -c 'printf forbidden'"),
+	] {
+		let (status, output, errors) = execute(command, None).await;
+		if status != Some(1) || !output.is_empty() || errors != "emulate: disabled in tool shells\n" {
+			failures.push(name);
+		}
+	}
+	assert!(failures.is_empty(), "emulate refusal missing for carriers: {failures:?}");
+}
+
+#[tokio::test]
+async fn tool_shell_emulate_cannot_switch_later_calls() {
+	let shell = Shell::new(Some(ShellOptions::default()));
+	let (status, _) = run(&shell, "emulate zsh").await;
+	let (later_status, later_output) = run(&shell, "shopt -s extglob; shopt -q extglob; emulate").await;
+	assert!(status == Some(1), "emulate must refuse a persistent mode switch");
+	assert!(later_status == Some(0) && later_output == "bash\n", "the later call must remain bash");
+}
+
+#[tokio::test]
+async fn tool_shell_emulate_keeps_bare_mode_and_ordinary_bash() {
+	let (status, output, errors) = execute("emulate", None).await;
+	assert!(status == Some(0) && output == "bash\n" && errors.is_empty(), "bare emulate must report bash");
+	let (status, output, errors) = execute("printf control", None).await;
+	assert!(status == Some(0) && output == "control" && errors.is_empty(), "ordinary bash must work");
+}
+
+#[tokio::test]
+async fn tool_shell_emulate_refuses_every_carrier() {
+	let mut source = tempfile::NamedTempFile::new().expect("dummy source");
+	source.write_all(b"emulate sh -c 'printf forbidden'\n").expect("write dummy source");
+	let source_command = format!("source '{}'", source.path().display());
+	let mut failures = Vec::new();
+	for (name, command) in [
+		("direct", "emulate sh -c 'printf forbidden'"),
+		("builtin", "builtin emulate sh -c 'printf forbidden'"),
+		("command", "command emulate sh -c 'printf forbidden'"),
+		("dynamic", "name=emulate; \"$name\" sh -c 'printf forbidden'"),
+		("eval", "eval \"emulate sh -c 'printf forbidden'\""),
+		("source", source_command.as_str()),
+		("nested-bash", "bash -c \"emulate sh -c 'printf forbidden'\""),
+		("function", "carrier() { emulate sh -c 'printf forbidden'; }; carrier"),
+	] {
+		let (status, output, errors) = execute(command, None).await;
+		let refused = if name == "nested-bash" {
+			status.is_some_and(|code| code != 0) && output.is_empty()
+		} else {
+			status == Some(1) && output.is_empty() && errors == "emulate: disabled in tool shells\n"
+		};
+		if !refused {
+			failures.push(name);
+		}
+	}
+	assert!(failures.is_empty(), "emulate refusal missing for carriers: {failures:?}");
+}
+
+#[tokio::test]
+async fn tool_shell_emulate_refuses_every_argument() {
+	let mut failures = Vec::new();
+	for argument in [
+		"sh", "zsh", "-L", "-R", "-l", "-c", "-o", "+o", "--", "''",
+		"-L sh", "-R sh", "-l sh", "sh -o noglob", "sh +o noglob",
+	] {
+		let (status, output, errors) = execute(&format!("emulate {argument}"), None).await;
+		if status != Some(1) || !output.is_empty() || errors != "emulate: disabled in tool shells\n" {
+			failures.push(argument);
+		}
+	}
+	assert!(failures.is_empty(), "emulate refusal missing for arguments: {failures:?}");
+}

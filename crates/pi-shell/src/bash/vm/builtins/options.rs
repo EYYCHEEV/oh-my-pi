@@ -196,6 +196,10 @@ pub fn setopt(ctx: &mut Ctx<'_, '_>, args: &[BString], unset: bool) -> R {
 /// `CMD` in it with options, mode and sticky emulation restored afterwards,
 /// and every function defined meanwhile keeps that sticky emulation.
 pub fn emulate(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
+	if !args.is_empty() && super::super::is_tool(ctx.cx.store, ctx.vp)? {
+		ctx.out_fd(2, b"emulate: disabled in tool shells\n");
+		return done(1);
+	}
 	let (mut local, mut reset, mut list) = (false, false, false);
 	let mut i = 0;
 	while let Some(arg) = args.get(i) {
