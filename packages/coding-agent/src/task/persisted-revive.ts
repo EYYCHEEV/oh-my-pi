@@ -493,6 +493,8 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 			// `tool_call` policy hooks stay in force. They bring hooks only: a restricted
 			// session registers no extension tools, MCP or discovered capabilities.
 			preloadedPreparedExtensions: spec.preparedExtensions,
+			requiredExtension: spec.requiredExtension,
+			preloadedExtensionPaths: spec.extensionPaths ? [...spec.extensionPaths] : [],
 			// Old files predate persisted spawns: deny re-spawning rather than let
 			// createAgentSession default to wildcard ("*").
 			spawns: init.spawns ?? "",
@@ -502,12 +504,9 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 				? {
 						enableIrc: false,
 						enableMCP: false,
-						preloadedExtensionPaths: [],
 						preloadedCustomToolPaths: [],
 					}
 				: {
-						requiredExtension: spec.requiredExtension,
-						preloadedExtensionPaths: spec.extensionPaths ? [...spec.extensionPaths] : undefined,
 						enableMCP: !mcpManager,
 						mcpManager,
 						mcpTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,

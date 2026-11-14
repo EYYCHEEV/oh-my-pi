@@ -16,6 +16,7 @@
  * Kept apart from the thread service so importing it never evaluates the service list.
  */
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
+import { isFilesystemSourcePath } from "../tools/path-utils";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
 import {
@@ -129,6 +130,18 @@ export async function runSubprocessPlaced(
 	options: ExecutorOptions,
 	runHere: (options: ExecutorOptions) => Promise<SingleResult>,
 ): Promise<SingleResult> {
+	if (
+		options.preloadedPreparedExtensions?.some(
+			extension => extension.factory !== null && !isFilesystemSourcePath(extension.resolvedPath),
+		)
+	) {
+		const release = pool.beginMainRun();
+		try {
+			return await runHere(options);
+		} finally {
+			release();
+		}
+	}
 	const placed = pool.place();
 	let request: SubagentRunRequest | undefined;
 	try {
@@ -208,6 +221,18 @@ export async function revivePersistedPlaced(
 	expected: AgentRef,
 	reviveHere: (spec: PersistedReviveSpec, expected: AgentRef) => Promise<AgentSessionHandle>,
 ): Promise<AgentSessionHandle> {
+	if (
+		spec.preparedExtensions?.some(
+			extension => extension.factory !== null && !isFilesystemSourcePath(extension.resolvedPath),
+		)
+	) {
+		const release = pool.beginMainRun();
+		try {
+			return await reviveHere(spec, expected);
+		} finally {
+			release();
+		}
+	}
 	const placement = await pool.acquire();
 	try {
 		if (!placement.worker) return await reviveHere(spec, expected);

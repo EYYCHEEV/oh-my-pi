@@ -5074,10 +5074,8 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 					workspaceTree: options.workspaceTree,
 					rules: options.rules,
 					extensionRoots: options.extensionRoots,
-					preloadedExtensionPaths: restrictToolNames ? [] : options.preloadedExtensionPaths,
-					requiredExtension: restrictToolNames ? undefined : options.requiredExtension,
-					// Restricted children keep the owner's prepared extensions so its `tool_call`
-					// policy hooks stay bound; the SDK registers no extension tools for them.
+					preloadedExtensionPaths: options.preloadedExtensionPaths,
+					requiredExtension: options.requiredExtension,
 					preloadedPreparedExtensions: options.preloadedPreparedExtensions,
 					preloadedCustomToolPaths: restrictToolNames ? [] : options.preloadedCustomToolPaths,
 					hasUI: false,

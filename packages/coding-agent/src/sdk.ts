@@ -2410,8 +2410,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		modelRegistry.hydrateCredentialScopedModelCaches(),
 	);
 	const restrictToolNames = options.restrictToolNames === true;
-	const requiredExtension =
-		restrictToolNames && !evaluation ? undefined : requiredExtensionFromSettings(options, settings);
+	const requiredExtension = requiredExtensionFromSettings(options, settings);
 	const requiredExtensionOptions = {
 		required: requiredExtension,
 		disabledExtensionIds: requiredExtension
@@ -2446,22 +2445,49 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				eventBus,
 				requiredExtensionOptions,
 			);
-		} else if ((restrictToolNames || options.preloadedPreparedExtensions) && !requiredExtension) {
+		} else if (options.preloadedPreparedExtensions || (restrictToolNames && !requiredExtension)) {
 			const preparedExtensions = options.preloadedPreparedExtensions ?? [];
-			// As above, `<inline-N>` source ids are not source paths: a child falling back to
-			// this list would try to import them as modules.
 			extensionPaths = preparedExtensions
 				.filter(prepared => isFilesystemSourcePath(prepared.resolvedPath))
-				.map(prepared => prepared.path);
-			extensionsResult = await logger.time(
-				"bindPreparedExtensions",
-				bindPreparedExtensions,
-				preparedExtensions,
-				cwd,
-				eventBus,
-			);
-			for (const { path, error } of extensionsResult.errors)
-				logger.error("Failed to bind extension", { path, error });
+				.map(prepared => prepared.resolvedPath);
+			if (requiredExtension) {
+				extensionsResult = await logger.time(
+					"attestInheritedExtensions",
+					loadExtensionsWithRequiredAttestation,
+					{ paths: extensionPaths },
+					cwd,
+					eventBus,
+					requiredExtensionOptions,
+				);
+				const inlinePrepared = preparedExtensions.filter(
+					prepared => !isFilesystemSourcePath(prepared.resolvedPath),
+				);
+				const inlineResult = await bindPreparedExtensions(
+					inlinePrepared,
+					cwd,
+					eventBus,
+					extensionsResult.runtime,
+				);
+				extensionsResult.extensions.push(...inlineResult.extensions);
+				extensionsResult.errors.push(...inlineResult.errors);
+				extensionsResult.preparedExtensions ??= [];
+				extensionsResult.preparedExtensions.push(...(inlineResult.preparedExtensions ?? []));
+			} else {
+				extensionsResult = await logger.time(
+					"bindPreparedExtensions",
+					bindPreparedExtensions,
+					preparedExtensions,
+					cwd,
+					eventBus,
+				);
+			}
+			if (
+				extensionsResult.errors.length > 0 ||
+				extensionsResult.extensions.length !== preparedExtensions.length
+			) {
+				disposeLoadedExtensions(extensionsResult);
+				throw new Error("Inherited policy extensions failed to bind before child startup");
+			}
 		} else if (options.preloadedExtensionPaths) {
 			extensionPaths = [...options.preloadedExtensionPaths];
 			extensionsResult = await logger.time(
