@@ -12,6 +12,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { postmortem } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
 import { runPrintMode } from "../../src/modes/print-mode";
@@ -34,6 +35,7 @@ interface StopChildConfig {
 }
 
 const config = JSON.parse(process.argv[2] ?? "{}") as StopChildConfig;
+postmortem.installProcessHandlers();
 const dbPath = path.join(config.dir, "mnemopi.db");
 
 const settings = Settings.isolated({

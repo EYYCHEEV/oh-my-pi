@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { currentEmbeddingModel } from "@oh-my-pi/pi-mnemopi/core/embeddings";
 import { Mnemopi } from "@oh-my-pi/pi-mnemopi/core/memory";
 import { logger } from "@oh-my-pi/pi-utils";
 
@@ -218,8 +219,9 @@ describe("forget scrubs the forgotten text out of retained transcripts", () => {
 		const forgotten = memory.remember(SECRET, { source: "coding-agent-retain" });
 		const { stored, unrelated } = seedTranscripts(memory);
 		for (const id of [forgotten, stored, unrelated]) {
-			db.run("INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, '[1,0]', 'fixture')", [
+			db.run("INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, '[1,0]', ?)", [
 				id,
+				currentEmbeddingModel(),
 			]);
 		}
 		const hit = async (): Promise<string> =>

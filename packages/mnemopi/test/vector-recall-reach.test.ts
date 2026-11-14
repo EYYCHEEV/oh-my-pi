@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { recall } from "@oh-my-pi/pi-mnemopi/core/beam/recall";
 import { initBeam } from "@oh-my-pi/pi-mnemopi/core/beam/schema";
 import type { BeamMemoryState } from "@oh-my-pi/pi-mnemopi/core/beam/types";
+import { currentEmbeddingModel } from "@oh-my-pi/pi-mnemopi/core/embeddings";
 
 type TestBeam = BeamMemoryState & { close(): void };
 
@@ -58,7 +59,7 @@ function seed(beam: TestBeam, table: Tier, newer: number): void {
 		`INSERT INTO ${table} (id, content, source, timestamp, session_id, importance, scope, veracity, memory_type) VALUES (?, ?, 'test', ?, 's1', 0.5, 'bank', 'unknown', 'general')`,
 	);
 	const insertEmbedding = beam.db.prepare(
-		"INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, 'fixture')",
+		"INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
 	);
 	const start = Date.UTC(2026, 4, 1);
 	beam.db.transaction(() => {
@@ -67,11 +68,11 @@ function seed(beam: TestBeam, table: Tier, newer: number): void {
 			"The vault selects the personal login.",
 			new Date(start - 86_400_000).toISOString(),
 		);
-		insertEmbedding.run("old-semantic", "[1,0]");
+		insertEmbedding.run("old-semantic", "[1,0]", currentEmbeddingModel());
 		for (let i = 0; i < newer; i += 1) {
 			const id = `newer-${i}`;
 			insertRow.run(id, `Routine rollout note number ${i}.`, new Date(start + i * 60_000).toISOString());
-			insertEmbedding.run(id, "[0,1]");
+			insertEmbedding.run(id, "[0,1]", currentEmbeddingModel());
 		}
 	})();
 }

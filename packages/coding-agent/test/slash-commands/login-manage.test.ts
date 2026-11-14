@@ -120,6 +120,7 @@ describe("SelectorController manage flow", () => {
 			session: {
 				sessionId,
 				modelRegistry: { authStorage, refreshProvider: vi.fn(async () => {}) },
+				refreshScopedModels: vi.fn(async () => {}),
 			},
 		};
 		const controller = new SelectorController(ctx as unknown as InteractiveModeContext);

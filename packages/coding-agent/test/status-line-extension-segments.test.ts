@@ -41,7 +41,7 @@ function session(options: { cost?: number; subscription?: boolean } = {}) {
 		isFastModeEnabled: () => false,
 		getContextUsage: () => ({ tokens: 0, contextWindow: 128000 }),
 		getGoalModeState: () => null,
-		modelRegistry: { isUsingOAuth: () => options.subscription ?? false },
+		modelRegistry: { isUsingSubscription: () => options.subscription ?? false },
 		sessionManager: {
 			getSessionName: () => "session",
 			getUsageStatistics: () => ({
