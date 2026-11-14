@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -70,6 +70,7 @@ describe("ModelRegistry runtime discovery", () => {
 	});
 
 	afterEach(() => {
+		vi.restoreAllMocks();
 		resetSettingsForTest();
 		if (originalOllamaBaseUrl === undefined) {
 			delete Bun.env.OLLAMA_BASE_URL;
@@ -3345,6 +3346,44 @@ describe("ModelRegistry runtime discovery", () => {
 		expect((await sendThroughStreamSimple(optional, {})).reasoning_effort).toBeUndefined();
 	});
 
+	test("openai-models-list discovery reads relay rows' advertised service tiers", async () => {
+		writeRawModelsJson({
+			"codex-relay": {
+				baseUrl: "http://127.0.0.1:9994",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "openai-models-list" },
+			},
+		});
+		// Relays republish the Codex catalog's tiers as bare ids, or (codex-lb)
+		// as codex-rs `{ id }` objects nested under `metadata`.
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:9994/v1/models") {
+				return new Response(
+					JSON.stringify({
+						data: [
+							{ id: "gpt-6.1-sol", object: "model", service_tiers: ["priority", "ultrafast"] },
+							{ id: "gpt-6-sol", object: "model", service_tiers: ["priority"] },
+							{
+								id: "gpt-6-astra",
+								object: "model",
+								metadata: { service_tiers: [{ id: "ultrafast", name: "Ultrafast" }] },
+							},
+						],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		expect(registry.find("codex-relay", "gpt-6.1-sol")?.serviceTiers).toEqual(["priority", "ultrafast"]);
+		expect(registry.find("codex-relay", "gpt-6-astra")?.serviceTiers).toEqual(["ultrafast"]);
+		expect(registry.find("codex-relay", "gpt-6-sol")?.serviceTiers).toEqual(["priority"]);
+	});
+
 	test("openai-models-list discovery reads server-advertised input modalities for ids absent from the catalog", async () => {
 		writeRawModelsJson({
 			"openai-test": {
@@ -4203,10 +4242,14 @@ describe("ModelRegistry runtime discovery", () => {
 				supports_vision: false,
 			},
 		];
+		let scopedIds = ["keep-chat-a", "keep-chat-b"];
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
 			if (url === "https://catalog.stencil.so/models.json.zstd") {
 				return Response.json({});
+			}
+			if (url === "http://127.0.0.1:4007/v1/models") {
+				return Response.json({ data: scopedIds.map(id => ({ id })) });
 			}
 			if (url === "http://127.0.0.1:4007/model_group/info") {
 				return Response.json({ data: modelGroups });
@@ -4218,7 +4261,7 @@ describe("ModelRegistry runtime discovery", () => {
 			) {
 				return new Response("Not Found", { status: 404 });
 			}
-			throw new Error(`/v1/models must not reintroduce the excluded model: ${url}`);
+			throw new Error(`Unexpected URL: ${url}`);
 		};
 
 		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
@@ -4233,6 +4276,7 @@ describe("ModelRegistry runtime discovery", () => {
 		await registry.refreshProvider("litellm", "online");
 		expect(getModelsForProvider(registry, "litellm").map(model => model.id)).toEqual(["keep-chat-a"]);
 
+		scopedIds = ["keep-chat-a"];
 		modelGroups = [{ model_group: "keep-chat-a", mode: "embedding" }];
 		await registry.refreshProvider("litellm", "online");
 		expect(getModelsForProvider(registry, "litellm")).toEqual([]);

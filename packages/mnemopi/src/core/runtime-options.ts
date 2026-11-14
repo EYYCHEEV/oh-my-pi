@@ -47,6 +47,8 @@ export interface MnemopiEmbeddingRuntimeOptions {
 	 * Unset or `true` keeps the first-use install and download.
 	 */
 	allowDownload?: boolean;
+	/** Override `MNEMOPI_EMBEDDING_BATCH_SIZE`: max texts per embedding API request. */
+	batchSize?: number;
 }
 
 export interface MnemopiLlmRuntimeOptions {
@@ -77,6 +79,7 @@ export interface ResolvedMnemopiEmbeddingRuntimeOptions {
 	provider?: MnemopiEmbeddingProvider;
 	maxInputChars?: number;
 	allowDownload?: boolean;
+	batchSize?: number;
 }
 
 export interface ResolvedMnemopiLlmRuntimeOptions {

@@ -9,6 +9,5 @@ await compileCodingAgent({
 	repoRoot: path.resolve(import.meta.dir, "../../../.."),
 	entrypoint: path.resolve(import.meta.dir, "../../src/cli.ts"),
 	outfile,
-	transformersVersion: "0.0.0-test",
 	native: null,
 });

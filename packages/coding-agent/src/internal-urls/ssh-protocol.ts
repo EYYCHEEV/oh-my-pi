@@ -33,6 +33,8 @@ import {
 	writeRemoteFile,
 } from "../ssh/file-transfer";
 import sshDoc from "../prompts/internal-urls/ssh.md" with { type: "text" };
+import sshReferenceDoc from "../prompts/internal-urls/ssh-reference.md" with { type: "text" };
+import { decodeUtf8Text } from "../tools/read-format";
 import { contentTypeForPath, formatDirectoryListing } from "./filesystem-resource";
 import type {
 	InternalResource,
@@ -46,16 +48,6 @@ import type {
 
 /** Largest remote text file `ssh://` will materialize (mirrors the local:// cap). */
 const SSH_TEXT_MAX_BYTES = 1024 * 1024;
-
-/** Decode the whole buffer as UTF-8 text, or null if it holds a NUL or invalid byte. */
-function decodeUtf8Text(bytes: Uint8Array): string | null {
-	if (bytes.indexOf(0) !== -1) return null;
-	try {
-		return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-	} catch {
-		return null;
-	}
-}
 
 /**
  * Remote absolute path from the URL. Uses `rawPathname` (pre-normalization) so
@@ -105,7 +97,7 @@ async function remotePathFromUrl(url: InternalUrl, target: SSHConnectionTarget, 
 	return decoded;
 }
 
-/** Load the configured SSH hosts from the `ssh` capability (managed/project `ssh.json`). */
+/** Load the configured SSH hosts from the `ssh` capability (`ssh.json` files and `~/.ssh/config` aliases). */
 async function loadConfiguredHosts(cwd?: string): Promise<SSHHost[]> {
 	const { items } = await capability.loadCapability<SSHHost>(sshCapability.id, cwd ? { cwd } : {});
 	return items;
@@ -119,7 +111,7 @@ function hostAddress(host: SSHHost): string {
 /** Render the configured-host index for a bare `ssh://` read (markdown with per-host links). */
 function formatHostIndex(hosts: readonly SSHHost[]): string {
 	if (hosts.length === 0) {
-		return "# SSH hosts\n\nNo SSH hosts are configured. Add hosts to an `ssh.json` capability file, or read `ssh://<host>/<path>` with any destination OpenSSH can resolve (e.g. a `~/.ssh/config` alias).\n";
+		return "# SSH hosts\n\nNo SSH hosts are configured. Add hosts to an `ssh.json` capability file or as `Host` entries in `~/.ssh/config`, or read `ssh://<host>/<path>` with any destination OpenSSH can resolve.\n";
 	}
 	const lines = hosts.map(host => {
 		const addr = hostAddress(host);
@@ -135,9 +127,10 @@ function formatHostIndex(hosts: readonly SSHHost[]): string {
  * user/port, the full DECODED authority (`url.rawHost`) is matched against a
  * configured host name, so percent-encoded reserved-char aliases (e.g.
  * `alice%40prod` → `alice@prod`) resolve correctly. A literal `user@`/`:port`
- * in the URL is an override: it is rejected on a configured bare name (the
- * ControlMaster/host-info caches key on `name` alone) and otherwise treated as
- * an opaque OpenSSH destination so plain `~/.ssh/config` aliases work.
+ * in the URL is an override: it is rejected on a configured name that pins its
+ * own destination (the ControlMaster/host-info caches key on `name` alone) and
+ * otherwise treated as an opaque OpenSSH destination, so `~/.ssh/config`
+ * aliases take overrides the way `ssh -p 2222 root@alias` does.
  */
 async function resolveTarget(url: InternalUrl, cwd?: string): Promise<SSHConnectionTarget> {
 	// `parseInternalUrl` falls back to a lenient regex parse when WHATWG `new URL`
@@ -221,11 +214,24 @@ async function resolveTarget(url: InternalUrl, cwd?: string): Promise<SSHConnect
 	const items = await loadConfiguredHosts(cwd);
 
 	// A literal user/port in the URL is an authority override. A configured alias
-	// is addressed only by its (percent-encoded) name, never with a separate
-	// user/port — so reject an override on a configured bare name, else opaque.
+	// that pins its destination is addressed only by its (percent-encoded) name —
+	// an override would be ambiguous, so reject it. An entry that only names an
+	// OpenSSH destination (a `~/.ssh/config` alias: host === name, nothing pinned)
+	// means the same thing as the opaque target, so the override goes to OpenSSH.
 	if (username || port !== undefined) {
 		const decodedBareHost = decodeOr(bareHost);
-		if (items.some(entry => entry.name === bareHost || entry.name === decodedBareHost)) {
+		const pinned = items.some(
+			entry =>
+				(entry.name === bareHost || entry.name === decodedBareHost) &&
+				!(
+					entry.host === entry.name &&
+					entry.username === undefined &&
+					entry.port === undefined &&
+					entry.keyPath === undefined &&
+					entry.compat === undefined
+				),
+		);
+		if (pinned) {
 			throw new Error(
 				`ssh://: user/port overrides are not allowed for the configured host "${decodedBareHost}"; use ssh://${bareHost}/<path> or an unconfigured hostname`,
 			);
@@ -267,6 +273,10 @@ export class SshProtocolHandler implements ProtocolHandler {
 	/** Advertised only when an `ssh` client is on PATH. */
 	promptDoc(): string | undefined {
 		return $which("ssh") ? sshDoc.trim() : undefined;
+	}
+
+	promptReference(): string | undefined {
+		return $which("ssh") ? sshReferenceDoc.trim() : undefined;
 	}
 
 	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {

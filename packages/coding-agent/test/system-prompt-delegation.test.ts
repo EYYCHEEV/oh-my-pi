@@ -11,7 +11,7 @@ const EMPTY_TREE = {
 
 type DelegationOptions = Pick<
 	BuildSystemPromptOptions,
-	"eagerTasks" | "eagerTasksAlways" | "model" | "taskBatch" | "taskMaxConcurrency"
+	"eagerTasks" | "eagerTasksAlways" | "model" | "taskBatch"
 >;
 
 async function renderDelegation(options: DelegationOptions = {}): Promise<string> {

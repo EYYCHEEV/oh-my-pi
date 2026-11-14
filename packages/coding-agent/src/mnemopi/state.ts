@@ -1,7 +1,13 @@
 import { dirname } from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type * as MnemopiNs from "@oh-my-pi/pi-mnemopi";
-import type { Mnemopi, RecallResult } from "@oh-my-pi/pi-mnemopi";
+import type {
+	MemoryFacadeStats,
+	Mnemopi,
+	RecallResult,
+	RememberFacadeOptions,
+	RememberInput,
+} from "@oh-my-pi/pi-mnemopi";
 import type * as MnemopiCoreNs from "@oh-my-pi/pi-mnemopi/core";
 import type { LocalModelInitializer } from "@oh-my-pi/pi-mnemopi/core";
 import { logger, postmortem, prompt, toError, withLoopPhase } from "@oh-my-pi/pi-utils";
@@ -25,6 +31,7 @@ import { memoryToolRefs } from "../memory-backend/tool-names";
 import type { MemoryPromptPreparation } from "../memory-backend/types";
 import { redactMemorySecrets, redactRememberWrite, vetRecalledMemoryText } from "../memory-backend/redact";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
+import type { AgentSessionHandle } from "../session/agent-session-handle";
 import memoryRecallChangesPrompt from "../prompts/system/memory-recall-changes.md" with { type: "text" };
 import mnemopiInstructions from "../prompts/system/mnemopi-instructions.md" with { type: "text" };
 import { type MnemopiBackendConfig, type MnemopiScoping, truncateApproxTokens } from "./config";
@@ -119,8 +126,29 @@ interface MnemopiScopedResources {
 	global?: MnemopiScopedMemory;
 }
 
-type MnemopiRememberInput = Parameters<Mnemopi["remember"]>[0];
-type MnemopiRememberOptions = Parameters<Mnemopi["remember"]>[1];
+/** What `Mnemopi.remember` stores. */
+export type MnemopiRememberInput = string | RememberInput;
+/** How `Mnemopi.remember` stores it. */
+export type MnemopiRememberOptions = RememberFacadeOptions;
+
+/** A scoped bank by name; the state owning the bank resolves the name to its live store. */
+export interface MnemopiBankTarget {
+	readonly bank: string;
+}
+
+/** `Mnemopi.getStats()` of one scoped bank. */
+export interface MnemopiBankStats {
+	bank: string;
+	stats: MemoryFacadeStats;
+}
+
+/** Options of {@link MnemopiSessionState.consolidate}. */
+export interface MnemopiConsolidateOptions {
+	full?: boolean;
+	extract?: boolean;
+	sleep?: boolean;
+	retain?: boolean;
+}
 
 export type MnemopiMemoryEditOperation = "update" | "forget" | "invalidate";
 
@@ -234,8 +262,11 @@ function sliceUnretainedMessages(
 	return [];
 }
 
-export function getMnemopiSessionState(session: AgentSession | undefined): MnemopiSessionState | undefined {
-	return session ? (session as AgentSessionWithMnemopiState)[kMnemopiSessionState] : undefined;
+/** Mnemopi state tagged on `session`; any session handle may be scanned (only local sessions carry the tag). */
+export function getMnemopiSessionState(session: AgentSessionHandle | undefined): MnemopiSessionState | undefined {
+	if (!session) return undefined;
+	const state: MnemopiSessionState | undefined = Reflect.get(session, kMnemopiSessionState);
+	return state;
 }
 
 export function setMnemopiSessionState(
@@ -253,7 +284,7 @@ export interface MnemopiSessionStateOptions {
 	sessionId: string;
 	config: MnemopiBackendConfig;
 	session: AgentSession;
-	aliasOf?: MnemopiSessionState;
+	aliasOf?: MnemopiSessionStateApi;
 	lastRetainedTurn?: number;
 	hasRecalledForFirstTurn?: boolean;
 }
@@ -270,14 +301,44 @@ const PROCESS_STOP_REASONS: Partial<Record<postmortem.Reason, true>> = {
 /** SQLite lock wait for the final write of a stopping process, which has seconds left rather than minutes. */
 const STOP_BUSY_TIMEOUT_MS = 1_500;
 
-export class MnemopiSessionState {
+/**
+ * What subagent aliases and the backend's `primary` reads use on a parent state: its
+ * identity, config, and every scoped-bank operation. A subagent worker holds a remote
+ * implementation whose banks are main's live stores.
+ */
+export interface MnemopiSessionStateApi {
+	readonly sessionId: string;
+	readonly config: MnemopiBackendConfig;
+	readonly hasRecalledForFirstTurn: boolean;
+	readonly lastRecallSnippet?: string;
+	readonly aliasOf?: MnemopiSessionStateApi;
+	getScopedRetainTarget(): MnemopiBankTarget;
+	getScopedRecallTargets(): readonly MnemopiBankTarget[];
+	getGlobalRetainTarget(): MnemopiBankTarget;
+	getScopedMemory(id: string): MnemopiScopedMemoryHit | null;
+	editScopedMemory(
+		op: MnemopiMemoryEditOperation,
+		id: string,
+		options?: MnemopiMemoryEditOptions,
+	): MnemopiMemoryEditResult;
+	collectScopedRecallResults(query: string): Promise<RecallResult[]>;
+	recallResultsScoped(query: string): Promise<RecallResult[]>;
+	formatScopedRecallContext(results: readonly RecallResult[], format?: "bullet" | "json"): string | undefined;
+	rememberScoped(memory: MnemopiRememberInput, options?: MnemopiRememberOptions, target?: MnemopiBankTarget): string;
+	getScopedStats(): MnemopiBankStats[];
+	consolidate(options?: MnemopiConsolidateOptions): Promise<void>;
+}
+
+export class MnemopiSessionState implements MnemopiSessionStateApi {
 	sessionId: string;
 	readonly config: MnemopiBackendConfig;
 	readonly session: AgentSession;
-	readonly memory: Mnemopi;
-	readonly globalMemory?: Mnemopi;
-	readonly aliasOf?: MnemopiSessionState;
-	private readonly scoped: MnemopiScopedResources;
+	readonly aliasOf?: MnemopiSessionStateApi;
+	/**
+	 * Live banks: a primary's own, or its parent's for an in-process alias. Undefined for an
+	 * alias whose parent lives on another thread; its bank work goes through {@link aliasOf}.
+	 */
+	readonly #scoped: MnemopiScopedResources | undefined;
 	lastRetainedTurn: number;
 	hasRecalledForFirstTurn: boolean;
 	lastRecallSnippet?: string;
@@ -295,9 +356,43 @@ export class MnemopiSessionState {
 		this.aliasOf = options.aliasOf;
 		this.lastRetainedTurn = options.lastRetainedTurn ?? 0;
 		this.hasRecalledForFirstTurn = options.hasRecalledForFirstTurn ?? false;
-		this.scoped = options.aliasOf?.scoped ?? createScopedResources(options.config);
-		this.memory = this.scoped.retain.memory;
-		this.globalMemory = this.scoped.global?.memory;
+		const parent = options.aliasOf;
+		this.#scoped = parent
+			? parent instanceof MnemopiSessionState
+				? parent.#scoped
+				: undefined
+			: createScopedResources(options.config);
+	}
+
+	/** Retain-bank store; only on the thread that owns the banks. */
+	get memory(): Mnemopi {
+		return this.#local().retain.memory;
+	}
+
+	/** Shared-bank store under `per-project-tagged` scoping; only on the thread that owns the banks. */
+	get globalMemory(): Mnemopi | undefined {
+		return this.#local().global?.memory;
+	}
+
+	/** This thread's live banks; an alias of a parent on another thread has none. */
+	#local(): MnemopiScopedResources {
+		if (this.#scoped) return this.#scoped;
+		throw new Error("Mnemopi banks live on the parent session's thread; use the parent state.");
+	}
+
+	/** The parent that runs this alias's bank work when the banks are not on this thread. */
+	#remoteParent(): MnemopiSessionStateApi | undefined {
+		return this.#scoped ? undefined : this.aliasOf;
+	}
+
+	/** Resolve a bank target (by identity, else by bank name) to this state's live store. */
+	#resolveTarget(target: MnemopiBankTarget | undefined): MnemopiScopedMemory {
+		const scoped = this.#local();
+		if (!target) return scoped.retain;
+		const targets = [scoped.retain, ...scoped.recall, ...(scoped.global ? [scoped.global] : [])];
+		const resolved = targets.find(entry => entry === target) ?? targets.find(entry => entry.bank === target.bank);
+		if (!resolved) throw new Error(`Mnemopi bank ${target.bank} is not in this session's scope.`);
+		return resolved;
 	}
 
 	setSessionId(sessionId: string): void {
@@ -317,19 +412,37 @@ export class MnemopiSessionState {
 	}
 
 	getScopedRecallTargets(): readonly MnemopiScopedMemory[] {
-		return this.scoped.recall;
+		return this.#local().recall;
 	}
 
 	getScopedRetainTarget(): MnemopiScopedMemory {
-		return this.scoped.retain;
+		return this.#local().retain;
+	}
+
+	/** Stats of the retain and recall banks, deduplicated by bank. */
+	getScopedStats(): MnemopiBankStats[] {
+		const parent = this.#remoteParent();
+		if (parent) return parent.getScopedStats();
+		const scoped = this.#local();
+		const seen = new Set<string>();
+		const stats: MnemopiBankStats[] = [];
+		for (const target of [scoped.retain, ...scoped.recall]) {
+			if (seen.has(target.bank)) continue;
+			seen.add(target.bank);
+			stats.push({ bank: target.bank, stats: target.memory.getStats() });
+		}
+		return stats;
 	}
 
 	/**
 	 * Bank for `scope: "global"` writes: the retain bank under `global` scoping, the shared bank
 	 * under `per-project-tagged`. Throws under `per-project`, which has no bank every project recalls.
 	 */
-	getGlobalRetainTarget(): MnemopiScopedMemory {
-		const target = this.config.scoping === "global" ? this.scoped.retain : this.scoped.global;
+	getGlobalRetainTarget(): MnemopiBankTarget {
+		const parent = this.#remoteParent();
+		if (parent) return parent.getGlobalRetainTarget();
+		const scoped = this.#local();
+		const target = this.config.scoping === "global" ? scoped.retain : scoped.global;
 		if (!target) throw new Error("Mnemopi global scope requires global or per-project-tagged scoping.");
 		return target;
 	}
@@ -348,11 +461,10 @@ export class MnemopiSessionState {
 	 * (issue #4443).
 	 */
 	getScopedMemory(id: string): MnemopiScopedMemoryHit | null {
-		const targets = dedupeScopedTargets([
-			this.scoped.retain,
-			...this.scoped.recall,
-			...(this.scoped.global ? [this.scoped.global] : []),
-		]);
+		const parent = this.#remoteParent();
+		if (parent) return parent.getScopedMemory(id);
+		const scoped = this.#local();
+		const targets = dedupeScopedTargets([scoped.retain, ...scoped.recall, ...(scoped.global ? [scoped.global] : [])]);
 		for (const target of targets) {
 			const raw = target.memory.get(id) as MnemopiStoredMemoryRow | null;
 			if (!raw) continue;
@@ -391,11 +503,14 @@ export class MnemopiSessionState {
 		id: string,
 		options: MnemopiMemoryEditOptions = {},
 	): MnemopiMemoryEditResult {
+		const parent = this.#remoteParent();
+		if (parent) return parent.editScopedMemory(op, id, options);
 		return withLoopPhase("mnemopi.edit", () => {
+			const scoped = this.#local();
 			const targets = dedupeScopedTargets([
-				this.scoped.retain,
-				...this.scoped.recall,
-				...(this.scoped.global ? [this.scoped.global] : []),
+				scoped.retain,
+				...scoped.recall,
+				...(scoped.global ? [scoped.global] : []),
 			]);
 			let ineligible: MnemopiMemoryEditResult | undefined;
 			for (const target of targets) {
@@ -488,19 +603,18 @@ export class MnemopiSessionState {
 	}
 
 	async collectScopedRecallResults(query: string): Promise<ScopedRecallResult[]> {
+		const parent = this.#remoteParent();
+		if (parent) return await parent.collectScopedRecallResults(query);
+		const scoped = this.#local();
 		const merged: RecallResult[] = [];
 		const byId = new Map<string, number>();
 		const byContent = new Map<string, number>();
 		const failures: Array<{ bank: string; error: Error }> = [];
 		let successfulTargets = 0;
-		const sharedFallbackQuery = deriveSharedRecallFallbackQuery(
-			query,
-			this.scoped.retain.bank,
-			this.scoped.global?.bank,
-		);
-		for (const target of this.scoped.recall) {
+		const sharedFallbackQuery = deriveSharedRecallFallbackQuery(query, scoped.retain.bank, scoped.global?.bank);
+		for (const target of scoped.recall) {
 			const queries =
-				target.bank === this.scoped.global?.bank && sharedFallbackQuery ? [query, sharedFallbackQuery] : [query];
+				target.bank === scoped.global?.bank && sharedFallbackQuery ? [query, sharedFallbackQuery] : [query];
 			let targetSucceeded = false;
 			try {
 				for (const recallQuery of queries) {
@@ -548,6 +662,8 @@ export class MnemopiSessionState {
 		results: readonly RecallResult[],
 		format: "bullet" | "json" = "bullet",
 	): string | undefined {
+		const parent = this.#remoteParent();
+		if (parent) return parent.formatScopedRecallContext(results, format);
 		return withLoopPhase("mnemopi.recall", () => {
 			const shown = results.filter(result => !isWithheldResult(result));
 			if (shown.length === 0) return undefined;
@@ -565,7 +681,7 @@ export class MnemopiSessionState {
 			return this.rememberScoped(memory, options);
 		} catch (error) {
 			logger.warn("Mnemopi: retain failed", {
-				bank: this.scoped.retain.bank,
+				bank: this.#scoped?.retain.bank ?? this.aliasOf?.getScopedRetainTarget().bank,
 				error: String(error),
 			});
 			return undefined;
@@ -579,11 +695,14 @@ export class MnemopiSessionState {
 	rememberScoped(
 		memory: MnemopiRememberInput,
 		options: MnemopiRememberOptions = {},
-		target: MnemopiScopedMemory = this.scoped.retain,
+		target?: MnemopiBankTarget,
 	): string {
+		const parent = this.#remoteParent();
+		if (parent) return parent.rememberScoped(memory, options, target);
 		return withLoopPhase("mnemopi.retain", () => {
+			const store = this.#resolveTarget(target).memory;
 			const [scrubbed, scrubbedOptions] = redactRememberWrite(memory, options);
-			return target.memory.remember(scrubbed, scrubbedOptions);
+			return store.remember(scrubbed, scrubbedOptions);
 		});
 	}
 
@@ -772,10 +891,10 @@ export class MnemopiSessionState {
 		try {
 			this.#boundOwnedBusyTimeout(STOP_BUSY_TIMEOUT_MS);
 			return this.forceRetainCurrentSession({ extract: false }).catch((error: unknown) => {
-				this.#logLifecycleFailure("stop retention", [this.scoped.retain.bank], error);
+				this.#logLifecycleFailure("stop retention", [this.#local().retain.bank], error);
 			});
 		} catch (error) {
-			this.#logLifecycleFailure("stop retention", [this.scoped.retain.bank], error);
+			this.#logLifecycleFailure("stop retention", [this.#local().retain.bank], error);
 			return Promise.resolve();
 		}
 	}
@@ -875,13 +994,13 @@ export class MnemopiSessionState {
 				void this.maybeRecallOnAgentStart().catch(error => {
 					this.#logLifecycleFailure(
 						"agent_start recall",
-						this.scoped.recall.map(target => target.bank),
+						this.#local().recall.map(target => target.bank),
 						error,
 					);
 				});
 			} else if (event.type === "agent_end") {
 				void this.maybeRetainOnAgentEnd(event.messages).catch(error => {
-					this.#logLifecycleFailure("agent_end retention", [this.scoped.retain.bank], error);
+					this.#logLifecycleFailure("agent_end retention", [this.#local().retain.bank], error);
 				});
 			}
 		});
@@ -958,11 +1077,12 @@ export class MnemopiSessionState {
 	 */
 	promoteEligibleWorkingMemory(): void {
 		if (this.aliasOf) return;
-		for (const memory of this.scoped.owned) {
+		const scoped = this.#local();
+		for (const memory of scoped.owned) {
 			try {
 				memory.sleep(false);
 			} catch (error) {
-				this.#logLifecycleFailure("startup consolidation", [this.scoped.retain.bank], error);
+				this.#logLifecycleFailure("startup consolidation", [scoped.retain.bank], error);
 			}
 		}
 	}
@@ -997,13 +1117,17 @@ export class MnemopiSessionState {
 	 *  Explicit consolidation retains by default; disposal passes the configured
 	 *  automatic-retention setting.
 	 */
-	async consolidate(
-		options: { full?: boolean; extract?: boolean; sleep?: boolean; retain?: boolean } = {},
-	): Promise<void> {
+	async consolidate(options: MnemopiConsolidateOptions = {}): Promise<void> {
 		if (options.retain !== false) {
 			await this.forceRetainCurrentSession({ extract: options.extract });
 		}
-		for (const memory of this.scoped.owned) {
+		const parent = this.#remoteParent();
+		if (parent) {
+			// The parent's own transcript is its concern; only the shared banks' flush and sleep run there.
+			await parent.consolidate({ ...options, retain: false });
+			return;
+		}
+		for (const memory of this.#local().owned) {
 			await memory.flushExtractions();
 			if (options.sleep === false) continue;
 			if (options.full) {
@@ -1046,7 +1170,7 @@ export class MnemopiSessionState {
 		// teardown for Mnemopi's default 5s busy timeout (#7351 review).
 		withLoopPhase("mnemopi.close", () => {
 			const busyTimeoutMs = Math.max(1, Math.floor(timeoutMs));
-			for (const memory of this.scoped.owned) memory.beam.db.exec(`PRAGMA busy_timeout=${busyTimeoutMs}`);
+			for (const memory of this.#local().owned) memory.beam.db.exec(`PRAGMA busy_timeout=${busyTimeoutMs}`);
 		});
 	}
 
@@ -1059,8 +1183,9 @@ export class MnemopiSessionState {
 		this.#cancelStopHook = undefined;
 		this.unsubscribe = undefined;
 		if (this.aliasOf) return;
+		const scoped = this.#local();
 		const closeOwned = (): void => {
-			for (const memory of this.scoped.owned) memory.close();
+			for (const memory of scoped.owned) memory.close();
 		};
 		if (options.consolidate === false) {
 			closeOwned();
@@ -1190,7 +1315,7 @@ function deriveSharedRecallFallbackQuery(
 	if (tokens.length === 0) return undefined;
 	let broadened = stripLiteralBankPhrase(query, tokens);
 	for (const token of tokens) {
-		broadened = broadened.replace(new RegExp(`\\b${escapeRegExp(token)}\\b`, "gi"), " ");
+		broadened = broadened.replace(new RegExp(`\\b${RegExp.escape(token)}\\b`, "gi"), " ");
 	}
 	broadened = cleanupBroadenedRecallQuery(broadened);
 	const normalizedBroadened = normalizeRecallQuery(broadened);
@@ -1205,7 +1330,7 @@ function tokenizeBankName(bank: string): string[] {
 function stripLiteralBankPhrase(query: string, tokens: readonly string[]): string {
 	if (tokens.length < 2) return query;
 	const separators = "[\\s_-]+";
-	const phrase = tokens.map(token => escapeRegExp(token)).join(separators);
+	const phrase = tokens.map(token => RegExp.escape(token)).join(separators);
 	return query.replace(new RegExp(`\\b${phrase}\\b`, "gi"), " ");
 }
 
@@ -1224,9 +1349,6 @@ function normalizeRecallQuery(query: string): string {
 		.trim();
 }
 
-function escapeRegExp(text: string): string {
-	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
 function createMemory(config: MnemopiBackendConfig, bank: string): Mnemopi {
 	const providerOptions = config.providerOptions as Record<string, unknown>;
 	const { Mnemopi } = requireMnemopi();

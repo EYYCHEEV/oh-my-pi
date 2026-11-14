@@ -75,7 +75,18 @@ import { buildAvailableSlashCommands, toAcpAvailableCommands } from "../../slash
 import { DEFAULT_STT_MODEL_KEY, STT_MODELS } from "../../stt/models";
 import { refreshAgentDiscovery } from "../../task";
 import { AUTO_THINKING, parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
-import { OTHER_OPTION } from "../../tools/ask";
+import {
+	blockText,
+	choiceValue,
+	defaultFormData,
+	fieldQuestions,
+	type HtmlFormData,
+	type HtmlFormValue,
+	isArrayChoice,
+	OTHER_LABEL,
+	textValue,
+} from "@oh-my-pi/pi-tui/html-form/data";
+import { type ChoiceField, type HtmlForm, parseHtmlForm, spansText } from "@oh-my-pi/pi-tui/html-form/parse";
 import { resolvePlanFilePath } from "../../plan-mode/plan-files";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import {
@@ -96,7 +107,7 @@ import {
 } from "./acp-event-mapper";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
 
-import { cfgDisabledExtensions } from "../../extensibility/settings";
+import { cfgDisabledExtensions, cfgExtensions } from "../../extensibility/settings";
 import { cfgPlanEnabled } from "../../plan-mode/settings";
 
 const ACP_DEFAULT_MODE_ID = "default";
@@ -104,6 +115,14 @@ const ACP_PLAN_MODE_ID = "plan";
 const DEFAULT_PLAN_FILE_URL = "local://PLAN.md";
 const APPROVE_OPTION = "Approve and execute";
 const REFINE_OPTION = "Refine plan";
+/** Title of the free-text property each `askDialog` question gets beside its options. */
+const OTHER_OPTION = "Other (type your own)";
+/**
+ * Suffix of the free-text "Other" property beside a choice property, shared by
+ * `askDialog` and HTML forms; clients such as Orca merge `<key>__other` into
+ * the `<key>` choice instead of rendering it as a separate question.
+ */
+const OTHER_SUFFIX = "__other";
 const MODE_CONFIG_ID = "mode";
 const MODEL_CONFIG_ID = "model";
 const THINKING_CONFIG_ID = "thinking";
@@ -350,6 +369,11 @@ function steeringQueueFromMeta(meta: unknown): "steering" | "followUp" {
 	return "steering";
 }
 
+type AcpCompactionNotification = {
+	method: "_omp/compaction/start" | "_omp/compaction/end";
+	params: Record<string, unknown>;
+};
+
 type ManagedSessionRecord = {
 	/** Stable ACP handle, independent of the underlying durable session. */
 	readonly protocolSessionId: string;
@@ -377,9 +401,12 @@ type ManagedSessionRecord = {
 	liveMessageProgress: { textEmitted: boolean; thoughtEmitted: boolean } | undefined;
 	toolArgsById: Map<string, unknown>;
 	extensionsConfigured: boolean;
-	// Installed inside `#scheduleBootstrapUpdates` (post-race-guard); released
-	// in `#disposeSessionRecord`. Lives independent of any prompt turn.
+	// Capture at registration, independently of prompt turns. Delivery opens
+	// after the bootstrap guard or a client prompt proves the session is known.
 	lifetimeUnsubscribe: (() => void) | undefined;
+	commandMetadataUnsubscribe: (() => void) | undefined;
+	lifetimeUpdatesReady: boolean;
+	pendingCompactionNotifications: AcpCompactionNotification[] | undefined;
 	closedError: RequestError | undefined;
 	promptEventHandlers: Set<Promise<void>>;
 	extensionUserMessageTasks: Set<Promise<void>>;
@@ -522,6 +549,11 @@ function buildAcpSpeechModelsCatalog(): Record<string, unknown> {
  * the caller's promise resolves to the stub fallback. Late SDK responses that
  * arrive after abort/timeout — both rejections and successful `accept`s —
  * are dropped silently (no `logger.warn`) to keep operator logs clean.
+ *
+ * A client that rejects the request (JSON-RPC error, unrenderable schema,
+ * closed transport) rejects the returned promise with that error as `cause`:
+ * `undefined` means the user dismissed the form, and a failed request is not
+ * a user decision.
  */
 async function elicitFormFromAcpClient(
 	connection: AgentSideConnection,
@@ -536,16 +568,17 @@ async function elicitFormFromAcpClient(
 	if (signal?.aborted) {
 		return undefined;
 	}
-	const { promise, resolve } = Promise.withResolvers<CreateElicitationResponse | undefined>();
+	const { promise, resolve, reject } = Promise.withResolvers<CreateElicitationResponse | undefined>();
 	let settled = false;
 	let timeoutId: NodeJS.Timeout | undefined;
-	const finish = (value: CreateElicitationResponse | undefined) => {
+	const settle = (done: () => void) => {
 		if (settled) return;
 		settled = true;
 		clearTimeout(timeoutId);
 		signal?.removeEventListener("abort", onAbort);
-		resolve(value);
+		done();
 	};
+	const finish = (value: CreateElicitationResponse | undefined) => settle(() => resolve(value));
 	const onAbort = () => finish(undefined);
 	signal?.addEventListener("abort", onAbort, { once: true });
 	if (dialogOptions?.timeout !== undefined) {
@@ -581,7 +614,8 @@ async function elicitFormFromAcpClient(
 			// Caller may already have moved on via abort/timeout; suppress noise.
 			if (settled) return;
 			logger.warn("ACP elicitation failed", { acpSessionId: sessionId, method, error });
-			finish(undefined);
+			const reason = error instanceof Error ? error.message : String(error);
+			settle(() => reject(new Error(`ACP client failed the ${method} elicitation: ${reason}`, { cause: error })));
 		});
 	const response = await promise;
 	if (!isAcceptedElicitation(response) || !response.content) {
@@ -590,6 +624,11 @@ async function elicitFormFromAcpClient(
 	return response.content;
 }
 
+/**
+ * Single-value elicitation for `select`/`confirm`/`input`/`editor` and plan
+ * approval. A failed client request reads as no answer: these callers already
+ * fail closed on `undefined` (deny, keep plan mode, skip input).
+ */
 async function elicitFromAcpClient(
 	connection: AgentSideConnection,
 	sessionId: string,
@@ -598,16 +637,168 @@ async function elicitFromAcpClient(
 	property: ElicitationPropertySchema,
 	dialogOptions: ExtensionUIDialogOptions | undefined,
 ): Promise<ElicitationContentValue | undefined> {
-	const content = await elicitFormFromAcpClient(
-		connection,
-		sessionId,
-		method,
-		message,
-		{ value: property },
-		["value"],
-		dialogOptions,
-	);
-	return content?.value;
+	try {
+		const content = await elicitFormFromAcpClient(
+			connection,
+			sessionId,
+			method,
+			message,
+			{ value: property },
+			["value"],
+			dialogOptions,
+		);
+		return content?.value;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The elicitation message for an HTML form: its section titles and context
+ * blocks (paragraphs, lists, preformatted text, tables) as plain text, the
+ * fields themselves being schema properties.
+ */
+function formElicitationMessage(form: HtmlForm): string {
+	const parts: string[] = [];
+	for (const section of form.sections) {
+		const title = spansText(section.title).trim();
+		if (title) parts.push(title);
+		for (const block of section.blocks) {
+			const text = blockText(block);
+			if (text) parts.push(text);
+		}
+	}
+	return parts.filter(part => part.trim()).join("\n\n") || "Fill in the form";
+}
+
+/**
+ * Property holding each "Other" choice field's free-text answer:
+ * `<name>__other` ({@link OTHER_SUFFIX}), with more underscores while another
+ * control already uses it.
+ */
+function otherProperties(form: HtmlForm): Map<ChoiceField, string> {
+	const taken = new Set([...form.fields.map(field => field.name), ...form.hidden.map(([name]) => name)]);
+	const properties = new Map<ChoiceField, string>();
+	for (const field of form.fields) {
+		if (field.kind !== "choice" || !field.other || !field.name) continue;
+		let property = `${field.name}${OTHER_SUFFIX}`;
+		while (taken.has(property)) property += "_";
+		taken.add(property);
+		properties.set(field, property);
+	}
+	return properties;
+}
+
+/**
+ * An elicitation schema with one property per named field: radios and single
+ * selects as a string enum, a lone checkbox as a boolean, checkbox groups and
+ * multi-selects as an array, number inputs as numbers, other text as strings.
+ * Radio and checkbox groups get an extra optional string for their free-text
+ * "Other" answer ({@link otherProperties}). Preselected options and prefilled
+ * text are the properties' defaults.
+ */
+function formElicitationSchema(form: HtmlForm): {
+	properties: Record<string, ElicitationPropertySchema>;
+	required: string[];
+} {
+	const questions = fieldQuestions(form);
+	const others = otherProperties(form);
+	const properties: Record<string, ElicitationPropertySchema> = {};
+	const required: string[] = [];
+	for (const field of form.fields) {
+		if (!field.name) continue;
+		const title = questions.get(field) ?? field.name;
+		if (field.required) required.push(field.name);
+		if (field.kind === "choice") {
+			const options = field.options.filter(option => !option.disabled);
+			const entries = options.map(option => ({
+				const: option.value,
+				title: spansText(option.label) || option.value,
+			}));
+			const checked = options.filter(option => option.checked).map(option => option.value);
+			if (isArrayChoice(field)) {
+				properties[field.name] = { type: "array", title, items: { anyOf: entries }, default: checked };
+			} else if (field.multi) {
+				// A lone checkbox renders as one box: its own label says what checking it means.
+				const boxLabel = entries[0]?.title;
+				properties[field.name] = {
+					type: "boolean",
+					title: boxLabel ?? title,
+					...(boxLabel !== undefined && title !== field.name && title !== boxLabel ? { description: title } : {}),
+					default: checked.length > 0,
+				};
+			} else {
+				properties[field.name] = {
+					type: "string",
+					title,
+					oneOf: entries,
+					...(checked[0] !== undefined ? { default: checked[0] } : {}),
+				};
+			}
+			const other = others.get(field);
+			if (other !== undefined) {
+				properties[other] = {
+					type: "string",
+					title: `${title} — ${OTHER_LABEL}`,
+					description: field.multi ? "Another answer, added to those checked" : "Your own answer instead",
+				};
+			}
+			continue;
+		}
+		const description = field.placeholder.trim() ? { description: field.placeholder } : {};
+		if (field.type === "number" || field.type === "range") {
+			const value = textValue(field, field.value);
+			properties[field.name] = {
+				type: "number",
+				title,
+				...description,
+				...(field.min !== undefined ? { minimum: field.min } : {}),
+				...(field.max !== undefined ? { maximum: field.max } : {}),
+				...(typeof value === "number" ? { default: value } : {}),
+			};
+			continue;
+		}
+		properties[field.name] = {
+			type: "string",
+			title,
+			...description,
+			...(field.minLength !== undefined ? { minLength: field.minLength } : {}),
+			...(field.maxLength !== undefined ? { maxLength: field.maxLength } : {}),
+			...(field.value ? { default: field.value } : {}),
+		};
+	}
+	return { properties, required };
+}
+
+/** Form data from an accepted elicitation of {@link formElicitationSchema}, keeping only values the form offers. */
+function formDataFromElicitation(form: HtmlForm, content: Record<string, ElicitationContentValue>): HtmlFormData {
+	const others = otherProperties(form);
+	const data: HtmlFormData = {};
+	for (const [name, value] of form.hidden) data[name] = value;
+	for (const field of form.fields) {
+		if (!field.name) continue;
+		const value = content[field.name];
+		let formValue: HtmlFormValue | undefined;
+		if (field.kind === "choice") {
+			const picked = new Set(
+				field.options.flatMap((option, index) => {
+					const chosen = Array.isArray(value)
+						? value.includes(option.value)
+						: typeof value === "boolean"
+							? value
+							: value === option.value;
+					return chosen ? [index] : [];
+				}),
+			);
+			const other = others.get(field);
+			const typed = other === undefined ? undefined : content[other];
+			formValue = choiceValue(field, picked, typeof typed === "string" ? typed : undefined);
+		} else {
+			formValue = textValue(field, value === undefined || Array.isArray(value) ? "" : String(value));
+		}
+		if (formValue !== undefined) data[field.name] = formValue;
+	}
+	return data;
 }
 
 /** Narrows a `CreateElicitationResponse` to the accepted-with-content branch; the SDK's `action: string` catch-all arm otherwise defeats literal narrowing on `action !== "accept"`. */
@@ -710,7 +901,7 @@ export function createAcpExtensionUiContext(
 						};
 					}
 				}
-				properties[`${key}__other`] = { type: "string", title: OTHER_OPTION };
+				properties[`${key}${OTHER_SUFFIX}`] = { type: "string", title: OTHER_OPTION };
 			}
 
 			let timedOut = false;
@@ -736,7 +927,7 @@ export function createAcpExtensionUiContext(
 				kind: "submit",
 				results: questions.map((question, index) => {
 					const key = `q${index}`;
-					const otherKey = `${key}__other`;
+					const otherKey = `${key}${OTHER_SUFFIX}`;
 					const labels = question.options.map(option => option.label);
 					const otherValue = content[otherKey];
 					const customInput = typeof otherValue === "string" && otherValue.trim() ? otherValue.trim() : undefined;
@@ -760,11 +951,36 @@ export function createAcpExtensionUiContext(
 				}),
 			};
 		},
+		formDialog: async (html, dialogOptions) => {
+			if (!supportsForm) return undefined;
+			const form = parseHtmlForm(html);
+			const { properties, required } = formElicitationSchema(form);
+			let timedOut = false;
+			const content = await elicitFormFromAcpClient(
+				connection,
+				getSessionId(),
+				"formDialog",
+				formElicitationMessage(form),
+				properties,
+				required.length > 0 ? required : undefined,
+				{
+					...dialogOptions,
+					onTimeout: () => {
+						timedOut = true;
+						dialogOptions?.onTimeout?.();
+					},
+				},
+			);
+			if (timedOut) return { data: defaultFormData(form), timedOut: true };
+			if (!content) return undefined;
+			return { data: formDataFromElicitation(form, content) };
+		},
 		notify: (message, type) => {
 			logger.debug("ACP extension notification", { message, type });
 		},
 		onTerminalInput: () => () => {},
 		rerenderMessage: () => {},
+		refreshTranscript: () => {},
 		getLinkClicksAvailable: () => false,
 		setStatus: () => {},
 		setWorkingMessage: () => {},
@@ -1004,16 +1220,11 @@ export class AcpAgent implements Agent {
 			});
 		}
 
-		// For `model`/`thinking`, `#setModelById`/`#setThinkingLevelById` change
-		// the session model/thinking level through AgentSession, which now emits
-		// a lifetime event (`model_changed`/`thinking_level_changed`) that
-		// `#handleLifetimeEvent` turns into a push once the subscription is
-		// installed. Only push here when that subscription is not yet
-		// installed, so pre-bootstrap callers still see the change without a
-		// post-bootstrap duplicate.
+		// Before lifetime delivery is ready, explicit client requests still
+		// receive their config update here. Once ready, the model/thinking
+		// event supplies that update without a duplicate push.
 		const handledBySubscription =
-			(params.configId === THINKING_CONFIG_ID || params.configId === MODEL_CONFIG_ID) &&
-			record.lifetimeUnsubscribe !== undefined;
+			(params.configId === THINKING_CONFIG_ID || params.configId === MODEL_CONFIG_ID) && record.lifetimeUpdatesReady;
 		if (!handledBySubscription) {
 			await this.#pushConfigOptionUpdate(record);
 		}
@@ -1022,6 +1233,7 @@ export class AcpAgent implements Agent {
 
 	async prompt(params: PromptRequest): Promise<PromptResponse> {
 		const record = this.#getSessionRecord(params.sessionId);
+		this.#activateLifetimeUpdates(record);
 		const activeTurn = record.promptTurn;
 		// A `_session/steering` refusal (`promptRequired`) now only ever
 		// happens while no client prompt owns the turn (idle, or an
@@ -1257,12 +1469,9 @@ export class AcpAgent implements Agent {
 				});
 			},
 			notifyConfigChanged: async options => {
-				// Mirrors `setSessionConfigOption`: once the session-lifetime
-				// subscription is installed, `model_changed`/`thinking_level_changed`
-				// already reach `#handleLifetimeEvent`, which pushes the
-				// `config_option_update`. Pushing again here would make clients
-				// redraw their config UI twice for a single change.
-				if (options?.handledBySessionEvent && record.lifetimeUnsubscribe !== undefined) {
+				// Once lifetime delivery is ready, model/thinking events already
+				// push the config update. Keep the pre-bootstrap explicit path.
+				if (options?.handledBySessionEvent && record.lifetimeUpdatesReady) {
 					await this.#waitForPromptEventHandlers(record);
 					return;
 				}
@@ -1495,9 +1704,14 @@ export class AcpAgent implements Agent {
 			}
 			case "_omp/extensions": {
 				const cwd = typeof params.cwd === "string" ? (params.cwd as string) : undefined;
-				const sm = await Settings.init();
+				const sm = cwd ? await Settings.loadReadOnly({ cwd }) : await Settings.init();
 				const disabledIds = cfgDisabledExtensions.get(sm);
-				const extensions = await loadAllExtensions(cwd, disabledIds);
+				const extensions = await loadAllExtensions(cwd, disabledIds, {
+					explicit: [],
+					mode: "merge",
+					configured: cfgExtensions.get(sm),
+					configuredLevel: sm.extensionsSourceLevel(),
+				});
 				return { extensions: extensions as unknown as Array<{ [key: string]: unknown }> };
 			}
 			case "_omp/extensions/toggle": {
@@ -1737,16 +1951,22 @@ export class AcpAgent implements Agent {
 		const record = this.#createManagedSessionRecord(session, setToolUIContext, protocolSessionId);
 		// Registered before extensions start: a `session_start` handler can already replace the durable session.
 		session.registerSessionChangeCallback(() => this.#rememberHandleSession(record));
-		session.setClientBridge(
-			createAcpClientBridge(this.#connection, record.protocolSessionId, this.#clientCapabilities),
-		);
+		session.setClientBridge({
+			...createAcpClientBridge(this.#connection, record.protocolSessionId, this.#clientCapabilities),
+			get deferAgentInitiatedTurns() {
+				const promptTurn = record.promptTurn;
+				return !promptTurn || promptTurn.settled || promptTurn.cancelRequested;
+			},
+		});
 		// Client-declared servers live in `record.mcpManager`, not the session's
 		// own (ACP sessions run with `enableMCP: false`); read it live so every
 		// reconfiguration's `refreshMCPTools` rebuild renders its instructions.
 		session.setMcpServerInstructionsSource(() => record.mcpManager?.getServerInstructions());
-		// `record.lifetimeUnsubscribe` is installed in `#scheduleBootstrapUpdates`
-		// so it shares the bootstrap race guard — see that comment for why.
 		try {
+			const unsubscribeEvents = session.subscribe(event => {
+				this.#handleLifetimeEvent(record, event);
+			});
+			record.lifetimeUnsubscribe = unsubscribeEvents;
 			await this.#configureExtensions(record);
 			await this.#configureMcpServers(record, mcpServers);
 			this.#sessions.set(record.protocolSessionId, record);
@@ -1780,28 +2000,79 @@ export class AcpAgent implements Agent {
 			pendingPromptDispatches: [],
 			extensionUserMessageTasks: new Set(),
 			lifetimeUnsubscribe: undefined,
+			commandMetadataUnsubscribe: undefined,
+			lifetimeUpdatesReady: false,
+			pendingCompactionNotifications: undefined,
 		};
 	}
 
-	async #handleLifetimeEvent(record: ManagedSessionRecord, event: AgentSessionEvent): Promise<void> {
-		if (event.type !== "thinking_level_changed" && event.type !== "model_changed") {
+	#handleLifetimeEvent(record: ManagedSessionRecord, event: AgentSessionEvent): void {
+		const sessionId = record.protocolSessionId;
+		let notification: AcpCompactionNotification;
+		if (event.type === "auto_compaction_start") {
+			notification = {
+				method: "_omp/compaction/start",
+				params: { sessionId, reason: event.reason, action: event.action },
+			};
+		} else if (event.type === "auto_compaction_end") {
+			// Undefined members drop out of the JSON-RPC payload.
+			notification = {
+				method: "_omp/compaction/end",
+				params: {
+					sessionId,
+					action: event.action,
+					aborted: event.aborted,
+					willRetry: event.willRetry,
+					skipped: event.skipped,
+					errorMessage: event.errorMessage,
+					tokensBefore: event.result?.tokensBefore,
+				},
+			};
+		} else {
+			if (
+				record.lifetimeUpdatesReady &&
+				(event.type === "thinking_level_changed" || event.type === "model_changed")
+			) {
+				this.#trackLifetimeDelivery(record, event.type, this.#pushConfigOptionUpdate(record));
+			}
 			return;
 		}
-		// Config delivery is part of command completion, even though the
-		// subscription lives beyond an individual prompt turn.
-		const delivery = this.#pushConfigOptionUpdate(record);
+		// Compaction transitions cannot be rebuilt from a snapshot, so buffer them until delivery opens.
+		if (record.lifetimeUpdatesReady) this.#deliverCompactionNotification(record, notification);
+		else (record.pendingCompactionNotifications ??= []).push(notification);
+	}
+
+	#deliverCompactionNotification(record: ManagedSessionRecord, notification: AcpCompactionNotification): void {
+		this.#trackLifetimeDelivery(
+			record,
+			notification.method,
+			this.#connection.extNotification(notification.method, notification.params),
+		);
+	}
+
+	#activateLifetimeUpdates(record: ManagedSessionRecord): void {
+		if (record.lifetimeUpdatesReady) return;
+		record.lifetimeUpdatesReady = true;
+		const pending = record.pendingCompactionNotifications;
+		record.pendingCompactionNotifications = undefined;
+		for (const notification of pending ?? []) this.#deliverCompactionNotification(record, notification);
+	}
+
+	#trackLifetimeDelivery(record: ManagedSessionRecord, eventType: string, delivery: Promise<void>): void {
 		record.promptEventHandlers.add(delivery);
-		try {
-			await delivery;
-		} catch (error) {
-			logger.warn("Failed to push config_option_update after a lifetime event", {
-				acpSessionId: record.protocolSessionId,
-				eventType: event.type,
-				error,
-			});
-		} finally {
-			record.promptEventHandlers.delete(delivery);
-		}
+		void delivery.then(
+			() => {
+				record.promptEventHandlers.delete(delivery);
+			},
+			error => {
+				record.promptEventHandlers.delete(delivery);
+				logger.warn("Failed to deliver ACP lifetime update", {
+					acpSessionId: record.protocolSessionId,
+					eventType,
+					error,
+				});
+			},
+		);
 	}
 
 	#getSessionRecord(sessionId: string): ManagedSessionRecord {
@@ -2363,6 +2634,7 @@ export class AcpAgent implements Agent {
 		session.setPlanReferencePath(planFilePath);
 		session.setPlanProposalHandler?.(null);
 		session.setPlanModeState(undefined);
+		session.sessionManager.appendModeChange("none", { approvedPlanFilePath: planFilePath });
 		let autosaveFailed = false;
 		try {
 			await autosaveApprovedPlan({
@@ -2521,13 +2793,10 @@ export class AcpAgent implements Agent {
 		// enough that the response future has scheduled before our timer fires
 		// on stdio-only transports.
 		//
-		// The session-lifetime subscription is installed inside the same timer
-		// so it shares this guard — without it, an extension's `session_start`
-		// handler (or any async work it schedules) calling `setThinkingLevel`
-		// would push a `config_option_update` for a session id the client
-		// hasn't been told about yet. The pre-bootstrap thinking level is
-		// reported in the response's `configOptions`, so deferring the
-		// notification loses no state.
+		// Lifetime events are captured at registration. Config changes before
+		// this guard are represented in the response's snapshot; compaction
+		// transitions are buffered because no snapshot can reconstruct them.
+		// A prompt can open delivery sooner: it proves the client knows the id.
 		setTimeout(() => {
 			if (this.#connection.signal.aborted) {
 				return;
@@ -2536,21 +2805,13 @@ export class AcpAgent implements Agent {
 			if (!record) {
 				return;
 			}
-			if (!record.lifetimeUnsubscribe) {
-				const unsubscribeEvents = record.session.subscribe(event => {
-					void this.#handleLifetimeEvent(record, event);
-				});
-				// Skills/commands rediscovery (live `skills.*`/`commands.*` edits, MCP
-				// prompts, manage_skill) re-advertises the palette.
-				const unsubscribeCommands = record.session.subscribeCommandMetadataChanged(() => {
+			this.#activateLifetimeUpdates(record);
+			if (!record.commandMetadataUnsubscribe) {
+				record.commandMetadataUnsubscribe = record.session.subscribeCommandMetadataChanged(() => {
 					void this.#emitAvailableCommandsUpdate(record).catch(error => {
 						logger.warn("Failed to emit ACP available commands update", { error: String(error) });
 					});
 				});
-				record.lifetimeUnsubscribe = () => {
-					unsubscribeEvents();
-					unsubscribeCommands();
-				};
 			}
 			void this.#emitBootstrapUpdates(sessionId, record);
 		}, ACP_BOOTSTRAP_RACE_GUARD_MS);
@@ -3028,7 +3289,9 @@ export class AcpAgent implements Agent {
 					});
 				},
 				sendUserMessage: (content, options) => {
-					this.#trackExtensionUserMessage(record, record.session.sendUserMessage(content, options));
+					const task = record.session.sendUserMessage(content, options);
+					this.#trackExtensionUserMessage(record, task);
+					return task;
 				},
 				appendEntry: (customType, data) => {
 					record.session.sessionManager.appendCustomEntry(customType, data);
@@ -3243,6 +3506,8 @@ export class AcpAgent implements Agent {
 
 	async #disposeSessionRecord(record: ManagedSessionRecord, reason?: postmortem.Reason): Promise<void> {
 		record.lifetimeUnsubscribe?.();
+		record.commandMetadataUnsubscribe?.();
+		record.pendingCompactionNotifications = undefined;
 		if (record.mcpManager) {
 			try {
 				await record.mcpManager.disconnectAll();

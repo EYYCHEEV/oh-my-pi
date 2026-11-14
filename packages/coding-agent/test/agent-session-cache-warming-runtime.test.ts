@@ -58,7 +58,7 @@ describe("AgentSession cache-warming runtime admission", () => {
 		});
 
 		vi.useFakeTimers();
-		warmer.start({ model, context: { messages: [] }, options: { cacheRetention: "short" } }, () => true);
+		warmer.start({ model, context: { messages: [] }, options: { cacheRetention: "short" } }, () => undefined);
 		vi.advanceTimersByTime(270_000);
 		for (let i = 0; i < 100; i++) await Promise.resolve();
 

@@ -216,7 +216,7 @@ describe("eval tool description", () => {
 			},
 		};
 		const tool = new EvalTool(makeSession({ preludes: () => [prelude] }));
-		expect(tool.description).toContain("`fixture`: Fixture summary line. → `xd://eval/fixture`");
+		expect(tool.description).toContain("`fixture`: Fixture summary line. → xd://eval/fixture");
 		expect(tool.description).not.toContain("CURRENT PRELUDE DOCUMENTATION");
 		expect(tool.docTopics().fixture).toContain("CURRENT PRELUDE DOCUMENTATION");
 		enabled = false;
@@ -350,6 +350,7 @@ describe("eval tool description await markers", () => {
 						output: () => output("probe"),
 						wait: () => wait([]),
 						"tool.<name>": () => tool.read({ path: dir + "/in.txt" }),
+						sh: () => sh("true"),
 					};
 					const probe = name => {
 						if (!(name in probes)) return "no probe for " + name;
@@ -395,6 +396,7 @@ describe("eval tool description await markers", () => {
 					'    "output": lambda: output("probe"),',
 					'    "wait": lambda: wait([]),',
 					'    "tool.<name>": lambda: tool.read({"path": os.path.join(dir, "in.txt")}),',
+					'    "sh": lambda: sh("true", cwd=dir),',
 					"}",
 					"def probe(name):",
 					"    if name not in probes:",

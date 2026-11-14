@@ -22,6 +22,8 @@ export type FinishReason =
 	| "PROHIBITED_CONTENT"
 	| "SPII"
 	| "MALFORMED_FUNCTION_CALL"
+	// Not in `@google/genai`'s enum, though the Gemini API sends it ("finished due to malformed response").
+	| "MALFORMED_RESPONSE"
 	| "IMAGE_SAFETY"
 	| "IMAGE_PROHIBITED_CONTENT"
 	| "IMAGE_RECITATION"
@@ -32,8 +34,8 @@ export type FinishReason =
 /** Mirror of `@google/genai`'s `FunctionCallingConfigMode` string enum. */
 export type FunctionCallingConfigMode = "MODE_UNSPECIFIED" | "AUTO" | "NONE" | "ANY" | "VALIDATED";
 
-/** Mirror of `@google/genai`'s `ThinkingLevel` string enum. */
-export type ThinkingLevel = "THINKING_LEVEL_UNSPECIFIED" | "MINIMAL" | "LOW" | "MEDIUM" | "HIGH";
+/** Mirror of `@google/genai`'s `ThinkingLevel` string enum, plus the API-documented `xhigh` it lacks. */
+export type ThinkingLevel = "THINKING_LEVEL_UNSPECIFIED" | "MINIMAL" | "LOW" | "MEDIUM" | "HIGH" | "xhigh";
 
 /** Inline base64-encoded data part. */
 export interface InlineDataPart {

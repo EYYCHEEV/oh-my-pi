@@ -15,7 +15,7 @@ import type { MemoryBackend, MemoryBackendStartOptions, MemoryPromptPreparation 
 import { formatMnemopiStartupFailure } from "../mnemopi/startup-failure";
 import hindsightInstructions from "../prompts/system/hindsight-instructions.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
-import { type BankScope, computeBankScope } from "./bank";
+import { type BankScope, computeBankScope, type HindsightBankSet } from "./bank";
 import { createHindsightClient } from "./client";
 import { type HindsightConfig, isHindsightConfigured, loadHindsightConfig } from "./config";
 import { type HindsightMessage, hasSubstantiveContent } from "./content";
@@ -46,6 +46,7 @@ export const hindsightBackend: MemoryBackend = {
 			if (!parent) return;
 			const previous = session.setHindsightSessionState(
 				new HindsightSessionState({
+					agentDir: options.agentDir,
 					sessionId,
 					client: parent.client,
 					bankId: parent.bankId,
@@ -267,7 +268,7 @@ export async function rebindMemoryBackendForCwd(session: AgentSession): Promise<
 async function installPrimaryState(
 	session: AgentSession,
 	settings: Settings,
-	banksSet: Set<string>,
+	banksSet: HindsightBankSet,
 ): Promise<HindsightSessionState | undefined> {
 	const sessionId = session.sessionId;
 	if (!sessionId) return undefined;
@@ -296,6 +297,7 @@ async function installPrimaryState(
 	}
 
 	const state = new HindsightSessionState({
+		agentDir: settings.getAgentDir(),
 		sessionId,
 		client,
 		bankId: scope.bankId,
@@ -316,6 +318,8 @@ async function installPrimaryState(
 	}
 	previous?.dispose();
 	state.attachSessionListeners();
+	// Deliver what earlier processes left in this destination's outbox; stored tags route each event.
+	void state.retainQueue.flush();
 
 	// Kick off mental-model bootstrap. Resolves asynchronously; the first
 	// turn races and is covered in `beforeAgentStartPrompt` via

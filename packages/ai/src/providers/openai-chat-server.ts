@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { type } from "@oh-my-pi/omptype";
-import { resolvePromptCacheKey } from "../auth-gateway/http";
+import {
+	isOpenAIReasoningEffort,
+	isOpenAIServiceTier,
+	openAIErrorResponse,
+	resolvePromptCacheKey,
+} from "../auth-gateway/http";
 /**
  * Parsed inbound OpenAI chat-completions request, ready to feed into pi-ai
  * `stream(model, context, options)`.
@@ -14,7 +19,6 @@ import type {
 	ImageContent,
 	Message,
 	Model,
-	ServiceTier,
 	StopReason,
 	TextContent,
 	Tool,
@@ -39,23 +43,6 @@ import {
 import { coerceNullMessageContentInPlace } from "./openai-shared";
 
 export type { ParsedRequest };
-
-type ReasoningEffort = NonNullable<ParsedRequest["options"]["reasoning"]>;
-
-function isReasoningEffort(value: unknown): value is ReasoningEffort {
-	return (
-		value === "minimal" ||
-		value === "low" ||
-		value === "medium" ||
-		value === "high" ||
-		value === "xhigh" ||
-		value === "max"
-	);
-}
-
-function isServiceTier(value: unknown): value is ServiceTier {
-	return value === "auto" || value === "default" || value === "flex" || value === "scale" || value === "priority";
-}
 
 const UNSUPPORTED_EXPLICIT_PROMPT_CACHE_MESSAGE =
 	"openai-chat: prompt_cache_options and prompt_cache_breakpoint are unsupported by this auth-gateway route; use /v1/pi/stream with options.promptCache instead";
@@ -91,11 +78,12 @@ function rejectUnsupportedExplicitPromptCacheFields(body: unknown): void {
 // ---------------------------------------------------------------------------
 
 export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
-	// Header capture is centralized in `auth-gateway/server.ts` (allow-listed
-	// headers like openai-organization/openai-project/openai-beta/x-stainless-*
-	// land on `options.headers` automatically). We consult `headers` here too
-	// for `resolvePromptCacheKey` to pull a cache identity out of inbound
-	// vendor-neutral headers when the body doesn't carry one.
+	// The gateway forwards allow-listed request headers (openai-organization,
+	// openai-project, openai-beta, x-stainless-*, …) itself, for the gateway
+	// token only (`applyCallerTrust` in `auth-gateway/caller-options.ts`). We
+	// consult `headers` here for `resolvePromptCacheKey` to pull a cache
+	// identity out of inbound vendor-neutral headers when the body doesn't
+	// carry one.
 	rejectUnsupportedExplicitPromptCacheFields(body);
 	const request =
 		typeof body === "object" && body !== null && !Array.isArray(body) ? (body as Record<string, unknown>) : undefined;
@@ -208,10 +196,10 @@ export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
 	if (data.parallel_tool_calls !== undefined) options.parallelToolCalls = data.parallel_tool_calls;
 	if (data.reasoning_effort === "none") {
 		options.forceReasoningOff = true;
-	} else if (data.reasoning_effort !== undefined && isReasoningEffort(data.reasoning_effort)) {
+	} else if (data.reasoning_effort !== undefined && isOpenAIReasoningEffort(data.reasoning_effort)) {
 		options.reasoning = data.reasoning_effort;
 	}
-	if (data.service_tier !== undefined && isServiceTier(data.service_tier)) {
+	if (data.service_tier !== undefined && isOpenAIServiceTier(data.service_tier)) {
 		options.serviceTier = data.service_tier;
 	}
 	if (data.metadata !== undefined) options.metadata = data.metadata;
@@ -420,6 +408,7 @@ function buildTools(tools: OpenAIChatTool[]): Tool[] | undefined {
 			name: t.function.name,
 			description: t.function.description ?? "",
 			parameters: (t.function.parameters ?? {}) as Record<string, unknown> as TSchema,
+			...(typeof t.function.strict === "boolean" ? { strict: t.function.strict } : {}),
 		});
 	}
 	return out;
@@ -842,9 +831,4 @@ export function encodeStream(
  *   `{ error: { message, type } }`
  * Matches the shape the official SDK auto-parses into `APIError`.
  */
-export function formatError(status: number, type: string, message: string): Response {
-	return new Response(JSON.stringify({ error: { message, type } }), {
-		status,
-		headers: { "Content-Type": "application/json" },
-	});
-}
+export const formatError = openAIErrorResponse;

@@ -38,10 +38,11 @@ import { EventBus } from "../../utils/event-bus";
 import * as TypeBox from "../legacy-typebox";
 import { resolveExtensionDirectory } from "./directory-resolution";
 import { installLegacyPiSpecifierShim, loadLegacyPiModule } from "../plugins/legacy-pi-compat";
-import { getAllPluginExtensionPaths } from "../plugins/loader";
+import { getEnabledPlugins, resolvePluginExtensionPaths } from "../plugins/loader";
 
 import { resolvePath, withHostGuard } from "../utils";
 import type { ComposerShapeDefinition } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
+import { notifyTranscriptPresentersChanged } from "@oh-my-pi/pi-tui/chat/transcript-presentation";
 import type {
 	AssistantTextRenderer,
 	AssistantThinkingRenderer,
@@ -57,9 +58,11 @@ import type {
 	ProviderConfig,
 	RegisteredCommand,
 	RegisteredStatusSegment,
+	ShortcutConflict,
 	SourceInfo,
 	ToolDefinition,
 	ToolInfo,
+	TranscriptPresenter,
 } from "./types";
 
 installLegacyPiSpecifierShim();
@@ -318,6 +321,10 @@ export class ExtensionRuntime implements IExtensionRuntime {
 		this.pendingProviderRegistrations.splice(0, this.pendingProviderRegistrations.length, ...remaining);
 	}
 
+	getShortcutConflict(): ShortcutConflict | undefined {
+		throw new ExtensionRuntimeNotInitializedError();
+	}
+
 	sendMessage(): void {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
@@ -330,7 +337,7 @@ export class ExtensionRuntime implements IExtensionRuntime {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
 
-	sendUserMessage(): void {
+	sendUserMessage(): Promise<void> {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
 
@@ -525,6 +532,10 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 		this.extension.shortcuts.set(shortcut, { shortcut, extensionPath: this.extension.path, ...options });
 	}
 
+	getShortcutConflict(shortcut: KeyId): ShortcutConflict | undefined {
+		return this.runtime.getShortcutConflict(shortcut, this.extension.path);
+	}
+
 	registerFlag(
 		name: string,
 		options: { description?: string; type: "boolean" | "string"; default?: boolean | string },
@@ -553,6 +564,25 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 			);
 		}
 		this.extension.assistantTextRenderers.push(renderer);
+	}
+
+	registerTranscriptPresenter(presenter: TranscriptPresenter): () => void {
+		if (typeof presenter !== "function") {
+			throw new TypeError(
+				`registerTranscriptPresenter expects a function, got ${typeof presenter} (extension ${this.extension.path})`,
+			);
+		}
+		const presenters = this.extension.transcriptPresenters;
+		presenters.push(presenter);
+		notifyTranscriptPresentersChanged();
+		let registered = true;
+		return () => {
+			if (!registered) return;
+			registered = false;
+			const index = presenters.indexOf(presenter);
+			if (index >= 0) presenters.splice(index, 1);
+			notifyTranscriptPresentersChanged();
+		};
 	}
 
 	registerLinkScheme(scheme: string): void {
@@ -606,8 +636,8 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 		return this.runtime.requireRuntime(this.extension, declaration);
 	}
 
-	sendUserMessage(content: string | (TextContent | ImageContent)[], options?: SendUserMessageOptions): void {
-		this.runtime.sendUserMessage(content, options);
+	sendUserMessage(content: string | (TextContent | ImageContent)[], options?: SendUserMessageOptions): Promise<void> {
+		return this.runtime.sendUserMessage(content, options);
 	}
 
 	appendEntry(customType: string, data?: unknown): void {
@@ -689,6 +719,7 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 		toolRegistrationListeners: new Set(),
 		assistantThinkingRenderers: [],
 		assistantTextRenderers: [],
+		transcriptPresenters: [],
 		linkSchemes: [],
 		fileWriteFallbackHandlers: [],
 		fileDeleteFallbackHandlers: [],
@@ -725,7 +756,8 @@ async function runExtensionFactory(
 	}
 }
 
-async function importExtensionModule(extensionPath: string, cwd: string): Promise<PreparedExtension> {
+/** Import one extension module and resolve its factory without binding it to a session. */
+export async function importExtensionModule(extensionPath: string, cwd: string): Promise<PreparedExtension> {
 	const resolvedPath = canonicalizeExtensionPath(extensionPath, cwd);
 	try {
 		const sha256 = new Bun.CryptoHasher("sha256").update(await Bun.file(resolvedPath).arrayBuffer()).digest("hex");
@@ -1097,7 +1129,8 @@ export async function loadExtensions(
 	return loadExtensionsWithRequiredAttestation({ paths }, cwd, eventBus);
 }
 
-function isExtensionFile(name: string): boolean {
+/** Whether a file name is a JS/TS module the loader imports; hook factories and directory scans use it. */
+export function isExtensionFile(name: string): boolean {
 	return name.endsWith(".ts") || name.endsWith(".js");
 }
 
@@ -1128,6 +1161,68 @@ async function discoverHooksInPackageRoot(root: string): Promise<string[]> {
 		}
 	}
 	return hooks;
+}
+
+/**
+ * Extension module entry from an installed plugin manifest or a configured
+ * `extensions` path — the lanes {@link discoverExtensionPaths} appends after
+ * native capability discovery. `/extensions` lists the toggleable ones beside
+ * native modules so the dashboard shows what the loader actually loads.
+ */
+export interface PackageExtensionModule {
+	/** Entry file; a missing configured path keeps its resolved spelling so the loader reports it. */
+	path: string;
+	/** Plugin install scope, or the provenance of the configured paths. */
+	level: "user" | "project";
+	/**
+	 * Whether `disabledExtensions` (`extension-module:<name>`) gates the entry.
+	 * False for configured file paths, which load regardless of that list.
+	 */
+	toggleable: boolean;
+}
+
+/**
+ * List installed-plugin entries (when `plugins` is set) followed by configured
+ * path entries, in load order. Configured directories expand through their
+ * manifest, index, or one-level scan.
+ *
+ * @throws When a configured path exists but cannot be stat'ed (anything but ENOENT).
+ */
+export async function listPackageExtensionModules(
+	configuredPaths: readonly string[],
+	cwd: string,
+	options: { plugins: boolean; configuredLevel?: "user" | "project" },
+): Promise<PackageExtensionModule[]> {
+	const modules: PackageExtensionModule[] = [];
+	if (options.plugins) {
+		for (const plugin of await getEnabledPlugins(cwd)) {
+			for (const entry of resolvePluginExtensionPaths(plugin)) {
+				modules.push({ path: entry, level: plugin.scope, toggleable: true });
+			}
+		}
+	}
+
+	const level = options.configuredLevel ?? "user";
+	for (const configuredPath of configuredPaths) {
+		const resolved = resolvePath(configuredPath, cwd);
+
+		let stat: fs1.Stats | null = null;
+		try {
+			stat = await fs.stat(resolved);
+		} catch (err) {
+			if (!isEnoent(err)) throw err;
+		}
+
+		if (stat?.isDirectory()) {
+			for (const entry of resolveExtensionDirectory(resolved, CONFIGURED_EXTENSION_DIRECTORY_OPTIONS).files) {
+				modules.push({ path: entry, level, toggleable: true });
+			}
+			continue;
+		}
+
+		modules.push({ path: resolved, level, toggleable: false });
+	}
+	return modules;
 }
 
 /**
@@ -1218,28 +1313,11 @@ export async function discoverExtensionPaths(
 		}
 	}
 
-	// 3. Discover extension entry points from installed plugins.
-	if (ambient) {
-		await addPaths(await getAllPluginExtensionPaths(cwd));
-	}
-
-	// 4. Explicitly configured paths
-	for (const configuredPath of configuredPaths) {
-		const resolved = resolvePath(configuredPath, cwd);
-
-		let stat: fs1.Stats | null = null;
-		try {
-			stat = await fs.stat(resolved);
-		} catch (err) {
-			if (!isEnoent(err)) throw err;
-		}
-
-		if (stat?.isDirectory()) {
-			await addPaths(resolveExtensionDirectory(resolved, CONFIGURED_EXTENSION_DIRECTORY_OPTIONS).files);
-			continue;
-		}
-
-		await addPath(resolved);
+	// 3–4. Installed-plugin entries (ambient only), then explicitly configured
+	// paths. Configured file paths bypass the disabled-name filter.
+	for (const module of await listPackageExtensionModules(configuredPaths, cwd, { plugins: ambient })) {
+		if (module.toggleable && isDisabledName(getExtensionNameFromPath(module.path))) continue;
+		await addPath(module.path);
 	}
 
 	return allPaths;

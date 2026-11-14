@@ -358,7 +358,7 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 			expect(retried.session).toBeDefined();
 			await retried.session.dispose();
 		} finally {
-			MCPManager.setInstance(previousMcpManager);
+			MCPManager.setInstance(previousMcpManager instanceof MCPManager ? previousMcpManager : undefined);
 			await priorMcpManager.disconnectAll();
 		}
 	});

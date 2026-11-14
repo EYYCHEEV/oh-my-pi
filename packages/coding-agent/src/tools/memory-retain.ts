@@ -6,8 +6,8 @@ import { isHindsightConfigured, loadHindsightConfig } from "../hindsight/config"
 import retainDescription from "../prompts/tools/retain.md" with { type: "text" };
 import type { ToolSession } from ".";
 
+import { isGlobalMemoryScopeAvailable } from "../memory-backend/global-scope";
 import { cfgMemoryBackend } from "../memory-backend/settings";
-import { isGlobalMemoryScopeAvailable } from "../mnemopi/settings";
 import { mnemopiNotInitialisedMessage } from "../mnemopi/startup-failure";
 
 const memoryRetainSchemaBase = type({
@@ -35,8 +35,21 @@ const memoryRetainSchemaWithExpiry = type({
 		.describe("memories to retain"),
 });
 
-/** Offered only where a shared bank exists; see {@link isGlobalMemoryScopeAvailable}. */
+/** Offered only where every project recalls a global item; see {@link isGlobalMemoryScopeAvailable}. */
 const memoryRetainSchemaWithScope = type({
+	items: type({
+		content: type("string").describe("information to remember"),
+		"context?": type("string").describe("source context"),
+		"scope?": type("'project' | 'global'").describe(
+			"storage scope; defaults to project, global is for durable cross-project knowledge",
+		),
+	})
+		.array()
+		.atLeastLength(1)
+		.describe("memories to retain"),
+});
+
+const memoryRetainSchemaWithScopeAndExpiry = type({
 	items: type({
 		content: type("string").describe("information to remember"),
 		"context?": type("string").describe("source context"),
@@ -53,9 +66,10 @@ const memoryRetainSchemaWithScope = type({
 type MemoryRetainSchema =
 	| typeof memoryRetainSchemaBase
 	| typeof memoryRetainSchemaWithExpiry
-	| typeof memoryRetainSchemaWithScope;
+	| typeof memoryRetainSchemaWithScope
+	| typeof memoryRetainSchemaWithScopeAndExpiry;
 
-export type MemoryRetainParams = typeof memoryRetainSchemaWithScope.infer;
+export type MemoryRetainParams = typeof memoryRetainSchemaWithScopeAndExpiry.infer;
 
 const EXPIRES_FORMS =
 	"an ISO date (2026-12-01), an ISO date-time with a UTC offset (2026-12-01T09:00:00Z), or a duration (90m, 12h, 30d, 2w)";
@@ -97,16 +111,17 @@ export class MemoryRetainTool implements AgentTool<MemoryRetainSchema, MemoryRet
 	readonly label = "Retain";
 	get description(): string {
 		return prompt.render(retainDescription, {
-			globalScope: isGlobalMemoryScopeAvailable(this.session.settings),
+			globalScope: isGlobalMemoryScopeAvailable(this.session),
 			expiry: cfgMemoryBackend.get(this.session.settings) === "mnemopi",
 			storedIds: cfgMemoryBackend.get(this.session.settings) === "mnemopi",
 		});
 	}
 	get parameters(): MemoryRetainSchema {
-		if (isGlobalMemoryScopeAvailable(this.session.settings)) return memoryRetainSchemaWithScope;
-		return cfgMemoryBackend.get(this.session.settings) === "mnemopi"
-			? memoryRetainSchemaWithExpiry
-			: memoryRetainSchemaBase;
+		const mnemopi = cfgMemoryBackend.get(this.session.settings) === "mnemopi";
+		if (isGlobalMemoryScopeAvailable(this.session)) {
+			return mnemopi ? memoryRetainSchemaWithScopeAndExpiry : memoryRetainSchemaWithScope;
+		}
+		return mnemopi ? memoryRetainSchemaWithExpiry : memoryRetainSchemaBase;
 	}
 	readonly strict = true;
 	readonly loadMode = "discoverable";
@@ -121,7 +136,7 @@ export class MemoryRetainTool implements AgentTool<MemoryRetainSchema, MemoryRet
 		return new MemoryRetainTool(session);
 	}
 
-	async execute(_id: string, params: MemoryRetainParams): Promise<AgentToolResult<MemoryRetainDetails>> {
+	async execute(toolCallId: string, params: MemoryRetainParams): Promise<AgentToolResult<MemoryRetainDetails>> {
 		const backend = cfgMemoryBackend.get(this.session.settings);
 		if (backend === "mnemopi") {
 			const state = this.session.getMnemopiSessionState?.();
@@ -206,20 +221,16 @@ export class MemoryRetainTool implements AgentTool<MemoryRetainSchema, MemoryRet
 		if (!state) {
 			throw new Error("Hindsight backend is not initialised for this session.");
 		}
+		// Check before queueing anything, so a disabled or unsupported global scope rejects the whole batch.
 		if (params.items.some(item => item.scope === "global")) {
-			throw new Error("Global memory scope is only available with the Mnemopi backend.");
+			state.assertGlobalRetainAvailable();
 		}
 		if (params.items.some(item => item.expires !== undefined)) {
 			throw new Error("Expiry is only available with the Mnemopi backend.");
 		}
 
-		// Push every item onto the session-owned queue and return immediately.
-		// The queue flushes either when it reaches its batch threshold or when
-		// its debounce timer fires. If the eventual batch fails, the queue
-		// surfaces a UI-only warning notice — the LLM is not informed.
-		for (const item of params.items) {
-			state.enqueueRetain(item.content, item.context);
-		}
+		// Acknowledge only once the whole call is on disk; delivery happens on a later flush.
+		await state.enqueueRetain(toolCallId, params.items);
 
 		const count = params.items.length;
 		const noun = count === 1 ? "memory" : "memories";

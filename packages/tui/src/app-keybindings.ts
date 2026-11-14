@@ -38,12 +38,14 @@ interface AppKeybindings {
 	"app.tools.expand": true;
 	"app.tools.toggleVisibility": true;
 	"app.ask.hide": true;
+	"app.ask.note": true;
 	"app.approval.approve": true;
 	"app.editor.external": true;
 	"app.local.open": true;
 	"app.message.followUp": true;
 	"app.retry": true;
 	"app.message.dequeue": true;
+	"app.btw.inject": true;
 	"app.clipboard.pasteImage": true;
 	"app.clipboard.pasteTextRaw": true;
 	"app.clipboard.copyLine": true;
@@ -148,6 +150,11 @@ export const KEYBINDINGS = {
 		defaultKeys: "alt+h",
 		description: "Hide or show a pending ask dialog",
 	},
+	"app.ask.note": {
+		// Dropdowns keep printable keys for type-ahead, so they take the first non-printable key.
+		defaultKeys: ["n", "alt+n"],
+		description: "Add or edit a note on the highlighted ask option",
+	},
 	"app.approval.approve": {
 		// A chord, not Enter: an Enter typed for the composer as the prompt appears must not approve.
 		// Ctrl+Q backs up Ctrl+Enter, which Windows Terminal cannot deliver (#1903).
@@ -181,6 +188,10 @@ export const KEYBINDINGS = {
 		// for character composition, leaving Alt+Up unreachable there.
 		defaultKeys: ["alt+up", "shift+up"],
 		description: "Dequeue message",
+	},
+	"app.btw.inject": {
+		defaultKeys: "alt+i",
+		description: "Send a /btw answer's steering prompt to the main session",
 	},
 	"app.clipboard.pasteImage": {
 		defaultKeys: getDefaultPasteImageKeys(),
@@ -235,7 +246,7 @@ export const KEYBINDINGS = {
 		description: "Rename session",
 	},
 	"app.session.delete": {
-		defaultKeys: "ctrl+d",
+		defaultKeys: ["backspace", "delete"],
 		description: "Delete session",
 	},
 	"app.session.deleteNoninvasive": {

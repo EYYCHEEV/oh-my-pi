@@ -200,6 +200,7 @@ function resolveRuntimeOptions(options: MnemopiOptions): ResolvedMnemopiRuntimeO
 	const embeddingProvider = resolveEmbeddingProvider(nestedEmbeddings?.provider);
 	const embeddingMaxInputChars = nestedEmbeddings?.maxInputChars;
 	const embeddingAllowDownload = nestedEmbeddings?.allowDownload;
+	const embeddingBatchSize = nestedEmbeddings?.batchSize;
 
 	const embeddings =
 		embeddingDisabled !== undefined ||
@@ -208,7 +209,8 @@ function resolveRuntimeOptions(options: MnemopiOptions): ResolvedMnemopiRuntimeO
 		embeddingApiKey !== undefined ||
 		embeddingProvider !== undefined ||
 		embeddingMaxInputChars !== undefined ||
-		embeddingAllowDownload !== undefined
+		embeddingAllowDownload !== undefined ||
+		embeddingBatchSize !== undefined
 			? {
 					disabled: embeddingDisabled,
 					model: embeddingModel,
@@ -217,6 +219,7 @@ function resolveRuntimeOptions(options: MnemopiOptions): ResolvedMnemopiRuntimeO
 					provider: embeddingProvider,
 					maxInputChars: embeddingMaxInputChars,
 					allowDownload: embeddingAllowDownload,
+					batchSize: embeddingBatchSize,
 				}
 			: undefined;
 
