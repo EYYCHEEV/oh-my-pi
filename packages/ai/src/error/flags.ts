@@ -158,6 +158,19 @@ function hasCauseTokenContextOverflowEvidence(error: unknown): boolean {
 	return false;
 }
 
+function hasCauseTokenOverflowCode(error: unknown): boolean {
+	const seen = new Set<object>();
+	let link: unknown = error;
+	while (typeof link === "object" && link !== null && !seen.has(link)) {
+		seen.add(link);
+		if ("code" in link && (link.code === "input_length_exceeded" || link.code === "context_length_exceeded")) {
+			return true;
+		}
+		link = "cause" in link ? link.cause : undefined;
+	}
+	return false;
+}
+
 const OVERFLOW_NO_BODY_PATTERN = /\b4(00|13)\s*(status code)?\s*\(no body\)/i;
 // Bare `413 (no body)` deliberately dual-flagged; maintenance arbitrates against local headroom (#9235).
 const PAYLOAD_REJECTION_PATTERNS = [
@@ -775,7 +788,9 @@ export function classify(error: unknown, api?: Api): number {
 	let kinds = 0;
 	const seen = new Set<object>();
 	const causeTokenEvidence = hasCauseTokenContextOverflowEvidence(error);
-	if (causeTokenEvidence) kinds |= Flag.ContextOverflow;
+	if (hasCauseTokenOverflowCode(error) || (causeTokenEvidence && !isUsageLimitStatus(status(error)))) {
+		kinds |= Flag.ContextOverflow;
+	}
 	let link: unknown = error;
 	// A terminal 4xx on an outer link governs its own cause diagnostics: a
 	// wrapped truncation or transport phrase is describing why the deterministic

@@ -138,6 +138,22 @@ describe("isContextOverflow - configured local context", () => {
 		expect(AIError.is(id, AIError.Flag.PayloadRejected)).toBe(false);
 	});
 
+	it("keeps a 429 token-cap error out of context overflow when classified from the error object", () => {
+		const error = Object.assign(
+			new Error(
+				"429 Too many tokens, please wait before trying again. (type=rate_limit_error param=rate_limit_exceeded)",
+			),
+			{ status: 429 },
+		);
+		const id = AIError.classify(new Error("Provider returned error", { cause: error }));
+		expect(AIError.is(id, AIError.Flag.ContextOverflow)).toBe(false);
+	});
+
+	it("still recognizes a structured context overflow code on a rate-limited error", () => {
+		const id = AIError.classify({ status: 429, code: "context_length_exceeded", message: "Request rejected" });
+		expect(AIError.is(id, AIError.Flag.ContextOverflow)).toBe(true);
+	});
+
 	it("does not treat a configured image admission limit as token overflow", () => {
 		const message = createErrorMessage("400 image input exceeds configured limit");
 		expect(isContextOverflow(message)).toBe(false);
