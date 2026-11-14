@@ -269,23 +269,23 @@ async fn actual_shell_presentation_restores_native_archive_and_rewinds_setters()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn previously_unobserved_alias_definition_announces_canonical_body_to_each_observer() {
+async fn same_call_function_definition_announces_canonical_body_to_each_observer() {
 	let shell = Shell::new(None);
-	let setup = "shopt -s expand_aliases\nalias native_viz_say='printf retained'\nnative_viz_f() { \
-	             native_viz_say; }";
-	let outcome = shell
-		.run(ShellRunOptions { command: setup.into(), ..ShellRunOptions::default() }, None, ().into())
-		.await
-		.unwrap();
-	assert_eq!(outcome.exit_code, Some(0));
 	for _ in 0..2 {
-		let trace = run(&shell, "native_viz_f").await;
+		let trace = run(&shell, "native_viz_f() { printf retained; }; native_viz_f").await;
 		let snapshot = trace.snapshot();
+		assert_eq!(snapshot.units.len(), 1);
+		assert_eq!(snapshot.units[0].at, Some(0));
+		assert!(snapshot.units[0].syntax.is_some());
+		assert!(snapshot.history.iter().any(|event| {
+			matches!(&event.data, HistoryData::FuncEnter { name, .. } if name.as_slice() == b"native_viz_f")
+		}));
 		assert!(
 			snapshot
-				.units
+				.history
 				.iter()
-				.any(|unit| unit.at.is_none() && unit.syntax.is_some())
+				.filter(|event| event.n.is_some())
+				.all(|event| event.u == Some(0))
 		);
 		let model = present(&trace, &Options::default());
 		assert_eq!(model["output"], "retained");

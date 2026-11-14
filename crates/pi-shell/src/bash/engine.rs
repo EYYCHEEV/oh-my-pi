@@ -68,7 +68,7 @@ pub struct Engine {
 	cfg:          EngineConfig,
 	units:        Mutex<UnitCache>,
 	/// Units of text parsed at run time (here-document bodies, arithmetic).
-	texts:        Mutex<HashMap<(TextKind, ModeId, BString), Arc<Unit>>>,
+	texts:        Mutex<HashMap<(TextKind, ModeId, Features, BString), Arc<Unit>>>,
 	/// Compiled arithmetic expressions by text (bounded; see
 	/// [`ArithCache::get`]).
 	arith:        ArithCache,
@@ -228,9 +228,10 @@ impl Engine {
 		text: &[u8],
 		kind: TextKind,
 		mode: ModeId,
+		features: Features,
 		observed: bool,
 	) -> Result<Arc<Unit>, TextError> {
-		let key = (kind, mode, BString::from(text));
+		let key = (kind, mode, features, BString::from(text));
 		if let Some(u) = self.texts.lock().get(&key) {
 			if observed && u.trace_syntax.get().is_none() {
 				let syntax = match kind {
@@ -240,7 +241,7 @@ impl Engine {
 						} else {
 							TextMode::HereDoc
 						};
-						crate::bash::syntax::parse_text(text, Features::NONE, mode)
+						crate::bash::syntax::parse_text(text, features, mode)
 							.ok()
 							.map(|(tree, root)| {
 								crate::bash::trace::syntax::UnitSyntax::new(
@@ -269,16 +270,16 @@ impl Engine {
 				} else {
 					TextMode::HereDoc
 				};
-				let (tree, root) = crate::bash::syntax::parse_text(text, Features::NONE, tmode)
+				let (tree, root) = crate::bash::syntax::parse_text(text, features, tmode)
 					.map_err(|e| TextError { line: e.line, msg: BString::from(e.bash_msg()) })?;
 				let word = crate::bash::syntax::tree::Word::at(&tree, root);
-				let unit = ir::lower_text(word, text, mode, Features::NONE).map_err(unsupported)?;
+				let unit = ir::lower_text(word, text, mode, features).map_err(unsupported)?;
 				if observed {
 					let syntax = crate::bash::trace::syntax::UnitSyntax::new(
 						0,
 						crate::bash::trace::syntax::SyntaxTree::from_word(tree, root),
 					)
-					.with_context(mode, Features::NONE.bits());
+					.with_context(mode, features.bits());
 					let _ = unit.trace_syntax.set(Arc::new(syntax));
 				}
 				unit
@@ -292,7 +293,7 @@ impl Engine {
 				src.extend_from_slice(b"declare __=(");
 				src.extend_from_slice(text);
 				src.extend_from_slice(b")\n");
-				let mut parser = crate::bash::syntax::Parser::new(&src, Features::NONE, NO_ALIASES);
+				let mut parser = crate::bash::syntax::Parser::new(&src, features, NO_ALIASES);
 				let cc = match parser.next_command() {
 					Some(Ok(cc)) => cc,
 					Some(Err(e)) => {
@@ -303,14 +304,14 @@ impl Engine {
 				if parser.next_command().is_some() {
 					return Err(unsupported("a compound array value that is not one word list"));
 				}
-				let unit = ir::lower_compound(&cc, &src, mode, Features::NONE).map_err(unsupported)?;
+				let unit = ir::lower_compound(&cc, &src, mode, features).map_err(unsupported)?;
 				if let Some(msg) = unit.syntax_abort() {
 					return Err(TextError { line: 1, msg: msg.clone() });
 				}
 				if observed {
 					let _ = unit.trace_syntax.set(Arc::new(
 						crate::bash::trace::syntax::UnitSyntax::list(cc)
-							.with_context(mode, Features::NONE.bits()),
+							.with_context(mode, features.bits()),
 					));
 				}
 				unit

@@ -680,6 +680,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 
 	/// Expand `text` parsed as arithmetic text.
 	fn expand_arith_text(&mut self, text: &[u8]) -> X<BString> {
+		let features = super::tool_syntax_features(self.cx.store, self.vp)?;
 		let unit = self
 			.k
 			.engine
@@ -687,6 +688,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 				text,
 				super::TextKind::Arith,
 				self.vp_mode(),
+				features,
 				self
 					.k
 					.mask
@@ -2174,6 +2176,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 		if !promptvars {
 			return Ok(BString::from(out));
 		}
+		let features = super::tool_syntax_features(self.cx.store, self.vp)?;
 		let unit = self
 			.k
 			.engine
@@ -2181,6 +2184,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 				&out,
 				super::TextKind::HereDoc,
 				self.vp_mode(),
+				features,
 				self
 					.k
 					.mask
@@ -3846,12 +3850,14 @@ pub fn compound_string(
 	assoc: bool,
 ) -> Result<Vec<CompoundElem>, Stop> {
 	let mode = super::exec::mode_of(vp);
+	let features = super::tool_syntax_features(cx.store, vp)?;
 	let unit = k
 		.engine
 		.text_unit(
 			text,
 			super::TextKind::Compound,
 			mode,
+			features,
 			k.mask.contains(crate::bash::event::EventKind::UnitCompiled),
 		)
 		.map_err(|e| Stop::Fail(Diag::Syntax { msg: e.msg }))?;

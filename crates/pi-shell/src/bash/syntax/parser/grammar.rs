@@ -151,7 +151,7 @@ impl Parser<'_> {
 			return Ok(None);
 		};
 		debug_assert_eq!(self.t.scratch_len(), 0, "a builder left children on the scratch stack");
-		self.fill_docs(0);
+		self.fill_docs(0)?;
 		let node_count = self.t.assign_ids(top.list.index());
 		// The command takes the buffers it was built in (see
 		// `Parser::recycle`).
@@ -874,7 +874,7 @@ impl Parser<'_> {
 				let seq = self.push_doc(delim.clone(), strip_tabs, quoted);
 				let doc = self.t.heredoc(&delim, &delim_raw, quoted, b"");
 				let text = self.t.heredoc_body(doc);
-				self.doc_nodes.push((text, seq));
+				self.doc_nodes.push((text, seq, quoted));
 				TargetB::HereDoc(doc)
 			},
 			(_, T::Word | T::Assign) => TargetB::Word(self.tok_word(w)),

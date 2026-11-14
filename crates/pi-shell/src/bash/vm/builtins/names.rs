@@ -83,6 +83,9 @@ pub fn alias_table(
 	cx: &mut Cx<'_>,
 	vp: &Vproc,
 ) -> Result<Option<Aliases>, StoreError> {
+	if super::super::is_tool(cx.store, vp)? {
+		return Ok(None);
+	}
 	if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
 		return zsh_alias_table(k, cx, vp);
 	}

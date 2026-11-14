@@ -196,6 +196,19 @@ pub fn is_tool(store: &mut dyn StateStore, vp: &Vproc) -> Result<bool, StoreErro
 	))
 }
 
+pub(crate) fn tool_syntax_features(
+	store: &mut dyn StateStore,
+	vp: &Vproc,
+) -> Result<crate::bash::syntax::Features, StoreError> {
+	use crate::bash::syntax::Features;
+
+	Ok(if is_tool(store, vp)? {
+		Features::NO_FORK_SUBSTITUTION
+	} else {
+		Features::NONE
+	})
+}
+
 impl Default for ShellInit {
 	fn default() -> Self {
 		Self {

@@ -25,6 +25,7 @@ impl Features {
 	const MULTIBYTE: u32 = Self::DOUBLE_BYTE.0 | Self::GB18030.0 | Self::SHIFT_JIS.0;
 	/// No switches: plain bash 5.3.
 	pub const NONE: Self = Self(0);
+	pub const NO_FORK_SUBSTITUTION: Self = Self(1 << 22);
 	/// `set -o posix`: POSIX-mode grammar differences.
 	pub const POSIX: Self = Self(1 << 1);
 	/// `Shift_JIS`: a byte 0x81–0x9F or 0xE0–0xFC starts a two-byte
@@ -78,7 +79,7 @@ impl Features {
 
 	/// Features from raw bits; unknown bits are dropped.
 	pub const fn from_bits(bits: u32) -> Self {
-		Self(bits & 0x3f_ffff)
+		Self(bits & 0x7f_ffff)
 	}
 
 	/// Whether every switch in `other` is on.

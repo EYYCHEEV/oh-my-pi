@@ -450,6 +450,14 @@ impl Session {
 		self.children.clone()
 	}
 
+	pub(crate) async fn clear_callables(&mut self) -> Result<(), SessionError> {
+		let jobs = self.jobs.as_ref().ok_or(SessionError::Closed)?;
+		let (reply, cleared) = flume::bounded(1);
+		jobs.send(Request::ClearCallables(reply)).map_err(|_| SessionError::Closed)?;
+		self.waker.wake_by_ref();
+		cleared.recv_async().await.map_err(|_| SessionError::Closed)
+	}
+
 	/// Number of background jobs (`cmd &`) still running an external
 	/// process ([`Shell::live_external_jobs`]); jobs of in-engine work only
 	/// are not counted. Exited externals are reaped between commands, so
@@ -617,6 +625,7 @@ enum Request {
 	Run(Job),
 	/// Count the background jobs running an external.
 	LiveJobs(flume::Sender<usize>),
+	ClearCallables(flume::Sender<()>),
 }
 
 /// One command for the driver.
@@ -650,6 +659,11 @@ impl Driver {
 				Ok(Request::Run(job)) => self.run(job).await,
 				Ok(Request::LiveJobs(reply)) => {
 					let _ = reply.send(self.shell.live_external_jobs());
+				},
+				Ok(Request::ClearCallables(reply)) => {
+					self.store.clear_callables();
+					self.image.publish(&self.store);
+					let _ = reply.send(());
 				},
 				Err(flume::TryRecvError::Disconnected) => break,
 				Err(flume::TryRecvError::Empty) => self.idle_turn().await,

@@ -416,12 +416,20 @@ fn zsh_cmdstack(vp: &Vproc) -> Vec<&'static str> {
 
 fn expand_ps4(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32) -> Option<BString> {
 	let mode = super::exec::mode_of(vp);
+	let features = match super::tool_syntax_features(cx.store, vp) {
+		Ok(features) => features,
+		Err(error) => {
+			k.fail(error);
+			return None;
+		},
+	};
 	let tunit = k
 		.engine
 		.text_unit(
 			b"${PS4@P}",
 			TextKind::HereDoc,
 			mode,
+			features,
 			k.mask.contains(crate::bash::event::EventKind::UnitCompiled),
 		)
 		.ok()?;

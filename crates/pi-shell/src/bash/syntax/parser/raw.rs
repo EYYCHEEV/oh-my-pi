@@ -35,6 +35,17 @@ impl Flags {
 }
 
 impl Parser<'_> {
+	pub(super) fn check_funsub(&self) -> PResult<()> {
+		if self.feat.contains(Features::NO_FORK_SUBSTITUTION) {
+			return Err(super::ParseError::new(
+				self.eof_span(),
+				self.bash_line(),
+				super::ParseErrorKind::Message(Box::from(super::NOFORK_DISABLED)),
+			));
+		}
+		Ok(())
+	}
+
 	/// Arithmetic text after `open` up to the matching `close` (consumed), as
 	/// bash stores it.
 	pub(super) fn raw_arith(&mut self, open: u8, close: u8, line: u32) -> PResult<Vec<u8>> {
@@ -245,6 +256,7 @@ impl Parser<'_> {
 			},
 			b'{' => {
 				let nested = if self.funsub_next() {
+					self.check_funsub()?;
 					let value = self.peek() == Some(b'|');
 					if value || matches!(self.peek(), Some(b' ' | b'\t')) {
 						self.bump();
@@ -381,7 +393,7 @@ impl Parser<'_> {
 		if !self.pending.is_empty() {
 			self.gather_ahead();
 		}
-		self.fill_docs(docs_from);
+		self.fill_docs(docs_from)?;
 
 		self.lx = saved_lx;
 		self.compound = saved_compound;

@@ -1124,12 +1124,34 @@ fn report_close_failure(
 	}
 }
 
+fn validate_tool_command(command: &str) -> Result<()> {
+	use crate::bash::syntax::{Features, NO_ALIASES, Parser};
+
+	if !command.as_bytes().contains(&b'$') {
+		return Ok(());
+	}
+	let mut parser = Parser::new(
+		command.as_bytes(),
+		Features::NO_FORK_SUBSTITUTION | Features::EXTGLOB,
+		NO_ALIASES,
+	);
+	while let Some(parsed) = parser.next_command() {
+		let parsed = parsed.map_err(|error| {
+			Error::msg(format!("syntax error: {}", String::from_utf8_lossy(&error.bash_msg())))
+		})?;
+		parser.recycle(parsed.tree);
+	}
+	Ok(())
+}
+
 async fn run_shell_command(
 	session: &mut ShellSessionCore,
 	options: &ShellRunConfig,
 	on_chunk: Option<Sender<String>>,
 	cancel_token: CancellationToken,
 ) -> Result<CommandResult> {
+	validate_tool_command(&options.command)?;
+	session.session.clear_callables().await?;
 	install_run_filesystem(session, options, &cancel_token);
 	let result = run_shell_command_in_filesystem(session, options, on_chunk, cancel_token).await;
 	restore_session_filesystem(session);
@@ -1536,6 +1558,8 @@ async fn run_shell_command_streams(
 	streams: StreamSinks,
 	cancel_token: CancellationToken,
 ) -> Result<CommandResult> {
+	validate_tool_command(&options.command)?;
+	session.session.clear_callables().await?;
 	install_run_filesystem(session, options, &cancel_token);
 	let result =
 		run_shell_command_streams_in_filesystem(session, options, streams, cancel_token).await;

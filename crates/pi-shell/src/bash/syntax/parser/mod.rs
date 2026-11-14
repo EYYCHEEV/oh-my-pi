@@ -237,7 +237,7 @@ pub struct Parser<'s> {
 	docs:           Vec<Vec<u8>>,
 	/// Here-document text nodes waiting for their bodies, and the
 	/// sequence numbers of the bodies.
-	doc_nodes:      Vec<(Id<Text>, u32)>,
+	doc_nodes:      Vec<(Id<Text>, u32, bool)>,
 	/// Here-documents waiting for the next newline.
 	pending:        Vec<PendingDoc>,
 	/// The syntax of the command being parsed.
@@ -326,7 +326,7 @@ pub(crate) fn parse_text_at(
 	p.virt = 0;
 	let word = p.text_word(mode)?;
 	debug_assert_eq!(p.t.scratch_len(), 0, "a builder left children on the scratch stack");
-	p.fill_docs(0);
+	p.fill_docs(0)?;
 	p.t.assign_ids(word.index());
 	Ok((p.t, word.index()))
 }
@@ -564,12 +564,21 @@ impl Parser<'_> {
 	/// next command's document numbers start over (a backquoted list
 	/// parses its commands into one tree), and a substitution must not
 	/// fill the enclosing command's documents before they are read.
-	fn fill_docs(&mut self, from: usize) {
-		for (node, seq) in self.doc_nodes.drain(from..) {
+	fn fill_docs(&mut self, from: usize) -> PResult<()> {
+		let features = self.feat;
+		let depth = self.depth;
+		for (node, seq, quoted) in self.doc_nodes.drain(from..) {
 			if let Some(text) = self.docs.get(seq as usize) {
+				if !quoted && features.contains(Features::NO_FORK_SUBSTITUTION) {
+					let mut nested = Parser::new(text, features, NO_ALIASES);
+					nested.depth = depth;
+					nested.nested(|parser| parser.text_word(TextMode::HereDoc))?;
+					nested.fill_docs(0)?;
+				}
 				self.t.set_text(node, text);
 			}
 		}
+		Ok(())
 	}
 
 	/// Run `f` one nesting level deeper. Past [`MAX_NESTING`] levels the
@@ -599,6 +608,8 @@ impl Parser<'_> {
 }
 
 const TOO_DEEP: &[u8] = b"syntax error: maximum nesting level exceeded";
+const NOFORK_DISABLED: &[u8] =
+	b"syntax error: no-fork command substitution is disabled in tool shells";
 
 /// Deepest nesting the parsers accept: compound commands, substitutions
 /// (two levels each: a word and a list), `${…}` operands, `[[ … ]]` groups
@@ -623,7 +634,7 @@ fn sub_parse_list(
 	feat: Features,
 	base: u32,
 	depth: u32,
-) -> Option<Id<shape::List>> {
+) -> PResult<Option<Id<shape::List>>> {
 	let mut p = Parser::new(code, feat, NO_ALIASES);
 	p.base = base;
 	p.depth = depth + 1;
@@ -631,15 +642,22 @@ fn sub_parse_list(
 	let mark = p.t.open();
 	let mut too_deep = depth >= MAX_NESTING;
 	let mut failed = too_deep;
+	let mut forbidden = None;
 	while !failed {
-		match p.top_list() {
-			Ok(Some(top)) => {
-				p.fill_docs(0);
-				p.t.kid_items(mark, top.list);
-			},
+		let parsed = p.top_list().and_then(|top| {
+			if top.is_some() {
+				p.fill_docs(0)?;
+			}
+			Ok(top)
+		});
+		match parsed {
+			Ok(Some(top)) => p.t.kid_items(mark, top.list),
 			Ok(None) => break,
 			Err(e) => {
 				too_deep = matches!(&e.kind, ParseErrorKind::Message(m) if **m == *TOO_DEEP);
+				if matches!(&e.kind, ParseErrorKind::Message(m) if **m == *NOFORK_DISABLED) {
+					forbidden = Some(e);
+				}
 				failed = true;
 			},
 		}
@@ -650,5 +668,8 @@ fn sub_parse_list(
 	let list = p.t.list_at(mark);
 	debug_assert_eq!(p.t.opened_len(mark), 0, "a builder left children on the scratch stack");
 	*t = p.t;
-	(!too_deep).then_some(list)
+	match forbidden {
+		Some(error) => Err(error),
+		None => Ok((!too_deep).then_some(list)),
+	}
 }

@@ -901,10 +901,8 @@ async fn persistent_shell_reaps_early_exiting_background_pipeline_stage() {
 	assert_eq!(waited.exit_code, Some(9), "wait must report the pipeline's last stage");
 }
 
-/// `exit` and errexit end the command, not the session: later runs keep
-/// the variables, functions, and options set before them.
 #[tokio::test(flavor = "multi_thread")]
-async fn exit_and_errexit_keep_session_state() {
+async fn exit_and_errexit_keep_variables_and_options_but_drop_functions() {
 	let _guard = shell_test_lock().lock().await;
 	let shell = Shell::new(None);
 	let exit_code = async |command: &str| {
@@ -918,7 +916,7 @@ async fn exit_and_errexit_keep_session_state() {
 			.expect("run")
 			.exit_code
 	};
-	let state_intact = "test \"$PI_KEPT\" = kept && pi_kept_fn";
+	let state_intact = "test \"$PI_KEPT\" = kept && ! type pi_kept_fn >/dev/null 2>&1";
 
 	assert_eq!(exit_code("set -e; PI_KEPT=kept; pi_kept_fn() { true; }").await, Some(0));
 	assert_eq!(exit_code("false; true").await, Some(1), "errexit stops the command");
@@ -1014,9 +1012,6 @@ async fn pids_reports_in_flight_children_until_run_returns() {
 	assert!(shell.pids().is_empty(), "pids cleared once the run returns");
 }
 
-/// A fork taken while a command runs starts from the state that command
-/// started from (variables, functions, cwd), without waiting for it; what the
-/// fork sets stays in the fork; sibling forks draw different `$RANDOM`s.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn fork_starts_from_the_state_before_the_running_command() {
@@ -1071,12 +1066,12 @@ async fn fork_starts_from_the_state_before_the_running_command() {
 		Duration::from_secs(5),
 		run(
 			&fork,
-			"printf '%s|%s|%s' \"$PI_FORK_VAR\" \"$(pi_fork_fn x)\" \"$PWD\"; PI_FORK_VAR=fork",
+			"printf '%s|%s' \"$PI_FORK_VAR\" \"$PWD\"; type pi_fork_fn >/dev/null 2>&1 && printf hidden; PI_FORK_VAR=fork",
 		),
 	)
 	.await
 	.expect("fork waited for the running command");
-	assert_eq!(seen, format!("before|fn:x|{}", dir_path.display()));
+	assert_eq!(seen, format!("before|{}", dir_path.display()));
 	let random = "echo $RANDOM $RANDOM $RANDOM";
 	assert_ne!(run(&shell.fork(), random).await, run(&shell.fork(), random).await);
 

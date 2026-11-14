@@ -711,7 +711,7 @@ impl<'s> Parser<'s> {
 				i += 1;
 			}
 		}
-		let body = super::sub_parse_list(&mut self.t, &code, self.feat, text_lo, self.depth)
+		let body = super::sub_parse_list(&mut self.t, &code, self.feat, text_lo, self.depth)?
 			.ok_or_else(|| self.too_deep())?;
 		Ok(self.t.comsub(ComsubKind::Backtick, body, &text))
 	}
@@ -1041,7 +1041,7 @@ impl<'s> Parser<'s> {
 				.arith(Span::new(lo + 1, hi.saturating_sub(1)), inner, false);
 			return Ok(self.t.arith_part(a));
 		}
-		let body = super::sub_parse_list(&mut self.t, &text, self.feat, lo, self.depth)
+		let body = super::sub_parse_list(&mut self.t, &text, self.feat, lo, self.depth)?
 			.ok_or_else(|| self.too_deep())?;
 		Ok(self.t.comsub(ComsubKind::Dollar, body, &text))
 	}
@@ -1054,6 +1054,7 @@ impl<'s> Parser<'s> {
 
 	/// `${ ` / `${|` seen: a nofork command substitution.
 	fn funsub(&mut self, value: bool) -> PResult<Id<Part>> {
+		self.check_funsub()?;
 		let (body, text) = self.comsub(b'}', value)?;
 		let kind = if value {
 			ComsubKind::ValueSub

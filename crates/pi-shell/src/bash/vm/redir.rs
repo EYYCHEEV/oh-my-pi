@@ -238,10 +238,18 @@ fn target_text(
 		},
 		RedirTargetIr::HereDoc { text, quoted: false } => {
 			let mode = super::exec::mode_of(vp);
+			let features = match super::tool_syntax_features(cx.store, vp) {
+				Ok(features) => features,
+				Err(error) => {
+					k.fail(error);
+					return Err(Halt::Flow(Flow::Abort(1)));
+				},
+			};
 			let tunit = match k.engine.text_unit(
 				text,
 				TextKind::HereDoc,
 				mode,
+				features,
 				k.mask.contains(crate::bash::event::EventKind::UnitCompiled),
 			) {
 				Ok(u) => u,

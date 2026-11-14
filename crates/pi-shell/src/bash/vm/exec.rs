@@ -884,6 +884,9 @@ pub(super) fn features(
 	vp: &Vproc,
 ) -> Result<Features, StoreError> {
 	let mut f = Features::NONE;
+	if super::is_tool(store, vp)? {
+		f = f | Features::NO_FORK_SUBSTITUTION;
+	}
 	if state::option(&mut k.root, store, vp, OptId::Extglob)? {
 		f = f | Features::EXTGLOB;
 	}

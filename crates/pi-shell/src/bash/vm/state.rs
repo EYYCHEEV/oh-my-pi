@@ -2082,6 +2082,9 @@ pub fn option(
 	vp: &Vproc,
 	opt: OptId,
 ) -> Result<bool, StoreError> {
+	if opt == OptId::ExpandAliases && super::is_tool(store, vp)? {
+		return Ok(false);
+	}
 	if let Some(image) = &vp.image {
 		return Ok(opt_value(opt, image.get(Key::Opt(opt))));
 	}

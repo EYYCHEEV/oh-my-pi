@@ -139,6 +139,18 @@ impl MemStore {
 		self.epoch += 1;
 	}
 
+	pub(crate) fn clear_callables(&mut self) {
+		let mut keys = Vec::new();
+		self.image.each_other(&mut |key, _| {
+			if matches!(key, Key::Func(_) | Key::Alias(_) | Key::ZshAlias { .. }) {
+				keys.push(key.to_buf());
+			}
+		});
+		for key in keys {
+			self.del_out_of_band(key.as_key());
+		}
+	}
+
 	/// Read a record without the trait's `&mut` (tests, `obash`).
 	#[inline]
 	pub fn record(&self, key: Key<'_>) -> Option<&Record> {
