@@ -4172,6 +4172,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 	}
 
+	#emitIdleWhenUnclaimed(runEpoch: number): void {
+		if (this.#isDisposed || runEpoch !== this.#runEpoch) return;
+		if (!this.agent.state.isStreaming) {
+			this.#emitRunState("idle");
+			return;
+		}
+		void this.agent.waitForIdle().then(() => this.#emitIdleWhenUnclaimed(runEpoch));
+	}
+
 	/**
 	 * Emit a UI-only notice to the session. Surfaces in interactive mode as a
 	 * `showWarning` / `showError` / `showStatus` line; non-interactive modes
@@ -6477,7 +6486,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// (and its registry ref) showing idle while it streams.
 		const runEpoch = this.#agentEndRunEpochs.get(event);
 		if (agentRunSequence === this.#agentRunSequence && (runEpoch === undefined || runEpoch === this.#runEpoch)) {
-			this.#emitRunState("idle");
+			this.#emitIdleWhenUnclaimed(this.#runEpoch);
 		}
 		// The run that ended leaves nothing held. A settle from an older run must not clear answers a
 		// newer run already holds.

@@ -2919,3 +2919,113 @@ describe("AgentSession TTSR resume gate", () => {
 		expect(reminders).toHaveLength(1);
 	});
 });
+
+describe("AgentSession run state while a new run prepares", () => {
+	let session: AgentSession;
+	let tempDir: string;
+
+	beforeEach(() => {
+		tempDir = path.join(os.tmpdir(), `pi-run-prepare-test-${Snowflake.next()}`);
+		fs.mkdirSync(tempDir, { recursive: true });
+	});
+
+	afterEach(async () => {
+		if (session) {
+			await session.dispose();
+		}
+		if (tempDir && fs.existsSync(tempDir)) {
+			removeSyncWithRetries(tempDir);
+		}
+	});
+
+	async function runStreamingEditAbort(mode: "throw" | "abort") {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["unreachable"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		const reports: { state: string; streaming: boolean }[] = [];
+		const settled = Promise.withResolvers<void>();
+		let settleReportCount = -1;
+		const extensionRuntime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			pi => {
+				pi.on("agent_end", () => {
+					if (settleReportCount >= 0) return;
+					settleReportCount = reports.length;
+					settled.resolve();
+					if (mode === "abort") void session.abort();
+				});
+			},
+			tempDir,
+			new EventBus(),
+			extensionRuntime,
+			"run-prepare-settle-probe",
+		);
+		const sessionManager = SessionManager.inMemory(tempDir);
+		const modelRegistry = sharedModelRegistry;
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": false, "edit.streamingAbort": true }),
+			modelRegistry,
+			extensionRunner: new ExtensionRunner([extension], extensionRuntime, tempDir, sessionManager, modelRegistry),
+		});
+		let preparations = 0;
+		session.agent.addBeforeRunHook(async signal => {
+			preparations++;
+			if (preparations === 1) return;
+			await settled.promise;
+			if (mode === "throw") throw new Error("preparation failed");
+			if (!signal?.aborted) {
+				const abortSeen = Promise.withResolvers<void>();
+				signal?.addEventListener("abort", () => abortSeen.resolve(), { once: true });
+				await abortSeen.promise;
+			}
+			throw signal?.reason ?? new Error("preparation aborted");
+		});
+		const unsubscribe = session.subscribeRunState(state =>
+			reports.push({ state, streaming: session.agent.state.isStreaming }),
+		);
+		let aborted = false;
+		const unsubscribeAgent = session.agent.subscribe(event => {
+			if (event.type !== "agent_start" || aborted) return;
+			aborted = true;
+			session.agent.emitExternalEvent({
+				type: "tool_stream_update",
+				toolCallId: "call-edit",
+				toolName: "edit",
+				update: { streaming: false, files: [{ path: "a.ts", error: "anchor mismatch" }] },
+			});
+		});
+		try {
+			await session.prompt("Edit the file.");
+			await session.waitForIdle();
+		} finally {
+			unsubscribeAgent();
+			unsubscribe();
+		}
+		return { reports, settleReportCount, providerCalls: mock.calls.length };
+	}
+
+	it("a run whose preparation fails ends idle and never reports idle while it streams", async () => {
+		const run = await runStreamingEditAbort("throw");
+
+		expect(run.reports.filter(report => report.state === "idle" && report.streaming)).toEqual([]);
+		expect(run.reports.at(-1)).toEqual({ state: "idle", streaming: false });
+		expect(session.agent.state.isStreaming).toBe(false);
+		expect(run.providerCalls).toBe(0);
+	});
+
+	it("an abort during a run's preparation ends idle exactly once", async () => {
+		const run = await runStreamingEditAbort("abort");
+
+		expect(run.reports.filter(report => report.state === "idle" && report.streaming)).toEqual([]);
+		expect(run.reports.slice(run.settleReportCount).filter(report => report.state === "idle")).toHaveLength(1);
+		expect(run.reports.at(-1)).toEqual({ state: "idle", streaming: false });
+		expect(session.agent.state.isStreaming).toBe(false);
+		expect(run.providerCalls).toBe(0);
+	});
+});
