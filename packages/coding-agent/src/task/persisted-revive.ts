@@ -494,7 +494,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 			// session registers no extension tools, MCP or discovered capabilities.
 			preloadedPreparedExtensions: spec.preparedExtensions,
 			requiredExtension: spec.requiredExtension,
-			preloadedExtensionPaths: spec.extensionPaths ? [...spec.extensionPaths] : [],
+			preloadedExtensionPaths: spec.extensionPaths ? [...spec.extensionPaths] : restrictToolNames ? [] : undefined,
 			// Old files predate persisted spawns: deny re-spawning rather than let
 			// createAgentSession default to wildcard ("*").
 			spawns: init.spawns ?? "",

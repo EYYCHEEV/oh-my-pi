@@ -175,6 +175,7 @@ describe("restricted sessions sharing extension providers", () => {
 					},
 				],
 				additionalExtensionPaths: [path.join(tempDir, "untrusted.mjs")],
+				preloadedExtensionPaths: [path.join(tempDir, "untrusted.mjs")],
 			});
 			try {
 				await initializeExtensions(child, { reportSendError: vi.fn(), reportRuntimeError: vi.fn() });
@@ -192,7 +193,11 @@ describe("restricted sessions sharing extension providers", () => {
 		const allowed = path.join(tempDir, "allowed.txt");
 		await Bun.write(blocked, "private fixture");
 		await Bun.write(allowed, "allowed fixture");
-		await Bun.write(path.join(tempDir, "untrusted.mjs"), "throw new Error('New extension path executed');");
+		const untrustedMarker = path.join(tempDir, "untrusted-ran.txt");
+		await Bun.write(
+			path.join(tempDir, "untrusted.mjs"),
+			`await Bun.write(${JSON.stringify(untrustedMarker)}, "ran");`,
+		);
 		const policy: ExtensionFactory = pi => {
 			let initialized = false;
 			pi.on("session_start", () => {
@@ -228,6 +233,7 @@ describe("restricted sessions sharing extension providers", () => {
 						]),
 					);
 				}
+				expect(await Bun.file(untrustedMarker).exists()).toBe(false);
 			} finally {
 				await grandchild.dispose();
 			}

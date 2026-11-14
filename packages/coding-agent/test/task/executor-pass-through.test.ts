@@ -349,8 +349,8 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(forwarded?.mcpManager).toBeUndefined();
 		expect(forwarded?.customTools).toBeUndefined();
 		expect(forwarded?.mcpTools).toBeUndefined();
-		expect(forwarded?.preloadedExtensionPaths).toEqual([]);
-		expect(forwarded?.requiredExtension).toBeUndefined();
+		expect(forwarded?.preloadedExtensionPaths).toEqual(preloadedExtensionPaths);
+		expect(forwarded?.requiredExtension).toEqual(requiredExtension);
 		expect(forwarded?.preloadedCustomToolPaths).toEqual([]);
 		expect(getTools).not.toHaveBeenCalled();
 		expect(forwarded?.outputSchemaMode).toBe("strict");
@@ -375,10 +375,9 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 
 		expect(result.exitCode).toBe(0);
 		const forwarded = spy.mock.calls[0]?.[0];
-		// The owner's factories travel as the same list; discovered paths, the required extension and tools do not.
 		expect(forwarded?.restrictToolNames).toBe(true);
 		expect(forwarded?.preloadedPreparedExtensions).toBe(preloadedPreparedExtensions);
-		expect(forwarded?.preloadedExtensionPaths).toEqual([]);
+		expect(forwarded?.preloadedExtensionPaths).toEqual(["/hostile/extensions/read.ts"]);
 		expect(forwarded?.requiredExtension).toBeUndefined();
 		expect(forwarded?.preloadedCustomToolPaths).toEqual([]);
 	});
