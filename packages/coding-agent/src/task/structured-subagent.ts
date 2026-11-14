@@ -873,8 +873,8 @@ function buildExecutorOptions(
 		// capture outlives its parking, so a bound copy would keep this parent's
 		// whole session graph alive for as long as the child can be revived.
 		extensionRoots: session.effectiveExtensionRoots,
-		preloadedExtensionPaths: restrictToolNames ? [] : session.extensionPaths,
-		requiredExtension: restrictToolNames ? undefined : session.requiredExtension,
+		preloadedExtensionPaths: preparedSession ? [] : session.extensionPaths,
+		requiredExtension: preparedSession ? undefined : session.requiredExtension,
 		// Restricted children keep the owner's prepared extensions so its `tool_call`
 		// policy hooks stay bound; the SDK registers no extension tools for them.
 		preloadedPreparedExtensions: session.preparedExtensions,

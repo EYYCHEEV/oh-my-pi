@@ -4,7 +4,7 @@
  * and a scripted OpenAI-compatible server the worker's model registry finds through
  * `models.yml` (the worker mirror re-reads it, so no spies reach into the worker).
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -28,6 +28,8 @@ import type { AuthStorage } from "../../src/session/auth-storage";
 import { CostGate } from "../../src/session/cost-gate";
 import { convertToLlm } from "../../src/session/messages";
 import { SessionManager } from "../../src/session/session-manager";
+import type { TaskTool } from "../../src/task";
+import * as discoveryModule from "../../src/task/discovery";
 import { type ExecutorOptions, runSubagentFollowUpTurn, runSubprocess } from "../../src/task/executor";
 import { createPersistedSubagentReviverFactory } from "../../src/task/persisted-revive";
 import { type AgentDefinition, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "../../src/task/types";
@@ -571,6 +573,9 @@ async function policyParent(options: {
 	extensions?: ExtensionFactory[];
 	requiredExtension?: RequiredExtensionSpec;
 	preloadedExtensionPaths?: string[];
+	restrictToolNames?: boolean;
+	toolNames?: string[];
+	settings?: Settings;
 }): Promise<AgentSession> {
 	const { session } = await createAgentSession({
 		cwd,
@@ -592,6 +597,43 @@ async function policyParent(options: {
 	});
 	cleanups.push(() => session.dispose());
 	return session;
+}
+
+const OWNER_POLICY_SOURCE =
+	'export default function (api) { api.on("tool_call", async event => (event.toolName === "read" ? { block: true, reason: "file-policy-block" } : undefined)); }';
+
+async function ownerWithRequiredPolicy(content: string): Promise<{ owner: AgentSession; extensionPath: string }> {
+	const extensionPath = path.join(root, "task-owner-policy.ts");
+	await fs.writeFile(extensionPath, content);
+	const owner = await policyParent({
+		requiredExtension: {
+			path: extensionPath,
+			extensionId: "extension-module:task-owner-policy",
+			expectedSha256: new Bun.SHA256().update(content).digest("hex"),
+		},
+		preloadedExtensionPaths: [extensionPath],
+		restrictToolNames: true,
+		toolNames: ["task"],
+		settings: Settings.isolated({
+			"task.agentIdleTtlMs": 0,
+			"task.completionProbe": false,
+			"task.batch": false,
+			"task.isolation.enabled": false,
+			"compaction.enabled": false,
+			"retry.enabled": false,
+			"todo.enabled": false,
+			"todo.reminders": false,
+			"advisor.enabled": false,
+			"async.enabled": false,
+			modelRoles: { default: MODEL },
+		}),
+	});
+	vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+		agents: [{ ...AGENT, model: [MODEL] }],
+		projectAgentsDir: null,
+	});
+	cleanups.push(() => vi.restoreAllMocks());
+	return { owner, extensionPath };
 }
 
 describe("inherited policy survives worker placement", () => {
@@ -713,4 +755,43 @@ describe("inherited policy survives worker placement", () => {
 			}, TEST_TIMEOUT_MS);
 		}
 	}
+
+	it("refuses a restricted child spawned through the owner's task tool when the required file changed after the owner started", async () => {
+		await fs.writeFile(path.join(cwd, "guard-probe.txt"), "tool-body-ran");
+		const { owner, extensionPath } = await ownerWithRequiredPolicy(OWNER_POLICY_SOURCE);
+		const marker = path.join(root, "replacement-ran.txt");
+		await fs.writeFile(
+			extensionPath,
+			`await Bun.write(${JSON.stringify(marker)}, "ran");\nexport default function () {}`,
+		);
+		const task = owner.getToolByName("task") as TaskTool | undefined;
+		if (!task) throw new Error("expected the owner's task tool");
+		const result = await task.execute("changed-owner-policy", {
+			agent: "task",
+			name: "ChangedOwnerPolicy",
+			task: POLICY_TASK,
+			solutionSpace: "A single spawn with one correct way to run it.",
+		});
+		expect(await Bun.file(marker).exists()).toBe(false);
+		expect(server.policyCalls === 0).toBe(true);
+		expect(result.details?.results[0]?.exitCode !== 0).toBe(true);
+	}, TEST_TIMEOUT_MS);
+
+	it("keeps blocking tool calls in a restricted child spawned through the owner's task tool when the required file is unchanged", async () => {
+		await fs.writeFile(path.join(cwd, "guard-probe.txt"), "tool-body-ran");
+		const { owner } = await ownerWithRequiredPolicy(OWNER_POLICY_SOURCE);
+		const task = owner.getToolByName("task") as TaskTool | undefined;
+		if (!task) throw new Error("expected the owner's task tool");
+		const result = await task.execute("unchanged-owner-policy", {
+			agent: "task",
+			name: "UnchangedOwnerPolicy",
+			task: POLICY_TASK,
+			solutionSpace: "A single spawn with one correct way to run it.",
+		});
+		const child = result.details?.results[0];
+		expect(child?.exitCode === 0).toBe(true);
+		expect(child?.output.includes("file-policy-block")).toBe(true);
+		expect(child?.output.includes("tool-body-ran")).toBe(false);
+		expect(server.policyCalls >= 1).toBe(true);
+	}, TEST_TIMEOUT_MS);
 });

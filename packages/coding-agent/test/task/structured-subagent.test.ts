@@ -1160,7 +1160,7 @@ describe("structured subagent primitive", () => {
 		expect(options[0]).toMatchObject({
 			enableMCP: false,
 			restrictToolNames: true,
-			preloadedExtensionPaths: [],
+			preloadedExtensionPaths: extensionPaths,
 			preloadedCustomToolPaths: [],
 		});
 		expect(options[0]?.mcpManager).toBeUndefined();
@@ -1180,7 +1180,7 @@ describe("structured subagent primitive", () => {
 		expect(options[3]).toMatchObject({
 			enableMCP: false,
 			restrictToolNames: true,
-			preloadedExtensionPaths: [],
+			preloadedExtensionPaths: extensionPaths,
 			preloadedCustomToolPaths: [],
 		});
 		expect(options[3]?.mcpManager).toBeUndefined();
@@ -1191,7 +1191,7 @@ describe("structured subagent primitive", () => {
 		await fs.rm(restrictedRun.artifactsDir, { recursive: true, force: true });
 	});
 
-	it("keeps the owner's prepared extensions for restricted and plan-mode children so policy hooks stay bound", async () => {
+	it("keeps the owner's prepared extensions, required extension and paths for restricted and plan-mode children so policy hooks stay bound", async () => {
 		mockDiscovery();
 		const preparedExtensions = [
 			{ path: "<owner-policy>", resolvedPath: "<owner-policy>", factory: () => {}, error: null },
@@ -1201,10 +1201,11 @@ describe("structured subagent primitive", () => {
 			extensionId: "extension-module:required",
 			expectedSha256: "0".repeat(64),
 		} as NonNullable<ToolSession["requiredExtension"]>;
+		const extensionPaths = [requiredExtension.path];
 		const planSession = session({ planMode: true });
-		Object.assign(planSession, { preparedExtensions, requiredExtension });
+		Object.assign(planSession, { preparedExtensions, requiredExtension, extensionPaths });
 		const restrictedSession = session();
-		Object.assign(restrictedSession, { restrictToolNames: true, preparedExtensions, requiredExtension });
+		Object.assign(restrictedSession, { restrictToolNames: true, preparedExtensions, requiredExtension, extensionPaths });
 		const options = [] as executorModule.ExecutorOptions[];
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async executorOptions => {
 			options.push(executorOptions);
@@ -1216,15 +1217,76 @@ describe("structured subagent primitive", () => {
 
 		expect(options).toHaveLength(2);
 		for (const forwarded of options) {
-			// The owner's factories travel as the same list; the required extension, paths and tools do not.
 			expect(forwarded.restrictToolNames).toBe(true);
 			expect(forwarded.preloadedPreparedExtensions).toBe(preparedExtensions);
-			expect(forwarded.preloadedExtensionPaths).toEqual([]);
-			expect(forwarded.requiredExtension).toBeUndefined();
+			expect(forwarded.preloadedExtensionPaths).toBe(extensionPaths);
+			expect(forwarded.requiredExtension).toBe(requiredExtension);
 			expect(forwarded.preloadedCustomToolPaths).toEqual([]);
 		}
 		await fs.rm(planRun.artifactsDir, { recursive: true, force: true });
 		await fs.rm(restrictedRun.artifactsDir, { recursive: true, force: true });
+	});
+
+	it("keeps seance children isolated from the owner's required extension and extension paths", async () => {
+		const seanceAgent = getBundledAgent("seance");
+		if (!seanceAgent) throw new Error("Expected the bundled seance agent");
+		mockDiscovery(seanceAgent);
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-seance-extension-contract-"));
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const cwd = path.join(tempDir, "project");
+		const sourceFile = path.join(tempDir, "sessions", "source.jsonl");
+		await fs.mkdir(path.dirname(sourceFile), { recursive: true });
+		await Bun.write(
+			sourceFile,
+			`${[
+				{ type: "session", version: 3, id: "saved-source", timestamp: "2026-10-01T00:00:00.000Z", cwd },
+				{
+					type: "model_change",
+					id: "default-model",
+					parentId: null,
+					timestamp: "2026-10-01T00:00:01.000Z",
+					model: "anthropic/claude-sonnet-4-5",
+					role: "default",
+				},
+			]
+				.map(entry => JSON.stringify(entry))
+				.join("\n")}\n`,
+		);
+		const requiredExtension = {
+			path: "/plugins/required.ts",
+			extensionId: "extension-module:required",
+			expectedSha256: "0".repeat(64),
+		} as NonNullable<ToolSession["requiredExtension"]>;
+		const caller = Object.assign(session({ cwd }), {
+			modelRegistry,
+			extensionPaths: [requiredExtension.path],
+			requiredExtension,
+		});
+		const options = [] as executorModule.ExecutorOptions[];
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async executorOptions => {
+			options.push(executorOptions);
+			return result();
+		});
+		try {
+			const settled = await runStructuredSubagent(
+				request({ session: caller, agent: "seance", sourceSession: sourceFile, retainArtifacts: true }),
+			);
+			expect(options).toHaveLength(1);
+			expect(options[0]?.preparedSession).toBeDefined();
+			expect(options[0]).toMatchObject({
+				restrictToolNames: true,
+				enableMCP: false,
+				preloadedExtensionPaths: [],
+				preloadedCustomToolPaths: [],
+			});
+			expect(options[0]?.requiredExtension).toBeUndefined();
+			await fs.rm(settled.artifactsDir, { recursive: true, force: true });
+		} finally {
+			authStorage.close();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
 	});
 
 	it("keeps nothing of the spawning session alive in what a parked child retains", async () => {
