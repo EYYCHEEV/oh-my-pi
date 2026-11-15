@@ -400,23 +400,30 @@ describe("the full-text indexes delete securely only while a forget runs", () =>
 		expect(leaks(file)).toEqual({});
 	});
 
+	function fakeVersion(db: Db, version: unknown): void {
+		const query = db.query.bind(db);
+		spyOn(db, "query").mockImplementation(((sql: string) =>
+			sql.includes("sqlite_version()") ? { get: () => ({ version }) } : query(sql)) as unknown as typeof db.query);
+	}
+
 	it.each([
 		["3.43.2", false],
 		["3.44.1", false],
 		["3.44.2", true],
 		["3.54.0", true],
+		["3.45", false],
+		["3.45.0-vendor", false],
+		["", false],
+		[345, false],
+		[null, false],
 	] as const)(
-		"on SQLite %s, uses the setting only from 3.44.2, whose FTS5 fixed mixing secure and plain deletes",
+		"on SQLite version %p, uses the setting only for an exact version from 3.44.2, whose FTS5 fixed mixing secure and plain deletes",
 		async (version, secure) => {
 			const file = bankPath();
 			const memory = openBank(file);
 			const note = await seedBank(memory);
 			const db = memory.beam.db;
-			const query = db.query.bind(db);
-			spyOn(db, "query").mockImplementation(((sql: string) =>
-				sql.includes("sqlite_version()")
-					? { get: () => ({ version }) }
-					: query(sql)) as unknown as typeof db.query);
+			fakeVersion(db, version);
 			const statements = observe(db, { refuse: false });
 
 			expect(memory.forget(note)).toBe(true);
@@ -427,4 +434,58 @@ describe("the full-text indexes delete securely only while a forget runs", () =>
 			expect(leaks(file)).toEqual({});
 		},
 	);
+
+	it("merges each index after a scrub that rewrote no transcript but cut a summary of pruned rows and their facts", async () => {
+		const file = bankPath();
+		const other = new Mnemopi({
+			sessionId: "pruned-bank",
+			dbPath: file,
+			noEmbeddings: true,
+			llm: { enabled: true, complete },
+			beamConfig: { pruneConsolidatedDays: 1 },
+		});
+		closers.push(() => other.close());
+		const db = other.beam.db;
+		const quoting = [
+			await retainTranscript(
+				other,
+				[
+					["user", `Please remember this: ${MEMORY}`],
+					["assistant", "Stored it."],
+				],
+				13,
+			),
+			await retainTranscript(
+				other,
+				[
+					["user", "What is the locker code of the delta bot?"],
+					["assistant", `From memory: ${FACT}.`],
+				],
+				13,
+			),
+		];
+		await retainTranscript(
+			other,
+			[
+				["user", "When does the quokka migration start?"],
+				["assistant", `${UNRELATED}.`],
+			],
+			13,
+		);
+		other.sleep(false);
+		for (const id of quoting)
+			db.run("UPDATE working_memory SET consolidated_at = ? WHERE id = ?", [hoursAgo(72), id]);
+		other.sleep(false);
+		expect(count(db, "SELECT COUNT(*) AS n FROM working_memory WHERE content LIKE '%OLIVE%'")).toBe(0);
+		db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+		expect(Object.keys(leaks(file))).toContain("main:olive");
+		fakeVersion(db, "3.43.2");
+		const statements = observe(db, { refuse: false });
+
+		expect(other.scrubForgottenTexts([MEMORY, FACT])).toBe(0);
+
+		expect(setting(statements, 1)).toEqual([]);
+		expect(merges(statements).map(sql => /fts_\w+/.exec(sql)?.[0])).toEqual(TABLES);
+		expect(leaks(file)).toEqual({});
+	});
 });

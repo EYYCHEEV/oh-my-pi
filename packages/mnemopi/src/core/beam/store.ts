@@ -552,11 +552,16 @@ function purgeOrphanDerivedRows(beam: BeamMemoryState, plan: ScrubPlan): void {
  *   whose rows were pruned are deleted when they quote the text.
  * - The windows of the texts are kept as tombstones, so a transcript retained after the forget is cut the same
  *   way (`remember`).
- * Runs in the caller's transaction and returns the ids of the transcript rows it rewrote.
+ * Runs in the caller's transaction and returns the ids of the transcript rows it rewrote, and whether it changed any row.
  */
-function scrubTranscripts(beam: BeamMemoryState, texts: readonly string[], droppedId: string | null): string[] {
+function scrubTranscripts(
+	beam: BeamMemoryState,
+	texts: readonly string[],
+	droppedId: string | null,
+): { ids: string[]; changed: boolean } {
 	const plan = planScrub(beam, texts);
-	if (plan === null) return [];
+	if (plan === null) return { ids: [], changed: false };
+	const before = totalChanges(beam.db);
 	const ids = scrubTranscriptRows(beam, plan);
 	for (let start = 0; start < ids.length; start += SCRUB_BATCH_SIZE) {
 		purgeWorkingMemoryArtifacts(beam.db, ids.slice(start, start + SCRUB_BATCH_SIZE), { keepAnnotations: true });
@@ -564,8 +569,14 @@ function scrubTranscripts(beam: BeamMemoryState, texts: readonly string[], dropp
 	if (ids.length > 0) rebuildScrubbedSummaries(beam, new Set(ids), droppedId, plan);
 	scrubSummaries(beam, plan);
 	purgeOrphanDerivedRows(beam, plan);
+	const changed = totalChanges(beam.db) > before;
 	recordTombstones(beam.db, plan.entries);
-	return ids;
+	return { ids, changed };
+}
+
+function totalChanges(db: BeamMemoryState["db"]): number {
+	const row = db.query("SELECT total_changes() AS changes").get() as { changes: number };
+	return row.changes;
 }
 
 /** Embed scrubbed rows again, as `remember` embeds a new row, so vector recall sees their new text. */
@@ -588,13 +599,13 @@ function reembedWorkingRows(beam: BeamMemoryState, ids: readonly string[]): void
  * than `MIN_SCRUB_CHARS`).
  */
 export function scrubForgottenTexts(beam: BeamMemoryState, texts: readonly string[]): number {
-	const { value: scrubbed, insecure } = transaction(beam.db, () =>
+	const { value: scrub, insecure } = transaction(beam.db, () =>
 		secureFullTextDeletes(beam.db, () => scrubTranscripts(beam, texts, null)),
 	);
 	invalidateCaches(beam);
-	reembedWorkingRows(beam, scrubbed);
-	if (scrubbed.length > 0) settleForget(beam.db, insecure);
-	return scrubbed.length;
+	reembedWorkingRows(beam, scrub.ids);
+	if (scrub.changed) settleForget(beam.db, insecure);
+	return scrub.ids.length;
 }
 
 /** True when `text` has content but too little of it to scrub from transcripts without hitting unrelated words. */
@@ -1320,7 +1331,7 @@ export function forgetWorkingDetailed(beam: BeamMemoryState, memoryId: string): 
 			const texts = tooShort ? [] : [row.content, row.embed_text ?? "", ...derivedTexts(beam.db, memoryId)];
 			purgeWorkingMemoryArtifacts(beam.db, [memoryId]);
 			// Scrub first, so a summary that lists the forgotten row and a scrubbed one is rewritten once.
-			const scrubbed = tooShort ? [] : scrubTranscripts(beam, texts, memoryId);
+			const scrubbed = tooShort ? [] : scrubTranscripts(beam, texts, memoryId).ids;
 			retireDerivedSummaries(beam, memoryId, { kind: "forget" });
 			return { scrubbed, tooShort, texts };
 		}),

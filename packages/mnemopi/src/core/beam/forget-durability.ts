@@ -21,12 +21,15 @@ const FTS_TABLES = ["fts_working", "fts_episodes", "fts_facts"] as const;
 const CHECKPOINT_WAIT_MS = 200;
 
 const RELIABLE_SECURE_DELETE = [3, 44, 2] as const;
+const EXACT_VERSION = /^(\d+)\.(\d+)\.(\d+)$/;
 
 function secureDeleteIsReliable(db: Database): boolean {
-	const row = db.query("SELECT sqlite_version() AS version").get() as { version: string } | null;
-	const parts = (row?.version ?? "").split(".").map(Number);
+	const row: unknown = db.query("SELECT sqlite_version() AS version").get();
+	const version = row !== null && typeof row === "object" && "version" in row ? row.version : undefined;
+	const match = typeof version === "string" ? EXACT_VERSION.exec(version) : null;
+	if (match === null) return false;
 	for (const [index, wanted] of RELIABLE_SECURE_DELETE.entries()) {
-		const part = parts[index] ?? 0;
+		const part = Number(match[index + 1]);
 		if (part !== wanted) return part > wanted;
 	}
 	return true;
