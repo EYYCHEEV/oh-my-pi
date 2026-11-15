@@ -359,9 +359,10 @@ describe("the full-text indexes delete securely only while a forget runs", () =>
 		for (const table of TABLES) expect(configOf(db, table)).toBeNull();
 	});
 
-	it("turns the setting on for each index around the deletes of a forget and off again, with no merge", async () => {
+	it("on a SQLite from 3.44.2, turns the setting on for each index around the deletes of a forget and off again, with no merge", async () => {
 		const memory = openBank(bankPath());
 		const note = await seedBank(memory);
+		fakeVersion(memory.beam.db, "3.54.0");
 		const statements = observe(memory.beam.db, { refuse: false });
 
 		expect(memory.forget(note)).toBe(true);
