@@ -399,4 +399,32 @@ describe("the full-text indexes delete securely only while a forget runs", () =>
 		expect(merges(statements).map(sql => /fts_\w+/.exec(sql)?.[0])).toEqual(TABLES);
 		expect(leaks(file)).toEqual({});
 	});
+
+	it.each([
+		["3.43.2", false],
+		["3.44.1", false],
+		["3.44.2", true],
+		["3.54.0", true],
+	] as const)(
+		"on SQLite %s, uses the setting only from 3.44.2, whose FTS5 fixed mixing secure and plain deletes",
+		async (version, secure) => {
+			const file = bankPath();
+			const memory = openBank(file);
+			const note = await seedBank(memory);
+			const db = memory.beam.db;
+			const query = db.query.bind(db);
+			spyOn(db, "query").mockImplementation(((sql: string) =>
+				sql.includes("sqlite_version()")
+					? { get: () => ({ version }) }
+					: query(sql)) as unknown as typeof db.query);
+			const statements = observe(db, { refuse: false });
+
+			expect(memory.forget(note)).toBe(true);
+
+			expect(setting(statements, 1).map(sql => /fts_\w+/.exec(sql)?.[0])).toEqual(secure ? TABLES : []);
+			expect(merges(statements).map(sql => /fts_\w+/.exec(sql)?.[0])).toEqual(secure ? [] : TABLES);
+			for (const table of TABLES) expect(configOf(db, table)).not.toEqual({ v: 1 });
+			expect(leaks(file)).toEqual({});
+		},
+	);
 });

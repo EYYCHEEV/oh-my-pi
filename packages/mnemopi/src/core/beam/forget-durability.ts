@@ -20,6 +20,18 @@ const FTS_TABLES = ["fts_working", "fts_episodes", "fts_facts"] as const;
  */
 const CHECKPOINT_WAIT_MS = 200;
 
+const RELIABLE_SECURE_DELETE = [3, 44, 2] as const;
+
+function secureDeleteIsReliable(db: Database): boolean {
+	const row = db.query("SELECT sqlite_version() AS version").get() as { version: string } | null;
+	const parts = (row?.version ?? "").split(".").map(Number);
+	for (const [index, wanted] of RELIABLE_SECURE_DELETE.entries()) {
+		const part = parts[index] ?? 0;
+		if (part !== wanted) return part > wanted;
+	}
+	return true;
+}
+
 function ftsDeletesSecurely(db: Database, table: string): boolean {
 	try {
 		const row = db.query(`SELECT v FROM ${table}_config WHERE k = 'secure-delete'`).get() as {
@@ -39,6 +51,7 @@ function ftsDeletesSecurely(db: Database, table: string): boolean {
  * 5000-row prune about 30 times slower (0.25 s to 8.5 s).
  */
 export function secureFullTextDeletes<T>(db: Database, fn: () => T): { value: T; insecure: string[] } {
+	if (!secureDeleteIsReliable(db)) return { value: fn(), insecure: [...FTS_TABLES] };
 	const insecure: string[] = [];
 	const restore: { table: string; value: 0 | 1 }[] = [];
 	for (const table of FTS_TABLES) {
