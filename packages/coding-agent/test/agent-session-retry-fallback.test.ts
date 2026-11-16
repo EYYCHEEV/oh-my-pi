@@ -8285,6 +8285,63 @@ describe("AgentSession retry fallback", () => {
 		expect(session.getContextUsage()?.contextWindow).toBe(400_000);
 	});
 
+	it("rebinds the active Codex model when discovery adds Ultrafast to its tier list", async () => {
+		authStorage.keys.setRuntime("openai-codex", "codex-test-key");
+		const bundled = getBundledModel("openai-codex", "gpt-6.1-sol");
+		expect(bundled.serviceTiers).not.toContain("ultrafast");
+		writeModelCache(
+			resolveModelCacheProviderId("openai-codex", {}),
+			Date.now(),
+			[buildModel({ ...bundled, serviceTiers: ["priority", "ultrafast"] })],
+			true,
+			"",
+			path.join(tempDir.path(), "models.db"),
+		);
+		const registry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.json"));
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: bundled, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: () => {
+				throw new Error("Not exercised");
+			},
+		});
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: registry,
+			rebindModelAfterDiscovery: true,
+			serviceTierByFamily: { openai: "ultrafast" },
+		});
+
+		expect(session.isUltrafastModeEnabled()).toBe(true);
+		expect(session.isFastModeActive()).toBe(false);
+
+		const { promise: modelChanged, resolve: resolveModelChanged } = Promise.withResolvers<void>();
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "model_changed") {
+				unsubscribe();
+				resolveModelChanged();
+			}
+		});
+
+		registry.refreshInBackground("offline");
+		await registry.awaitInitialBackgroundRefresh();
+		expect(registry.find("openai-codex", "gpt-6.1-sol")?.serviceTiers).toEqual(["priority", "ultrafast"]);
+		await Promise.race([
+			modelChanged,
+			scheduler.wait(2_000).then(() => {
+				throw new Error("model_changed was not emitted after discovery settled");
+			}),
+		]);
+
+		expect(session.model?.id).toBe("gpt-6.1-sol");
+		expect(session.model?.contextWindow).toBe(bundled.contextWindow);
+		expect(session.model?.serviceTiers).toEqual(["priority", "ultrafast"]);
+		expect(session.isFastModeActive()).toBe(true);
+	});
+
 	it("warns on unknown or malformed model-selector chain keys at startup", () => {
 		const primaryModel = getBundledModel("openai", "gpt-4o-mini");
 		if (!primaryModel) {
