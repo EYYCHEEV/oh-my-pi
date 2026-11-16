@@ -28,6 +28,7 @@
 
 - Fixed Ultrafast availability using another account's cached capabilities when launching with `--oauth-account`.
 - Fixed Ultrafast availability depending on which Codex account was listed first in an unpinned multi-account pool: `/fast ultra` is accepted when any pool account offers it, and each request is gated on the serving account's own tiers.
+- Fixed a session started before its Codex account's model list was cached keeping the built-in tier list after discovery finished, so `/fast ultra` reported Ultrafast on while the status line showed no fast mark and requests went out without the Ultrafast tier until the model was re-selected. The startup model now picks up refreshed service-tier lists, not only a changed context window.
 - Fixed stale supervised-process completions flooding logs while preserving notifications for resumed sessions.
 - Fixed JavaScript evaluator startup failing during synchronous cleanup-handler loading after the CLI was imported.
 - Fixed restricted extension sessions failing to start in compiled OMP binaries.
