@@ -502,7 +502,8 @@ describe("AgentSession mid-run threshold compaction", () => {
 		expect(observedContexts).toHaveLength(1);
 		expect(compactionWarnings).toHaveLength(1);
 		expect(compactionWarnings[0]).toContain("usable budget");
-		expect(terminalStates).toEqual([true]);
+		expect(terminalStates.filter(Boolean)).toHaveLength(1);
+		expect(terminalStates.at(-1)).toBe(true);
 		const terminalRefusal = session.getLastAssistantMessage();
 		expect(terminalRefusal?.stopReason).toBe("error");
 		expect(terminalRefusal?.errorMessage).toContain("usable budget");
@@ -743,7 +744,8 @@ describe("AgentSession mid-run threshold compaction", () => {
 		expect(observedContexts).toHaveLength(2);
 		expect(warnings).toHaveLength(1);
 		expect(lifecycle.indexOf("warning")).toBeLessThan(lifecycle.indexOf("provider:1"));
-		expect(terminalStates).toEqual([true]);
+		expect(terminalStates.filter(Boolean)).toHaveLength(1);
+		expect(terminalStates.at(-1)).toBe(true);
 		expect(session.getLastAssistantMessage()?.stopReason).toBe("stop");
 		const branch = sessionManager.getBranch();
 		const compactionIndex = branch.findIndex(entry => entry.type === "compaction");

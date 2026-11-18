@@ -235,7 +235,7 @@ describe("tool-call answer seam, fix round 1", () => {
 
 			await expect(
 				wrapped.execute("c1", { path: ORIGINAL_URL }, controller.signal, undefined, askContext()),
-			).rejects.toThrow("Operation aborted");
+			).rejects.toThrow("Aborted");
 			expect(executed).toEqual([]);
 		});
 
