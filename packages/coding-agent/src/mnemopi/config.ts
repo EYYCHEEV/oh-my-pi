@@ -15,7 +15,9 @@ import {
 	cfgMnemopiDebug,
 	cfgMnemopiEmbeddingApiKey,
 	cfgMnemopiEmbeddingApiUrl,
+	cfgMnemopiEmbeddingInputType,
 	cfgMnemopiEmbeddingModel,
+	cfgMnemopiEmbeddingQueryPrefix,
 	cfgMnemopiEmbeddingVariant,
 	cfgMnemopiEnhancedRecall,
 	cfgMnemopiGraphLinkWindow,
@@ -43,7 +45,7 @@ export type MnemopiScoping = "global" | "per-project" | "per-project-tagged";
 
 export type MnemopiProviderOptions = Pick<
 	MnemopiOptions,
-	"noEmbeddings" | "embeddingModel" | "embeddingApiUrl" | "embeddingApiKey" | "embeddings" | "llm" | "debug"
+	"noEmbeddings" | "embeddings" | "embeddingModel" | "embeddingApiUrl" | "embeddingApiKey" | "llm" | "debug"
 >;
 
 export interface MnemopiBackendConfig {
@@ -83,8 +85,9 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 	const configuredDbPath = cfgMnemopiDbPath.get(settings);
 	const cwd = settings.getCwd();
 	const scoping = cfgMnemopiScoping.get(settings);
+	// Separators only: `path.normalize` would also collapse `..`, which names another directory after a symlink.
 	const dbPath = configuredDbPath?.trim()
-		? expandTilde(configuredDbPath.trim())
+		? expandTilde(configuredDbPath.trim()).replaceAll("/", path.sep)
 		: path.join(getMemoriesDir(agentDir), "mnemopi", "mnemopi.db");
 	const scope = computeMnemopiBankScope(cfgMnemopiBank.get(settings), cwd, scoping);
 	const recallBanks =
@@ -123,11 +126,16 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 		debug: cfgMnemopiDebug.get(settings),
 		providerOptions: {
 			noEmbeddings: cfgMnemopiNoEmbeddings.get(settings),
-			embeddings: cfgMnemopiAllowModelDownload.get(settings) ? undefined : { allowDownload: false },
 			debug: cfgMnemopiDebug.get(settings),
 			embeddingModel,
 			embeddingApiUrl: cfgMnemopiEmbeddingApiUrl.get(settings),
 			embeddingApiKey: cfgMnemopiEmbeddingApiKey.get(settings),
+			embeddings: {
+				allowDownload: cfgMnemopiAllowModelDownload.get(settings) ? undefined : false,
+				// A blank prefix is unset; a set one keeps its whitespace (`query: `).
+				queryPrefix: cfgMnemopiEmbeddingQueryPrefix.get(settings) || undefined,
+				inputType: cfgMnemopiEmbeddingInputType.get(settings),
+			},
 			llm:
 				llmMode === "remote"
 					? {

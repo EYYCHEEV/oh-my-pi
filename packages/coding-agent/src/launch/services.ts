@@ -8,7 +8,7 @@ import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { getDaemonRuntimeDir, logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import { type DaemonBrokerClient, daemonClientForProject } from "./client";
 import { canonicalProjectDir } from "./paths";
-import type { DaemonOperation, DaemonRpcResult } from "./protocol";
+import { DAEMON_OUTPUT_PATTERN_FLAGS, type DaemonOperation, type DaemonRpcResult } from "./protocol";
 import { renderTerminalOutputIsolated } from "./terminal-output-worker-client";
 import type { ToolSession } from "../tools";
 import { resolveToCwd } from "../tools/path-utils";
@@ -249,7 +249,7 @@ export async function startService(
 	if (ready && !ready.log && ready.port === undefined) throw new ToolError("ready requires log or port");
 	if (ready?.log) {
 		try {
-			new RegExp(ready.log, "u");
+			new RegExp(ready.log, DAEMON_OUTPUT_PATTERN_FLAGS);
 		} catch (error) {
 			throw new ToolError(`Invalid readiness regex: ${error instanceof Error ? error.message : String(error)}`);
 		}

@@ -9,10 +9,7 @@ const EMPTY_TREE = {
 	agentsMdFiles: [],
 };
 
-type DelegationOptions = Pick<
-	BuildSystemPromptOptions,
-	"eagerTasks" | "eagerTasksAlways" | "model" | "taskBatch"
->;
+type DelegationOptions = Pick<BuildSystemPromptOptions, "eagerTasks" | "eagerTasksAlways" | "model" | "taskBatch">;
 
 async function renderDelegation(options: DelegationOptions = {}): Promise<string> {
 	const { systemPrompt } = await buildSystemPrompt({

@@ -308,7 +308,6 @@ describe("seance artifact lifecycle", () => {
 				enableLsp: false,
 				enableMCP: false,
 				parentAgentId: "Main",
-				structured: false,
 				eventBus,
 			});
 			expect(result.exitCode).toBe(0);

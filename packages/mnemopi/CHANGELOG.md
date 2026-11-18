@@ -22,6 +22,25 @@
 - Fixed `forget` still leaving the forgotten text recallable when a retained transcript quoted it another way, or was retained after the forget. A recall shows what the fact extractor made of a memory, in the extractor's wording, and the transcript of a recall session quotes that, so `forget` now also cuts the facts' wording out of transcripts, and finds a quote by word windows instead of exact text: another case or punctuation, the AAAK compaction of a summary (`and` became `+`), or a partial quote of five consecutive words or more (a text under 8 characters, one word, or only numbers has no windows). It keeps the windows as salted hashes, never as text, in `forget_tombstones` (newest 50 000 per bank, `MNEMOPI_FORGET_TOMBSTONE_LIMIT`), and a transcript retained afterwards (`remember` with source `coding-agent-transcript`) is cut by them before it is stored, embedded or mined for facts, so the transcript of the session that forgot a memory cannot keep it. A `sleep` summary of transcripts whose rows `pruneConsolidatedDays` deleted is cut in place (`rewriteSleepSummary`), and the facts of pruned rows that quote the text are deleted, so pruning no longer keeps a quote out of reach. `ForgetOutcome` gains `forgottenTexts`, and `Mnemopi.scrubForgottenText(text)` is now `scrubForgottenTexts(texts)`, which also records the tombstones in the other banks of a session
 - Fixed `forget` leaving the forgotten text in the database files. SQLite keeps what a delete frees in the free space of the main file, in the write-ahead log until a checkpoint, and in the segments of a full-text index, so anything that opened `mnemopi.db` and `mnemopi.db-wal` (or a copy of them) could still read a forgotten memory, its facts and the transcripts that quoted it, although no query returned them. Every pragma'd connection now sets `PRAGMA secure_delete=ON` (the build default is FAST or OFF). While a forget (or a `scrubForgottenTexts` that rewrites rows) deletes, the three full-text indexes get the FTS5 `secure-delete` option, put back with the same commit, because a secure full-text delete rewrites segment pages and left on it made a 5000-row prune about 30 times slower; an SQLite whose FTS5 refuses the option gets an `optimize` merge of each index after the forget instead. The forget then ends with `PRAGMA wal_checkpoint(TRUNCATE)`, which waits at most 200 ms for readers. A checkpoint a reader blocks is recorded in the new `forget_checkpoint_pending` table and finished by the next open, `sleep` or close of the bank, in any process. Bytes that earlier non-secure deletes left in the free space of an existing file stay until a `VACUUM`.
 - Fixed `forget` leaving a forgotten word findable by full-text search, and the index damaged, on an SQLite older than 3.44.2 (the system SQLite of older macOS, which Bun uses there). Its FTS5 corrupts an index when deletes with the `secure-delete` option and plain deletes mix on one table, and a forget turns the option on only while it runs. On such an SQLite, or one whose version is not a plain three-part number, a forget now leaves the option off and merges each full-text index after it, as on an FTS5 without the option. `scrubForgottenTexts` now also merges and checkpoints after a scrub that rewrote no transcript but cut a summary or deleted facts, which it used to leave in the index segments and the log.
+## [18.22.1] - 2026-11-17
+
+### Fixed
+
+- Fixed embedding requests failing when oversized inputs were clipped in the middle of an emoji or other Unicode character.
+
+## [18.21.0] - 2026-11-16
+
+### Changed
+
+- Improved file memory bank performance by reducing unnecessary disk synchronization during checkpointing, lowering per-turn I/O overhead for banks shared across multiple processes.
+
+## [18.20.3] - 2026-11-16
+
+### Added
+
+- Added configurable embedding query prefixes and input types for instruction-tuned and asymmetric embedding models, including Qwen3-Embedding, E5, and NVIDIA NIM.
+- Added the `embeddings.onRequestFailed` callback, allowing hosts to handle and surface failed embedding API requests.
+
 ## [18.20.0] - 2026-11-12
 
 ### Fixed

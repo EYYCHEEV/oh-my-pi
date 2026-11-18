@@ -491,7 +491,8 @@ describe("AgentSession mid-run threshold compaction", () => {
 			if (event.type === "notice" && event.level === "warning" && event.source === "compaction") {
 				compactionWarnings.push(event.message);
 			}
-			if (event.type === "agent_end") terminalStates.push(event.isTerminal === true);
+			if (event.type === "agent_end" || event.type === "agent_pause")
+				terminalStates.push(event.type === "agent_end");
 		});
 
 		await session.prompt("preserve the refusal after rewritten recovery cannot continue");
@@ -729,7 +730,8 @@ describe("AgentSession mid-run threshold compaction", () => {
 				directRunStarted.resolve();
 			}
 			if (event.type === "notice" && event.source === "compaction") lifecycle.push("warning");
-			if (event.type === "agent_end") terminalStates.push(event.isTerminal === true);
+			if (event.type === "agent_end" || event.type === "agent_pause")
+				terminalStates.push(event.type === "agent_end");
 		});
 
 		await session.prompt("create a rewritten prepared refusal");
@@ -805,7 +807,8 @@ describe("AgentSession mid-run threshold compaction", () => {
 		const warnings = collectPreparedBudgetWarnings(session);
 		const terminalStates: boolean[] = [];
 		session.subscribe(event => {
-			if (event.type === "agent_end") terminalStates.push(event.isTerminal === true);
+			if (event.type === "agent_end" || event.type === "agent_pause")
+				terminalStates.push(event.type === "agent_end");
 		});
 
 		const prompt = session.prompt("abort the delayed recovery");
@@ -879,7 +882,8 @@ describe("AgentSession mid-run threshold compaction", () => {
 			if (event.type === "notice" && event.level === "warning" && event.source === "compaction") {
 				notices.push(event.message);
 			}
-			if (event.type === "agent_end") terminalStates.push(event.isTerminal === true);
+			if (event.type === "agent_end" || event.type === "agent_pause")
+				terminalStates.push(event.type === "agent_end");
 		});
 
 		await session.prompt("do not duplicate the terminal warning");
@@ -1163,7 +1167,8 @@ describe("AgentSession mid-run threshold compaction", () => {
 			if (event.type === "notice" && event.level === "warning" && event.source === "compaction") {
 				warnings.push(event.message);
 			}
-			if (event.type === "agent_end") terminalStates.push(event.isTerminal === true);
+			if (event.type === "agent_end" || event.type === "agent_pause")
+				terminalStates.push(event.type === "agent_end");
 		});
 		const prompt = session.prompt("start an active goal retry");
 		try {
