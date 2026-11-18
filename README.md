@@ -151,7 +151,7 @@ An upgrade fails before build or installation if the block is stale, any require
 - `tool-call-answer-seam`: A tool_call handler can answer the call itself (result); the tool does not run, approval still gates the call, a block still wins, and the stored result carries answeredBy
 - `no-native-shell-subcommands`: omp ships no zsh, bash or sh subcommand that runs a line through its shell engine
 - `tool-shell-guard-parity`: The bash tool's shell refuses no-fork command substitution and never expands aliases, so the command guard reads what runs
-- `codex-client-version-launcher-pin`: With PI_AI_CODEX_CLIENT_VERSION set by the launcher, omp never asks npm for the Codex version and writes no version record
+- `codex-client-version-launcher-pin`: omp never asks npm for the Codex version or reads or writes a version record, with or without PI_AI_CODEX_CLIENT_VERSION
 - `seance-session-consult`: Seance: a read-only child consults a saved session's transcript and artifacts through the task tool and /seance
 <!-- stronk-omp:fork-contracts:end -->
 

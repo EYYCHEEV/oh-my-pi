@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Fixed direct starts requesting the Codex client version from npm; pinned starts and direct starts no longer use a version record.
 - Kept Codex model catalogs for restricted OAuth accounts separate from shared account catalogs.
 ## [18.22.2] - 2026-11-18
 
