@@ -5102,8 +5102,11 @@ describe("ExtensionRunner", () => {
 				sessionManager,
 				modelRegistry,
 			);
+			const context = {
+				settings: Settings.isolated({ "tools.approvalMode": "yolo" }),
+			} as unknown as AgentToolContext;
 			runner.setNativeToolResolver(name =>
-				name === native.name ? { tool: native, makeContext: () => ({}) as never } : undefined,
+				name === native.name ? { tool: native, makeContext: () => context } : undefined,
 			);
 			return runner;
 		};

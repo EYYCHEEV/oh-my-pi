@@ -4346,13 +4346,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			setActiveToolNames(snapshot);
 			toolContextStore.setToolNames(snapshot);
 		};
-		// Native built-in implementations backing same-tool `ctx.invokeTool`, so a tool that
-		// re-registers a built-in (e.g. wrapping `write`) can delegate to the original — reaching the
-		// unwrapped native execute, which inherits the caller's already-granted approval rather than
-		// re-running the gate. Seeded from the xdev registry when present (it retains discoverable
-		// built-ins like `browser` that xdev partitioning removes from the active tool array), else
-		// from the built-in registry; captured before the ExtensionToolWrapper pass so the natives
-		// stay unwrapped. The extension runner exposes it to re-registered tools via createContext.
 		const nativeToolsByName = new Map<string, Tool>(toolSession.xdev?.tools ?? undefined);
 
 		const registeredTools =
@@ -4404,9 +4397,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 		// All built-in tools are active (conditional tools like git/ask return null from factory if disabled)
 		const builtInRegistryToolNames = toolSession.xdev?.builtInNames ?? new Set(toolRegistry.keys());
-		// Capture the native built-in implementations before extension re-registration replaces registry
-		// entries and before the ExtensionToolWrapper pass below, so `ctx.invokeTool` reaches the
-		// unwrapped native execute (inheriting the caller's already-granted approval, not re-gating).
 		for (const [name, tool] of toolRegistry) {
 			nativeToolsByName.set(name, tool);
 		}

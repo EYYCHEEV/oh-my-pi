@@ -1049,14 +1049,15 @@ ctx.invokeTool?<TDetails>(
 ): Promise<AgentToolResult<TDetails>>
 ```
 
-It runs the **native** built-in of the same name as your tool (delegation is same-tool only, so it
-cannot reach an arbitrary target or escalate past the approval already granted for this call) and
-returns its result, including the native tool's own side effects and internal bookkeeping.
-By default it inherits the outer call's abort signal, progress callback, and tool/provider
-metadata; explicit `signal` / `onUpdate` options override those channels. It is
-present only when a native built-in of that name exists — `ctx.invokeTool` is `undefined` for a
-net-new tool that shadows no built-in. The native call is not re-gated, since it is the same tool you
-are already approved as, and delegation depth is guarded against accidental self-recursion.
+It runs the **native** built-in of the same name as your tool and returns its result, including
+the native tool's own side effects and internal bookkeeping.
+The delegated input passes through the normal `tool_call` hooks and approval check before execution.
+Approval of the outer call does not approve different delegated input.
+By default it inherits the outer call's abort signal, progress callback, and tool/provider metadata.
+Explicit `signal` / `onUpdate` options override those channels.
+It is present only when a native built-in of that name exists; `ctx.invokeTool` is `undefined` for a
+new tool that shadows no built-in.
+Delegation depth is guarded against accidental self-recursion.
 
 Template:
 
