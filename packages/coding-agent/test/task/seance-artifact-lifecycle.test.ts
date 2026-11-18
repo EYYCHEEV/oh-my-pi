@@ -189,6 +189,7 @@ describe("seance artifact lifecycle", () => {
 				enableLsp: false,
 				enableMCP: false,
 				parentAgentId: "Main",
+				outputSchema: {},
 				eventBus,
 			});
 			expect(result.exitCode).toBe(0);
@@ -480,6 +481,7 @@ describe("seance artifact lifecycle", () => {
 					enableLsp: false,
 					enableMCP: false,
 					parentAgentId: "Main",
+					outputSchema: {},
 				});
 				expect(result.exitCode).toBe(0);
 			}
@@ -489,8 +491,10 @@ describe("seance artifact lifecycle", () => {
 			);
 			expect(files.toSorted()).toEqual([
 				"0.read.log",
+				"SeanceRepeatOne.json",
 				"SeanceRepeatOne.jsonl",
 				"SeanceRepeatOne.md",
+				"SeanceRepeatTwo.json",
 				"SeanceRepeatTwo.jsonl",
 				"SeanceRepeatTwo.md",
 			]);
