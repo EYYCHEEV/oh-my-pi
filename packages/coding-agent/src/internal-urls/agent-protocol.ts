@@ -164,7 +164,8 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		const outputId = url.rawHost || url.hostname;
 		if (!outputId) throw new Error("agent:// URL requires an output ID: agent://<id>");
 		if (outputId === "all" || hasPathExtraction(url)) return null;
-		if (isSuperseded(context?.agentRegistry ?? AgentRegistry.global(), outputId)) return null;
+		const registry = this.#registry(context);
+		if (registry && isSuperseded(registry, outputId)) return null;
 		const dirs = await this.#outputDirs(context);
 		if (dirs.length === 0) return null;
 		return (await this.#findOutput(dirs, outputId)).foundPath ?? null;
@@ -218,19 +219,20 @@ export class AgentProtocolHandler implements ProtocolHandler {
 
 		const dirs = await this.#outputDirs(context);
 		const scan = dirs.length > 0 ? await this.#findOutput(dirs, outputId) : undefined;
-		const registry = context?.agentRegistry ?? AgentRegistry.global();
+		const registry = this.#registry(context);
 		if (!scan?.foundPath) {
 			// No published output yet. A registered agent (running, idle after a
 			// non-terminal yield, or parked before publishing) is the same
 			// registry `write agent://<id>` delivers to: answer with its progress.
-			const ref = registry.get(outputId);
+			const ref = registry?.get(outputId);
 			if (ref && ref.kind !== "advisor") return this.#resolveProgress(url, ref, extraction);
 			if (!scan) throw new Error("No session - agent outputs unavailable");
 			if (!scan.anyDirExists) throw new Error("No artifacts directory found");
-			const registered = registry
-				.list()
-				.filter(candidate => candidate.kind !== "advisor")
-				.map(candidate => candidate.id);
+			const registered =
+				registry
+					?.list()
+					.filter(candidate => candidate.kind !== "advisor")
+					.map(candidate => candidate.id) ?? [];
 			throw notFoundError(outputId, [...scan.availableIds, ...registered]);
 		}
 
@@ -249,7 +251,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		// A published file belongs to a finished run. If the agent is streaming
 		// again (follow-up or IRC wake), the file is the previous run's result;
 		// unmarked, a reader takes it as the current state.
-		if (!extraction && isSuperseded(registry, outputId)) {
+		if (!extraction && registry && isSuperseded(registry, outputId)) {
 			const publishedAt = (await fs.stat(scan.foundPath)).mtimeMs;
 			content = `${prompt.render(agentSupersededTemplate, {
 				id: outputId,
@@ -354,6 +356,11 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		};
 	}
 
+	#registry(context: ResolveContext | undefined): AgentRegistryApi | undefined {
+		if (context?.session?.seanceSourceArtifactsDir ?? context?.seanceSourceArtifactsDir) return undefined;
+		return context?.agentRegistry ?? AgentRegistry.global();
+	}
+
 	/**
 	 * Artifact dirs to scan for the caller's outputs, in priority order.
 	 *
@@ -368,7 +375,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
 	 */
 	async #outputDirs(context: ResolveContext | undefined): Promise<string[]> {
 		// A seance reads the consulted source's agent outputs in place, nothing else.
-		const seanceDir = context?.session?.seanceSourceArtifactsDir;
+		const seanceDir = context?.session?.seanceSourceArtifactsDir ?? context?.seanceSourceArtifactsDir;
 		if (seanceDir) return [seanceDir];
 		const rootSessionFile = context?.sessionFile
 			? await ensurePersistedRoster(AgentRegistry.global(), context.sessionFile)
@@ -417,9 +424,9 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		return { foundPath, jsonPath, anyDirExists, availableIds };
 	}
 
-	async complete(): Promise<UrlCompletion[]> {
+	async complete(_query?: string, context?: ResolveContext): Promise<UrlCompletion[]> {
 		const ids = new Set<string>();
-		for (const dir of artifactsDirsFromRegistry()) {
+		for (const dir of await this.#outputDirs(context)) {
 			let files: string[];
 			try {
 				files = await fs.readdir(dir);
