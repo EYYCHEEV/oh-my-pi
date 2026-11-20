@@ -68,7 +68,9 @@ describe("bash tool guard parity after native rebuild", () => {
 	});
 
 	it("keeps ordinary expansions and same-call functions", async () => {
-		const result = await run('name=control; local_fn() { printf "%s" "${name}:$(printf normal):`printf backtick`"; }; local_fn');
+		const result = await run(
+			'name=control; local_fn() { printf "%s" "${name}:$(printf normal):`printf backtick`"; }; local_fn',
+		);
 		expect(result.exitCode === 0).toBe(true);
 		expect(result.output === "control:normal:backtick").toBe(true);
 	});
@@ -83,7 +85,10 @@ describe("bash tool guard parity after native rebuild", () => {
 
 	it("restores neither saved aliases nor saved functions", async () => {
 		snapshotPath = path.join(directory, "snapshot.sh");
-		await fs.writeFile(snapshotPath, "shopt -s expand_aliases\nalias omp_guard_alias='printf forbidden'\nomp_guard_function() { printf forbidden; }\n");
+		await fs.writeFile(
+			snapshotPath,
+			"shopt -s expand_aliases\nalias omp_guard_alias='printf forbidden'\nomp_guard_function() { printf forbidden; }\n",
+		);
 		for (const command of ["omp_guard_alias", "omp_guard_function"]) {
 			const result = await run(command);
 			expect(result.exitCode !== 0).toBe(true);

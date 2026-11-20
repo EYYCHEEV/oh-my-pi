@@ -491,7 +491,8 @@ describe("AgentSession mid-run threshold compaction", () => {
 			if (event.type === "notice" && event.level === "warning" && event.source === "compaction") {
 				compactionWarnings.push(event.message);
 			}
-			if (event.type === "agent_end") terminalStates.push(event.isTerminal === true);
+			if (event.type === "agent_end" || event.type === "agent_pause")
+				terminalStates.push(event.type === "agent_end");
 		});
 
 		await session.prompt("preserve the refusal after rewritten recovery cannot continue");
@@ -501,7 +502,8 @@ describe("AgentSession mid-run threshold compaction", () => {
 		expect(observedContexts).toHaveLength(1);
 		expect(compactionWarnings).toHaveLength(1);
 		expect(compactionWarnings[0]).toContain("usable budget");
-		expect(terminalStates).toEqual([true]);
+		expect(terminalStates.filter(Boolean)).toHaveLength(1);
+		expect(terminalStates.at(-1)).toBe(true);
 		const terminalRefusal = session.getLastAssistantMessage();
 		expect(terminalRefusal?.stopReason).toBe("error");
 		expect(terminalRefusal?.errorMessage).toContain("usable budget");
@@ -729,7 +731,8 @@ describe("AgentSession mid-run threshold compaction", () => {
 				directRunStarted.resolve();
 			}
 			if (event.type === "notice" && event.source === "compaction") lifecycle.push("warning");
-			if (event.type === "agent_end") terminalStates.push(event.isTerminal === true);
+			if (event.type === "agent_end" || event.type === "agent_pause")
+				terminalStates.push(event.type === "agent_end");
 		});
 
 		await session.prompt("create a rewritten prepared refusal");
@@ -741,7 +744,8 @@ describe("AgentSession mid-run threshold compaction", () => {
 		expect(observedContexts).toHaveLength(2);
 		expect(warnings).toHaveLength(1);
 		expect(lifecycle.indexOf("warning")).toBeLessThan(lifecycle.indexOf("provider:1"));
-		expect(terminalStates).toEqual([true]);
+		expect(terminalStates.filter(Boolean)).toHaveLength(1);
+		expect(terminalStates.at(-1)).toBe(true);
 		expect(session.getLastAssistantMessage()?.stopReason).toBe("stop");
 		const branch = sessionManager.getBranch();
 		const compactionIndex = branch.findIndex(entry => entry.type === "compaction");
@@ -805,7 +809,8 @@ describe("AgentSession mid-run threshold compaction", () => {
 		const warnings = collectPreparedBudgetWarnings(session);
 		const terminalStates: boolean[] = [];
 		session.subscribe(event => {
-			if (event.type === "agent_end") terminalStates.push(event.isTerminal === true);
+			if (event.type === "agent_end" || event.type === "agent_pause")
+				terminalStates.push(event.type === "agent_end");
 		});
 
 		const prompt = session.prompt("abort the delayed recovery");
@@ -879,7 +884,8 @@ describe("AgentSession mid-run threshold compaction", () => {
 			if (event.type === "notice" && event.level === "warning" && event.source === "compaction") {
 				notices.push(event.message);
 			}
-			if (event.type === "agent_end") terminalStates.push(event.isTerminal === true);
+			if (event.type === "agent_end" || event.type === "agent_pause")
+				terminalStates.push(event.type === "agent_end");
 		});
 
 		await session.prompt("do not duplicate the terminal warning");
@@ -1163,7 +1169,8 @@ describe("AgentSession mid-run threshold compaction", () => {
 			if (event.type === "notice" && event.level === "warning" && event.source === "compaction") {
 				warnings.push(event.message);
 			}
-			if (event.type === "agent_end") terminalStates.push(event.isTerminal === true);
+			if (event.type === "agent_end" || event.type === "agent_pause")
+				terminalStates.push(event.type === "agent_end");
 		});
 		const prompt = session.prompt("start an active goal retry");
 		try {

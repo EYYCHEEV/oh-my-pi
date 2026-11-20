@@ -664,7 +664,7 @@ describe("tool-call answer seam, fix round 2", () => {
 	});
 
 	describe("F4: answeredBy is set only when the answer was used", () => {
-		it("leaves answeredBy off the event and the result when an abort turned the answered call into an error", async () => {
+		it("never applies the answer when an abort ends the call during approval", async () => {
 			const executed: unknown[] = [];
 			const seen: Array<{ answeredBy?: string; isError: boolean }> = [];
 			const runner = await makeRunner([
@@ -686,13 +686,12 @@ describe("tool-call answer seam, fix round 2", () => {
 			});
 			const wrapped = new ExtensionToolWrapper(promptingTool(executed), runner);
 
-			const result = await wrapped.execute("c1", { path: ORIGINAL_URL }, controller.signal, undefined, askContext());
+			await expect(
+				wrapped.execute("c1", { path: ORIGINAL_URL }, controller.signal, undefined, askContext()),
+			).rejects.toThrow("Aborted");
 
 			expect(executed).toEqual([]);
-			expect(seen).toEqual([{ answeredBy: undefined, isError: true }]);
-			expect(result.isError).toBe(true);
-			expect(result.answeredBy).toBeUndefined();
-			expect(result.content).toEqual([{ type: "text", text: "rewritten" }]);
+			expect(seen).toEqual([]);
 		});
 	});
 

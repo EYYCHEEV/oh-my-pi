@@ -2949,16 +2949,15 @@ describe("AgentSession run state while a new run prepares", () => {
 		const reports: { state: string; streaming: boolean }[] = [];
 		const settled = Promise.withResolvers<void>();
 		let settleReportCount = -1;
+		const onLoopEnd = () => {
+			if (settleReportCount >= 0) return;
+			settleReportCount = reports.length;
+			settled.resolve();
+			if (mode === "abort") void session.abort();
+		};
 		const extensionRuntime = new ExtensionRuntime();
 		const extension = await loadExtensionFromFactory(
-			pi => {
-				pi.on("agent_end", () => {
-					if (settleReportCount >= 0) return;
-					settleReportCount = reports.length;
-					settled.resolve();
-					if (mode === "abort") void session.abort();
-				});
-			},
+			() => {},
 			tempDir,
 			new EventBus(),
 			extensionRuntime,
@@ -2991,6 +2990,7 @@ describe("AgentSession run state while a new run prepares", () => {
 		);
 		let aborted = false;
 		const unsubscribeAgent = session.agent.subscribe(event => {
+			if (event.type === "agent_end") onLoopEnd();
 			if (event.type !== "agent_start" || aborted) return;
 			aborted = true;
 			session.agent.emitExternalEvent({

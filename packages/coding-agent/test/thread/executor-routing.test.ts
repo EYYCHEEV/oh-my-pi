@@ -319,7 +319,6 @@ function runOptions(id: string, task: string, extra: Partial<ExecutorOptions> = 
 		id,
 		description: `routing ${id}`,
 		modelOverride: MODEL,
-		structured: false,
 		settings,
 		authStorage,
 		modelRegistry,
@@ -477,7 +476,6 @@ describe("subagent runs routed into pooled workers", () => {
 				id: "Parked",
 				agent: AGENT,
 				message: "again",
-				structured: false,
 			});
 			expect(followUp.error).toBeUndefined();
 			expect(followUp.output).toBe("pong");
@@ -529,7 +527,7 @@ describe("subagent runs routed into pooled workers", () => {
 			const worker = pool.forThread(home);
 			if (!worker) throw new Error("home worker missing");
 
-			const turn = runSubagentFollowUpTurn({ id: "Crash", agent: AGENT, message: HANG_TASK, structured: false });
+			const turn = runSubagentFollowUpTurn({ id: "Crash", agent: AGENT, message: HANG_TASK });
 			await server.hung();
 			worker.terminate("worker crashed: boom");
 			const failed = await turn;
@@ -561,7 +559,6 @@ describe("subagent runs routed into pooled workers", () => {
 				id: "Crash",
 				agent: AGENT,
 				message: "again",
-				structured: false,
 			});
 			expect(again.output).toBe("pong");
 		},
@@ -638,160 +635,208 @@ async function ownerWithRequiredPolicy(content: string): Promise<{ owner: AgentS
 
 describe("inherited policy survives worker placement", () => {
 	for (const restricted of [true, false]) {
-		it(`keeps an inline parent blocker for a ${restricted ? "restricted" : "non-restricted"} child and cold revival`, async () => {
-			await fs.writeFile(path.join(cwd, "guard-probe.txt"), "tool-body-ran");
-			const parent = await policyParent({
-				extensions: [api => {
-					api.on("tool_call", async () => ({ block: true, reason: "inherited-policy-block" }));
-				}],
-			});
-			const id = restricted ? "InlineRestricted" : "InlineUnrestricted";
-			const result = await runSubprocess(runOptions(id, POLICY_TASK, {
-				restrictToolNames: restricted,
-				preloadedPreparedExtensions: parent.preparedExtensions,
-			}));
-			expect(result.output.includes("inherited-policy-block")).toBe(true);
-			expect(result.output.includes("tool-body-ran")).toBe(false);
-			const lifecycle = AgentLifecycleManager.global();
-			await lifecycle.park(id);
-			const ref = AgentRegistry.global().get(id);
-			if (!ref) throw new Error("expected parked child");
-			const factory = createPersistedSubagentReviverFactory({
-				session: parent, authStorage, modelRegistry, settings, enableLsp: false, eventBus,
-			});
-			const revive = await factory(ref);
-			if (!revive) throw new Error("expected persisted reviver");
-			await revive(ref);
-			const next = await runSubagentFollowUpTurn({ id, agent: AGENT, message: POLICY_TASK, structured: false });
-			expect(next.output.includes("inherited-policy-block")).toBe(true);
-			expect(next.output.includes("tool-body-ran")).toBe(false);
-		}, TEST_TIMEOUT_MS);
-
-		it(`refuses startup when an inherited ${restricted ? "restricted" : "non-restricted"} policy factory cannot bind`, async () => {
-			let refuseBinding = false;
-			const parent = await policyParent({
-				extensions: [api => {
-					if (refuseBinding) throw new Error("dummy policy binding failure");
-					api.on("tool_call", async () => ({ block: true, reason: "inherited-policy-block" }));
-				}],
-			});
-			refuseBinding = true;
-			const result = await runSubprocess(runOptions("BindingFailure", POLICY_TASK, {
-				restrictToolNames: restricted,
-				preloadedPreparedExtensions: parent.preparedExtensions,
-			}));
-			expect(result.exitCode !== 0).toBe(true);
-			expect(server.policyCalls === 0).toBe(true);
-			expect(AgentRegistry.global().get("BindingFailure")?.session == null).toBe(true);
-		}, TEST_TIMEOUT_MS);
-
-		for (const change of ["changed", "removed"] as const) {
-			it(`refuses a ${restricted ? "restricted" : "non-restricted"} worker child when the attested file is ${change}`, async () => {
-				const extensionPath = path.join(root, "required-policy.ts");
-				const content = 'export default function (api) { api.on("tool_call", async () => ({ block: true, reason: "file-policy-block" })); }';
-				await fs.writeFile(extensionPath, content);
-				const required: RequiredExtensionSpec = {
-					path: extensionPath,
-					extensionId: "extension-module:required-policy",
-					expectedSha256: new Bun.SHA256().update(content).digest("hex"),
-				};
+		it(
+			`keeps an inline parent blocker for a ${restricted ? "restricted" : "non-restricted"} child and cold revival`,
+			async () => {
+				await fs.writeFile(path.join(cwd, "guard-probe.txt"), "tool-body-ran");
 				const parent = await policyParent({
-					requiredExtension: required,
-					preloadedExtensionPaths: [extensionPath],
+					extensions: [
+						api => {
+							api.on("tool_call", async () => ({ block: true, reason: "inherited-policy-block" }));
+						},
+					],
 				});
-				if (change === "changed") await fs.writeFile(extensionPath, "export default function () {}");
-				else await fs.unlink(extensionPath);
-				const result = await runSubprocess(runOptions("ChangedPolicy", POLICY_TASK, {
-					restrictToolNames: restricted,
-					requiredExtension: required,
-					preloadedExtensionPaths: [extensionPath],
-					preloadedPreparedExtensions: parent.preparedExtensions,
-				}));
-				expect(result.exitCode !== 0).toBe(true);
-				expect(server.policyCalls === 0).toBe(true);
-				expect(AgentRegistry.global().get("ChangedPolicy")?.session == null).toBe(true);
-			}, TEST_TIMEOUT_MS);
-
-			it(`refuses ${restricted ? "restricted" : "non-restricted"} persisted worker revival when the attested file is ${change}`, async () => {
-				const extensionPath = path.join(root, "revived-policy.ts");
-				const content = 'export default function (api) { api.on("tool_call", async () => ({ block: true, reason: "file-policy-block" })); }';
-				await fs.writeFile(extensionPath, content);
-				const required: RequiredExtensionSpec = {
-					path: extensionPath,
-					extensionId: "extension-module:revived-policy",
-					expectedSha256: new Bun.SHA256().update(content).digest("hex"),
-				};
-				const parent = await policyParent({
-					requiredExtension: required,
-					preloadedExtensionPaths: [extensionPath],
-				});
-				const first = await runSubprocess(runOptions("RevivedPolicy", "ping", {
-					restrictToolNames: restricted,
-					requiredExtension: required,
-					preloadedExtensionPaths: [extensionPath],
-					preloadedPreparedExtensions: parent.preparedExtensions,
-				}));
-				expect(first.exitCode === 0).toBe(true);
-				await AgentLifecycleManager.global().park("RevivedPolicy");
-				const ref = AgentRegistry.global().get("RevivedPolicy");
+				const id = restricted ? "InlineRestricted" : "InlineUnrestricted";
+				const result = await runSubprocess(
+					runOptions(id, POLICY_TASK, {
+						restrictToolNames: restricted,
+						preloadedPreparedExtensions: parent.preparedExtensions,
+					}),
+				);
+				expect(result.output.includes("inherited-policy-block")).toBe(true);
+				expect(result.output.includes("tool-body-ran")).toBe(false);
+				const lifecycle = AgentLifecycleManager.global();
+				await lifecycle.park(id);
+				const ref = AgentRegistry.global().get(id);
 				if (!ref) throw new Error("expected parked child");
-				if (change === "changed") await fs.writeFile(extensionPath, "export default function () {}");
-				else await fs.unlink(extensionPath);
 				const factory = createPersistedSubagentReviverFactory({
-					session: parent, authStorage, modelRegistry, settings, enableLsp: false, eventBus,
-					requiredExtension: required,
-					extensionPaths: [extensionPath],
+					session: parent,
+					authStorage,
+					modelRegistry,
+					settings,
+					enableLsp: false,
+					eventBus,
 				});
 				const revive = await factory(ref);
 				if (!revive) throw new Error("expected persisted reviver");
-				let refused = false;
-				try {
-					await revive(ref);
-				} catch {
-					refused = true;
-				}
-				expect(refused).toBe(true);
+				await revive(ref);
+				const next = await runSubagentFollowUpTurn({ id, agent: AGENT, message: POLICY_TASK });
+				expect(next.output.includes("inherited-policy-block")).toBe(true);
+				expect(next.output.includes("tool-body-ran")).toBe(false);
+			},
+			TEST_TIMEOUT_MS,
+		);
+
+		it(
+			`refuses startup when an inherited ${restricted ? "restricted" : "non-restricted"} policy factory cannot bind`,
+			async () => {
+				let refuseBinding = false;
+				const parent = await policyParent({
+					extensions: [
+						api => {
+							if (refuseBinding) throw new Error("dummy policy binding failure");
+							api.on("tool_call", async () => ({ block: true, reason: "inherited-policy-block" }));
+						},
+					],
+				});
+				refuseBinding = true;
+				const result = await runSubprocess(
+					runOptions("BindingFailure", POLICY_TASK, {
+						restrictToolNames: restricted,
+						preloadedPreparedExtensions: parent.preparedExtensions,
+					}),
+				);
+				expect(result.exitCode !== 0).toBe(true);
 				expect(server.policyCalls === 0).toBe(true);
-			}, TEST_TIMEOUT_MS);
+				expect(AgentRegistry.global().get("BindingFailure")?.session == null).toBe(true);
+			},
+			TEST_TIMEOUT_MS,
+		);
+
+		for (const change of ["changed", "removed"] as const) {
+			it(
+				`refuses a ${restricted ? "restricted" : "non-restricted"} worker child when the attested file is ${change}`,
+				async () => {
+					const extensionPath = path.join(root, "required-policy.ts");
+					const content =
+						'export default function (api) { api.on("tool_call", async () => ({ block: true, reason: "file-policy-block" })); }';
+					await fs.writeFile(extensionPath, content);
+					const required: RequiredExtensionSpec = {
+						path: extensionPath,
+						extensionId: "extension-module:required-policy",
+						expectedSha256: new Bun.SHA256().update(content).digest("hex"),
+					};
+					const parent = await policyParent({
+						requiredExtension: required,
+						preloadedExtensionPaths: [extensionPath],
+					});
+					if (change === "changed") await fs.writeFile(extensionPath, "export default function () {}");
+					else await fs.unlink(extensionPath);
+					const result = await runSubprocess(
+						runOptions("ChangedPolicy", POLICY_TASK, {
+							restrictToolNames: restricted,
+							requiredExtension: required,
+							preloadedExtensionPaths: [extensionPath],
+							preloadedPreparedExtensions: parent.preparedExtensions,
+						}),
+					);
+					expect(result.exitCode !== 0).toBe(true);
+					expect(server.policyCalls === 0).toBe(true);
+					expect(AgentRegistry.global().get("ChangedPolicy")?.session == null).toBe(true);
+				},
+				TEST_TIMEOUT_MS,
+			);
+
+			it(
+				`refuses ${restricted ? "restricted" : "non-restricted"} persisted worker revival when the attested file is ${change}`,
+				async () => {
+					const extensionPath = path.join(root, "revived-policy.ts");
+					const content =
+						'export default function (api) { api.on("tool_call", async () => ({ block: true, reason: "file-policy-block" })); }';
+					await fs.writeFile(extensionPath, content);
+					const required: RequiredExtensionSpec = {
+						path: extensionPath,
+						extensionId: "extension-module:revived-policy",
+						expectedSha256: new Bun.SHA256().update(content).digest("hex"),
+					};
+					const parent = await policyParent({
+						requiredExtension: required,
+						preloadedExtensionPaths: [extensionPath],
+					});
+					const first = await runSubprocess(
+						runOptions("RevivedPolicy", "ping", {
+							restrictToolNames: restricted,
+							requiredExtension: required,
+							preloadedExtensionPaths: [extensionPath],
+							preloadedPreparedExtensions: parent.preparedExtensions,
+						}),
+					);
+					expect(first.exitCode === 0).toBe(true);
+					await AgentLifecycleManager.global().park("RevivedPolicy");
+					const ref = AgentRegistry.global().get("RevivedPolicy");
+					if (!ref) throw new Error("expected parked child");
+					if (change === "changed") await fs.writeFile(extensionPath, "export default function () {}");
+					else await fs.unlink(extensionPath);
+					const factory = createPersistedSubagentReviverFactory({
+						session: parent,
+						authStorage,
+						modelRegistry,
+						settings,
+						enableLsp: false,
+						eventBus,
+						requiredExtension: required,
+						extensionPaths: [extensionPath],
+					});
+					const revive = await factory(ref);
+					if (!revive) throw new Error("expected persisted reviver");
+					let refused = false;
+					try {
+						await revive(ref);
+					} catch {
+						refused = true;
+					}
+					expect(refused).toBe(true);
+					expect(server.policyCalls === 0).toBe(true);
+				},
+				TEST_TIMEOUT_MS,
+			);
 		}
 	}
 
-	it("refuses a restricted child spawned through the owner's task tool when the required file changed after the owner started", async () => {
-		await fs.writeFile(path.join(cwd, "guard-probe.txt"), "tool-body-ran");
-		const { owner, extensionPath } = await ownerWithRequiredPolicy(OWNER_POLICY_SOURCE);
-		const marker = path.join(root, "replacement-ran.txt");
-		await fs.writeFile(
-			extensionPath,
-			`await Bun.write(${JSON.stringify(marker)}, "ran");\nexport default function () {}`,
-		);
-		const task = owner.getToolByName("task") as TaskTool | undefined;
-		if (!task) throw new Error("expected the owner's task tool");
-		const result = await task.execute("changed-owner-policy", {
-			agent: "task",
-			name: "ChangedOwnerPolicy",
-			task: POLICY_TASK,
-			solutionSpace: "A single spawn with one correct way to run it.",
-		});
-		expect(await Bun.file(marker).exists()).toBe(false);
-		expect(server.policyCalls === 0).toBe(true);
-		expect(result.details?.results[0]?.exitCode !== 0).toBe(true);
-	}, TEST_TIMEOUT_MS);
+	it(
+		"refuses a restricted child spawned through the owner's task tool when the required file changed after the owner started",
+		async () => {
+			await fs.writeFile(path.join(cwd, "guard-probe.txt"), "tool-body-ran");
+			const { owner, extensionPath } = await ownerWithRequiredPolicy(OWNER_POLICY_SOURCE);
+			const marker = path.join(root, "replacement-ran.txt");
+			await fs.writeFile(
+				extensionPath,
+				`await Bun.write(${JSON.stringify(marker)}, "ran");\nexport default function () {}`,
+			);
+			const task = owner.getToolByName("task") as TaskTool | undefined;
+			if (!task) throw new Error("expected the owner's task tool");
+			const result = await task.execute("changed-owner-policy", {
+				agent: "task",
+				name: "ChangedOwnerPolicy",
+				task: POLICY_TASK,
+				solutionSpace: "A single spawn with one correct way to run it.",
+			});
+			expect(await Bun.file(marker).exists()).toBe(false);
+			expect(server.policyCalls === 0).toBe(true);
+			expect(result.details?.results[0]?.exitCode !== 0).toBe(true);
+		},
+		TEST_TIMEOUT_MS,
+	);
 
-	it("keeps blocking tool calls in a restricted child spawned through the owner's task tool when the required file is unchanged", async () => {
-		await fs.writeFile(path.join(cwd, "guard-probe.txt"), "tool-body-ran");
-		const { owner } = await ownerWithRequiredPolicy(OWNER_POLICY_SOURCE);
-		const task = owner.getToolByName("task") as TaskTool | undefined;
-		if (!task) throw new Error("expected the owner's task tool");
-		const result = await task.execute("unchanged-owner-policy", {
-			agent: "task",
-			name: "UnchangedOwnerPolicy",
-			task: POLICY_TASK,
-			solutionSpace: "A single spawn with one correct way to run it.",
-		});
-		const child = result.details?.results[0];
-		expect(child?.exitCode === 0).toBe(true);
-		expect(child?.output.includes("file-policy-block")).toBe(true);
-		expect(child?.output.includes("tool-body-ran")).toBe(false);
-		expect(server.policyCalls >= 1).toBe(true);
-	}, TEST_TIMEOUT_MS);
+	it(
+		"keeps blocking tool calls in a restricted child spawned through the owner's task tool when the required file is unchanged",
+		async () => {
+			await fs.writeFile(path.join(cwd, "guard-probe.txt"), "tool-body-ran");
+			const { owner } = await ownerWithRequiredPolicy(OWNER_POLICY_SOURCE);
+			const task = owner.getToolByName("task") as TaskTool | undefined;
+			if (!task) throw new Error("expected the owner's task tool");
+			const result = await task.execute("unchanged-owner-policy", {
+				agent: "task",
+				name: "UnchangedOwnerPolicy",
+				task: POLICY_TASK,
+				solutionSpace: "A single spawn with one correct way to run it.",
+			});
+			const child = result.details?.results[0];
+			expect(child?.exitCode === 0).toBe(true);
+			expect(child?.output.includes("file-policy-block")).toBe(true);
+			expect(child?.output.includes("tool-body-ran")).toBe(false);
+			expect(server.policyCalls >= 1).toBe(true);
+		},
+		TEST_TIMEOUT_MS,
+	);
 });

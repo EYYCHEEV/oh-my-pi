@@ -10,6 +10,7 @@ import {
 	buildManagedKernelEnv,
 	buildManagedKernelEnvPatch,
 	createCancelledKernelResult,
+	type DisposeByOwnerOptions,
 	EvalKernelNotRunningError,
 	executeWithKernelBase,
 	getExecutionDeadlineMs,
@@ -577,8 +578,8 @@ export async function disposeAllKernelSessions(): Promise<void> {
 	await sessionRegistry.disposeAll();
 }
 
-export async function disposeKernelSessionsByOwner(ownerId: string): Promise<void> {
-	await sessionRegistry.disposeByOwner(ownerId);
+export async function disposeKernelSessionsByOwner(ownerId: string, options?: DisposeByOwnerOptions): Promise<void> {
+	await sessionRegistry.disposeByOwner(ownerId, options);
 }
 
 /** Projects against an already-retained, idle Python session without starting a kernel. */

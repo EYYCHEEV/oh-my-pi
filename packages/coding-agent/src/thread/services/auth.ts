@@ -448,8 +448,9 @@ function registerAuthErrors(): void {
 	registerRpcError("ApiKeyRequiredError", message => new ApiKeyRequiredError(message));
 	registerRpcError("LoginCancelledError", message => new LoginCancelledError(message));
 	registerRpcError("OAuthError", message => new OAuthError(message));
-	registerRpcError("OAuthAccountPoolError", message =>
-		new OAuthAccountPoolError("restricted_unavailable", "", message),
+	registerRpcError(
+		"OAuthAccountPoolError",
+		message => new OAuthAccountPoolError("restricted_unavailable", "", message),
 	);
 	registerRpcError("ConfigurationError", message => new ConfigurationError(message));
 	registerRpcError("AuthBrokerError", message => new AuthBrokerError(message));

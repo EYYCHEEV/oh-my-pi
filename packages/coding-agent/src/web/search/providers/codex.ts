@@ -24,11 +24,11 @@ import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import {
 	applyCodexResidencyHeader,
 	CODEX_BASE_URL,
-	CODEX_CLIENT_VERSION,
 	getCodexAccountId,
 	OPENAI_HEADER_VALUES,
 	OPENAI_HEADERS,
 } from "@oh-my-pi/pi-catalog/wire/codex";
+import { getCodexClientVersion } from "@oh-my-pi/pi-catalog/wire/codex-version";
 import { $env, readSseJson, USER_AGENT } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import type { ModelRegistry } from "../../../config/model-registry";
@@ -699,7 +699,7 @@ function buildCodexHeaders(
 	}
 	applyCodexResidencyHeader(headers, accessToken);
 	headers.set(OPENAI_HEADERS.ORIGINATOR, OPENAI_HEADER_VALUES.ORIGINATOR_CODEX);
-	headers.set(OPENAI_HEADERS.VERSION, CODEX_CLIENT_VERSION);
+	headers.set(OPENAI_HEADERS.VERSION, getCodexClientVersion());
 	headers.set("User-Agent", USER_AGENT);
 	headers.set("Accept", "text/event-stream");
 	headers.set("Content-Type", "application/json");

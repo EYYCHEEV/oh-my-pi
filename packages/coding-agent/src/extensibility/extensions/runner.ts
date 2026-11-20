@@ -55,6 +55,7 @@ import {
 import { ManagedTimers } from "./managed-timers";
 import { createExtensionModelQuery } from "./model-api";
 import { trackUserWaits, type UserWaitTracker } from "./user-wait";
+import { ExtensionToolWrapper } from "./wrapper";
 import type { ComposerShapeDefinition } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
 import { extensionLinkClicksAvailable } from "@oh-my-pi/pi-tui/render/extension-links";
 import {
@@ -921,14 +922,6 @@ export class ExtensionRunner {
 		return this.#nativeToolResolver?.(name)?.tool.delegationGuidance ?? "";
 	}
 
-	/**
-	 * Run the native built-in of `name` with `params` and return its result — the delegation target
-	 * of a same-tool `ctx.invokeTool`. Calls the unwrapped native `execute` directly with the loop's
-	 * ordinary tool context, so it inherits the caller's already-granted approval (the caller is the
-	 * same tool) rather than re-running the gate. `depth` guards a wrapper that recurses into itself;
-	 * it is per call chain (threaded from the caller), not session-global, so concurrent independent
-	 * delegations do not interfere.
-	 */
 	async invokeNativeTool<TDetails = unknown>(
 		name: string,
 		params: Record<string, unknown>,
@@ -953,12 +946,13 @@ export class ExtensionRunner {
 			throw new Error(`invokeTool: delegation depth exceeded 8 (recursive invokeTool for "${name}"?)`);
 		}
 		const toolCallId = options?.toolCallId ?? `invoke-${name}-${Date.now().toString(36)}-${depth}`;
-		return (await resolved.tool.execute(
+		const { xdevPolicyKey: _outerApproval, ...context } = options?.callerContext ?? resolved.makeContext();
+		return (await new ExtensionToolWrapper(resolved.tool, this).execute(
 			toolCallId,
 			params as never,
 			options?.signal,
 			options?.onUpdate as never,
-			options?.callerContext ?? resolved.makeContext(),
+			context,
 		)) as AgentToolResult<TDetails>;
 	}
 
