@@ -8,6 +8,7 @@
 
 ### Added
 
+- Added the `bash.refuseHandlerUrlWrites` setting (default off): when on, the shell refuses every write to a handler-written URL (`agent://`, `proc://`, `ssh://`, `xd://`, `cfg://`, `out://`, …) with EROFS, so such writes go only through the write tool; file-written URLs such as `local://` are unaffected.
 - Added host-selected restricted extension sessions without product-specific tool policies.
 - Extensions can size complete context pages to the current tool execution's output budget.
 - Added `/login manage [provider]` and `omp auth list|pause|resume <provider> [credential-id] [--json]` to pause and resume stored OAuth accounts by durable credential id; paused accounts are skipped by routing, usage polling, reset sweeps, Codex model discovery, and security-scan account picking in every process.

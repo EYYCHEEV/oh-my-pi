@@ -165,6 +165,19 @@ export const cfgBashGitGuard = register({
 	},
 });
 
+export const cfgBashRefuseHandlerUrlWrites = register({
+	id: "bash.refuseHandlerUrlWrites",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "shell",
+		group: "Bash",
+		label: "Refuse Handler URL Writes",
+		description:
+			"Refuse shell writes to handler-written URLs (agent://, proc://, ssh://, xd://, cfg://, out://, and the like) with EROFS; write them with the write tool instead. File-written URLs such as local:// are unaffected",
+	},
+});
+
 export const cfgBashPatterns = register({
 	id: "bash.patterns",
 	type: "array",

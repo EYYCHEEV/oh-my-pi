@@ -1,9 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { type LocalProtocolOptions, resolveLocalRoot } from "@oh-my-pi/pi-coding-agent/internal-urls";
-import { InternalUrlFilesystem } from "@oh-my-pi/pi-coding-agent/internal-urls/url-filesystem";
+import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls/router";
+import { InternalUrlFilesystem, type UrlWriteReport } from "@oh-my-pi/pi-coding-agent/internal-urls/url-filesystem";
 import { executeShell, ShellFsFileType, ShellFsOp } from "@oh-my-pi/pi-natives";
 
 const READ = { read: true, write: false, append: false, truncate: false, create: false, createNew: false };
@@ -169,6 +171,94 @@ describe("InternalUrlFilesystem policy", () => {
 		const response = await shellFs("write").handle({ op: ShellFsOp.Metadata, path: "ssh://host/etc/hosts" });
 
 		expect(response.error?.code).toBe("EACCES");
+	});
+});
+
+describe("InternalUrlFilesystem with bash.refuseHandlerUrlWrites", () => {
+	const REFUSED = "is written through the write tool, not the shell";
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	function switchedFs(refuse: boolean, reports: UrlWriteReport[] = []) {
+		const session = { settings: Settings.isolated({ "bash.refuseHandlerUrlWrites": refuse }) };
+		const filesystem = new InternalUrlFilesystem({
+			context: { localProtocolOptions: localOptions, session } as never,
+			tier: "exec",
+			onReply: () => {},
+			onWrite: report => reports.push(report),
+		});
+		return { filesystem, session };
+	}
+
+	it("refuses opening any handler-written URL for writing, before a handler sees it", async () => {
+		const write = vi.spyOn(InternalUrlRouter.instance(), "write").mockResolvedValue({ content: [] } as never);
+		const reports: UrlWriteReport[] = [];
+		const { filesystem } = switchedFs(true, reports);
+		const urls = ["agent://a", "proc://bg_1/kill", "xd://resolve", "cfg://bash.refuseHandlerUrlWrites", "out://"];
+
+		for (const url of urls) {
+			const response = await filesystem.handle({ op: ShellFsOp.Open, path: url, open: CREATE });
+			expect(response.error?.code).toBe("EROFS");
+			expect(response.error?.message).toBe(`${url.slice(0, url.indexOf(":"))}:// ${REFUSED}: ${url}`);
+		}
+		expect(write).not.toHaveBeenCalled();
+		expect(reports).toHaveLength(urls.length);
+		expect(reports.every(report => report.failed)).toBe(true);
+	});
+
+	it("refuses renaming a local:// file into a handler-written URL in the same words", async () => {
+		await fs.mkdir(localRoot, { recursive: true });
+		await fs.writeFile(path.join(localRoot, "f.txt"), "x");
+
+		const response = await switchedFs(true).filesystem.handle({
+			op: ShellFsOp.Rename,
+			path: "local://f.txt",
+			target: "agent://x",
+		});
+
+		expect(response.error?.code).toBe("EROFS");
+		expect(response.error?.message).toBe(`agent:// ${REFUSED}: agent://x`);
+	});
+
+	it("refuses delivering a sink opened before the setting turned on", async () => {
+		const write = vi.spyOn(InternalUrlRouter.instance(), "write").mockResolvedValue({ content: [] } as never);
+		const { filesystem, session } = switchedFs(false);
+		const opened = await filesystem.handle({ op: ShellFsOp.Open, path: "agent://a", open: CREATE });
+		const handle = opened.handle;
+		if (handle === undefined) throw new Error("expected a write handle with the setting off");
+		await filesystem.handle({ op: ShellFsOp.Write, handle, data: Buffer.from("x") });
+		session.settings = Settings.isolated({ "bash.refuseHandlerUrlWrites": true });
+
+		const closed = await filesystem.handle({ op: ShellFsOp.Close, handle });
+
+		expect(closed.error?.code).toBe("EROFS");
+		expect(closed.error?.message).toBe(`agent:// ${REFUSED}: agent://a`);
+		expect(write).not.toHaveBeenCalled();
+	});
+
+	it("still writes local:// files with the setting on", async () => {
+		await fs.mkdir(localRoot, { recursive: true });
+
+		const response = await switchedFs(true).filesystem.handle({
+			op: ShellFsOp.Open,
+			path: "local://kept.txt",
+			open: CREATE,
+		});
+
+		expect(response).toEqual({ local: path.join(localRoot, "kept.txt") });
+	});
+
+	it("opens a write sink for handler-written URLs with the setting off", async () => {
+		const response = await switchedFs(false).filesystem.handle({
+			op: ShellFsOp.Open,
+			path: "agent://a",
+			open: CREATE,
+		});
+
+		expect(response.error).toBeUndefined();
+		expect(response.handle).toBeDefined();
 	});
 });
 

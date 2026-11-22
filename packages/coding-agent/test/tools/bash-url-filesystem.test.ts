@@ -1,10 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { resolveLocalRoot } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls/router";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 
@@ -226,5 +227,74 @@ describe("bash replies through out://", () => {
 
 		const read = await run("cat out://; echo status=$?");
 		expect(read.text).toContain("status=1");
+	});
+});
+
+describe("bash with bash.refuseHandlerUrlWrites", () => {
+	const REFUSED = "is written through the write tool, not the shell";
+	let manager: AsyncJobManager;
+	let write: ReturnType<typeof vi.spyOn>;
+
+	beforeEach(() => {
+		manager = new AsyncJobManager({});
+		session = {
+			...session,
+			getSessionId: () => tempDir,
+			asyncJobManager: manager,
+			settings: Settings.isolated({
+				"bash.autoBackground.enabled": false,
+				"bashInterceptor.enabled": false,
+				"bash.refuseHandlerUrlWrites": true,
+			}),
+		} as unknown as ToolSession;
+		write = vi.spyOn(InternalUrlRouter.instance(), "write").mockResolvedValue({ content: [] } as never);
+		vi.spyOn(InternalUrlRouter.instance(), "resolve").mockRejectedValue(new Error("not found"));
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		await manager.dispose();
+	});
+
+	it("fails every shell write to a handler-written URL and never calls the handler", async () => {
+		await fs.writeFile(path.join(tempDir, "src.txt"), "x");
+		const commands = [
+			"printf x > agent://a",
+			"printf x | tee proc://bg_1/kill",
+			"cp src.txt ssh://host/x",
+			"printf '{}' > xd://resolve",
+			'target=agent; printf x > "$target://b"',
+			"echo hi > out://",
+		];
+
+		for (const command of commands) {
+			const { text } = await run(`${command}; echo status=$?`);
+			expect(text).toContain("status=1");
+			expect(text).toContain(REFUSED);
+		}
+		expect(write).not.toHaveBeenCalled();
+	});
+
+	it("refuses the write in a background job too", async () => {
+		const started = await new BashTool(session).execute("bg", {
+			command: "printf x > agent://a; echo status=$?",
+			async: true,
+			timeout: 0,
+		});
+		const id = started.details?.async?.jobId;
+		if (!id) throw new Error("expected a background job");
+
+		await manager.getJob(id)?.promise;
+
+		expect(manager.getJob(id)?.resultText).toContain("status=1");
+		expect(write).not.toHaveBeenCalled();
+	});
+
+	it("still writes and reads local:// files", async () => {
+		const { text, isError } = await run("printf 'kept\\n' > local://note.txt; cat local://note.txt");
+
+		expect(isError).toBeUndefined();
+		expect(text).toContain("kept\n");
+		expect(await fs.readFile(path.join(localRoot, "note.txt"), "utf-8")).toBe("kept\n");
 	});
 });

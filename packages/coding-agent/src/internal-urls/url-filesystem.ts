@@ -31,6 +31,7 @@ import {
 	type ShellFsResponse,
 } from "@oh-my-pi/pi-natives";
 import { isFsError } from "@oh-my-pi/pi-utils";
+import { cfgBashRefuseHandlerUrlWrites } from "../exec/settings";
 import { resolveApproval, TIER_RANK } from "../tools/approval";
 import { cfgToolsApproval } from "../tools/settings";
 import { UrlContainmentError } from "./filesystem-resource";
@@ -556,7 +557,10 @@ export class InternalUrlFilesystem {
 		const writes = open.write === true || open.append === true || open.truncate === true || create;
 		if (writes && isUrlPath(input)) {
 			const { spec } = this.#route(input);
-			if (spec.write?.via === "handler") return this.#openSink(input, spec, open);
+			if (spec.write?.via === "handler") {
+				if (this.#refusesHandlerWrites()) throw this.#refuseHandlerWrite(input);
+				return this.#openSink(input, spec, open);
+			}
 		}
 		// O_EXCL never follows a final symlink; every other open does.
 		const node = await this.#node(input, open.createNew !== true, create);
@@ -618,6 +622,7 @@ export class InternalUrlFilesystem {
 	 */
 	async #deliver(sink: WriteSink): Promise<void> {
 		if (sink.overflowed || this.#context.signal?.aborted) return;
+		if (this.#refusesHandlerWrites()) throw this.#refuseHandlerWrite(sink.url);
 		let text: string;
 		try {
 			text = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(sink.chunks));
@@ -966,12 +971,29 @@ export class InternalUrlFilesystem {
 
 	#readOnly(node: { url: string; spec: SchemeSpec }): UrlFsError {
 		const scheme = schemeOf(node.url);
+		if (node.spec.write?.via === "handler" && this.#refusesHandlerWrites()) {
+			return new UrlFsError("EROFS", `${scheme}:// is written through the write tool, not the shell: ${node.url}`);
+		}
 		return new UrlFsError(
 			"EROFS",
 			node.spec.write?.via === "handler"
 				? `${scheme}:// takes only whole writes (a bash redirect or the write tool): ${node.url}`
 				: `${scheme}:// is read-only: ${node.url}`,
 		);
+	}
+
+	#refusesHandlerWrites(): boolean {
+		const settings = this.#context.session?.settings;
+		return settings !== undefined && cfgBashRefuseHandlerUrlWrites.get(settings);
+	}
+
+	#refuseHandlerWrite(url: string): UrlFsError {
+		const error = new UrlFsError(
+			"EROFS",
+			`${schemeOf(url)}:// is written through the write tool, not the shell: ${url}`,
+		);
+		this.#onWrite?.({ url, text: error.message, failed: true });
+		return error;
 	}
 
 	#handle(handle: number | undefined): VirtualNode | WriteSink {
