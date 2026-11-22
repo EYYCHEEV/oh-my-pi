@@ -153,6 +153,7 @@ An upgrade fails before build or installation if the block is stale, any require
 - `tool-shell-guard-parity`: The bash tool's shell refuses no-fork command substitution and never expands aliases, so the command guard reads what runs
 - `codex-client-version-launcher-pin`: omp never asks npm for the Codex version or reads or writes a version record, with or without PI_AI_CODEX_CLIENT_VERSION
 - `seance-session-consult`: Seance: a read-only child consults a saved session's transcript and artifacts through the task tool and /seance
+- `bash-refuse-handler-url-writes`: Bash: an opt-in setting refuses shell writes to handler-written internal URLs
 <!-- stronk-omp:fork-contracts:end -->
 
 ## Upstream alignment
